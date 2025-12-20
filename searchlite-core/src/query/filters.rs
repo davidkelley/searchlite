@@ -40,12 +40,13 @@ mod tests {
   fn evaluates_all_filter_types() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let mut writer = FastFieldsWriter::new();
     writer.set("cat", 0, FastValue::Str("news".into()));
     writer.set("year", 0, FastValue::I64(2024));
     writer.set("score", 0, FastValue::F64(0.75));
-    writer.write_to(&path).unwrap();
-    let reader = FastFieldsReader::open(&path).unwrap();
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
 
     let filters = vec![
       Filter::KeywordEq {

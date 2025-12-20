@@ -5,11 +5,12 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 
-use crate::api::types::IndexOptions;
+use crate::api::types::{IndexOptions, StorageType};
 use crate::index::directory::ensure_root;
 use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::SegmentWriter;
 use crate::index::wal::Wal;
+use crate::storage::{FsStorage, InMemoryStorage, Storage};
 
 pub mod codec;
 pub mod directory;
@@ -31,15 +32,20 @@ pub(crate) struct InnerIndex {
   pub options: IndexOptions,
   pub manifest: RwLock<Manifest>,
   pub writer_lock: Mutex<()>,
+  pub storage: Arc<dyn Storage>,
 }
 
 impl Index {
   pub fn create(path: &Path, schema: Schema, opts: IndexOptions) -> Result<Self> {
-    ensure_root(path)?;
+    let mut opts = opts;
+    opts.path = path.to_path_buf();
+    let storage = storage_from_options(&opts);
+    ensure_root(storage.as_ref(), path)?;
     let manifest = Manifest::new(schema);
-    manifest.store(&Manifest::manifest_path(path))?;
+    manifest.store(storage.as_ref(), &Manifest::manifest_path(path))?;
     let inner = Arc::new(InnerIndex {
       path: path.to_path_buf(),
+      storage,
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
@@ -48,20 +54,22 @@ impl Index {
   }
 
   pub fn open(opts: IndexOptions) -> Result<Self> {
-    ensure_root(&opts.path)?;
+    let storage = storage_from_options(&opts);
+    ensure_root(storage.as_ref(), &opts.path)?;
     let manifest_path = Manifest::manifest_path(&opts.path);
-    let manifest = if manifest_path.exists() {
-      Manifest::load(&manifest_path)?
+    let manifest = if storage.exists(&manifest_path) {
+      Manifest::load(storage.as_ref(), &manifest_path)?
     } else if opts.create_if_missing {
       let schema = Schema::default_text_body();
       let m = Manifest::new(schema);
-      m.store(&manifest_path)?;
+      m.store(storage.as_ref(), &manifest_path)?;
       m
     } else {
       bail!("index does not exist at {:?}", manifest_path);
     };
     let inner = Arc::new(InnerIndex {
       path: opts.path.clone(),
+      storage,
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
@@ -108,11 +116,15 @@ impl Index {
       &schema,
       inner.options.enable_positions,
       cfg!(feature = "zstd"),
+      inner.storage.clone(),
     );
     let new_seg = writer.write_segment(&all_docs, generation)?;
     manifest_guard.segments = vec![new_seg];
     manifest_guard.committed_at = Utc::now().to_rfc3339();
-    manifest_guard.store(&Manifest::manifest_path(&inner.path))?;
+    manifest_guard.store(
+      inner.storage.as_ref(),
+      &Manifest::manifest_path(&inner.path),
+    )?;
     Ok(())
   }
 
@@ -124,10 +136,17 @@ impl Index {
 impl InnerIndex {
   pub(crate) fn wal(&self) -> Result<Wal> {
     let wal_path = directory::wal_path(&self.path);
-    Wal::open(&wal_path)
+    Wal::open(self.storage.clone(), &wal_path)
   }
 
   pub(crate) fn manifest_path(&self) -> PathBuf {
     Manifest::manifest_path(&self.path)
+  }
+}
+
+fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
+  match opts.storage {
+    StorageType::Filesystem => Arc::new(FsStorage::new(opts.path.clone())),
+    StorageType::InMemory => Arc::new(InMemoryStorage::new(opts.path.clone())),
   }
 }

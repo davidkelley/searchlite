@@ -1,12 +1,15 @@
 use searchlite_core::api::types::Document;
+use searchlite_core::storage::FsStorage;
 use searchlite_core::util::varint;
 use searchlite_core::wal::Wal;
+use std::sync::Arc;
 
 #[test]
 fn wal_roundtrip() {
   let dir = tempfile::tempdir().unwrap();
   let path = dir.path().join("wal.log");
-  let mut wal = Wal::open(&path).unwrap();
+  let storage = Arc::new(FsStorage::new(dir.path().to_path_buf()));
+  let mut wal = Wal::open(storage.clone(), &path).unwrap();
   let doc = Document {
     fields: [("body".to_string(), serde_json::json!("hello wal"))]
       .into_iter()
@@ -14,7 +17,7 @@ fn wal_roundtrip() {
   };
   wal.append_add_doc(&doc).unwrap();
   wal.append_commit().unwrap();
-  let entries = Wal::replay(&path).unwrap();
+  let entries = Wal::replay(storage.as_ref(), &path).unwrap();
   assert!(!entries.is_empty());
 }
 

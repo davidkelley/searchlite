@@ -3,21 +3,21 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-pub fn write_u32<W: Write>(w: &mut W, v: u32) -> Result<()> {
+pub fn write_u32<W: Write + ?Sized>(w: &mut W, v: u32) -> Result<()> {
   w.write_u32::<LittleEndian>(v)?;
   Ok(())
 }
 
-pub fn write_f32<W: Write>(w: &mut W, v: f32) -> Result<()> {
+pub fn write_f32<W: Write + ?Sized>(w: &mut W, v: f32) -> Result<()> {
   w.write_f32::<LittleEndian>(v)?;
   Ok(())
 }
 
-pub fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
+pub fn read_u32<R: Read + ?Sized>(r: &mut R) -> Result<u32> {
   r.read_u32::<LittleEndian>().context("reading u32")
 }
 
-pub fn read_f32<R: Read>(r: &mut R) -> Result<f32> {
+pub fn read_f32<R: Read + ?Sized>(r: &mut R) -> Result<f32> {
   r.read_f32::<LittleEndian>().context("reading f32")
 }
 

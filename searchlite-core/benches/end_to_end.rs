@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
-use searchlite_core::api::types::{Document, IndexOptions, Schema, SearchRequest};
+use searchlite_core::api::types::{Document, IndexOptions, Schema, SearchRequest, StorageType};
 use searchlite_core::api::Index;
 
 fn bench_indexing(c: &mut Criterion) {
@@ -14,6 +14,7 @@ fn bench_indexing(c: &mut Criterion) {
         enable_positions: true,
         bm25_k1: 0.9,
         bm25_b: 0.4,
+        storage: StorageType::Filesystem,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       };
@@ -48,6 +49,7 @@ fn bench_search(c: &mut Criterion) {
       enable_positions: true,
       bm25_k1: 0.9,
       bm25_b: 0.4,
+      storage: StorageType::Filesystem,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

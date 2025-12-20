@@ -42,6 +42,7 @@ impl IndexReader {
     let mut segments = Vec::new();
     for seg in manifest.segments.iter() {
       segments.push(SegmentReader::open(
+        inner.storage.clone(),
         seg.clone(),
         inner.options.enable_positions,
       )?);
@@ -55,6 +56,7 @@ impl IndexReader {
         enable_positions: inner.options.enable_positions,
         bm25_k1: inner.options.bm25_k1,
         bm25_b: inner.options.bm25_b,
+        storage: inner.options.storage.clone(),
         #[cfg(feature = "vectors")]
         vector_defaults: inner.options.vector_defaults.clone(),
       },

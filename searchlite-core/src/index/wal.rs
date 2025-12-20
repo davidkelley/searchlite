@@ -1,11 +1,12 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crc32fast::Hasher;
 
 use crate::api::types::Document;
+use crate::storage::{Storage, StorageFile};
 use crate::util::varint::{read_u64, write_u64};
 
 #[derive(Debug, Clone)]
@@ -15,18 +16,21 @@ pub enum WalEntry {
 }
 
 pub struct Wal {
-  file: File,
+  _storage: Arc<dyn Storage>,
+  _path: PathBuf,
+  file: Box<dyn StorageFile>,
 }
 
 impl Wal {
-  pub fn open(path: &Path) -> Result<Self> {
-    let file = File::options()
-      .create(true)
-      .append(true)
-      .read(true)
-      .open(path)
+  pub fn open(storage: Arc<dyn Storage>, path: &Path) -> Result<Self> {
+    let file = storage
+      .open_append(path)
       .with_context(|| format!("opening wal at {:?}", path))?;
-    Ok(Self { file })
+    Ok(Self {
+      _storage: storage,
+      _path: path.to_path_buf(),
+      file,
+    })
   }
 
   pub fn append_add_doc(&mut self, doc: &Document) -> Result<()> {
@@ -55,16 +59,14 @@ impl Wal {
   pub fn truncate(&mut self) -> Result<()> {
     self.file.set_len(0)?;
     self.file.seek(SeekFrom::Start(0))?;
-    Ok(())
+    self.file.sync_all()
   }
 
-  pub fn replay(path: &Path) -> Result<Vec<WalEntry>> {
-    if !path.exists() {
+  pub fn replay(storage: &dyn Storage, path: &Path) -> Result<Vec<WalEntry>> {
+    if !storage.exists(path) {
       return Ok(Vec::new());
     }
-    let mut file = File::open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let data = storage.read_to_end(path)?;
     let mut cursor = 0usize;
     let mut entries = Vec::new();
     while cursor < data.len() {
@@ -106,8 +108,12 @@ impl Wal {
     Ok(entries)
   }
 
-  pub fn last_pending_documents(path: &Path) -> Result<Vec<Document>> {
-    let entries = Self::replay(path)?;
+  pub fn last_pending_documents(storage: &dyn Storage, path: &Path) -> Result<Vec<Document>> {
+    let entries = if storage.exists(path) {
+      Self::replay(storage, path)?
+    } else {
+      Vec::new()
+    };
     let mut pending = Vec::new();
     for entry in entries {
       match entry {
@@ -128,7 +134,8 @@ mod tests {
   fn replays_entries_and_handles_commit() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let mut wal = Wal::open(&path).unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut wal = Wal::open(Arc::new(storage), &path).unwrap();
     let doc = Document {
       fields: [("body".into(), serde_json::json!("hello"))]
         .into_iter()
@@ -136,9 +143,10 @@ mod tests {
     };
     wal.append_add_doc(&doc).unwrap();
     wal.append_commit().unwrap();
-    let entries = Wal::replay(&path).unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let entries = Wal::replay(&storage, &path).unwrap();
     assert!(matches!(entries.last(), Some(WalEntry::Commit)));
-    let pending = Wal::last_pending_documents(&path).unwrap();
+    let pending = Wal::last_pending_documents(&storage, &path).unwrap();
     assert!(pending.is_empty());
   }
 
@@ -147,7 +155,8 @@ mod tests {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     std::fs::write(&path, vec![1u8, 2, 3, 4]).unwrap();
-    let entries = Wal::replay(&path).unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let entries = Wal::replay(&storage, &path).unwrap();
     assert!(entries.is_empty());
   }
 }

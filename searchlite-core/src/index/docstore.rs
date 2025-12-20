@@ -1,19 +1,18 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::Result;
 
 use crate::DocId;
 
-pub struct DocStoreWriter<'a> {
-  file: &'a mut File,
+pub struct DocStoreWriter<'a, W: Write + Seek + ?Sized> {
+  file: &'a mut W,
   offsets: Vec<u64>,
   #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
   use_zstd: bool,
 }
 
-impl<'a> DocStoreWriter<'a> {
-  pub fn new(file: &'a mut File, use_zstd: bool) -> Self {
+impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
+  pub fn new(file: &'a mut W, use_zstd: bool) -> Self {
     Self {
       file,
       offsets: Vec::new(),
@@ -41,15 +40,15 @@ impl<'a> DocStoreWriter<'a> {
   }
 }
 
-pub struct DocStoreReader {
-  file: File,
+pub struct DocStoreReader<R: Read + Seek> {
+  file: R,
   offsets: Vec<u64>,
   #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
   use_zstd: bool,
 }
 
-impl DocStoreReader {
-  pub fn new(file: File, offsets: Vec<u64>, use_zstd: bool) -> Self {
+impl<R: Read + Seek> DocStoreReader<R> {
+  pub fn new(file: R, offsets: Vec<u64>, use_zstd: bool) -> Self {
     Self {
       file,
       offsets,
@@ -102,7 +101,7 @@ mod tests {
     let offsets = writer.offsets().to_vec();
     drop(writer);
     drop(file);
-    let reader_file = File::open(path).unwrap();
+    let reader_file = std::fs::File::open(path).unwrap();
     let mut reader = DocStoreReader::new(reader_file, offsets, false);
     let first = reader.get(0).unwrap();
     assert_eq!(first["title"], "Rust");

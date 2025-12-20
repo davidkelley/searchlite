@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::storage::Storage;
 use crate::DocId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,9 +39,13 @@ impl FastFieldsWriter {
     col[doc_id as usize] = value;
   }
 
-  pub fn write_to(&self, path: &Path) -> Result<()> {
-    let writer = BufWriter::new(File::create(path)?);
-    serde_json::to_writer_pretty(writer, &self.data)?;
+  pub fn write_to(&self, storage: &dyn Storage, path: &Path) -> Result<()> {
+    let mut handle = storage.open_write(path)?;
+    let mut writer = BufWriter::new(&mut *handle);
+    serde_json::to_writer_pretty(&mut writer, &self.data)?;
+    writer.flush()?;
+    drop(writer);
+    handle.sync_all()?;
     Ok(())
   }
 }
@@ -51,9 +55,9 @@ pub struct FastFieldsReader {
 }
 
 impl FastFieldsReader {
-  pub fn open(path: &Path) -> Result<Self> {
-    let reader = BufReader::new(File::open(path)?);
-    let data: FastFieldFile = serde_json::from_reader(reader)?;
+  pub fn open(storage: &dyn Storage, path: &Path) -> Result<Self> {
+    let data = storage.read_to_end(path)?;
+    let data: FastFieldFile = serde_json::from_slice(&data)?;
     Ok(Self { data })
   }
 
@@ -103,13 +107,14 @@ mod tests {
   fn writes_and_reads_fast_fields() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let mut writer = FastFieldsWriter::new();
     writer.set("tag", 0, FastValue::Str("news".into()));
     writer.set("year", 0, FastValue::I64(2024));
     writer.set("score", 0, FastValue::F64(0.42));
-    writer.write_to(&path).unwrap();
+    writer.write_to(&storage, &path).unwrap();
 
-    let reader = FastFieldsReader::open(&path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
     assert!(reader.matches_keyword("tag", 0, "news"));
     assert!(reader.matches_keyword_in("tag", 0, &vec!["sports".into(), "news".into()]));
     assert!(reader.matches_i64_range("year", 0, 2020, 2025));

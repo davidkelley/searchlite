@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::Result;
@@ -55,13 +54,13 @@ impl InvertedIndexBuilder {
   }
 }
 
-pub struct PostingsWriter<'a> {
-  file: &'a mut File,
+pub struct PostingsWriter<'a, W: Write + Seek + ?Sized> {
+  file: &'a mut W,
   keep_positions: bool,
 }
 
-impl<'a> PostingsWriter<'a> {
-  pub fn new(file: &'a mut File, keep_positions: bool) -> Self {
+impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
+  pub fn new(file: &'a mut W, keep_positions: bool) -> Self {
     Self {
       file,
       keep_positions,
@@ -107,7 +106,7 @@ pub struct PostingsReader {
 }
 
 impl PostingsReader {
-  pub fn read_at(file: &mut File, offset: u64, keep_positions: bool) -> Result<Self> {
+  pub fn read_at<R: Read + Seek>(file: &mut R, offset: u64, keep_positions: bool) -> Result<Self> {
     file.seek(SeekFrom::Start(offset))?;
     let doc_freq = read_u32(file)? as usize;
     let has_positions = {

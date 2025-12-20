@@ -10,8 +10,22 @@ pub struct IndexOptions {
   pub enable_positions: bool,
   pub bm25_k1: f32,
   pub bm25_b: f32,
+  #[serde(default)]
+  pub storage: StorageType,
   #[cfg(feature = "vectors")]
   pub vector_defaults: Option<VectorOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StorageType {
+  Filesystem,
+  InMemory,
+}
+
+impl Default for StorageType {
+  fn default() -> Self {
+    StorageType::Filesystem
+  }
 }
 
 #[cfg(feature = "vectors")]

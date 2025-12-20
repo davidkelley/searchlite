@@ -21,7 +21,7 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     drop(_guard);
     let wal_path = crate::index::directory::wal_path(&inner.path);
-    let pending = Wal::last_pending_documents(&wal_path)?;
+    let pending = Wal::last_pending_documents(inner.storage.as_ref(), &wal_path)?;
     let wal = inner.wal()?;
     let schema = inner.manifest.read().schema.clone();
     Ok(Self {
@@ -58,11 +58,12 @@ impl IndexWriter {
       &self.schema,
       self.inner.options.enable_positions,
       cfg!(feature = "zstd"),
+      self.inner.storage.clone(),
     );
     let segment = writer.write_segment(&self.pending, generation)?;
     manifest.segments.push(segment);
     manifest.committed_at = Utc::now().to_rfc3339();
-    manifest.store(&self.inner.manifest_path())?;
+    manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
     self.wal.truncate()?;
     self.pending.clear();
     Ok(())
@@ -78,7 +79,7 @@ impl IndexWriter {
 
 #[cfg(test)]
 mod tests {
-  use crate::api::types::{Document, IndexOptions, Schema};
+  use crate::api::types::{Document, IndexOptions, Schema, StorageType};
   use crate::index::Index;
   use tempfile::tempdir;
 
@@ -89,6 +90,7 @@ mod tests {
       enable_positions: true,
       bm25_k1: 1.2,
       bm25_b: 0.75,
+      storage: StorageType::Filesystem,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }

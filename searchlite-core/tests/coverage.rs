@@ -1,6 +1,6 @@
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, Filter, IndexOptions, KeywordField, NumericField, Schema, SearchRequest,
+  Document, Filter, IndexOptions, KeywordField, NumericField, Schema, SearchRequest, StorageType,
 };
 use tempfile::tempdir;
 
@@ -11,6 +11,7 @@ fn opts(path: &std::path::Path) -> IndexOptions {
     enable_positions: true,
     bm25_k1: 1.2,
     bm25_b: 0.75,
+    storage: StorageType::Filesystem,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }

@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod api;
 mod index;
 pub mod query;
+pub mod storage;
 pub mod util;
 
 #[cfg(feature = "gpu")]

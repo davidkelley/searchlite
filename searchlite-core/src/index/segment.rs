@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Read};
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
@@ -17,6 +17,7 @@ use crate::index::fastfields::{FastFieldsReader, FastFieldsWriter, FastValue};
 use crate::index::manifest::{Schema, SegmentMeta, SegmentPaths};
 use crate::index::postings::{InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
+use crate::storage::{Storage, StorageFile};
 use crate::util::checksum::checksum;
 use crate::DocId;
 
@@ -34,15 +35,23 @@ pub struct SegmentWriter<'a> {
   schema: &'a Schema,
   enable_positions: bool,
   use_zstd: bool,
+  storage: Arc<dyn Storage>,
 }
 
 impl<'a> SegmentWriter<'a> {
-  pub fn new(root: &'a Path, schema: &'a Schema, enable_positions: bool, use_zstd: bool) -> Self {
+  pub fn new(
+    root: &'a Path,
+    schema: &'a Schema,
+    enable_positions: bool,
+    use_zstd: bool,
+    storage: Arc<dyn Storage>,
+  ) -> Self {
     Self {
       root,
       schema,
       enable_positions,
       use_zstd,
+      storage,
     }
   }
 
@@ -67,8 +76,8 @@ impl<'a> SegmentWriter<'a> {
       .map(|f| (f.name.as_str(), (f.i64, f.fast)))
       .collect();
 
-    let mut docstore_file = File::create(Path::new(&paths.docstore))?;
-    let mut doc_writer = DocStoreWriter::new(&mut docstore_file, self.use_zstd);
+    let mut docstore_file = self.storage.open_write(Path::new(&paths.docstore))?;
+    let mut doc_writer = DocStoreWriter::new(&mut *docstore_file, self.use_zstd);
 
     #[cfg(feature = "vectors")]
     let mut vector_fields: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
@@ -160,8 +169,8 @@ impl<'a> SegmentWriter<'a> {
     drop(doc_writer);
     docstore_file.sync_all()?;
 
-    let mut postings_file = File::create(Path::new(&paths.postings))?;
-    let mut postings_writer = PostingsWriter::new(&mut postings_file, self.enable_positions);
+    let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
+    let mut postings_writer = PostingsWriter::new(&mut *postings_file, self.enable_positions);
     let mut term_offsets = Vec::new();
     for (term, postings) in postings_builder.into_terms() {
       let offset = postings_writer.write_term(&postings)?;
@@ -169,11 +178,15 @@ impl<'a> SegmentWriter<'a> {
     }
     postings_file.sync_all()?;
 
-    write_terms(Path::new(&paths.terms), &term_offsets)?;
+    write_terms(
+      self.storage.as_ref(),
+      Path::new(&paths.terms),
+      &term_offsets,
+    )?;
 
     let avg_field_lengths = compute_avg_lengths(&doc_lengths, docs.len() as u64);
 
-    fast_writer.write_to(Path::new(&paths.fast))?;
+    fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
 
     let seg_file_meta = SegmentFileMeta {
       doc_offsets,
@@ -182,9 +195,13 @@ impl<'a> SegmentWriter<'a> {
       vectors: vector_fields,
       use_zstd: self.use_zstd,
     };
-    write_segment_meta(Path::new(&paths.meta), &seg_file_meta)?;
+    write_segment_meta(
+      self.storage.as_ref(),
+      Path::new(&paths.meta),
+      &seg_file_meta,
+    )?;
 
-    let checksums = collect_checksums(&paths)?;
+    let checksums = collect_checksums(self.storage.as_ref(), &paths)?;
 
     let meta = SegmentMeta {
       id,
@@ -200,9 +217,13 @@ impl<'a> SegmentWriter<'a> {
   }
 }
 
-fn write_segment_meta(path: &Path, meta: &SegmentFileMeta) -> Result<()> {
-  let writer = BufWriter::new(File::create(path)?);
-  serde_json::to_writer_pretty(writer, meta)?;
+fn write_segment_meta(storage: &dyn Storage, path: &Path, meta: &SegmentFileMeta) -> Result<()> {
+  let mut handle = storage.open_write(path)?;
+  let mut writer = BufWriter::new(&mut *handle);
+  serde_json::to_writer_pretty(&mut writer, meta)?;
+  writer.flush()?;
+  drop(writer);
+  handle.sync_all()?;
   Ok(())
 }
 
@@ -219,7 +240,7 @@ fn compute_avg_lengths(lengths: &HashMap<String, u64>, total_docs: u64) -> HashM
   out
 }
 
-fn collect_checksums(paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
+fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
   let mut map = HashMap::new();
   for (name, path_str) in [
     ("terms", &paths.terms),
@@ -228,8 +249,7 @@ fn collect_checksums(paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
     ("fast", &paths.fast),
     ("meta", &paths.meta),
   ] {
-    let mut buf = Vec::new();
-    File::open(path_str)?.read_to_end(&mut buf)?;
+    let buf = storage.read_to_end(Path::new(path_str))?;
     map.insert(name.to_string(), checksum(&buf));
   }
   Ok(map)
@@ -238,21 +258,22 @@ fn collect_checksums(paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
 pub struct SegmentReader {
   pub meta: SegmentMeta,
   terms: TinyTerms,
-  postings: RefCell<File>,
-  docstore: RefCell<DocStoreReader>,
+  postings: RefCell<Box<dyn StorageFile>>,
+  docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
   seg_meta: SegmentFileMeta,
 }
 
 impl SegmentReader {
-  pub fn open(meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
-    let terms = read_terms(Path::new(&meta.paths.terms))?;
-    let postings = File::open(&meta.paths.postings)?;
-    let doc_file = File::open(&meta.paths.docstore)?;
-    let seg_meta: SegmentFileMeta = serde_json::from_reader(File::open(&meta.paths.meta)?)?;
+  pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
+    let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
+    let postings = storage.open_read(Path::new(&meta.paths.postings))?;
+    let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
+    let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
+    let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
-    let fast_fields = FastFieldsReader::open(Path::new(&meta.paths.fast))?;
+    let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
     Ok(Self {
       meta,
       terms: TinyTerms(terms),
@@ -350,7 +371,8 @@ mod tests {
   fn writes_and_reads_segment() {
     let dir = tempdir().unwrap();
     let schema = sample_schema();
-    let writer = SegmentWriter::new(dir.path(), &schema, true, false);
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone());
     let meta = writer
       .write_segment(
         &[
@@ -360,7 +382,7 @@ mod tests {
         1,
       )
       .unwrap();
-    let reader = SegmentReader::open(meta.clone(), true).unwrap();
+    let reader = SegmentReader::open(storage, meta.clone(), true).unwrap();
     let postings = reader.postings("body:rust").unwrap();
     assert_eq!(postings.len(), 2);
     let fast = reader.fast_fields();

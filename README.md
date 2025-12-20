@@ -94,7 +94,9 @@ cargo run -p searchlite-cli -- compact --index "$INDEX"
 ```rust
 use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
-    types::{Document, IndexOptions, KeywordField, NumericField, Schema, SearchRequest},
+    types::{
+        Document, IndexOptions, KeywordField, NumericField, Schema, SearchRequest, StorageType,
+    },
 };
 use std::path::PathBuf;
 
@@ -103,7 +105,16 @@ let mut schema = Schema::default_text_body();
 schema.keyword_fields.push(KeywordField { name: "lang".into(), stored: true, indexed: true, fast: true });
 schema.numeric_fields.push(NumericField { name: "year".into(), i64: true, fast: true, stored: true });
 
-let opts = IndexOptions { path: path.clone(), create_if_missing: true, enable_positions: true, bm25_k1: 0.9, bm25_b: 0.4, #[cfg(feature = "vectors")] vector_defaults: None };
+let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+};
 
 // Create or open the index.
 let idx = IndexBuilder::create(&path, schema, opts.clone())?;

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::storage::Storage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -49,25 +49,20 @@ impl Manifest {
     }
   }
 
-  pub fn load(path: &Path) -> Result<Self> {
-    let data =
-      fs::read_to_string(path).with_context(|| format!("reading manifest at {:?}", path))?;
+  pub fn load(storage: &dyn Storage, path: &Path) -> Result<Self> {
+    let data = storage
+      .read_to_end(path)
+      .with_context(|| format!("reading manifest at {:?}", path))?;
     let manifest: Manifest =
-      serde_json::from_str(&data).with_context(|| format!("parsing manifest at {:?}", path))?;
+      serde_json::from_slice(&data).with_context(|| format!("parsing manifest at {:?}", path))?;
     Ok(manifest)
   }
 
-  pub fn store(&self, path: &Path) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
+  pub fn store(&self, storage: &dyn Storage, path: &Path) -> Result<()> {
     let data = serde_json::to_vec_pretty(self)?;
-    {
-      let mut file =
-        fs::File::create(&tmp).with_context(|| format!("writing manifest tmp at {:?}", tmp))?;
-      file.write_all(&data)?;
-      file.sync_all()?;
-    }
-    fs::rename(&tmp, path).with_context(|| format!("atomic rename manifest to {:?}", path))?;
-    Ok(())
+    storage
+      .atomic_write(path, &data)
+      .with_context(|| format!("writing manifest at {:?}", path))
   }
 
   pub fn manifest_path(root: &Path) -> PathBuf {
@@ -166,6 +161,7 @@ mod tests {
   #[test]
   fn persists_manifest_and_schema_helpers() {
     let dir = tempdir().unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let schema = Schema {
       text_fields: vec![TextField {
         name: "body".into(),
@@ -190,8 +186,8 @@ mod tests {
     };
     let manifest = Manifest::new(schema.clone());
     let path = Manifest::manifest_path(dir.path());
-    manifest.store(&path).unwrap();
-    let loaded = Manifest::load(&path).unwrap();
+    manifest.store(&storage, &path).unwrap();
+    let loaded = Manifest::load(&storage, &path).unwrap();
     assert!(loaded.schema.is_indexed_field("body"));
     assert!(loaded.schema.is_stored_field("year"));
     assert_eq!(

@@ -1,15 +1,12 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use super::manifest::SegmentPaths;
+use crate::storage::Storage;
 
-pub fn ensure_root(path: &Path) -> Result<()> {
-  if !path.exists() {
-    fs::create_dir_all(path)?;
-  }
-  Ok(())
+pub fn ensure_root(storage: &dyn Storage, path: &Path) -> Result<()> {
+  storage.ensure_dir(path)
 }
 
 pub fn wal_path(root: &Path) -> PathBuf {
@@ -59,7 +56,8 @@ mod tests {
   #[test]
   fn builds_paths_under_root() {
     let dir = tempdir().unwrap();
-    ensure_root(dir.path()).unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    ensure_root(&storage, dir.path()).unwrap();
     let paths = segment_paths(dir.path(), "abc");
     assert!(paths.terms.ends_with("seg_abc.terms"));
     assert!(paths.postings.ends_with("seg_abc.post"));

@@ -31,6 +31,7 @@ impl IndexBuilder {
 mod tests {
   use super::*;
   use crate::api::types::Schema;
+  use crate::api::types::StorageType;
   use tempfile::tempdir;
 
   #[test]
@@ -46,6 +47,7 @@ mod tests {
       enable_positions: true,
       bm25_k1: 1.1,
       bm25_b: 0.4,
+      storage: StorageType::Filesystem,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

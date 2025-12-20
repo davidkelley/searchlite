@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
-use searchlite_core::api::types::{Document, IndexOptions, SearchRequest};
+use searchlite_core::api::types::{Document, IndexOptions, SearchRequest, StorageType};
 use searchlite_core::api::Index;
 
 #[repr(C)]
@@ -26,6 +26,7 @@ pub extern "C" fn searchlite_index_open(
     enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
+    storage: StorageType::Filesystem,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

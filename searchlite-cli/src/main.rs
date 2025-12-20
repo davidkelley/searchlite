@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
-use searchlite_core::api::types::{Document, Filter, IndexOptions, SearchRequest};
+use searchlite_core::api::types::{Document, Filter, IndexOptions, SearchRequest, StorageType};
 use searchlite_core::api::Index;
 
 #[derive(Parser)]
@@ -101,6 +101,7 @@ fn default_options(path: &PathBuf) -> IndexOptions {
     enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
+    storage: StorageType::Filesystem,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }
