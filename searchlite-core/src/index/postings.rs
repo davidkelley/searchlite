@@ -8,6 +8,9 @@ use crate::index::codec::{read_f32, read_u32, write_f32, write_u32};
 use crate::util::varint::{read_u32_var, write_u32_var};
 use crate::DocId;
 
+pub const DEFAULT_BLOCK_SIZE: usize = 128;
+const BLOCK_META_FLAG: u32 = 1u32 << 31;
+
 #[derive(Debug, Clone)]
 pub struct PostingEntry {
   pub doc_id: DocId,
@@ -71,14 +74,37 @@ impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
     let offset = self.file.stream_position()?;
     write_u32(self.file, postings.len() as u32)?;
     self.file.write_all(&[self.keep_positions as u8])?;
-    write_u32(self.file, 1)?; // block count placeholder
+    let block_size = DEFAULT_BLOCK_SIZE;
+    let block_count =
+      ((postings.len() + block_size - 1) / block_size).min(u32::MAX as usize) as u32;
+    let block_flagged = if block_count > 0 {
+      block_count | BLOCK_META_FLAG
+    } else {
+      0
+    };
+    write_u32(self.file, block_flagged)?;
     let max_doc_id = postings.last().map(|p| p.doc_id).unwrap_or(0);
-    let block_max = postings
+    let max_tf = postings
       .iter()
       .map(|p| p.term_freq as f32)
       .fold(0.0_f32, f32::max);
     write_u32(self.file, max_doc_id)?;
-    write_f32(self.file, block_max)?;
+    write_f32(self.file, max_tf)?;
+
+    if block_count > 0 {
+      write_u32(self.file, block_size as u32)?;
+      for chunk in postings.chunks(block_size) {
+        let max_doc = chunk.last().map(|p| p.doc_id).unwrap_or(0);
+        write_u32(self.file, max_doc)?;
+      }
+      for chunk in postings.chunks(block_size) {
+        let tf_max = chunk
+          .iter()
+          .map(|p| p.term_freq as f32)
+          .fold(0.0_f32, f32::max);
+        write_f32(self.file, tf_max)?;
+      }
+    }
 
     let mut buf = Vec::with_capacity(postings.len() * 8);
     for p in postings {
@@ -102,7 +128,10 @@ impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
 #[derive(Debug, Clone)]
 pub struct PostingsReader {
   data: Vec<PostingEntry>,
-  pub block_max_score: f32,
+  pub max_tf: f32,
+  pub block_max_doc_ids: Vec<DocId>,
+  pub block_max_tfs: Vec<f32>,
+  pub block_size: usize,
 }
 
 impl PostingsReader {
@@ -114,9 +143,26 @@ impl PostingsReader {
       file.read_exact(&mut flag)?;
       flag[0] == 1 && keep_positions
     };
-    let _blocks = read_u32(file)?; // currently unused (single block)
-    let _max_doc = read_u32(file)?;
-    let block_max_score = read_f32(file)?;
+    let raw_block = read_u32(file)?;
+    let has_block_meta = raw_block & BLOCK_META_FLAG != 0;
+    let block_count = (raw_block & (!BLOCK_META_FLAG)) as usize;
+    let max_doc_id = read_u32(file)?;
+    let mut max_tf = read_f32(file)?;
+
+    let mut block_size = DEFAULT_BLOCK_SIZE;
+    let mut block_max_doc_ids = Vec::new();
+    let mut block_max_tfs = Vec::new();
+    if has_block_meta && block_count > 0 {
+      block_size = read_u32(file)? as usize;
+      block_max_doc_ids.reserve(block_count);
+      block_max_tfs.reserve(block_count);
+      for _ in 0..block_count {
+        block_max_doc_ids.push(read_u32(file)?);
+      }
+      for _ in 0..block_count {
+        block_max_tfs.push(read_f32(file)?);
+      }
+    }
     let mut data = Vec::with_capacity(doc_freq);
     for _ in 0..doc_freq {
       let doc_id = read_u32_var(file)?;
@@ -136,9 +182,28 @@ impl PostingsReader {
         positions,
       });
     }
+    if block_max_doc_ids.is_empty() {
+      block_size = DEFAULT_BLOCK_SIZE;
+      for chunk in data.chunks(block_size) {
+        let max_doc = chunk.last().map(|p| p.doc_id).unwrap_or(max_doc_id);
+        let tf_max = chunk
+          .iter()
+          .map(|p| p.term_freq as f32)
+          .fold(0.0_f32, f32::max);
+        block_max_doc_ids.push(max_doc);
+        block_max_tfs.push(tf_max);
+      }
+    }
+    let computed_max = block_max_tfs.iter().copied().fold(0.0_f32, f32::max);
+    if computed_max > max_tf {
+      max_tf = computed_max;
+    }
     Ok(Self {
       data,
-      block_max_score,
+      max_tf,
+      block_max_doc_ids,
+      block_max_tfs,
+      block_size,
     })
   }
 
@@ -146,8 +211,43 @@ impl PostingsReader {
     self.data.iter()
   }
 
+  pub fn entry(&self, idx: usize) -> Option<&PostingEntry> {
+    self.data.get(idx)
+  }
+
+  pub fn entries(&self) -> &[PostingEntry] {
+    &self.data
+  }
+
   pub fn len(&self) -> usize {
     self.data.len()
+  }
+
+  #[cfg(test)]
+  pub fn from_entries_for_test(entries: Vec<PostingEntry>, block_size: usize) -> Self {
+    let mut reader = Self {
+      max_tf: 0.0,
+      block_max_doc_ids: Vec::new(),
+      block_max_tfs: Vec::new(),
+      block_size: block_size.max(1),
+      data: entries,
+    };
+    reader.max_tf = reader
+      .data
+      .iter()
+      .map(|p| p.term_freq as f32)
+      .fold(0.0_f32, f32::max);
+    for chunk in reader.data.chunks(reader.block_size) {
+      if let Some(last) = chunk.last() {
+        reader.block_max_doc_ids.push(last.doc_id);
+      }
+      let tf_max = chunk
+        .iter()
+        .map(|p| p.term_freq as f32)
+        .fold(0.0_f32, f32::max);
+      reader.block_max_tfs.push(tf_max);
+    }
+    reader
   }
 }
 
@@ -195,7 +295,9 @@ mod tests {
     let mut reader_file = std::fs::File::open(path).unwrap();
     let reader = PostingsReader::read_at(&mut reader_file, offset, true).unwrap();
     assert_eq!(reader.len(), 2);
-    assert!(reader.block_max_score >= 2.0);
+    assert!(reader.max_tf >= 2.0);
+    assert_eq!(reader.block_max_doc_ids.len(), 1);
+    assert_eq!(reader.block_max_tfs.len(), 1);
     let collected: Vec<_> = reader
       .iter()
       .map(|p| (p.doc_id, p.positions.iter().copied().collect::<Vec<_>>()))

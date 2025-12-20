@@ -1,6 +1,7 @@
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, Filter, IndexOptions, KeywordField, NumericField, Schema, SearchRequest, StorageType,
+  Document, ExecutionStrategy, Filter, IndexOptions, KeywordField, NumericField, Schema,
+  SearchRequest, StorageType,
 };
 use tempfile::tempdir;
 
@@ -93,6 +94,8 @@ fn search_with_phrase_filters_and_compaction() {
         },
       ],
       limit: 10,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,

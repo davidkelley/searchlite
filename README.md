@@ -10,7 +10,8 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 **Core capabilities**
 - Single-writer, multi-reader index backed by a WAL and atomic manifest updates.
 - BM25 scoring (`k1=0.9`, `b=0.4` by default) with phrase matching and basic highlighting.
-- Block-level max scores per term (BlockMax WAND style) for faster top-k.
+- Block-level max scores per term (WAND/BMW pruning) for faster exact top-k.
+- Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
 - Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
 
 ## Development setup
@@ -95,7 +96,8 @@ cargo run -p searchlite-cli -- compact --index "$INDEX"
 use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
     types::{
-        Document, IndexOptions, KeywordField, NumericField, Schema, SearchRequest, StorageType,
+        Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
+        SearchRequest, StorageType,
     },
 };
 use std::path::PathBuf;
@@ -145,6 +147,8 @@ let results = reader.search(&SearchRequest {
     fields: None,
     filters: vec![Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }],
     limit: 5,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
     return_stored: true,
     highlight_field: Some("body".into()),
     #[cfg(feature = "vectors")]
@@ -156,6 +160,15 @@ for hit in results.hits {
 ```
 
 `Index::open(opts)` opens an existing index; `Index::compact()` rewrites all segments into one. WAL-backed writers queue documents until `commit` is called; `rollback` drops uncommitted changes.
+
+### Query execution modes
+- `execution`: choose `"bm25"` (full evaluation), `"wand"` (exact WAND pruning), or `"bmw"` (block-max WAND). Default is `wand`.
+- `bmw_block_size`: optional block size when using BMW pruning.
+
+The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthetic benchmark that compares the strategies lives in `searchlite-core/examples/pruning.rs` (`cargo run -p searchlite-core --example pruning`).
+
+### In-memory indexes
+For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `IndexOptions`. The API and search behavior stay the same, but no files are created on disk. (The CLI currently uses filesystem storage only.)
 
 ## Building the C library
 Build the FFI crate to generate a shared library and header for C or other language bindings.

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
-use searchlite_core::api::types::{Document, Filter, IndexOptions, SearchRequest, StorageType};
+use searchlite_core::api::types::{
+  Document, ExecutionStrategy, Filter, IndexOptions, SearchRequest, StorageType,
+};
 use searchlite_core::api::Index;
 
 #[derive(Parser)]
@@ -29,6 +31,10 @@ enum Commands {
     query: String,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[arg(long, default_value = "wand")]
+    execution: String,
+    #[arg(long)]
+    bmw_block_size: Option<usize>,
     #[arg(long)]
     fields: Option<String>,
     #[arg(long)]
@@ -64,6 +70,8 @@ fn main() -> Result<()> {
       index,
       query,
       limit,
+      execution,
+      bmw_block_size,
       fields,
       filter,
       return_stored,
@@ -78,6 +86,8 @@ fn main() -> Result<()> {
       &index,
       query,
       limit,
+      execution,
+      bmw_block_size,
       fields,
       filter,
       return_stored,
@@ -153,6 +163,8 @@ fn cmd_search(
   index: &PathBuf,
   query: String,
   limit: usize,
+  execution: String,
+  bmw_block_size: Option<usize>,
   fields: Option<String>,
   filters: Vec<String>,
   return_stored: bool,
@@ -173,6 +185,8 @@ fn cmd_search(
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
     filters: parsed_filters,
     limit,
+    execution: parse_execution(&execution),
+    bmw_block_size,
     #[cfg(feature = "vectors")]
     vector_query: build_vector_query(vector_field, vector, alpha)?,
     return_stored,
@@ -214,6 +228,14 @@ fn parse_filter(input: &str) -> Option<Filter> {
     }
   }
   None
+}
+
+fn parse_execution(value: &str) -> ExecutionStrategy {
+  match value.to_ascii_lowercase().as_str() {
+    "bm25" => ExecutionStrategy::Bm25,
+    "bmw" => ExecutionStrategy::Bmw,
+    _ => ExecutionStrategy::Wand,
+  }
 }
 
 #[cfg(feature = "vectors")]
@@ -308,6 +330,8 @@ mod tests {
       &index,
       "rust".to_string(),
       5,
+      "wand".to_string(),
+      None,
       None,
       vec![],
       true,

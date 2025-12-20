@@ -8,12 +8,13 @@ use crate::api::query::parse_query;
 use crate::api::types::{IndexOptions, SearchRequest};
 use crate::index::highlight::make_snippet;
 use crate::index::manifest::Manifest;
+use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
-use crate::query::bm25::bm25;
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
+use crate::query::wand::{execute_top_k, ScoredTerm};
 use crate::DocId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,103 +142,21 @@ impl IndexReader {
 
     let mut hits: Vec<Hit> = Vec::new();
     for seg in self.segments.iter() {
-      let mut scores: HashMap<DocId, f32> = HashMap::new();
-      for (field, _, key) in qualified_terms.iter() {
-        if let Some(postings) = seg.postings(key) {
-          let df = postings.len() as f32;
-          let docs = seg.meta.doc_count as f32;
-          let avgdl = seg.avg_field_length(field);
-          for entry in postings.iter() {
-            let doc_len = if avgdl > 0.0 {
-              avgdl
-            } else {
-              entry.term_freq as f32
-            };
-            let score = bm25(
-              entry.term_freq as f32,
-              df,
-              doc_len,
-              avgdl,
-              docs,
-              self.options.bm25_k1,
-              self.options.bm25_b,
-            );
-            *scores.entry(entry.doc_id).or_insert(0.0) += score;
-          }
-        }
-      }
-
-      // Remove docs that match NOT terms.
-      for key in qualified_not_terms.iter() {
-        if let Some(postings) = seg.postings(key) {
-          for entry in postings.iter() {
-            scores.remove(&entry.doc_id);
-          }
-        }
-      }
-
-      // Phrase filtering if requested.
-      scores.retain(|doc_id, _| {
-        for (phrase_idx, phrase) in parsed.phrases.iter().enumerate() {
-          let mut ok_any_field = false;
-          for (_field, term_keys) in phrase_fields[phrase_idx].iter() {
-            let mut per_term = Vec::with_capacity(term_keys.len());
-            for key in term_keys.iter() {
-              if let Some(postings) = seg.postings(key) {
-                per_term.push(postings.iter().cloned().collect::<Vec<_>>());
-              }
-            }
-            if per_term.len() == phrase.terms.len() && matches_phrase(&per_term, *doc_id) {
-              ok_any_field = true;
-              break;
-            }
-          }
-          if !ok_any_field {
-            return false;
-          }
-        }
-        true
-      });
-
-      // Filters.
-      scores.retain(|doc_id, _| passes_filters(seg.fast_fields(), *doc_id, &req.filters));
-
-      let need_doc = req.return_stored || req.highlight_field.is_some();
-
-      for (doc_id, score) in scores.into_iter() {
-        let mut doc_cache = None;
-        if need_doc {
-          doc_cache = seg.get_doc(doc_id).ok();
-        }
-
-        let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
-          if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
-            make_snippet(text_val, &highlight_terms)
-          } else {
-            None
-          }
-        } else {
-          None
-        };
-
-        let fields_val = if req.return_stored {
-          doc_cache.clone()
-        } else {
-          None
-        };
-        hits.push(Hit {
-          doc_id,
-          score,
-          fields: fields_val,
-          snippet,
-        });
-      }
+      let mut seg_hits = self.search_segment(
+        seg,
+        &qualified_terms,
+        &qualified_not_terms,
+        &phrase_fields,
+        &highlight_terms,
+        req,
+      )?;
+      hits.append(&mut seg_hits);
     }
 
     hits.sort_by(|a, b| {
       b.score
-        .partial_cmp(&a.score)
-        .unwrap_or(std::cmp::Ordering::Equal)
+        .total_cmp(&a.score)
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
     });
     if hits.len() > req.limit {
       hits.truncate(req.limit);
@@ -246,5 +165,135 @@ impl IndexReader {
       total_hits_estimate: hits.len() as u64,
       hits,
     })
+  }
+
+  fn search_segment(
+    &self,
+    seg: &SegmentReader,
+    qualified_terms: &[(String, String, String)],
+    qualified_not_terms: &[String],
+    phrase_fields: &[Vec<(String, Vec<String>)>],
+    highlight_terms: &[String],
+    req: &SearchRequest,
+  ) -> Result<Vec<Hit>> {
+    let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
+    for (field, _, key) in qualified_terms.iter() {
+      let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
+      entry.1 += 1;
+    }
+
+    let docs = seg.meta.doc_count as f32;
+    let mut terms: Vec<ScoredTerm> = Vec::new();
+    for (key, (field, weight)) in term_counts.into_iter() {
+      if let Some(postings) = seg.postings(&key) {
+        terms.push(ScoredTerm {
+          postings,
+          weight,
+          avgdl: seg.avg_field_length(&field),
+          docs,
+          k1: self.options.bm25_k1,
+          b: self.options.bm25_b,
+        });
+      }
+    }
+    if terms.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let not_doc_lists: Vec<Vec<DocId>> = qualified_not_terms
+      .iter()
+      .filter_map(|key| {
+        seg
+          .postings(key)
+          .map(|p| p.iter().map(|e| e.doc_id).collect())
+      })
+      .collect();
+
+    let phrase_postings: Vec<Vec<Vec<Vec<PostingEntry>>>> = phrase_fields
+      .iter()
+      .map(|fields| {
+        fields
+          .iter()
+          .filter_map(|(_field, term_keys)| {
+            let per_term: Vec<Vec<PostingEntry>> = term_keys
+              .iter()
+              .filter_map(|key| seg.postings(key).map(|p| p.iter().cloned().collect()))
+              .collect();
+            if per_term.len() == term_keys.len() {
+              Some(per_term)
+            } else {
+              None
+            }
+          })
+          .collect::<Vec<Vec<Vec<PostingEntry>>>>()
+      })
+      .collect();
+
+    let mut accept = |doc_id: DocId, _score: f32| -> bool {
+      if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
+        return false;
+      }
+      for list in not_doc_lists.iter() {
+        if list.binary_search(&doc_id).is_ok() {
+          return false;
+        }
+      }
+      for variants in phrase_postings.iter() {
+        if variants.is_empty() {
+          return false;
+        }
+        let mut ok_any_field = false;
+        for per_term in variants.iter() {
+          if matches_phrase(per_term.as_slice(), doc_id) {
+            ok_any_field = true;
+            break;
+          }
+        }
+        if !ok_any_field {
+          return false;
+        }
+      }
+      true
+    };
+
+    let ranked = execute_top_k(
+      terms,
+      req.limit,
+      req.execution.clone(),
+      req.bmw_block_size,
+      &mut accept,
+    );
+
+    let need_doc = req.return_stored || req.highlight_field.is_some();
+    let mut hits = Vec::with_capacity(ranked.len());
+    for rd in ranked.into_iter() {
+      let mut doc_cache = None;
+      if need_doc {
+        doc_cache = seg.get_doc(rd.doc_id).ok();
+      }
+
+      let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
+        if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
+          make_snippet(text_val, highlight_terms)
+        } else {
+          None
+        }
+      } else {
+        None
+      };
+
+      let fields_val = if req.return_stored {
+        doc_cache.clone()
+      } else {
+        None
+      };
+      hits.push(Hit {
+        doc_id: rd.doc_id,
+        score: rd.score,
+        fields: fields_val,
+        snippet,
+      });
+    }
+    Ok(hits)
   }
 }

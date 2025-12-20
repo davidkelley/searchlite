@@ -1,6 +1,6 @@
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, IndexOptions, NumericField, Schema, SearchRequest, StorageType,
+  Document, ExecutionStrategy, IndexOptions, NumericField, Schema, SearchRequest, StorageType,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -54,6 +54,8 @@ fn index_and_search() {
         max: 2024,
       }],
       limit: 5,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -96,6 +98,8 @@ fn in_memory_storage_keeps_disk_clean() {
       fields: None,
       filters: vec![],
       limit: 5,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,

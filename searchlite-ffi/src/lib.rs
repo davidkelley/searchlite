@@ -2,7 +2,9 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
-use searchlite_core::api::types::{Document, IndexOptions, SearchRequest, StorageType};
+use searchlite_core::api::types::{
+  Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
+};
 use searchlite_core::api::Index;
 
 #[repr(C)]
@@ -123,6 +125,8 @@ pub extern "C" fn searchlite_search(
     fields: None,
     filters: vec![],
     limit,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
     return_stored: true,
     highlight_field: None,
     #[cfg(feature = "vectors")]

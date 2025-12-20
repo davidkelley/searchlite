@@ -3,6 +3,20 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionStrategy {
+  Bm25,
+  Wand,
+  Bmw,
+}
+
+impl Default for ExecutionStrategy {
+  fn default() -> Self {
+    ExecutionStrategy::Wand
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexOptions {
   pub path: PathBuf,
@@ -53,6 +67,10 @@ pub struct SearchRequest {
   pub fields: Option<Vec<String>>,
   pub filters: Vec<Filter>,
   pub limit: usize,
+  #[serde(default)]
+  pub execution: ExecutionStrategy,
+  #[serde(default)]
+  pub bmw_block_size: Option<usize>,
   #[cfg(feature = "vectors")]
   pub vector_query: Option<(String, Vec<f32>, f32)>,
   pub return_stored: bool,
