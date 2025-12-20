@@ -1,0 +1,35 @@
+[workspace]
+members = [
+  "searchlite-core",
+  "searchlite-cli",
+  "searchlite-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Searchlite Authors"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.86"
+thiserror = "1.0.57"
+serde = { version = "1.0.193", features = ["derive"] }
+serde_json = "1.0.108"
+memmap2 = "0.9.3"
+crc32fast = "1.3.2"
+hashbrown = "0.14.3"
+rayon = "1.8.0"
+clap = { version = "4.4.11", features = ["derive"] }
+rand = "0.8.5"
+criterion = { version = "0.5.1", features = ["cargo_bench_support"] }
+uuid = { version = "1.6.1", features = ["v4", "serde"] }
+chrono = { version = "0.4.31", features = ["serde", "clock"] }
+byteorder = "1.5.0"
+bytemuck = { version = "1.14.0", features = ["derive"] }
+serde_with = "3.4.0"
+parking_lot = "0.12.1"
+smallvec = "1.11.2"
+env_logger = "0.10.1"
+tempfile = "3.8.1"

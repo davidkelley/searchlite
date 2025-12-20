@@ -1,0 +1,42 @@
+[package]
+name = "searchlite-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Searchlite Authors"]
+license = "MIT"
+description = "Embedded search engine core for searchlite"
+
+[features]
+default = []
+vectors = ["bytemuck"]
+gpu = []
+zstd = ["dep:zstd"]
+ffi = []
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+crc32fast = { workspace = true }
+hashbrown = { workspace = true }
+rayon = { workspace = true, optional = false }
+uuid = { workspace = true }
+chrono = { workspace = true }
+byteorder = { workspace = true }
+bytemuck = { workspace = true, optional = true }
+serde_with = { workspace = true }
+parking_lot = { workspace = true }
+smallvec = { workspace = true }
+
+zstd = { version = "0.13.1", optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+criterion = { workspace = true }
+tempfile = "3.8.1"
+
+[lib]
+name = "searchlite_core"
+path = "src/lib.rs"

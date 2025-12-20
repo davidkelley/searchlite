@@ -1,0 +1,27 @@
+[package]
+name = "searchlite-ffi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Searchlite Authors"]
+license = "MIT"
+description = "C FFI for searchlite"
+
+[features]
+default = []
+ffi = ["searchlite-core/ffi"]
+vectors = ["searchlite-core/vectors"]
+gpu = ["searchlite-core/gpu"]
+zstd = ["searchlite-core/zstd"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+searchlite-core = { path = "../searchlite-core", package = "searchlite-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+name = "searchlite_ffi"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
