@@ -100,6 +100,8 @@ fn search_with_phrase_filters_and_compaction() {
       vector_query: None,
       return_stored: true,
       highlight_field: Some("body".into()),
+      facets: Vec::new(),
+      aggregations: Vec::new(),
     })
     .unwrap();
   assert_eq!(result.hits.len(), 2);

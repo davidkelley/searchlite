@@ -191,6 +191,8 @@ fn cmd_search(
     vector_query: build_vector_query(vector_field, vector, alpha)?,
     return_stored,
     highlight_field: highlight,
+    facets: Vec::new(),
+    aggregations: Vec::new(),
   };
   let result = reader.search(&request)?;
   for hit in result.hits.iter() {

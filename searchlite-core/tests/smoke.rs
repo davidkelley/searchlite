@@ -60,6 +60,8 @@ fn index_and_search() {
       vector_query: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
+      facets: Vec::new(),
+      aggregations: Vec::new(),
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
@@ -104,6 +106,8 @@ fn in_memory_storage_keeps_disk_clean() {
       vector_query: None,
       return_stored: true,
       highlight_field: None,
+      facets: Vec::new(),
+      aggregations: Vec::new(),
     })
     .unwrap();
   assert_eq!(resp.hits.len(), 1);

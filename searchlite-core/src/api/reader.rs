@@ -1,4 +1,5 @@
 use hashbrown::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use crate::index::manifest::Manifest;
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
+use crate::query::facets::{AggregationOutput, AggregationPlan, AggregationState, FacetPlan};
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
@@ -29,6 +31,20 @@ pub struct Hit {
 pub struct SearchResult {
   pub total_hits_estimate: u64,
   pub hits: Vec<Hit>,
+  pub facets: Vec<FacetResult>,
+  pub aggregations: Vec<AggregationOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacetResult {
+  pub field: String,
+  pub counts: BTreeMap<String, u64>,
+}
+
+struct SegmentSearchOutput {
+  hits: Vec<Hit>,
+  facets: Option<Vec<BTreeMap<String, u64>>>,
+  aggregations: Option<Vec<AggregationState>>,
 }
 
 pub struct IndexReader {
@@ -140,17 +156,39 @@ impl IndexReader {
       })
       .collect();
 
+    let facet_plan = FacetPlan::new(&req.facets, &self.manifest.schema);
+    let agg_plan = AggregationPlan::new(&req.aggregations, &self.manifest.schema);
+
+    let mut facet_totals = facet_plan.as_ref().map(|p| vec![BTreeMap::new(); p.len()]);
+    let mut agg_totals: Option<Vec<AggregationState>> = None;
+
     let mut hits: Vec<Hit> = Vec::new();
     for seg in self.segments.iter() {
-      let mut seg_hits = self.search_segment(
+      let seg_out = self.search_segment(
         seg,
         &qualified_terms,
         &qualified_not_terms,
         &phrase_fields,
         &highlight_terms,
         req,
+        facet_plan.as_ref(),
+        agg_plan.as_ref(),
       )?;
-      hits.append(&mut seg_hits);
+      hits.extend(seg_out.hits);
+      if let (Some(global), Some(mut local)) = (facet_totals.as_mut(), seg_out.facets) {
+        for (g, l) in global.iter_mut().zip(local.drain(..)) {
+          for (k, v) in l.into_iter() {
+            *g.entry(k).or_insert(0) += v;
+          }
+        }
+      }
+      if let (Some(global), Some(local)) = (agg_totals.as_mut(), seg_out.aggregations) {
+        for (g, l) in global.iter_mut().zip(local.iter()) {
+          g.merge_from(l);
+        }
+      } else if agg_totals.is_none() {
+        agg_totals = seg_out.aggregations;
+      }
     }
 
     hits.sort_by(|a, b| {
@@ -161,9 +199,28 @@ impl IndexReader {
     if hits.len() > req.limit {
       hits.truncate(req.limit);
     }
+    let facets = if let (Some(plan), Some(counts)) = (facet_plan, facet_totals) {
+      counts
+        .into_iter()
+        .zip(plan.configs())
+        .map(|(counts, cfg)| FacetResult {
+          field: cfg.field_name().to_string(),
+          counts,
+        })
+        .collect()
+    } else {
+      Vec::new()
+    };
+    let aggregations = agg_totals
+      .unwrap_or_default()
+      .into_iter()
+      .map(|s| s.finalize())
+      .collect();
     Ok(SearchResult {
       total_hits_estimate: hits.len() as u64,
       hits,
+      facets,
+      aggregations,
     })
   }
 
@@ -175,7 +232,9 @@ impl IndexReader {
     phrase_fields: &[Vec<(String, Vec<String>)>],
     highlight_terms: &[String],
     req: &SearchRequest,
-  ) -> Result<Vec<Hit>> {
+    facet_plan: Option<&FacetPlan>,
+    agg_plan: Option<&AggregationPlan>,
+  ) -> Result<SegmentSearchOutput> {
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
       let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
@@ -197,7 +256,11 @@ impl IndexReader {
       }
     }
     if terms.is_empty() {
-      return Ok(Vec::new());
+      return Ok(SegmentSearchOutput {
+        hits: Vec::new(),
+        facets: facet_plan.map(|p| vec![BTreeMap::new(); p.len()]),
+        aggregations: agg_plan.map(|p| p.collector(seg.fast_fields()).into_states()),
+      });
     }
 
     let not_doc_lists: Vec<Vec<DocId>> = qualified_not_terms
@@ -229,6 +292,9 @@ impl IndexReader {
       })
       .collect();
 
+    let mut facet_collector = facet_plan.map(|p| p.collector(seg.fast_fields()));
+    let mut agg_collector = agg_plan.map(|p| p.collector(seg.fast_fields()));
+
     let mut accept = |doc_id: DocId, _score: f32| -> bool {
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
@@ -252,6 +318,12 @@ impl IndexReader {
         if !ok_any_field {
           return false;
         }
+      }
+      if let Some(facets) = facet_collector.as_mut() {
+        facets.collect(doc_id);
+      }
+      if let Some(aggs) = agg_collector.as_mut() {
+        aggs.collect(doc_id);
       }
       true
     };
@@ -294,6 +366,12 @@ impl IndexReader {
         snippet,
       });
     }
-    Ok(hits)
+    let facets = facet_collector.map(|c| c.into_counts());
+    let aggregations = agg_collector.map(|c| c.into_states());
+    Ok(SegmentSearchOutput {
+      hits,
+      facets,
+      aggregations,
+    })
   }
 }

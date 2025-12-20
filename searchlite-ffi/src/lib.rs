@@ -131,6 +131,8 @@ pub extern "C" fn searchlite_search(
     highlight_field: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+    facets: Vec::new(),
+    aggregations: Vec::new(),
   };
   let res = match reader.search(&req) {
     Ok(r) => r,

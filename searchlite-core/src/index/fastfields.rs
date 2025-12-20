@@ -15,26 +15,26 @@ pub enum FastValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldType {
+pub enum FastFieldType {
   I64,
   F64,
   Str,
 }
 
-impl FieldType {
+impl FastFieldType {
   fn as_u8(self) -> u8 {
     match self {
-      FieldType::I64 => 0,
-      FieldType::F64 => 1,
-      FieldType::Str => 2,
+      FastFieldType::I64 => 0,
+      FastFieldType::F64 => 1,
+      FastFieldType::Str => 2,
     }
   }
 
   fn from_u8(v: u8) -> Option<Self> {
     match v {
-      0 => Some(FieldType::I64),
-      1 => Some(FieldType::F64),
-      2 => Some(FieldType::Str),
+      0 => Some(FastFieldType::I64),
+      1 => Some(FastFieldType::F64),
+      2 => Some(FastFieldType::Str),
       _ => None,
     }
   }
@@ -213,6 +213,39 @@ impl FastFieldsReader {
       _ => false,
     }
   }
+
+  pub fn keyword_value(&self, field: &str, doc_id: DocId) -> Option<&str> {
+    match self.fields.get(field) {
+      Some(Column::Str { dict, values }) => values
+        .get(doc_id as usize)
+        .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
+        .map(|s| s.as_str()),
+      _ => None,
+    }
+  }
+
+  pub fn i64_value(&self, field: &str, doc_id: DocId) -> Option<i64> {
+    match self.fields.get(field) {
+      Some(Column::I64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      _ => None,
+    }
+  }
+
+  pub fn f64_value(&self, field: &str, doc_id: DocId) -> Option<f64> {
+    match self.fields.get(field) {
+      Some(Column::F64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      _ => None,
+    }
+  }
+
+  pub fn field_type(&self, field: &str) -> Option<FastFieldType> {
+    match self.fields.get(field) {
+      Some(Column::I64(_)) => Some(FastFieldType::I64),
+      Some(Column::F64(_)) => Some(FastFieldType::F64),
+      Some(Column::Str { .. }) => Some(FastFieldType::Str),
+      None => None,
+    }
+  }
 }
 
 fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()> {
@@ -221,7 +254,7 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
   buf.extend_from_slice(name_bytes);
   match col {
     ColumnBuilder::I64(values) => {
-      buf.push(FieldType::I64.as_u8());
+      buf.push(FastFieldType::I64.as_u8());
       buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
       write_presence(values.iter().map(|v| v.is_some()), buf);
       for v in values {
@@ -229,7 +262,7 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
       }
     }
     ColumnBuilder::F64(values) => {
-      buf.push(FieldType::F64.as_u8());
+      buf.push(FastFieldType::F64.as_u8());
       buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
       write_presence(values.iter().map(|v| v.is_some()), buf);
       for v in values {
@@ -237,7 +270,7 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
       }
     }
     ColumnBuilder::Str(builder) => {
-      buf.push(FieldType::Str.as_u8());
+      buf.push(FastFieldType::Str.as_u8());
       buf.extend_from_slice(&(builder.values.len() as u32).to_le_bytes());
       let dict_len = builder.dict.len() as u32;
       buf.extend_from_slice(&dict_len.to_le_bytes());
@@ -278,11 +311,11 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
     }
     let name = String::from_utf8_lossy(&data[cursor..cursor + name_len]).into_owned();
     cursor += name_len;
-    let ty = FieldType::from_u8(read_u8(&mut cursor, data)?)
+    let ty = FastFieldType::from_u8(read_u8(&mut cursor, data)?)
       .ok_or_else(|| anyhow!("invalid fast field type"))?;
     let doc_len = read_u32(&mut cursor, data)? as usize;
     let column = match ty {
-      FieldType::I64 => {
+      FastFieldType::I64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
         let mut vals = Vec::with_capacity(doc_len);
         for present in presence.into_iter() {
@@ -300,7 +333,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
         Column::I64(vals)
       }
-      FieldType::F64 => {
+      FastFieldType::F64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
         let mut vals = Vec::with_capacity(doc_len);
         for present in presence.into_iter() {
@@ -318,7 +351,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
         Column::F64(vals)
       }
-      FieldType::Str => {
+      FastFieldType::Str => {
         let dict_len = read_u32(&mut cursor, data)? as usize;
         let mut dict = Vec::with_capacity(dict_len);
         for _ in 0..dict_len {

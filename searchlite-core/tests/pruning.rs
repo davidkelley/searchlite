@@ -62,6 +62,8 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       vector_query: None,
       return_stored: false,
       highlight_field: None,
+      facets: Vec::new(),
+      aggregations: Vec::new(),
     };
     let bm25 = reader.search(&req).unwrap();
 
@@ -102,6 +104,8 @@ fn empty_query_returns_no_hits() {
     vector_query: None,
     return_stored: false,
     highlight_field: None,
+    facets: Vec::new(),
+    aggregations: Vec::new(),
   };
   let resp = reader.search(&req).unwrap();
   assert!(resp.hits.is_empty());

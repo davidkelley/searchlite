@@ -84,6 +84,8 @@ fn bench_search(c: &mut Criterion) {
         vector_query: None,
         return_stored: true,
         highlight_field: None,
+        facets: Vec::new(),
+        aggregations: Vec::new(),
       };
       let _ = reader.search(&req).unwrap();
     });

@@ -75,6 +75,10 @@ pub struct SearchRequest {
   pub vector_query: Option<(String, Vec<f32>, f32)>,
   pub return_stored: bool,
   pub highlight_field: Option<String>,
+  #[serde(default)]
+  pub facets: Vec<FacetRequest>,
+  #[serde(default)]
+  pub aggregations: Vec<AggregationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +87,51 @@ pub enum Filter {
   KeywordIn { field: String, values: Vec<String> },
   I64Range { field: String, min: i64, max: i64 },
   F64Range { field: String, min: f64, max: f64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacetRequest {
+  pub field: String,
+  #[serde(flatten)]
+  pub facet: FacetKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FacetKind {
+  Keyword,
+  #[serde(rename_all = "camelCase")]
+  Range {
+    ranges: Vec<NumericRange>,
+  },
+  #[serde(rename_all = "camelCase")]
+  Histogram {
+    interval: f64,
+    #[serde(default)]
+    min: Option<f64>,
+  },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumericRange {
+  pub min: f64,
+  pub max: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationRequest {
+  pub field: String,
+  #[serde(default)]
+  pub operations: Vec<AggregationOp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregationOp {
+  Min,
+  Max,
+  Sum,
+  Avg,
 }
 
 pub use crate::index::manifest::{KeywordField, NumericField, Schema, TextField};
