@@ -1396,13 +1396,34 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
   let value: f64 = spec[..idx].parse().ok()?;
   let suffix = &spec[idx..];
   let mult = match suffix {
+    "" | "s" => 1.0,
     "ms" => 0.001,
-    "s" => 1.0,
     "m" => 60.0,
     "h" => 3600.0,
     "d" => 86_400.0,
     "w" => 604_800.0,
-    _ => 1.0,
+    _ => return None,
   };
   Some(value * mult)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parse_interval_seconds;
+
+  #[test]
+  fn parse_interval_seconds_accepts_valid_units() {
+    assert_eq!(parse_interval_seconds("10"), Some(10.0));
+    assert_eq!(parse_interval_seconds("1500ms"), Some(1.5));
+    assert_eq!(parse_interval_seconds("2s"), Some(2.0));
+    assert_eq!(parse_interval_seconds("1m"), Some(60.0));
+    assert_eq!(parse_interval_seconds("2.5m"), Some(150.0));
+    assert_eq!(parse_interval_seconds("1h"), Some(3_600.0));
+  }
+
+  #[test]
+  fn parse_interval_seconds_rejects_unknown_units() {
+    assert_eq!(parse_interval_seconds("5x"), None);
+    assert_eq!(parse_interval_seconds("10foo"), None);
+  }
 }
