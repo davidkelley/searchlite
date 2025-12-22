@@ -395,10 +395,8 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           collector.collect(doc_id, score);
         }
       }
-      if score > threshold && accepted {
-        if rank_hits {
-          push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
-        }
+      if score > threshold && accepted && rank_hits {
+        push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
       }
       requeue_terms(&mut order, &terms, &mut mutated);
     } else {

@@ -40,7 +40,7 @@ fn terms_and_stats_aggregations() {
   };
   let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
   let mut writer = idx.writer().expect("writer");
-  let docs = vec![
+  let docs = [
     Document {
       fields: [
         ("body".into(), json!("rust systems")),

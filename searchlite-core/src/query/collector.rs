@@ -41,15 +41,9 @@ impl AggregationSegmentCollector for MatchCountingCollector {
 }
 
 #[cfg(test)]
+#[derive(Default)]
 pub struct RecordingCollector {
   pub docs: Vec<(DocId, f32)>,
-}
-
-#[cfg(test)]
-impl Default for RecordingCollector {
-  fn default() -> Self {
-    Self { docs: Vec::new() }
-  }
 }
 
 #[cfg(test)]

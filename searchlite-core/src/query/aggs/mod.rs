@@ -126,7 +126,7 @@ impl<'a> SegmentAggregationCollector<'a> {
   }
 }
 
-impl<'a> DocCollector for SegmentAggregationCollector<'a> {
+impl DocCollector for SegmentAggregationCollector<'_> {
   fn collect(&mut self, doc_id: DocId, score: f32) {
     for agg in self.aggs.values_mut() {
       agg.collect(doc_id, score);
@@ -134,7 +134,7 @@ impl<'a> DocCollector for SegmentAggregationCollector<'a> {
   }
 }
 
-impl<'a> AggregationSegmentCollector for SegmentAggregationCollector<'a> {
+impl AggregationSegmentCollector for SegmentAggregationCollector<'_> {
   type Output = BTreeMap<String, AggregationIntermediate>;
 
   fn finish(self) -> Self::Output {
@@ -238,7 +238,7 @@ enum BucketKey<'a> {
   Owned(String),
 }
 
-impl<'a> BucketKey<'a> {
+impl BucketKey<'_> {
   fn as_str(&self) -> &str {
     match self {
       BucketKey::Borrowed(s) => s,
@@ -247,15 +247,15 @@ impl<'a> BucketKey<'a> {
   }
 }
 
-impl<'a> PartialEq for BucketKey<'a> {
+impl PartialEq for BucketKey<'_> {
   fn eq(&self, other: &Self) -> bool {
     self.as_str() == other.as_str()
   }
 }
 
-impl<'a> Eq for BucketKey<'a> {}
+impl Eq for BucketKey<'_> {}
 
-impl<'a> Hash for BucketKey<'a> {
+impl Hash for BucketKey<'_> {
   fn hash<H: Hasher>(&self, state: &mut H) {
     self.as_str().hash(state);
   }
@@ -334,10 +334,7 @@ impl<'a> TermsCollector<'a> {
         .cmp(&a.doc_count)
         .then_with(|| bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key)))
     });
-    let limit = self
-      .shard_size
-      .or(self.size)
-      .unwrap_or_else(|| buckets.len());
+    let limit = self.shard_size.or(self.size).unwrap_or(buckets.len());
     buckets.truncate(limit);
     AggregationIntermediate::Terms {
       buckets: buckets
@@ -450,11 +447,8 @@ impl<'a> DateRangeCollector<'a> {
       .iter()
       .map(|r| crate::api::types::RangeBound {
         key: r.key.clone(),
-        from: r
-          .from
-          .as_ref()
-          .and_then(|s| parse_date(s).map(|d| d as f64)),
-        to: r.to.as_ref().and_then(|s| parse_date(s).map(|d| d as f64)),
+        from: r.from.as_deref().and_then(parse_date),
+        to: r.to.as_deref().and_then(parse_date),
       })
       .collect();
     let numeric = RangeAggregation {
@@ -1199,7 +1193,7 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
           .cmp(&a.doc_count)
           .then_with(|| bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key)))
       });
-      let limit = size.or(shard_size).unwrap_or_else(|| buckets.len());
+      let limit = size.or(shard_size).unwrap_or(buckets.len());
       if buckets.len() > limit {
         buckets.truncate(limit);
       }

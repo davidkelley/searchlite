@@ -18,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
   /// Initialize a new index with a schema
   Init { index: PathBuf, schema: PathBuf },

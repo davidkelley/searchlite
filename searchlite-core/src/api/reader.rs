@@ -37,6 +37,16 @@ pub struct SearchResult {
   pub aggregations: BTreeMap<String, AggregationResponse>,
 }
 
+struct SegmentSearchParams<'a> {
+  qualified_terms: &'a [(String, String, String)],
+  qualified_not_terms: &'a [String],
+  phrase_fields: &'a [Vec<(String, Vec<String>)>],
+  highlight_terms: &'a [String],
+  agg_collector: Option<&'a mut dyn DocCollector>,
+  match_counter: Option<&'a mut u64>,
+  req: &'a SearchRequest,
+}
+
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
@@ -165,16 +175,16 @@ impl IndexReader {
         } else {
           None
         };
-        self.search_segment(
-          seg,
-          &qualified_terms,
-          &qualified_not_terms,
-          &phrase_fields,
-          &highlight_terms,
-          agg_ref,
-          counter,
+        let params = SegmentSearchParams {
+          qualified_terms: &qualified_terms,
+          qualified_not_terms: &qualified_not_terms,
+          phrase_fields: &phrase_fields,
+          highlight_terms: &highlight_terms,
+          agg_collector: agg_ref,
+          match_counter: counter,
           req,
-        )?
+        };
+        self.search_segment(seg, params)?
       };
       if let Some(collector) = agg_collector {
         agg_results.push(collector.finish());
@@ -209,14 +219,17 @@ impl IndexReader {
   fn search_segment(
     &self,
     seg: &SegmentReader,
-    qualified_terms: &[(String, String, String)],
-    qualified_not_terms: &[String],
-    phrase_fields: &[Vec<(String, Vec<String>)>],
-    highlight_terms: &[String],
-    agg_collector: Option<&mut dyn DocCollector>,
-    match_counter: Option<&mut u64>,
-    req: &SearchRequest,
+    params: SegmentSearchParams<'_>,
   ) -> Result<Vec<Hit>> {
+    let SegmentSearchParams {
+      qualified_terms,
+      qualified_not_terms,
+      phrase_fields,
+      highlight_terms,
+      agg_collector,
+      match_counter,
+      req,
+    } = params;
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
       let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
