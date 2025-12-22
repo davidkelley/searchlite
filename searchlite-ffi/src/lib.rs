@@ -130,7 +130,13 @@ pub unsafe extern "C" fn searchlite_search(
   let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
     let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
     let body = String::from_utf8_lossy(raw).to_string();
-    serde_json::from_str(&body).unwrap_or_default()
+    match serde_json::from_str(&body) {
+      Ok(map) => map,
+      Err(err) => {
+        eprintln!("searchlite_search: failed to parse aggregation JSON: {err}");
+        return 0;
+      }
+    }
   } else {
     BTreeMap::new()
   };
@@ -194,6 +200,37 @@ mod tests {
       )
     };
     assert!(written > 0);
+    unsafe { searchlite_index_close(handle) };
+  }
+
+  #[test]
+  fn ffi_search_invalid_aggs_json_returns_error() {
+    let dir = tempdir().unwrap();
+    let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+    let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
+    assert!(!handle.is_null());
+
+    let doc = CString::new(r#"{"body":"hello from ffi"}"#).unwrap();
+    let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
+    assert!(added >= 0);
+    assert_eq!(unsafe { searchlite_commit(handle) }, 0);
+
+    let mut buf = vec![0 as c_char; 1024];
+    let query = CString::new("hello").unwrap();
+    let bad_aggs = CString::new("not valid json").unwrap();
+    let written = unsafe {
+      searchlite_search(
+        handle,
+        query.as_ptr(),
+        5,
+        bad_aggs.as_ptr(),
+        bad_aggs.as_bytes().len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+      )
+    };
+    assert_eq!(written, 0);
+
     unsafe { searchlite_index_close(handle) };
   }
 }
