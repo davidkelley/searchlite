@@ -9,7 +9,7 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'marco' }}
+    if: ${{ github.repository_owner == 'davidkelley' }}
     permissions:
       contents: write
     steps:
