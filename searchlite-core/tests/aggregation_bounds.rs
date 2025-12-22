@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
+use chrono::DateTime;
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, HistogramAggregation, HistogramBounds, IndexOptions,
-  KeywordField, MetricAggregation, NumericField, Schema, SearchRequest, StorageType,
-  TermsAggregation, TopHitsAggregation,
+  Aggregation, DateHistogramAggregation, DateHistogramBounds, Document, ExecutionStrategy,
+  HistogramAggregation, HistogramBounds, IndexOptions, KeywordField, MetricAggregation,
+  NumericField, Schema, SearchRequest, StorageType, TermsAggregation, TopHitsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -232,9 +233,9 @@ fn top_hits_returns_requested_docs() {
     Aggregation::TopHits(TopHitsAggregation {
       size: 2,
       from: 0,
-      fields: None,
+      fields: Some(vec!["tag".into()]),
       sort: None,
-      highlight_field: None,
+      highlight_field: Some("body".into()),
     }),
   );
 
@@ -262,7 +263,102 @@ fn top_hits_returns_requested_docs() {
     assert_eq!(top_hits.hits.len(), 2);
     assert!(top_hits.hits[0].score.is_some());
     assert!(top_hits.hits.iter().all(|h| h.fields.is_some()));
+    // fields projection and snippet should be present
+    assert!(top_hits
+      .hits
+      .iter()
+      .all(|h| h.fields.as_ref().unwrap().get("tag").is_some()));
+    assert!(top_hits.hits.iter().all(|h| h.snippet.is_some()));
   } else {
     panic!("expected top hits response");
+  }
+}
+
+#[test]
+fn date_histogram_calendar_month_interval() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+  {
+    let mut writer = idx.writer().unwrap();
+    for t in [
+      "2024-01-02T00:00:00Z",
+      "2024-01-15T12:00:00Z",
+      "2024-02-05T00:00:00Z",
+    ] {
+      writer
+        .add_document(&Document {
+          fields: [("body".into(), json!("rust")), ("ts".into(), json!(ts(t)))]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "dates".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("month".into()),
+      fixed_interval: None,
+      offset: None,
+      format: None,
+      min_doc_count: Some(0),
+      extended_bounds: Some(DateHistogramBounds {
+        min: "2024-01-01T00:00:00Z".into(),
+        max: "2024-03-01T00:00:00Z".into(),
+      }),
+      hard_bounds: None,
+      missing: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filters: vec![],
+      limit: 0,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: false,
+      highlight_field: None,
+      aggs,
+    })
+    .unwrap();
+
+  let agg = resp.aggregations.get("dates").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets } = agg {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        json!(ts("2024-01-01T00:00:00Z")),
+        json!(ts("2024-02-01T00:00:00Z")),
+        json!(ts("2024-03-01T00:00:00Z"))
+      ]
+    );
+    assert_eq!(buckets[0].doc_count, 2);
+    assert_eq!(buckets[1].doc_count, 1);
+    assert_eq!(buckets[2].doc_count, 0);
+  } else {
+    panic!("expected date histogram response");
   }
 }

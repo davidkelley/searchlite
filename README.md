@@ -103,6 +103,12 @@ cargo run -p searchlite-cli -- search \
 
 If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"}}'`.
 
+### Aggregations quick reference
+- Field requirements: `terms` needs a fast keyword field; `range`, `histogram`, `stats`, `date_histogram` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `top_hits` has no field requirement but returns stored fields/snippets when enabled.
+- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`.
+- Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
+- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations`.
+
 Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
 - Inspect or compact:

@@ -14,7 +14,7 @@ use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
 use crate::query::aggregation::AggregationPipeline;
-use crate::query::collector::DocCollector;
+use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
@@ -148,8 +148,9 @@ impl IndexReader {
 
     let mut hits: Vec<Hit> = Vec::new();
     let mut agg_results = Vec::new();
+    let mut total_matches: u64 = 0;
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
-    let mut agg_pipeline = AggregationPipeline::from_request(&req.aggs);
+    let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
     for seg in self.segments.iter() {
       let mut agg_collector = agg_pipeline
         .as_ref()
@@ -157,8 +158,13 @@ impl IndexReader {
         .transpose()?;
       let mut seg_hits = {
         let agg_ref = agg_collector
-          .as_deref_mut()
+          .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
+        let counter = if req.limit == 0 && agg_ref.is_some() {
+          Some(&mut total_matches)
+        } else {
+          None
+        };
         self.search_segment(
           seg,
           &qualified_terms,
@@ -166,6 +172,7 @@ impl IndexReader {
           &phrase_fields,
           &highlight_terms,
           agg_ref,
+          counter,
           req,
         )?
       };
@@ -189,7 +196,11 @@ impl IndexReader {
       BTreeMap::new()
     };
     Ok(SearchResult {
-      total_hits_estimate: hits.len() as u64,
+      total_hits_estimate: if req.limit == 0 {
+        total_matches
+      } else {
+        hits.len() as u64
+      },
       hits,
       aggregations,
     })
@@ -203,6 +214,7 @@ impl IndexReader {
     phrase_fields: &[Vec<(String, Vec<String>)>],
     highlight_terms: &[String],
     agg_collector: Option<&mut dyn DocCollector>,
+    match_counter: Option<&mut u64>,
     req: &SearchRequest,
   ) -> Result<Vec<Hit>> {
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
@@ -258,6 +270,7 @@ impl IndexReader {
       })
       .collect();
 
+    let mut match_counter = match_counter;
     let mut accept = |doc_id: DocId, _score: f32| -> bool {
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
@@ -281,6 +294,9 @@ impl IndexReader {
         if !ok_any_field {
           return false;
         }
+      }
+      if let Some(counter) = match_counter.as_mut() {
+        **counter += 1;
       }
       true
     };

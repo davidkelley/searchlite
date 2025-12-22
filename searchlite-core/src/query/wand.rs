@@ -249,7 +249,7 @@ fn with_stats(stats: &mut Option<&mut QueryStats>, f: impl FnOnce(&mut QueryStat
   }
 }
 
-pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
+pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   terms: Vec<ScoredTerm>,
   k: usize,
   strategy: ExecutionStrategy,
@@ -260,7 +260,7 @@ pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   execute_top_k_with_stats(terms, k, strategy, block_size, accept, collector, None)
 }
 
-pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
+pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   terms: Vec<ScoredTerm>,
   k: usize,
   strategy: ExecutionStrategy,
@@ -294,7 +294,7 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   )
 }
 
-fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
+fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   terms: &[ScoredTerm],
   k: usize,
   rank_hits: bool,
@@ -339,7 +339,7 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   finalize_heap(heap)
 }
 
-fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
+fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   mut terms: Vec<TermState>,
   k: usize,
   rank_hits: bool,
@@ -357,7 +357,16 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
       break;
     }
     let threshold = heap.peek().map(|d| d.0.score).unwrap_or(0.0);
-    let pivot_idx = match choose_pivot(&order, &terms, threshold, use_block_bounds) {
+    let pivot_idx = match choose_pivot(
+      &order,
+      &terms,
+      if collector.is_some() {
+        f32::NEG_INFINITY
+      } else {
+        threshold
+      },
+      use_block_bounds,
+    ) {
       Some(idx) => idx,
       None => break,
     };
@@ -380,10 +389,13 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
         s.candidates_examined += 1;
         s.scored_docs += 1;
       });
-      if score > threshold && accept(doc_id, score) {
+      let accepted = accept(doc_id, score);
+      if accepted {
         if let Some(collector) = collector.as_deref_mut() {
           collector.collect(doc_id, score);
         }
+      }
+      if score > threshold && accepted {
         if rank_hits {
           push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
         }
