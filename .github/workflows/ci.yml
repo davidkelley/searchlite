@@ -27,6 +27,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Format check
+        if: ${{ matrix.toolchain == 'stable' }}
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all --all-features --all-targets -- -D warnings
