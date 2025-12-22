@@ -396,7 +396,7 @@ mod tests {
 
     let reader = FastFieldsReader::open(&storage, &path).unwrap();
     assert!(reader.matches_keyword("tag", 0, "news"));
-    assert!(reader.matches_keyword_in("tag", 0, &vec!["sports".into(), "news".into()]));
+    assert!(reader.matches_keyword_in("tag", 0, &["sports".into(), "news".into()]));
     assert!(reader.matches_i64_range("year", 0, 2020, 2025));
     assert!(reader.matches_f64_range("score", 0, 0.0, 1.0));
     assert!(!reader.matches_keyword("tag", 1, "news"));
