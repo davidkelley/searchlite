@@ -6,7 +6,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::api::query::parse_query;
-use crate::api::types::{Aggregation, AggregationResponse, IndexOptions, SearchRequest};
+use crate::api::types::{
+  Aggregation, AggregationResponse, DateHistogramAggregation, HistogramAggregation, IndexOptions,
+  SearchRequest,
+};
 use crate::api::AggregationError;
 use crate::index::highlight::make_snippet;
 use crate::index::manifest::{Manifest, Schema};
@@ -14,6 +17,7 @@ use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
 use crate::query::aggregation::AggregationPipeline;
+use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_seconds};
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
@@ -374,10 +378,12 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
       }
       Aggregation::Histogram(h) => {
         ensure_numeric_fast(schema, &h.field, name)?;
+        validate_histogram_config(name, h)?;
         validate_aggregations(schema, &h.aggs)?;
       }
       Aggregation::DateHistogram(h) => {
         ensure_numeric_fast(schema, &h.field, name)?;
+        validate_date_histogram_config(name, h)?;
         validate_aggregations(schema, &h.aggs)?;
       }
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
@@ -433,4 +439,146 @@ fn ensure_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
     }
     .into(),
   )
+}
+
+fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<()> {
+  if agg.interval <= 0.0 {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("histogram `{name}` requires interval > 0"),
+      }
+      .into(),
+    );
+  }
+  if let Some(bounds) = &agg.extended_bounds {
+    if bounds.min > bounds.max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("histogram `{name}` extended_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.hard_bounds {
+    if bounds.min > bounds.max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("histogram `{name}` hard_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+    if let Some(ext) = &agg.extended_bounds {
+      if ext.min < bounds.min || ext.max > bounds.max {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("histogram `{name}` extended_bounds must be within hard_bounds"),
+          }
+          .into(),
+        );
+      }
+    }
+  }
+  Ok(())
+}
+
+fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) -> Result<()> {
+  let has_calendar = agg.calendar_interval.is_some();
+  let has_fixed = agg.fixed_interval.is_some();
+  if !has_calendar && !has_fixed {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("date_histogram `{name}` requires `calendar_interval` or `fixed_interval`"),
+      }
+      .into(),
+    );
+  }
+  if let Some(cal) = &agg.calendar_interval {
+    if parse_calendar_interval(cal).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` calendar_interval `{cal}` is not supported"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(fixed) = &agg.fixed_interval {
+    if parse_interval_seconds(fixed).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` fixed_interval `{fixed}` is invalid"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(offset) = &agg.offset {
+    if parse_interval_seconds(offset).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` offset `{offset}` is invalid"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.extended_bounds {
+    let min = parse_date(&bounds.min).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` extended_bounds.min `{}` is not a valid date/number",
+        bounds.min
+      ),
+    })?;
+    let max = parse_date(&bounds.max).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` extended_bounds.max `{}` is not a valid date/number",
+        bounds.max
+      ),
+    })?;
+    if min > max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` extended_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.hard_bounds {
+    let min = parse_date(&bounds.min).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` hard_bounds.min `{}` is not a valid date/number",
+        bounds.min
+      ),
+    })?;
+    let max = parse_date(&bounds.max).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` hard_bounds.max `{}` is not a valid date/number",
+        bounds.max
+      ),
+    })?;
+    if min > max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` hard_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+    if let Some(ext) = &agg.extended_bounds {
+      let ext_min = parse_date(&ext.min).unwrap_or(min);
+      let ext_max = parse_date(&ext.max).unwrap_or(max);
+      if ext_min < min || ext_max > max {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_histogram `{name}` extended_bounds must be within hard_bounds"),
+          }
+          .into(),
+        );
+      }
+    }
+  }
+  Ok(())
 }

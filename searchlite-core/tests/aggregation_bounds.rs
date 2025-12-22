@@ -56,7 +56,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       field: "score".into(),
       interval: 10.0,
       offset: None,
-      min_doc_count: Some(0),
+      min_doc_count: None,
       extended_bounds: Some(HistogramBounds {
         min: 0.0,
         max: 30.0,
@@ -92,13 +92,59 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       keys,
       vec![json!(0.0), json!(10.0), json!(20.0), json!(30.0)]
     );
-    assert_eq!(buckets[0].doc_count, 0);
+    assert_eq!(buckets[0].doc_count, 1);
     assert_eq!(buckets[1].doc_count, 1);
-    assert_eq!(buckets[2].doc_count, 1);
+    assert_eq!(buckets[2].doc_count, 0);
     assert_eq!(buckets[3].doc_count, 0);
   } else {
     panic!("unexpected histogram response");
   }
+}
+
+#[test]
+fn histogram_requires_positive_interval() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+  });
+  let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "score".into(),
+      interval: -10.0,
+      offset: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = idx.reader().unwrap().search(&SearchRequest {
+    query: "rust".into(),
+    fields: None,
+    filters: vec![],
+    limit: 0,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: false,
+    highlight_field: None,
+    aggs,
+  });
+  assert!(resp.is_err());
+  let msg = resp.err().unwrap().to_string();
+  assert!(msg.contains("interval > 0"));
 }
 
 #[test]
@@ -202,6 +248,94 @@ fn nested_terms_stats_aggregation() {
   } else {
     panic!("unexpected terms response");
   }
+}
+
+#[test]
+fn date_histogram_rejects_invalid_config() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("fortnight".into()),
+      fixed_interval: None,
+      offset: Some("bogus".into()),
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = idx.reader().unwrap().search(&SearchRequest {
+    query: "rust".into(),
+    fields: None,
+    filters: vec![],
+    limit: 0,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: false,
+    highlight_field: None,
+    aggs,
+  });
+  assert!(resp.is_err());
+  let msg = resp.err().unwrap().to_string();
+  assert!(msg.contains("calendar_interval"));
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("day".into()),
+      fixed_interval: None,
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: Some(DateHistogramBounds {
+        min: "2024-01-03T00:00:00Z".into(),
+        max: "2024-01-02T00:00:00Z".into(),
+      }),
+      hard_bounds: Some(DateHistogramBounds {
+        min: "2024-01-05T00:00:00Z".into(),
+        max: "2024-01-01T00:00:00Z".into(),
+      }),
+      missing: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = idx.reader().unwrap().search(&SearchRequest {
+    query: "rust".into(),
+    fields: None,
+    filters: vec![],
+    limit: 0,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: false,
+    highlight_field: None,
+    aggs,
+  });
+  assert!(resp.is_err());
+  let msg = resp.err().unwrap().to_string();
+  assert!(msg.contains("extended_bounds") || msg.contains("hard_bounds"));
 }
 
 #[test]

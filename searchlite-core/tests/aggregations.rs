@@ -264,6 +264,89 @@ fn histogram_bucket_generation() {
 }
 
 #[test]
+fn histogram_uses_floor_for_bucket_boundaries() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "views".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for val in [0, 4, 5] {
+      writer
+        .add_document(&Document {
+          fields: [("body".into(), json!("rust")), ("views".into(), json!(val))]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "views_hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "views".into(),
+      interval: 5.0,
+      offset: None,
+      min_doc_count: Some(0),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filters: vec![],
+      limit: 0,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: false,
+      highlight_field: None,
+      aggs,
+    })
+    .unwrap();
+  let hist = resp.aggregations.get("views_hist").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets } = hist {
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0].key, json!(0.0));
+    assert_eq!(buckets[0].doc_count, 2); // both 0 and 4 land in the first bucket
+    assert_eq!(buckets[1].key, json!(5.0));
+    assert_eq!(buckets[1].doc_count, 1);
+  } else {
+    panic!("expected histogram response");
+  }
+}
+
+#[test]
 fn range_aggregation_counts() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();

@@ -108,7 +108,7 @@ enum DateInterval {
 }
 
 #[derive(Clone, Copy)]
-enum CalendarUnit {
+pub(crate) enum CalendarUnit {
   Day,
   Week,
   Month,
@@ -329,11 +329,7 @@ impl<'a> TermsCollector<'a> {
       .into_values()
       .filter(|b| b.doc_count >= self.min_doc_count)
       .collect();
-    buckets.sort_by(|a, b| {
-      b.doc_count
-        .cmp(&a.doc_count)
-        .then_with(|| bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key)))
-    });
+    buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
     let limit = self.shard_size.or(self.size).unwrap_or(buckets.len());
     buckets.truncate(limit);
     AggregationIntermediate::Terms {
@@ -506,11 +502,12 @@ impl<'a> HistogramCollector<'a> {
     let offset = agg.offset.unwrap_or(0.0);
     let extended_bounds = agg.extended_bounds.as_ref().map(|b| (b.min, b.max));
     let hard_bounds = agg.hard_bounds.as_ref().map(|b| (b.min, b.max));
+    let has_bounds = agg.extended_bounds.is_some() || agg.hard_bounds.is_some();
     Self {
       field: agg.field.clone(),
       interval: agg.interval,
       offset,
-      min_doc_count: agg.min_doc_count.unwrap_or(1),
+      min_doc_count: agg.min_doc_count.unwrap_or(if has_bounds { 0 } else { 1 }),
       buckets: HashMap::new(),
       extended_bounds,
       hard_bounds,
@@ -521,7 +518,7 @@ impl<'a> HistogramCollector<'a> {
   }
 
   fn bucket_key(&self, val: f64) -> i64 {
-    ((val - self.offset) / self.interval).ceil() as i64
+    ((val - self.offset) / self.interval).floor() as i64
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
@@ -562,7 +559,7 @@ impl<'a> HistogramCollector<'a> {
     let extended_bounds = self.extended_bounds;
     let hard_bounds = self.hard_bounds;
     let mut buckets = self.buckets;
-    let bucket_key = |val: f64| ((val - offset) / interval).ceil() as i64;
+    let bucket_key = |val: f64| ((val - offset) / interval).floor() as i64;
     let bucket_value = |bucket_id: i64| bucket_id as f64 * interval + offset;
     if let Some((min, max)) = extended_bounds.or(hard_bounds) {
       let mut bucket_id = bucket_key(min);
@@ -1014,6 +1011,11 @@ fn merge_intermediate_in_place(
       if shard_size.is_none() {
         *shard_size = incoming_shard;
       }
+      let limit = shard_size.unwrap_or_else(|| target_buckets.len());
+      target_buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+      if target_buckets.len() > limit {
+        target_buckets.truncate(limit);
+      }
     }
     (
       AggregationIntermediate::Range {
@@ -1140,7 +1142,10 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
         .then_with(|| other.doc_id.cmp(&self.doc_id))
     }
   }
-  let mut heap: BinaryHeap<std::cmp::Reverse<Ranked>> = BinaryHeap::with_capacity(limit + 1);
+  let total_hits = target.hits.len().saturating_add(incoming.hits.len());
+  let min_capacity = target.size.max(1);
+  let cap = limit.min(total_hits.max(min_capacity)).saturating_add(1);
+  let mut heap: BinaryHeap<std::cmp::Reverse<Ranked>> = BinaryHeap::with_capacity(cap);
   let mut push_hit = |hit: TopHit| {
     let ranked = Ranked {
       score: hit.score.unwrap_or(0.0),
@@ -1181,6 +1186,17 @@ fn bucket_key_string(key: &serde_json::Value) -> String {
   }
 }
 
+fn terms_bucket_cmp(
+  a_key: &serde_json::Value,
+  a_count: u64,
+  b_key: &serde_json::Value,
+  b_count: u64,
+) -> Ordering {
+  b_count
+    .cmp(&a_count)
+    .then_with(|| bucket_key_string(a_key).cmp(&bucket_key_string(b_key)))
+}
+
 fn finalize_response(intermediate: AggregationIntermediate) -> AggregationResponse {
   match intermediate {
     AggregationIntermediate::Terms {
@@ -1188,12 +1204,8 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
       size,
       shard_size,
     } => {
-      buckets.sort_by(|a, b| {
-        b.doc_count
-          .cmp(&a.doc_count)
-          .then_with(|| bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key)))
-      });
-      let limit = size.or(shard_size).unwrap_or(buckets.len());
+      buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+      let limit = size.unwrap_or(shard_size.unwrap_or(buckets.len()));
       if buckets.len() > limit {
         buckets.truncate(limit);
       }
@@ -1275,7 +1287,7 @@ fn cmp_bucket_value(a: &serde_json::Value, b: &serde_json::Value) -> Ordering {
   a.to_string().cmp(&b.to_string())
 }
 
-fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
+pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
   match spec.to_ascii_lowercase().as_str() {
     "day" | "1d" => Some(CalendarUnit::Day),
     "week" | "1w" => Some(CalendarUnit::Week),
@@ -1362,14 +1374,14 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
   Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(next_dt, Utc).timestamp_millis())
 }
 
-fn parse_date(value: &str) -> Option<f64> {
+pub(crate) fn parse_date(value: &str) -> Option<f64> {
   chrono::DateTime::parse_from_rfc3339(value)
     .map(|dt| dt.timestamp_millis() as f64)
     .ok()
     .or_else(|| value.parse::<f64>().ok())
 }
 
-fn parse_interval_seconds(spec: &str) -> Option<f64> {
+pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
   let mut idx = 0usize;
   for ch in spec.chars() {
     if ch.is_ascii_digit() || ch == '.' {
