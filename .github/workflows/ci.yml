@@ -46,4 +46,4 @@ jobs:
         with:
           cache-on-failure: true
       - name: Benchmarks
-        run: cargo bench -p searchlite-core --all-features
+        run: cargo bench -p searchlite-core
