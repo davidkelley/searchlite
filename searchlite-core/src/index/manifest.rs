@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -75,6 +75,8 @@ pub struct Schema {
   pub text_fields: Vec<TextField>,
   pub keyword_fields: Vec<KeywordField>,
   pub numeric_fields: Vec<NumericField>,
+  #[serde(default)]
+  pub nested_fields: Vec<NestedField>,
   #[cfg(feature = "vectors")]
   pub vector_fields: Vec<VectorField>,
 }
@@ -90,6 +92,7 @@ impl Schema {
       }],
       keyword_fields: Vec::new(),
       numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
       #[cfg(feature = "vectors")]
       vector_fields: Vec::new(),
     }
@@ -97,54 +100,87 @@ impl Schema {
 
   pub fn is_indexed_field(&self, field: &str) -> bool {
     self
-      .text_fields
+      .resolved_fields()
       .iter()
-      .any(|f| f.name == field && f.indexed)
-      || self
-        .keyword_fields
-        .iter()
-        .any(|f| f.name == field && f.indexed)
-      || self.numeric_fields.iter().any(|f| f.name == field)
+      .any(|f| f.path == field && f.indexed)
   }
 
   pub fn is_stored_field(&self, field: &str) -> bool {
-    self.text_fields.iter().any(|f| f.name == field && f.stored)
-      || self
-        .keyword_fields
-        .iter()
-        .any(|f| f.name == field && f.stored)
-      || self
-        .numeric_fields
-        .iter()
-        .any(|f| f.name == field && f.stored)
+    self
+      .resolved_fields()
+      .iter()
+      .any(|f| f.path == field && f.stored)
   }
 
   pub fn fast_fields(&self) -> Vec<String> {
     self
-      .numeric_fields
-      .iter()
+      .resolved_fields()
+      .into_iter()
       .filter(|f| f.fast)
-      .map(|f| f.name.clone())
-      .chain(
-        self
-          .keyword_fields
-          .iter()
-          .filter(|f| f.fast)
-          .map(|f| f.name.clone()),
-      )
+      .map(|f| f.path)
       .collect()
   }
 
   pub fn field_kind(&self, field: &str) -> FieldKind {
-    if self.text_fields.iter().any(|f| f.name == field) {
-      FieldKind::Text
-    } else if self.keyword_fields.iter().any(|f| f.name == field) {
-      FieldKind::Keyword
-    } else if self.numeric_fields.iter().any(|f| f.name == field) {
-      FieldKind::Numeric
-    } else {
-      FieldKind::Unknown
+    self
+      .resolved_fields()
+      .into_iter()
+      .find(|f| f.path == field)
+      .map(|f| f.kind)
+      .unwrap_or(FieldKind::Unknown)
+  }
+
+  pub fn field_meta(&self, field: &str) -> Option<ResolvedField> {
+    self.resolved_fields().into_iter().find(|f| f.path == field)
+  }
+
+  pub fn resolved_fields(&self) -> Vec<ResolvedField> {
+    let mut fields = Vec::new();
+    for f in self.text_fields.iter() {
+      fields.push(ResolvedField {
+        path: f.name.clone(),
+        kind: FieldKind::Text,
+        indexed: f.indexed,
+        stored: f.stored,
+        fast: false,
+        numeric_i64: None,
+      });
     }
+    for f in self.keyword_fields.iter() {
+      fields.push(ResolvedField {
+        path: f.name.clone(),
+        kind: FieldKind::Keyword,
+        indexed: f.indexed,
+        stored: f.stored,
+        fast: f.fast,
+        numeric_i64: None,
+      });
+    }
+    for f in self.numeric_fields.iter() {
+      fields.push(ResolvedField {
+        path: f.name.clone(),
+        kind: FieldKind::Numeric,
+        indexed: true,
+        stored: f.stored,
+        fast: f.fast,
+        numeric_i64: Some(f.i64),
+      });
+    }
+    for nested in self.nested_fields.iter() {
+      nested.collect_fields(None, &mut fields);
+    }
+    fields
+  }
+
+  pub fn validate_document(&self, doc: &crate::api::types::Document) -> anyhow::Result<()> {
+    for (name, value) in doc.fields.iter() {
+      if let Some(nested) = self.nested_fields.iter().find(|n| n.name == *name) {
+        nested
+          .validate(value)
+          .with_context(|| format!("validating nested field {name}"))?;
+      }
+    }
+    Ok(())
   }
 
   #[cfg(feature = "vectors")]
@@ -181,6 +217,15 @@ mod tests {
         fast: true,
         stored: true,
       }],
+      nested_fields: vec![NestedField {
+        name: "comment".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: true,
+        })],
+      }],
       #[cfg(feature = "vectors")]
       vector_fields: Vec::new(),
     };
@@ -190,13 +235,23 @@ mod tests {
     let loaded = Manifest::load(&storage, &path).unwrap();
     assert!(loaded.schema.is_indexed_field("body"));
     assert!(loaded.schema.is_stored_field("year"));
+    let mut fast_fields = loaded.schema.fast_fields();
+    fast_fields.sort();
     assert_eq!(
-      loaded.schema.fast_fields(),
-      vec!["year".to_string(), "tag".to_string()]
+      fast_fields,
+      vec![
+        "comment.author".to_string(),
+        "tag".to_string(),
+        "year".to_string()
+      ]
     );
     assert!(matches!(
       loaded.schema.field_kind("year"),
       FieldKind::Numeric
+    ));
+    assert!(matches!(
+      loaded.schema.field_kind("comment.author"),
+      FieldKind::Keyword
     ));
   }
 }
@@ -207,6 +262,16 @@ pub enum FieldKind {
   Keyword,
   Numeric,
   Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedField {
+  pub path: String,
+  pub kind: FieldKind,
+  pub indexed: bool,
+  pub stored: bool,
+  pub fast: bool,
+  pub numeric_i64: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +297,115 @@ pub struct NumericField {
   pub fast: bool,
   #[serde(default)]
   pub stored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedField {
+  pub name: String,
+  #[serde(default)]
+  pub fields: Vec<NestedProperty>,
+}
+
+impl NestedField {
+  fn validate(&self, value: &serde_json::Value) -> anyhow::Result<()> {
+    match value {
+      serde_json::Value::Array(arr) => {
+        for v in arr.iter() {
+          self.validate(v)?;
+        }
+        Ok(())
+      }
+      serde_json::Value::Object(map) => {
+        for (k, v) in map.iter() {
+          let Some(prop) = self.fields.iter().find(|p| p.name() == k) else {
+            return Err(anyhow!("unknown nested field {k}"));
+          };
+          match prop {
+            NestedProperty::Text(_) | NestedProperty::Keyword(_) => {
+              if !(v.is_string() || v.is_array()) {
+                return Err(anyhow!("nested field {k} must be string or array"));
+              }
+            }
+            NestedProperty::Numeric(_) => {
+              if !(v.is_number() || v.is_array()) {
+                return Err(anyhow!("nested field {k} must be number or array"));
+              }
+            }
+            NestedProperty::Object(obj) => {
+              obj.validate(v)?;
+            }
+          }
+        }
+        Ok(())
+      }
+      _ => Err(anyhow!(
+        "nested field {} must be object or array",
+        self.name
+      )),
+    }
+  }
+
+  fn collect_fields(&self, prefix: Option<&str>, out: &mut Vec<ResolvedField>) {
+    let mut full_prefix = String::new();
+    if let Some(p) = prefix {
+      full_prefix.push_str(p);
+      full_prefix.push('.');
+    }
+    full_prefix.push_str(&self.name);
+    for f in self.fields.iter() {
+      f.collect_fields(&full_prefix, out);
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NestedProperty {
+  Text(TextField),
+  Keyword(KeywordField),
+  Numeric(NumericField),
+  Object(NestedField),
+}
+
+impl NestedProperty {
+  pub fn name(&self) -> &str {
+    match self {
+      NestedProperty::Text(f) => &f.name,
+      NestedProperty::Keyword(f) => &f.name,
+      NestedProperty::Numeric(f) => &f.name,
+      NestedProperty::Object(f) => &f.name,
+    }
+  }
+
+  fn collect_fields(&self, prefix: &str, out: &mut Vec<ResolvedField>) {
+    match self {
+      NestedProperty::Text(f) => out.push(ResolvedField {
+        path: format!("{prefix}.{}", f.name),
+        kind: FieldKind::Text,
+        indexed: f.indexed,
+        stored: f.stored,
+        fast: false,
+        numeric_i64: None,
+      }),
+      NestedProperty::Keyword(f) => out.push(ResolvedField {
+        path: format!("{prefix}.{}", f.name),
+        kind: FieldKind::Keyword,
+        indexed: f.indexed,
+        stored: f.stored,
+        fast: f.fast,
+        numeric_i64: None,
+      }),
+      NestedProperty::Numeric(f) => out.push(ResolvedField {
+        path: format!("{prefix}.{}", f.name),
+        kind: FieldKind::Numeric,
+        indexed: true,
+        stored: f.stored,
+        fast: f.fast,
+        numeric_i64: Some(f.i64),
+      }),
+      NestedProperty::Object(obj) => obj.collect_fields(Some(prefix), out),
+    }
+  }
 }
 
 #[cfg(feature = "vectors")]

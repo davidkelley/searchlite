@@ -8,5 +8,13 @@
   "numeric_fields": [
     { "name": "year", "i64": true, "fast": true }
   ],
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "stored": true, "indexed": true, "fast": true }
+      ]
+    }
+  ],
   "vector_fields": []
 }

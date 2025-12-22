@@ -16,7 +16,9 @@ use crate::api::types::Document;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
 use crate::index::fastfields::{FastFieldsReader, FastFieldsWriter, FastValue};
-use crate::index::manifest::{Schema, SegmentMeta, SegmentPaths};
+use crate::index::manifest::{
+  FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
+};
 use crate::index::postings::{InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
 use crate::storage::{Storage, StorageFile};
@@ -30,6 +32,174 @@ pub struct SegmentFileMeta {
   #[cfg(feature = "vectors")]
   pub vectors: HashMap<String, Vec<Vec<f32>>>,
   pub use_zstd: bool,
+}
+
+#[derive(Default)]
+struct CollectedDocument {
+  text: HashMap<String, Vec<String>>,
+  keywords: HashMap<String, Vec<String>>,
+  i64s: HashMap<String, Vec<i64>>,
+  f64s: HashMap<String, Vec<f64>>,
+  stored: HashMap<String, Vec<serde_json::Value>>,
+}
+
+impl CollectedDocument {
+  fn push_stored(&mut self, path: &str, values: impl IntoIterator<Item = serde_json::Value>) {
+    let entry = self.stored.entry(path.to_string()).or_default();
+    entry.extend(values);
+  }
+
+  fn finalize_stored(self) -> serde_json::Map<String, serde_json::Value> {
+    self
+      .stored
+      .into_iter()
+      .map(|(k, vals)| {
+        let value = if vals.len() == 1 {
+          vals.into_iter().next().unwrap()
+        } else {
+          serde_json::Value::Array(vals)
+        };
+        (k, value)
+      })
+      .collect()
+  }
+}
+
+fn collect_strings(value: &serde_json::Value) -> Vec<String> {
+  match value {
+    serde_json::Value::String(s) => vec![s.clone()],
+    serde_json::Value::Array(arr) => arr
+      .iter()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect(),
+    _ => Vec::new(),
+  }
+}
+
+fn collect_i64s(value: &serde_json::Value) -> Vec<i64> {
+  match value {
+    serde_json::Value::Number(n) => n.as_i64().into_iter().collect(),
+    serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_i64()).collect(),
+    _ => Vec::new(),
+  }
+}
+
+fn collect_f64s(value: &serde_json::Value) -> Vec<f64> {
+  match value {
+    serde_json::Value::Number(n) => n.as_f64().into_iter().collect(),
+    serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_f64()).collect(),
+    _ => Vec::new(),
+  }
+}
+
+fn handle_field(
+  meta: &ResolvedField,
+  value: &serde_json::Value,
+  collected: &mut CollectedDocument,
+) {
+  match meta.kind {
+    FieldKind::Text => {
+      let vals = collect_strings(value);
+      if meta.indexed && !vals.is_empty() {
+        collected
+          .text
+          .entry(meta.path.clone())
+          .or_default()
+          .extend(vals.iter().cloned());
+      }
+      if meta.stored {
+        collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::String));
+      }
+    }
+    FieldKind::Keyword => {
+      let vals = collect_strings(value);
+      if !vals.is_empty() {
+        collected
+          .keywords
+          .entry(meta.path.clone())
+          .or_default()
+          .extend(vals.iter().cloned());
+      }
+      if meta.stored {
+        collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::String));
+      }
+    }
+    FieldKind::Numeric => {
+      if meta.numeric_i64.unwrap_or(false) {
+        let vals = collect_i64s(value);
+        if !vals.is_empty() {
+          collected
+            .i64s
+            .entry(meta.path.clone())
+            .or_default()
+            .extend(vals.iter().cloned());
+        }
+        if meta.stored {
+          collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::from));
+        }
+      } else {
+        let vals = collect_f64s(value);
+        if !vals.is_empty() {
+          collected
+            .f64s
+            .entry(meta.path.clone())
+            .or_default()
+            .extend(vals.iter().cloned());
+        }
+        if meta.stored {
+          collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::from));
+        }
+      }
+    }
+    FieldKind::Unknown => {}
+  }
+}
+
+fn collect_nested(
+  schema: &Schema,
+  nested: &NestedField,
+  value: &serde_json::Value,
+  prefix: &str,
+  collected: &mut CollectedDocument,
+) {
+  match value {
+    serde_json::Value::Array(arr) => {
+      for v in arr.iter() {
+        collect_nested(schema, nested, v, prefix, collected);
+      }
+    }
+    serde_json::Value::Object(map) => {
+      for (k, v) in map.iter() {
+        if let Some(prop) = nested.fields.iter().find(|p| p.name() == k) {
+          match prop {
+            NestedProperty::Object(obj) => {
+              let next_prefix = format!("{prefix}.{}", obj.name);
+              collect_nested(schema, obj, v, &next_prefix, collected);
+            }
+            _ => {
+              let full_path = format!("{prefix}.{k}");
+              if let Some(meta) = schema.field_meta(&full_path) {
+                handle_field(&meta, v, collected);
+              }
+            }
+          }
+        }
+      }
+    }
+    _ => {}
+  }
+}
+
+fn collect_document(schema: &Schema, doc: &Document) -> CollectedDocument {
+  let mut collected = CollectedDocument::default();
+  for (field, value) in doc.fields.iter() {
+    if let Some(meta) = schema.field_meta(field) {
+      handle_field(&meta, value, &mut collected);
+    } else if let Some(nested) = schema.nested_fields.iter().find(|n| n.name == *field) {
+      collect_nested(schema, nested, value, &nested.name, &mut collected);
+    }
+  }
+  collected
 }
 
 pub struct SegmentWriter<'a> {
@@ -64,18 +234,21 @@ impl<'a> SegmentWriter<'a> {
     let mut postings_builder = InvertedIndexBuilder::new();
     let mut doc_lengths: HashMap<String, u64> = HashMap::new();
     let mut fast_writer = FastFieldsWriter::new();
-    let keyword_fast: FastHashSet<&str> = self
+    let resolved: FastHashMap<String, ResolvedField> = self
       .schema
-      .keyword_fields
-      .iter()
-      .filter(|f| f.fast)
-      .map(|f| f.name.as_str())
+      .resolved_fields()
+      .into_iter()
+      .map(|f| (f.path.clone(), f))
       .collect();
-    let numeric_info: FastHashMap<&str, (bool, bool)> = self
-      .schema
-      .numeric_fields
-      .iter()
-      .map(|f| (f.name.as_str(), (f.i64, f.fast)))
+    let keyword_fast: FastHashSet<&str> = resolved
+      .values()
+      .filter(|f| matches!(f.kind, FieldKind::Keyword) && f.fast)
+      .map(|f| f.path.as_str())
+      .collect();
+    let numeric_info: FastHashMap<&str, (bool, bool)> = resolved
+      .values()
+      .filter(|f| matches!(f.kind, FieldKind::Numeric))
+      .map(|f| (f.path.as_str(), (f.numeric_i64.unwrap_or(false), f.fast)))
       .collect();
 
     let mut docstore_file = self.storage.open_write(Path::new(&paths.docstore))?;
@@ -86,62 +259,87 @@ impl<'a> SegmentWriter<'a> {
 
     for (doc_id_u64, doc) in docs.iter().enumerate() {
       let doc_id = doc_id_u64 as DocId;
-      let mut stored = serde_json::Map::new();
-      for (k, v) in doc.fields.iter() {
-        stored.insert(k.clone(), v.clone());
-      }
-      for (field, value) in doc.fields.iter() {
-        match self.schema.field_kind(field) {
-          crate::index::manifest::FieldKind::Text => {
-            if let Some(text) = value.as_str() {
-              let tokens = tokenize(text);
-              doc_lengths
-                .entry(field.clone())
-                .and_modify(|v| *v += tokens.len() as u64)
-                .or_insert(tokens.len() as u64);
-              for (pos, tok) in tokens.iter().enumerate() {
-                let mut term_key = String::with_capacity(field.len() + tok.len() + 1);
-                term_key.push_str(field);
-                term_key.push(':');
-                term_key.push_str(tok);
-                postings_builder.add_term(&term_key, doc_id, pos as u32, self.enable_positions);
-              }
-            }
+      self.schema.validate_document(doc)?;
+      let collected = collect_document(self.schema, doc);
+
+      for (field, values) in collected.text.iter() {
+        if let Some(meta) = resolved.get(field) {
+          if !meta.indexed {
+            continue;
           }
-          crate::index::manifest::FieldKind::Keyword => {
-            if let Some(s) = value.as_str() {
-              let lower = s.to_ascii_lowercase();
+        }
+        let mut position_offset: u32 = 0;
+        for text in values.iter() {
+          let tokens = tokenize(text);
+          doc_lengths
+            .entry(field.clone())
+            .and_modify(|v| *v += tokens.len() as u64)
+            .or_insert(tokens.len() as u64);
+          for (pos, tok) in tokens.iter().enumerate() {
+            let mut term_key = String::with_capacity(field.len() + tok.len() + 1);
+            term_key.push_str(field);
+            term_key.push(':');
+            term_key.push_str(tok);
+            postings_builder.add_term(
+              &term_key,
+              doc_id,
+              position_offset + pos as u32,
+              self.enable_positions,
+            );
+          }
+          position_offset += tokens.len() as u32;
+        }
+      }
+
+      for (field, values) in collected.keywords.iter() {
+        let mut seen_terms = FastHashSet::new();
+        let indexed = resolved.get(field).map(|m| m.indexed).unwrap_or(true);
+        for value in values.iter() {
+          if indexed {
+            let lower = value.to_ascii_lowercase();
+            if seen_terms.insert(lower.clone()) {
               let mut term_key = String::with_capacity(field.len() + lower.len() + 1);
               term_key.push_str(field);
               term_key.push(':');
               term_key.push_str(&lower);
               postings_builder.add_term(&term_key, doc_id, 0, false);
-              if keyword_fast.contains(field.as_str()) {
-                fast_writer.set(field, doc_id, FastValue::Str(s.to_string()));
-              }
             }
           }
-          crate::index::manifest::FieldKind::Numeric => {
-            if let Some((is_i64, fast)) = numeric_info.get(field.as_str()) {
-              if *is_i64 {
-                if let Some(n) = value.as_i64() {
-                  if *fast {
-                    fast_writer.set(field, doc_id, FastValue::I64(n));
-                  }
-                }
-              } else if let Some(f) = value.as_f64() {
-                if *fast {
-                  fast_writer.set(field, doc_id, FastValue::F64(f));
-                }
-              }
-            }
-          }
-          crate::index::manifest::FieldKind::Unknown => {}
         }
-        if self.schema.is_stored_field(field) {
-          stored.insert(field.clone(), value.clone());
+        if keyword_fast.contains(field.as_str()) {
+          if values.len() == 1 {
+            fast_writer.set(field, doc_id, FastValue::Str(values[0].clone()));
+          } else {
+            fast_writer.set(field, doc_id, FastValue::StrList(values.clone()));
+          }
         }
       }
+
+      for (field, values) in collected.i64s.iter() {
+        if let Some((_, fast)) = numeric_info.get(field.as_str()) {
+          if *fast {
+            if values.len() == 1 {
+              fast_writer.set(field, doc_id, FastValue::I64(values[0]));
+            } else {
+              fast_writer.set(field, doc_id, FastValue::I64List(values.clone()));
+            }
+          }
+        }
+      }
+
+      for (field, values) in collected.f64s.iter() {
+        if let Some((_, fast)) = numeric_info.get(field.as_str()) {
+          if *fast {
+            if values.len() == 1 {
+              fast_writer.set(field, doc_id, FastValue::F64(values[0]));
+            } else {
+              fast_writer.set(field, doc_id, FastValue::F64List(values.clone()));
+            }
+          }
+        }
+      }
+
+      let stored = collected.finalize_stored();
 
       #[cfg(feature = "vectors")]
       for vf in self.schema.vector_fields.iter() {
@@ -352,6 +550,7 @@ mod tests {
         fast: true,
         stored: true,
       }],
+      nested_fields: Vec::new(),
       #[cfg(feature = "vectors")]
       vector_fields: Vec::new(),
     }

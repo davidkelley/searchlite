@@ -75,6 +75,7 @@ pub enum Filter {
   KeywordIn { field: String, values: Vec<String> },
   I64Range { field: String, min: i64, max: i64 },
   F64Range { field: String, min: f64, max: f64 },
+  Nested { path: String, filter: Box<Filter> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -272,4 +273,6 @@ pub struct TopHit {
   pub snippet: Option<String>,
 }
 
-pub use crate::index::manifest::{KeywordField, NumericField, Schema, TextField};
+pub use crate::index::manifest::{
+  KeywordField, NestedField, NestedProperty, NumericField, Schema, TextField,
+};

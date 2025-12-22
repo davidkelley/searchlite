@@ -39,11 +39,19 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
   "numeric_fields": [
     { "name": "year", "i64": true, "fast": true }
   ],
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "stored": true, "indexed": true, "fast": true }
+      ]
+    }
+  ],
   "vector_fields": []
 }
 ```
 
-`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`.
+`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
 
 ## CLI workflow examples
 Set an index location once:

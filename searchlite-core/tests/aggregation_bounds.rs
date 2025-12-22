@@ -342,7 +342,13 @@ fn date_histogram_rejects_invalid_config() {
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
-  let schema = Schema::default_text_body();
+  let mut schema = Schema::default_text_body();
+  schema.keyword_fields.push(KeywordField {
+    name: "tag".into(),
+    stored: true,
+    indexed: true,
+    fast: false,
+  });
   let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
   {
     let mut writer = idx.writer().unwrap();

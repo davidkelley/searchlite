@@ -12,6 +12,9 @@ pub enum FastValue {
   I64(i64),
   F64(f64),
   Str(String),
+  I64List(Vec<i64>),
+  F64List(Vec<f64>),
+  StrList(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +22,9 @@ enum FieldType {
   I64,
   F64,
   Str,
+  I64List,
+  F64List,
+  StrList,
 }
 
 impl FieldType {
@@ -27,6 +33,9 @@ impl FieldType {
       FieldType::I64 => 0,
       FieldType::F64 => 1,
       FieldType::Str => 2,
+      FieldType::I64List => 3,
+      FieldType::F64List => 4,
+      FieldType::StrList => 5,
     }
   }
 
@@ -35,6 +44,9 @@ impl FieldType {
       0 => Some(FieldType::I64),
       1 => Some(FieldType::F64),
       2 => Some(FieldType::Str),
+      3 => Some(FieldType::I64List),
+      4 => Some(FieldType::F64List),
+      5 => Some(FieldType::StrList),
       _ => None,
     }
   }
@@ -64,11 +76,42 @@ impl StrColumnBuilder {
   }
 }
 
+#[derive(Debug, Default)]
+struct StrListColumnBuilder {
+  dict: Vec<String>,
+  dict_index: HashMap<String, u32>,
+  values: Vec<Vec<u32>>,
+}
+
+impl StrListColumnBuilder {
+  fn push(&mut self, doc_id: usize, entries: &[String]) {
+    if self.values.len() <= doc_id {
+      self.values.resize(doc_id + 1, Vec::new());
+    }
+    let doc_values = &mut self.values[doc_id];
+    doc_values.clear();
+    for value in entries {
+      let idx = if let Some(&idx) = self.dict_index.get(value) {
+        idx
+      } else {
+        let idx = self.dict.len() as u32;
+        self.dict.push(value.to_string());
+        self.dict_index.insert(value.to_string(), idx);
+        idx
+      };
+      doc_values.push(idx);
+    }
+  }
+}
+
 #[derive(Debug)]
 enum ColumnBuilder {
   I64(Vec<Option<i64>>),
+  I64List(Vec<Vec<i64>>),
   F64(Vec<Option<f64>>),
+  F64List(Vec<Vec<f64>>),
   Str(StrColumnBuilder),
+  StrList(StrListColumnBuilder),
 }
 
 pub struct FastFieldsWriter {
@@ -115,6 +158,36 @@ impl FastFieldsWriter {
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
+      FastValue::I64List(values) => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::I64List(Vec::new()));
+        match col {
+          ColumnBuilder::I64List(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            entries[idx] = values;
+          }
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::F64List(values) => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::F64List(Vec::new()));
+        match col {
+          ColumnBuilder::F64List(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            entries[idx] = values;
+          }
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
       FastValue::Str(v) => {
         let col = self
           .data
@@ -122,6 +195,16 @@ impl FastFieldsWriter {
           .or_insert_with(|| ColumnBuilder::Str(StrColumnBuilder::default()));
         match col {
           ColumnBuilder::Str(builder) => builder.push(idx, &v),
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::StrList(values) => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::StrList(StrListColumnBuilder::default()));
+        match col {
+          ColumnBuilder::StrList(builder) => builder.push(idx, &values),
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -149,10 +232,16 @@ impl FastFieldsWriter {
 #[derive(Debug)]
 enum Column {
   I64(Vec<Option<i64>>),
+  I64List(Vec<Vec<i64>>),
   F64(Vec<Option<f64>>),
+  F64List(Vec<Vec<f64>>),
   Str {
     dict: Vec<String>,
     values: Vec<Option<u32>>,
+  },
+  StrList {
+    dict: Vec<String>,
+    values: Vec<Vec<u32>>,
   },
 }
 
@@ -174,6 +263,14 @@ impl FastFieldsReader {
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| s == value)
         .unwrap_or(false),
+      Some(Column::StrList { dict, values }) => values
+        .get(doc_id as usize)
+        .map(|vals| {
+          vals
+            .iter()
+            .any(|idx| dict.get(*idx as usize).map(|s| s == value).unwrap_or(false))
+        })
+        .unwrap_or(false),
       _ => false,
     }
   }
@@ -188,6 +285,20 @@ impl FastFieldsReader {
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| values.iter().any(|v| v == s))
         .unwrap_or(false),
+      Some(Column::StrList {
+        dict,
+        values: lookup,
+      }) => lookup
+        .get(doc_id as usize)
+        .map(|items| {
+          items.iter().any(|idx| {
+            dict
+              .get(*idx as usize)
+              .map(|s| values.iter().any(|v| v == s))
+              .unwrap_or(false)
+          })
+        })
+        .unwrap_or(false),
       _ => false,
     }
   }
@@ -198,6 +309,10 @@ impl FastFieldsReader {
         .get(doc_id as usize)
         .and_then(|opt| *opt)
         .map(|v| v >= min && v <= max)
+        .unwrap_or(false),
+      Some(Column::I64List(values)) => values
+        .get(doc_id as usize)
+        .map(|vals| vals.iter().any(|v| *v >= min && *v <= max))
         .unwrap_or(false),
       _ => false,
     }
@@ -210,6 +325,10 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| v >= min && v <= max)
         .unwrap_or(false),
+      Some(Column::F64List(values)) => values
+        .get(doc_id as usize)
+        .map(|vals| vals.iter().any(|v| *v >= min && *v <= max))
+        .unwrap_or(false),
       _ => false,
     }
   }
@@ -220,6 +339,11 @@ impl FastFieldsReader {
         .get(doc_id as usize)
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| s.as_str()),
+      Some(Column::StrList { dict, values }) => values
+        .get(doc_id as usize)
+        .and_then(|vals| vals.first())
+        .and_then(|idx| dict.get(*idx as usize))
+        .map(|s| s.as_str()),
       _ => None,
     }
   }
@@ -227,6 +351,10 @@ impl FastFieldsReader {
   pub fn i64_value(&self, field: &str, doc_id: DocId) -> Option<i64> {
     match self.fields.get(field) {
       Some(Column::I64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      Some(Column::I64List(values)) => values
+        .get(doc_id as usize)
+        .and_then(|vals| vals.first())
+        .copied(),
       _ => None,
     }
   }
@@ -234,7 +362,55 @@ impl FastFieldsReader {
   pub fn f64_value(&self, field: &str, doc_id: DocId) -> Option<f64> {
     match self.fields.get(field) {
       Some(Column::F64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      Some(Column::F64List(values)) => values
+        .get(doc_id as usize)
+        .and_then(|vals| vals.first())
+        .copied(),
       _ => None,
+    }
+  }
+
+  pub fn str_values(&self, field: &str, doc_id: DocId) -> Vec<&str> {
+    match self.fields.get(field) {
+      Some(Column::Str { dict, values }) => values
+        .get(doc_id as usize)
+        .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
+        .map(|s| vec![s.as_str()])
+        .unwrap_or_default(),
+      Some(Column::StrList { dict, values }) => values
+        .get(doc_id as usize)
+        .map(|vals| {
+          vals
+            .iter()
+            .filter_map(|idx| dict.get(*idx as usize).map(|s| s.as_str()))
+            .collect()
+        })
+        .unwrap_or_default(),
+      _ => Vec::new(),
+    }
+  }
+
+  pub fn i64_values(&self, field: &str, doc_id: DocId) -> Vec<i64> {
+    match self.fields.get(field) {
+      Some(Column::I64(values)) => values
+        .get(doc_id as usize)
+        .and_then(|opt| *opt)
+        .map(|v| vec![v])
+        .unwrap_or_default(),
+      Some(Column::I64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      _ => Vec::new(),
+    }
+  }
+
+  pub fn f64_values(&self, field: &str, doc_id: DocId) -> Vec<f64> {
+    match self.fields.get(field) {
+      Some(Column::F64(values)) => values
+        .get(doc_id as usize)
+        .and_then(|opt| *opt)
+        .map(|v| vec![v])
+        .unwrap_or_default(),
+      Some(Column::F64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      _ => Vec::new(),
     }
   }
 }
@@ -252,12 +428,32 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
         buf.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
       }
     }
+    ColumnBuilder::I64List(values) => {
+      buf.push(FieldType::I64List.as_u8());
+      buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      for vals in values.iter() {
+        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        for v in vals.iter() {
+          buf.extend_from_slice(&v.to_le_bytes());
+        }
+      }
+    }
     ColumnBuilder::F64(values) => {
       buf.push(FieldType::F64.as_u8());
       buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
       write_presence(values.iter().map(|v| v.is_some()), buf);
       for v in values {
         buf.extend_from_slice(&v.unwrap_or(0.0).to_le_bytes());
+      }
+    }
+    ColumnBuilder::F64List(values) => {
+      buf.push(FieldType::F64List.as_u8());
+      buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      for vals in values.iter() {
+        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        for v in vals.iter() {
+          buf.extend_from_slice(&v.to_le_bytes());
+        }
       }
     }
     ColumnBuilder::Str(builder) => {
@@ -273,6 +469,23 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
       for v in builder.values.iter() {
         let idx = v.map(|i| i).unwrap_or(u32::MAX);
         buf.extend_from_slice(&idx.to_le_bytes());
+      }
+    }
+    ColumnBuilder::StrList(builder) => {
+      buf.push(FieldType::StrList.as_u8());
+      buf.extend_from_slice(&(builder.values.len() as u32).to_le_bytes());
+      let dict_len = builder.dict.len() as u32;
+      buf.extend_from_slice(&dict_len.to_le_bytes());
+      for entry in builder.dict.iter() {
+        let b = entry.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+      }
+      for vals in builder.values.iter() {
+        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        for idx in vals.iter() {
+          buf.extend_from_slice(&idx.to_le_bytes());
+        }
       }
     }
   }
@@ -324,6 +537,24 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
         Column::I64(vals)
       }
+      FieldType::I64List => {
+        let mut rows = Vec::with_capacity(doc_len);
+        for _ in 0..doc_len {
+          let entry_len = read_u32(&mut cursor, data)? as usize;
+          let mut vals = Vec::with_capacity(entry_len);
+          for _ in 0..entry_len {
+            if cursor + 8 > data.len() {
+              return Err(anyhow!("unexpected end of fast field i64 list"));
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&data[cursor..cursor + 8]);
+            cursor += 8;
+            vals.push(i64::from_le_bytes(arr));
+          }
+          rows.push(vals);
+        }
+        Column::I64List(rows)
+      }
       FieldType::F64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
         let mut vals = Vec::with_capacity(doc_len);
@@ -341,6 +572,24 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           }
         }
         Column::F64(vals)
+      }
+      FieldType::F64List => {
+        let mut rows = Vec::with_capacity(doc_len);
+        for _ in 0..doc_len {
+          let entry_len = read_u32(&mut cursor, data)? as usize;
+          let mut vals = Vec::with_capacity(entry_len);
+          for _ in 0..entry_len {
+            if cursor + 8 > data.len() {
+              return Err(anyhow!("unexpected end of fast field f64 list"));
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&data[cursor..cursor + 8]);
+            cursor += 8;
+            vals.push(f64::from_le_bytes(arr));
+          }
+          rows.push(vals);
+        }
+        Column::F64List(rows)
       }
       FieldType::Str => {
         let dict_len = read_u32(&mut cursor, data)? as usize;
@@ -367,6 +616,33 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           }
         }
         Column::Str { dict, values: vals }
+      }
+      FieldType::StrList => {
+        let dict_len = read_u32(&mut cursor, data)? as usize;
+        let mut dict = Vec::with_capacity(dict_len);
+        for _ in 0..dict_len {
+          let slen = read_u32(&mut cursor, data)? as usize;
+          if cursor + slen > data.len() {
+            return Err(anyhow!("unexpected end of fast field dict"));
+          }
+          let s = String::from_utf8_lossy(&data[cursor..cursor + slen]).into_owned();
+          cursor += slen;
+          dict.push(s);
+        }
+        let mut vals = Vec::with_capacity(doc_len);
+        for _ in 0..doc_len {
+          let entry_len = read_u32(&mut cursor, data)? as usize;
+          let mut row = Vec::with_capacity(entry_len);
+          for _ in 0..entry_len {
+            let idx = read_u32(&mut cursor, data)?;
+            if idx as usize >= dict.len() {
+              return Err(anyhow!("invalid fast field dict index"));
+            }
+            row.push(idx);
+          }
+          vals.push(row);
+        }
+        Column::StrList { dict, values: vals }
       }
     };
     fields.insert(name, column);
@@ -414,15 +690,29 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let mut writer = FastFieldsWriter::new();
     writer.set("tag", 0, FastValue::Str("news".into()));
+    writer.set(
+      "tags",
+      0,
+      FastValue::StrList(vec!["news".into(), "tech".into()]),
+    );
     writer.set("year", 0, FastValue::I64(2024));
+    writer.set("years", 0, FastValue::I64List(vec![2022, 2024]));
     writer.set("score", 0, FastValue::F64(0.42));
+    writer.set("scores", 0, FastValue::F64List(vec![0.1, 0.42]));
     writer.write_to(&storage, &path).unwrap();
 
     let reader = FastFieldsReader::open(&storage, &path).unwrap();
     assert!(reader.matches_keyword("tag", 0, "news"));
+    assert!(reader.matches_keyword("tags", 0, "tech"));
     assert!(reader.matches_keyword_in("tag", 0, &["sports".into(), "news".into()]));
+    assert!(reader.matches_keyword_in("tags", 0, &["sports".into(), "tech".into()]));
     assert!(reader.matches_i64_range("year", 0, 2020, 2025));
+    assert!(reader.matches_i64_range("years", 0, 2020, 2023));
     assert!(reader.matches_f64_range("score", 0, 0.0, 1.0));
+    assert!(reader.matches_f64_range("scores", 0, 0.4, 0.5));
     assert!(!reader.matches_keyword("tag", 1, "news"));
+    assert_eq!(reader.str_values("tags", 0).len(), 2);
+    assert_eq!(reader.i64_values("years", 0), vec![2022, 2024]);
+    assert_eq!(reader.f64_values("scores", 0), vec![0.1, 0.42]);
   }
 }
