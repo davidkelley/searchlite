@@ -2,8 +2,7 @@ pub fn bm25(tf: f32, df: f32, doc_len: f32, avgdl: f32, docs: f32, k1: f32, b: f
   let idf = ((docs - df + 0.5) / (df + 0.5)).ln().max(0.0) + 1.0;
   let norm_dl = if avgdl > 0.0 { doc_len / avgdl } else { 1.0 };
   let denom = tf + k1 * (1.0 - b + b * norm_dl);
-  let score = idf * (tf * (k1 + 1.0)) / denom.max(1e-6);
-  score
+  idf * (tf * (k1 + 1.0)) / denom.max(1e-6)
 }
 
 #[cfg(test)]

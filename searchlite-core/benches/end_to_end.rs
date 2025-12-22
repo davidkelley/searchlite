@@ -5,12 +5,12 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, IndexOptions, Schema, SearchRequest, StorageType,
 };
-use searchlite_core::api::Index;
 
 fn bench_indexing(c: &mut Criterion) {
   c.bench_function("index_small", |b| {
     b.iter(|| {
-      let path = tempfile::tempdir().unwrap().into_path();
+      let tempdir = tempfile::tempdir().unwrap();
+      let path = tempdir.path().to_path_buf();
       let schema = Schema::default_text_body();
       let opts = IndexOptions {
         path: path.clone(),
@@ -45,7 +45,8 @@ fn bench_indexing(c: &mut Criterion) {
 
 fn bench_search(c: &mut Criterion) {
   c.bench_function("search_small", |b| {
-    let path = tempfile::tempdir().unwrap().into_path();
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().to_path_buf();
     let schema = Schema::default_text_body();
     let opts = IndexOptions {
       path: path.clone(),

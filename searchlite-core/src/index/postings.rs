@@ -75,8 +75,7 @@ impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
     write_u32(self.file, postings.len() as u32)?;
     self.file.write_all(&[self.keep_positions as u8])?;
     let block_size = DEFAULT_BLOCK_SIZE;
-    let block_count =
-      ((postings.len() + block_size - 1) / block_size).min(u32::MAX as usize) as u32;
+    let block_count = postings.len().div_ceil(block_size).min(u32::MAX as usize) as u32;
     let block_flagged = if block_count > 0 {
       block_count | BLOCK_META_FLAG
     } else {

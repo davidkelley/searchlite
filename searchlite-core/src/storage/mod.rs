@@ -101,7 +101,7 @@ impl Storage for FsStorage {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
-    fs::write(&tmp, &data)?;
+    fs::write(&tmp, data)?;
     fs::rename(&tmp, path)?;
     Ok(())
   }

@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+#[cfg(feature = "vectors")]
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -151,10 +153,10 @@ impl<'a> SegmentWriter<'a> {
               .filter_map(|v| v.as_f64())
               .map(|v| v as f32)
               .collect();
-            if vecvals.len() < vf.dim {
-              vecvals.resize(vf.dim, 0.0);
-            } else if vecvals.len() > vf.dim {
-              vecvals.truncate(vf.dim);
+            match vecvals.len().cmp(&vf.dim) {
+              Ordering::Less => vecvals.resize(vf.dim, 0.0),
+              Ordering::Greater => vecvals.truncate(vf.dim),
+              Ordering::Equal => {}
             }
             entry.push(vecvals);
             continue;

@@ -3,18 +3,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionStrategy {
   Bm25,
+  #[default]
   Wand,
   Bmw,
-}
-
-impl Default for ExecutionStrategy {
-  fn default() -> Self {
-    ExecutionStrategy::Wand
-  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,16 +25,11 @@ pub struct IndexOptions {
   pub vector_defaults: Option<VectorOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum StorageType {
+  #[default]
   Filesystem,
   InMemory,
-}
-
-impl Default for StorageType {
-  fn default() -> Self {
-    StorageType::Filesystem
-  }
 }
 
 #[cfg(feature = "vectors")]

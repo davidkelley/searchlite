@@ -13,15 +13,17 @@ pub struct IndexHandle {
   index: Index,
 }
 
+/// # Safety
+/// `path` must be a valid, non-null C string pointer that remains valid for the duration of the call.
 #[no_mangle]
-pub extern "C" fn searchlite_index_open(
+pub unsafe extern "C" fn searchlite_index_open(
   path: *const c_char,
   create_if_missing: bool,
 ) -> *mut IndexHandle {
   if path.is_null() {
     return std::ptr::null_mut();
   }
-  let c_str = unsafe { CStr::from_ptr(path) };
+  let c_str = CStr::from_ptr(path);
   let path_buf = PathBuf::from(c_str.to_string_lossy().to_string());
   let opts = IndexOptions {
     path: path_buf,
@@ -39,18 +41,20 @@ pub extern "C" fn searchlite_index_open(
   }
 }
 
+/// # Safety
+/// `handle` must be a pointer returned by `searchlite_index_open` that has not been freed.
 #[no_mangle]
-pub extern "C" fn searchlite_index_close(handle: *mut IndexHandle) {
+pub unsafe extern "C" fn searchlite_index_close(handle: *mut IndexHandle) {
   if handle.is_null() {
     return;
   }
-  unsafe {
-    drop(Box::from_raw(handle));
-  }
+  drop(Box::from_raw(handle));
 }
 
+/// # Safety
+/// `handle` must be a valid pointer from `searchlite_index_open`, and `json` must point to a valid, null-terminated UTF-8 string.
 #[no_mangle]
-pub extern "C" fn searchlite_add_json(
+pub unsafe extern "C" fn searchlite_add_json(
   handle: *mut IndexHandle,
   json: *const c_char,
   _len: usize,
@@ -58,13 +62,11 @@ pub extern "C" fn searchlite_add_json(
   if handle.is_null() || json.is_null() {
     return -1;
   }
-  let h = unsafe { &mut *handle };
-  let json_str = unsafe { CStr::from_ptr(json) }
-    .to_string_lossy()
-    .to_string();
+  let h = &mut *handle;
+  let json_str = CStr::from_ptr(json).to_string_lossy().to_string();
   match serde_json::from_str::<serde_json::Value>(&json_str) {
     Ok(val) => {
-      let mut fields = std::collections::BTreeMap::new();
+      let mut fields = BTreeMap::new();
       if let Some(map) = val.as_object() {
         for (k, v) in map.iter() {
           fields.insert(k.clone(), v.clone());
@@ -87,12 +89,14 @@ pub extern "C" fn searchlite_add_json(
   }
 }
 
+/// # Safety
+/// `handle` must be a valid pointer returned by `searchlite_index_open` and not already freed.
 #[no_mangle]
-pub extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
+pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
   if handle.is_null() {
     return -1;
   }
-  let h = unsafe { &mut *handle };
+  let h = &mut *handle;
   match h.index.writer() {
     Ok(mut w) => match w.commit() {
       Ok(_) => 0,
@@ -102,8 +106,10 @@ pub extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
   }
 }
 
+/// # Safety
+/// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `aggs_json`, when provided, must point to `aggs_len` bytes of JSON; `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
 #[no_mangle]
-pub extern "C" fn searchlite_search(
+pub unsafe extern "C" fn searchlite_search(
   handle: *mut IndexHandle,
   query: *const c_char,
   limit: usize,
@@ -115,16 +121,14 @@ pub extern "C" fn searchlite_search(
   if handle.is_null() || query.is_null() {
     return 0;
   }
-  let h = unsafe { &mut *handle };
-  let query_str = unsafe { CStr::from_ptr(query) }
-    .to_string_lossy()
-    .to_string();
+  let h = &mut *handle;
+  let query_str = CStr::from_ptr(query).to_string_lossy().to_string();
   let reader = match h.index.reader() {
     Ok(r) => r,
     Err(_) => return 0,
   };
   let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
-    let raw = unsafe { std::slice::from_raw_parts(aggs_json as *const u8, aggs_len) };
+    let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
     let body = String::from_utf8_lossy(raw).to_string();
     serde_json::from_str(&body).unwrap_or_default()
   } else {
@@ -152,11 +156,9 @@ pub extern "C" fn searchlite_search(
   }
   let encoded = serde_json::to_string(&res).unwrap_or_else(|_| "{}".to_string());
   let bytes = encoded.as_bytes();
-  let len = bytes.len().min(buf_cap - 1);
-  unsafe {
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, len);
-    *out_json_buf.add(len) = 0;
-  }
+  let len = bytes.len().min(buf_cap.saturating_sub(1));
+  std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, len);
+  *out_json_buf.add(len) = 0;
   len
 }
 
@@ -170,26 +172,28 @@ mod tests {
   fn ffi_roundtrip_search() {
     let dir = tempdir().unwrap();
     let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
-    let handle = searchlite_index_open(path.as_ptr(), true);
+    let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
     assert!(!handle.is_null());
 
     let doc = CString::new(r#"{"body":"hello from ffi"}"#).unwrap();
-    let added = searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len());
+    let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
     assert!(added >= 0);
-    assert_eq!(searchlite_commit(handle), 0);
+    assert_eq!(unsafe { searchlite_commit(handle) }, 0);
 
     let mut buf = vec![0 as c_char; 1024];
     let query = CString::new("hello").unwrap();
-    let written = searchlite_search(
-      handle,
-      query.as_ptr(),
-      5,
-      std::ptr::null(),
-      0,
-      buf.as_mut_ptr(),
-      buf.len(),
-    );
+    let written = unsafe {
+      searchlite_search(
+        handle,
+        query.as_ptr(),
+        5,
+        std::ptr::null(),
+        0,
+        buf.as_mut_ptr(),
+        buf.len(),
+      )
+    };
     assert!(written > 0);
-    searchlite_index_close(handle);
+    unsafe { searchlite_index_close(handle) };
   }
 }
