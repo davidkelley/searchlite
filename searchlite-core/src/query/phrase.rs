@@ -20,7 +20,7 @@ pub fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId) -> bool {
     let mut ok = true;
     for (i, term_positions) in positions_per_term.iter().enumerate().skip(1) {
       let target = start + i as u32;
-      if !term_positions.iter().any(|p| *p == target) {
+      if !term_positions.contains(&target) {
         ok = false;
         break;
       }

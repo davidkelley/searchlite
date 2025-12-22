@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -63,9 +63,9 @@ fn main() -> Result<()> {
   env_logger::init();
   let cli = Cli::parse();
   match cli.command {
-    Commands::Init { index, schema } => cmd_init(&index, &schema),
-    Commands::Add { index, doc } => cmd_add(&index, &doc),
-    Commands::Commit { index } => cmd_commit(&index),
+    Commands::Init { index, schema } => cmd_init(index.as_path(), schema.as_path()),
+    Commands::Add { index, doc } => cmd_add(index.as_path(), doc.as_path()),
+    Commands::Commit { index } => cmd_commit(index.as_path()),
     Commands::Search {
       index,
       query,
@@ -82,14 +82,14 @@ fn main() -> Result<()> {
       vector,
       #[cfg(feature = "vectors")]
       alpha,
-    } => cmd_search(
-      &index,
+    } => cmd_search(SearchArgs {
+      index,
       query,
       limit,
       execution,
       bmw_block_size,
       fields,
-      filter,
+      filters: filter,
       return_stored,
       highlight,
       #[cfg(feature = "vectors")]
@@ -98,15 +98,15 @@ fn main() -> Result<()> {
       vector,
       #[cfg(feature = "vectors")]
       alpha,
-    ),
-    Commands::Inspect { index } => cmd_inspect(&index),
-    Commands::Compact { index } => cmd_compact(&index),
+    }),
+    Commands::Inspect { index } => cmd_inspect(index.as_path()),
+    Commands::Compact { index } => cmd_compact(index.as_path()),
   }
 }
 
-fn default_options(path: &PathBuf) -> IndexOptions {
+fn default_options(path: &Path) -> IndexOptions {
   IndexOptions {
-    path: path.clone(),
+    path: path.to_path_buf(),
     create_if_missing: true,
     enable_positions: true,
     bm25_k1: 0.9,
@@ -117,7 +117,25 @@ fn default_options(path: &PathBuf) -> IndexOptions {
   }
 }
 
-fn cmd_init(index: &PathBuf, schema_path: &PathBuf) -> Result<()> {
+struct SearchArgs {
+  index: PathBuf,
+  query: String,
+  limit: usize,
+  execution: String,
+  bmw_block_size: Option<usize>,
+  fields: Option<String>,
+  filters: Vec<String>,
+  return_stored: bool,
+  highlight: Option<String>,
+  #[cfg(feature = "vectors")]
+  vector_field: Option<String>,
+  #[cfg(feature = "vectors")]
+  vector: Option<String>,
+  #[cfg(feature = "vectors")]
+  alpha: f32,
+}
+
+fn cmd_init(index: &Path, schema_path: &Path) -> Result<()> {
   let opts = default_options(index);
   let schema_str = fs::read_to_string(schema_path)?;
   let schema: searchlite_core::api::types::Schema = serde_json::from_str(&schema_str)?;
@@ -126,7 +144,7 @@ fn cmd_init(index: &PathBuf, schema_path: &PathBuf) -> Result<()> {
   Ok(())
 }
 
-fn cmd_add(index: &PathBuf, doc_path: &PathBuf) -> Result<()> {
+fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
   let opts = default_options(index);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer()?;
@@ -150,7 +168,7 @@ fn cmd_add(index: &PathBuf, doc_path: &PathBuf) -> Result<()> {
   Ok(())
 }
 
-fn cmd_commit(index: &PathBuf) -> Result<()> {
+fn cmd_commit(index: &Path) -> Result<()> {
   let opts = default_options(index);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer()?;
@@ -159,21 +177,25 @@ fn cmd_commit(index: &PathBuf) -> Result<()> {
   Ok(())
 }
 
-fn cmd_search(
-  index: &PathBuf,
-  query: String,
-  limit: usize,
-  execution: String,
-  bmw_block_size: Option<usize>,
-  fields: Option<String>,
-  filters: Vec<String>,
-  return_stored: bool,
-  highlight: Option<String>,
-  #[cfg(feature = "vectors")] vector_field: Option<String>,
-  #[cfg(feature = "vectors")] vector: Option<String>,
-  #[cfg(feature = "vectors")] alpha: f32,
-) -> Result<()> {
-  let opts = default_options(index);
+fn cmd_search(args: SearchArgs) -> Result<()> {
+  let SearchArgs {
+    index,
+    query,
+    limit,
+    execution,
+    bmw_block_size,
+    fields,
+    filters,
+    return_stored,
+    highlight,
+    #[cfg(feature = "vectors")]
+    vector_field,
+    #[cfg(feature = "vectors")]
+    vector,
+    #[cfg(feature = "vectors")]
+    alpha,
+  } = args;
+  let opts = default_options(index.as_path());
   let idx = Index::open(opts)?;
   let reader = idx.reader()?;
   let parsed_filters = filters
@@ -261,7 +283,7 @@ fn build_vector_query(
   Ok(None)
 }
 
-fn cmd_inspect(index: &PathBuf) -> Result<()> {
+fn cmd_inspect(index: &Path) -> Result<()> {
   let opts = default_options(index);
   let idx = Index::open(opts)?;
   let manifest = idx.manifest();
@@ -269,7 +291,7 @@ fn cmd_inspect(index: &PathBuf) -> Result<()> {
   Ok(())
 }
 
-fn cmd_compact(index: &PathBuf) -> Result<()> {
+fn cmd_compact(index: &Path) -> Result<()> {
   let opts = default_options(index);
   let idx = Index::open(opts)?;
   idx.compact()?;
@@ -316,7 +338,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(&index, &schema_path).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -324,27 +346,27 @@ mod tests {
       "{\"body\":\"Rust search\"}\n{\"body\":\"Another document\"}\n",
     )
     .unwrap();
-    cmd_add(&index, &docs_path).unwrap();
-    cmd_commit(&index).unwrap();
-    cmd_search(
-      &index,
-      "rust".to_string(),
-      5,
-      "wand".to_string(),
-      None,
-      None,
-      vec![],
-      true,
-      Some("body".to_string()),
+    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
+    cmd_commit(index.as_path()).unwrap();
+    cmd_search(SearchArgs {
+      index: index.clone(),
+      query: "rust".to_string(),
+      limit: 5,
+      execution: "wand".to_string(),
+      bmw_block_size: None,
+      fields: None,
+      filters: vec![],
+      return_stored: true,
+      highlight: Some("body".to_string()),
       #[cfg(feature = "vectors")]
-      None,
+      vector_field: None,
       #[cfg(feature = "vectors")]
-      None,
+      vector: None,
       #[cfg(feature = "vectors")]
-      0.5,
-    )
+      alpha: 0.5,
+    })
     .unwrap();
-    cmd_inspect(&index).unwrap();
-    cmd_compact(&index).unwrap();
+    cmd_inspect(index.as_path()).unwrap();
+    cmd_compact(index.as_path()).unwrap();
   }
 }
