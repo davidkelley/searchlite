@@ -1,5 +1,8 @@
+pub mod aggregation;
+pub mod aggs;
 pub mod bm25;
 pub mod boolean;
+pub mod collector;
 pub mod filters;
 pub mod phrase;
 pub mod planner;

@@ -1,16 +1,24 @@
 use hashbrown::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::api::query::parse_query;
-use crate::api::types::{IndexOptions, SearchRequest};
+use crate::api::types::{
+  Aggregation, AggregationResponse, DateHistogramAggregation, HistogramAggregation, IndexOptions,
+  SearchRequest,
+};
+use crate::api::AggregationError;
 use crate::index::highlight::make_snippet;
-use crate::index::manifest::Manifest;
+use crate::index::manifest::{Manifest, Schema};
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
+use crate::query::aggregation::AggregationPipeline;
+use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_seconds};
+use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
@@ -29,6 +37,18 @@ pub struct Hit {
 pub struct SearchResult {
   pub total_hits_estimate: u64,
   pub hits: Vec<Hit>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggregations: BTreeMap<String, AggregationResponse>,
+}
+
+struct SegmentSearchParams<'a> {
+  qualified_terms: &'a [(String, String, String)],
+  qualified_not_terms: &'a [String],
+  phrase_fields: &'a [Vec<(String, Vec<String>)>],
+  highlight_terms: &'a [String],
+  agg_collector: Option<&'a mut dyn DocCollector>,
+  match_counter: Option<&'a mut u64>,
+  req: &'a SearchRequest,
 }
 
 pub struct IndexReader {
@@ -141,15 +161,38 @@ impl IndexReader {
       .collect();
 
     let mut hits: Vec<Hit> = Vec::new();
+    let mut agg_results = Vec::new();
+    let mut total_matches: u64 = 0;
+    validate_aggregations(&self.manifest.schema, &req.aggs)?;
+    let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
     for seg in self.segments.iter() {
-      let mut seg_hits = self.search_segment(
-        seg,
-        &qualified_terms,
-        &qualified_not_terms,
-        &phrase_fields,
-        &highlight_terms,
-        req,
-      )?;
+      let mut agg_collector = agg_pipeline
+        .as_ref()
+        .map(|p| p.for_segment(seg))
+        .transpose()?;
+      let mut seg_hits = {
+        let agg_ref = agg_collector
+          .as_mut()
+          .map(|collector| collector as &mut dyn DocCollector);
+        let counter = if req.limit == 0 && agg_ref.is_some() {
+          Some(&mut total_matches)
+        } else {
+          None
+        };
+        let params = SegmentSearchParams {
+          qualified_terms: &qualified_terms,
+          qualified_not_terms: &qualified_not_terms,
+          phrase_fields: &phrase_fields,
+          highlight_terms: &highlight_terms,
+          agg_collector: agg_ref,
+          match_counter: counter,
+          req,
+        };
+        self.search_segment(seg, params)?
+      };
+      if let Some(collector) = agg_collector {
+        agg_results.push(collector.finish());
+      }
       hits.append(&mut seg_hits);
     }
 
@@ -161,21 +204,36 @@ impl IndexReader {
     if hits.len() > req.limit {
       hits.truncate(req.limit);
     }
+    let aggregations = if let Some(pipeline) = agg_pipeline {
+      pipeline.merge(agg_results)?
+    } else {
+      BTreeMap::new()
+    };
     Ok(SearchResult {
-      total_hits_estimate: hits.len() as u64,
+      total_hits_estimate: if req.limit == 0 {
+        total_matches
+      } else {
+        hits.len() as u64
+      },
       hits,
+      aggregations,
     })
   }
 
   fn search_segment(
     &self,
     seg: &SegmentReader,
-    qualified_terms: &[(String, String, String)],
-    qualified_not_terms: &[String],
-    phrase_fields: &[Vec<(String, Vec<String>)>],
-    highlight_terms: &[String],
-    req: &SearchRequest,
+    params: SegmentSearchParams<'_>,
   ) -> Result<Vec<Hit>> {
+    let SegmentSearchParams {
+      qualified_terms,
+      qualified_not_terms,
+      phrase_fields,
+      highlight_terms,
+      agg_collector,
+      match_counter,
+      req,
+    } = params;
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
       let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
@@ -229,6 +287,7 @@ impl IndexReader {
       })
       .collect();
 
+    let mut match_counter = match_counter;
     let mut accept = |doc_id: DocId, _score: f32| -> bool {
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
@@ -253,6 +312,9 @@ impl IndexReader {
           return false;
         }
       }
+      if let Some(counter) = match_counter.as_mut() {
+        **counter += 1;
+      }
       true
     };
 
@@ -262,6 +324,7 @@ impl IndexReader {
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
+      agg_collector,
     );
 
     let need_doc = req.return_stored || req.highlight_field.is_some();
@@ -296,4 +359,226 @@ impl IndexReader {
     }
     Ok(hits)
   }
+}
+
+fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) -> Result<()> {
+  for (name, agg) in aggs.iter() {
+    match agg {
+      Aggregation::Terms(t) => {
+        ensure_keyword_fast(schema, &t.field, name)?;
+        validate_aggregations(schema, &t.aggs)?;
+      }
+      Aggregation::Range(r) => {
+        ensure_numeric_fast(schema, &r.field, name)?;
+        validate_aggregations(schema, &r.aggs)?;
+      }
+      Aggregation::DateRange(r) => {
+        ensure_numeric_fast(schema, &r.field, name)?;
+        validate_aggregations(schema, &r.aggs)?;
+      }
+      Aggregation::Histogram(h) => {
+        ensure_numeric_fast(schema, &h.field, name)?;
+        validate_histogram_config(name, h)?;
+        validate_aggregations(schema, &h.aggs)?;
+      }
+      Aggregation::DateHistogram(h) => {
+        ensure_numeric_fast(schema, &h.field, name)?;
+        validate_date_histogram_config(name, h)?;
+        validate_aggregations(schema, &h.aggs)?;
+      }
+      Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
+        ensure_numeric_fast(schema, &m.field, name)?
+      }
+      Aggregation::TopHits(_) => {}
+    }
+  }
+  Ok(())
+}
+
+fn ensure_keyword_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
+  if let Some(def) = schema.keyword_fields.iter().find(|f| f.name == field) {
+    if def.fast {
+      Ok(())
+    } else {
+      Err(
+        AggregationError::MissingFastField {
+          field: field.to_string(),
+        }
+        .into(),
+      )
+    }
+  } else {
+    Err(
+      AggregationError::UnsupportedFieldType {
+        agg: agg.to_string(),
+        field: field.to_string(),
+        expected: "fast keyword field".to_string(),
+      }
+      .into(),
+    )
+  }
+}
+
+fn ensure_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
+  if let Some(def) = schema.numeric_fields.iter().find(|f| f.name == field) {
+    if def.fast {
+      return Ok(());
+    }
+    return Err(
+      AggregationError::MissingFastField {
+        field: field.to_string(),
+      }
+      .into(),
+    );
+  }
+  Err(
+    AggregationError::UnsupportedFieldType {
+      agg: agg.to_string(),
+      field: field.to_string(),
+      expected: "fast numeric field".to_string(),
+    }
+    .into(),
+  )
+}
+
+fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<()> {
+  if agg.interval <= 0.0 {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("histogram `{name}` requires interval > 0"),
+      }
+      .into(),
+    );
+  }
+  if let Some(bounds) = &agg.extended_bounds {
+    if bounds.min > bounds.max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("histogram `{name}` extended_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.hard_bounds {
+    if bounds.min > bounds.max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("histogram `{name}` hard_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+    if let Some(ext) = &agg.extended_bounds {
+      if ext.min < bounds.min || ext.max > bounds.max {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("histogram `{name}` extended_bounds must be within hard_bounds"),
+          }
+          .into(),
+        );
+      }
+    }
+  }
+  Ok(())
+}
+
+fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) -> Result<()> {
+  let has_calendar = agg.calendar_interval.is_some();
+  let has_fixed = agg.fixed_interval.is_some();
+  if !has_calendar && !has_fixed {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("date_histogram `{name}` requires `calendar_interval` or `fixed_interval`"),
+      }
+      .into(),
+    );
+  }
+  if let Some(cal) = &agg.calendar_interval {
+    if parse_calendar_interval(cal).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` calendar_interval `{cal}` is not supported"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(fixed) = &agg.fixed_interval {
+    if parse_interval_seconds(fixed).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` fixed_interval `{fixed}` is invalid"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(offset) = &agg.offset {
+    if parse_interval_seconds(offset).is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` offset `{offset}` is invalid"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.extended_bounds {
+    let min = parse_date(&bounds.min).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` extended_bounds.min `{}` is not a valid date/number",
+        bounds.min
+      ),
+    })?;
+    let max = parse_date(&bounds.max).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` extended_bounds.max `{}` is not a valid date/number",
+        bounds.max
+      ),
+    })?;
+    if min > max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` extended_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+  }
+  if let Some(bounds) = &agg.hard_bounds {
+    let min = parse_date(&bounds.min).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` hard_bounds.min `{}` is not a valid date/number",
+        bounds.min
+      ),
+    })?;
+    let max = parse_date(&bounds.max).ok_or_else(|| AggregationError::InvalidConfig {
+      reason: format!(
+        "date_histogram `{name}` hard_bounds.max `{}` is not a valid date/number",
+        bounds.max
+      ),
+    })?;
+    if min > max {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("date_histogram `{name}` hard_bounds.min > max"),
+        }
+        .into(),
+      );
+    }
+    if let Some(ext) = &agg.extended_bounds {
+      let ext_min = parse_date(&ext.min).unwrap_or(min);
+      let ext_max = parse_date(&ext.max).unwrap_or(max);
+      if ext_min < min || ext_max > max {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_histogram `{name}` extended_bounds must be within hard_bounds"),
+          }
+          .into(),
+        );
+      }
+    }
+  }
+  Ok(())
 }

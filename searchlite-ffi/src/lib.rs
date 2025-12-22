@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -65,7 +66,7 @@ pub unsafe extern "C" fn searchlite_add_json(
   let json_str = CStr::from_ptr(json).to_string_lossy().to_string();
   match serde_json::from_str::<serde_json::Value>(&json_str) {
     Ok(val) => {
-      let mut fields = std::collections::BTreeMap::new();
+      let mut fields = BTreeMap::new();
       if let Some(map) = val.as_object() {
         for (k, v) in map.iter() {
           fields.insert(k.clone(), v.clone());
@@ -106,12 +107,14 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
 }
 
 /// # Safety
-/// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
+/// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `aggs_json`, when provided, must point to `aggs_len` bytes of JSON; `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_search(
   handle: *mut IndexHandle,
   query: *const c_char,
   limit: usize,
+  aggs_json: *const c_char,
+  aggs_len: usize,
   out_json_buf: *mut c_char,
   buf_cap: usize,
 ) -> usize {
@@ -124,6 +127,19 @@ pub unsafe extern "C" fn searchlite_search(
     Ok(r) => r,
     Err(_) => return 0,
   };
+  let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
+    let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
+    let body = String::from_utf8_lossy(raw).to_string();
+    match serde_json::from_str(&body) {
+      Ok(map) => map,
+      Err(err) => {
+        eprintln!("searchlite_search: failed to parse aggregation JSON: {err}");
+        return 0;
+      }
+    }
+  } else {
+    BTreeMap::new()
+  };
   let req = SearchRequest {
     query: query_str,
     fields: None,
@@ -133,6 +149,7 @@ pub unsafe extern "C" fn searchlite_search(
     bmw_block_size: None,
     return_stored: true,
     highlight_field: None,
+    aggs: aggs_map,
     #[cfg(feature = "vectors")]
     vector_query: None,
   };
@@ -145,7 +162,7 @@ pub unsafe extern "C" fn searchlite_search(
   }
   let encoded = serde_json::to_string(&res).unwrap_or_else(|_| "{}".to_string());
   let bytes = encoded.as_bytes();
-  let len = bytes.len().min(buf_cap - 1);
+  let len = bytes.len().min(buf_cap.saturating_sub(1));
   std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, len);
   *out_json_buf.add(len) = 0;
   len
@@ -171,9 +188,49 @@ mod tests {
 
     let mut buf = vec![0 as c_char; 1024];
     let query = CString::new("hello").unwrap();
-    let written =
-      unsafe { searchlite_search(handle, query.as_ptr(), 5, buf.as_mut_ptr(), buf.len()) };
+    let written = unsafe {
+      searchlite_search(
+        handle,
+        query.as_ptr(),
+        5,
+        std::ptr::null(),
+        0,
+        buf.as_mut_ptr(),
+        buf.len(),
+      )
+    };
     assert!(written > 0);
+    unsafe { searchlite_index_close(handle) };
+  }
+
+  #[test]
+  fn ffi_search_invalid_aggs_json_returns_error() {
+    let dir = tempdir().unwrap();
+    let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+    let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
+    assert!(!handle.is_null());
+
+    let doc = CString::new(r#"{"body":"hello from ffi"}"#).unwrap();
+    let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
+    assert!(added >= 0);
+    assert_eq!(unsafe { searchlite_commit(handle) }, 0);
+
+    let mut buf = vec![0 as c_char; 1024];
+    let query = CString::new("hello").unwrap();
+    let bad_aggs = CString::new("not valid json").unwrap();
+    let written = unsafe {
+      searchlite_search(
+        handle,
+        query.as_ptr(),
+        5,
+        bad_aggs.as_ptr(),
+        bad_aggs.as_bytes().len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+      )
+    };
+    assert_eq!(written, 0);
+
     unsafe { searchlite_index_close(handle) };
   }
 }

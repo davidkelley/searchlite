@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rand::rngs::StdRng;
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use searchlite_core::api::types::{
@@ -62,6 +64,7 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       vector_query: None,
       return_stored: false,
       highlight_field: None,
+      aggs: BTreeMap::new(),
     };
     let bm25 = reader.search(&req).unwrap();
 
@@ -102,6 +105,7 @@ fn empty_query_returns_no_hits() {
     vector_query: None,
     return_stored: false,
     highlight_field: None,
+    aggs: BTreeMap::new(),
   };
   let resp = reader.search(&req).unwrap();
   assert!(resp.hits.is_empty());

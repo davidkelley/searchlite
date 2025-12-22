@@ -83,6 +83,32 @@ cargo run -p searchlite-cli -- search \
   --highlight body
 ```
 
+Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Provide inline JSON o
+r a file path; results are emitted as a single JSON blob containing `hits` and `aggregations`.
+
+```bash
+cat > /tmp/aggs.json <<'EOF'
+{
+  "langs": { "type": "terms", "field": "lang", "size": 5 },
+  "views_stats": { "type": "stats", "field": "year" }
+}
+EOF
+
+cargo run -p searchlite-cli -- search \
+  --index "$INDEX" \
+  --q "rust" \
+  --limit 0 \
+  --aggs-file /tmp/aggs.json
+```
+
+If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"}}'`.
+
+### Aggregations quick reference
+- Field requirements: `terms` needs a fast keyword field; `range`, `histogram`, `stats`, `date_histogram` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `top_hits` has no field requirement but returns stored fields/snippets when enabled.
+- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`.
+- Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
+- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations`.
+
 Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
 - Inspect or compact:
@@ -96,11 +122,11 @@ cargo run -p searchlite-cli -- compact --index "$INDEX"
 use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
     types::{
-        Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
+        Aggregation, Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
         SearchRequest, StorageType,
     },
 };
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 let path = PathBuf::from("./example_idx");
 let mut schema = Schema::default_text_body();
@@ -151,6 +177,19 @@ let results = reader.search(&SearchRequest {
     bmw_block_size: None,
     return_stored: true,
     highlight_field: Some("body".into()),
+    aggs: [(
+        "langs".to_string(),
+        Aggregation::Terms(Box::new(searchlite_core::api::types::TermsAggregation {
+            field: "lang".into(),
+            size: Some(3),
+            shard_size: None,
+            min_doc_count: None,
+            missing: None,
+            aggs: BTreeMap::new(),
+        })),
+    )]
+    .into_iter()
+    .collect(),
     #[cfg(feature = "vectors")]
     vector_query: None,
 })?;

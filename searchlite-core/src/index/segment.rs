@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+#[cfg(feature = "vectors")]
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};

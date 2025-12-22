@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, Filter, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, Filter, IndexOptions, SearchRequest, StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -17,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
   /// Initialize a new index with a schema
   Init { index: PathBuf, schema: PathBuf },
@@ -52,6 +54,12 @@ enum Commands {
     #[cfg(feature = "vectors")]
     #[arg(long, default_value_t = 0.5)]
     alpha: f32,
+    /// Aggregations JSON (Elasticsearch-style map)
+    #[arg(long)]
+    aggs: Option<String>,
+    /// Aggregations JSON file path
+    #[arg(long)]
+    aggs_file: Option<PathBuf>,
   },
   /// Inspect manifest and segments
   Inspect { index: PathBuf },
@@ -82,6 +90,8 @@ fn main() -> Result<()> {
       vector,
       #[cfg(feature = "vectors")]
       alpha,
+      aggs,
+      aggs_file,
     } => cmd_search(SearchArgs {
       index,
       query,
@@ -98,6 +108,8 @@ fn main() -> Result<()> {
       vector,
       #[cfg(feature = "vectors")]
       alpha,
+      aggs,
+      aggs_file,
     }),
     Commands::Inspect { index } => cmd_inspect(index.as_path()),
     Commands::Compact { index } => cmd_compact(index.as_path()),
@@ -133,6 +145,8 @@ struct SearchArgs {
   vector: Option<String>,
   #[cfg(feature = "vectors")]
   alpha: f32,
+  aggs: Option<String>,
+  aggs_file: Option<PathBuf>,
 }
 
 fn cmd_init(index: &Path, schema_path: &Path) -> Result<()> {
@@ -194,6 +208,8 @@ fn cmd_search(args: SearchArgs) -> Result<()> {
     vector,
     #[cfg(feature = "vectors")]
     alpha,
+    aggs,
+    aggs_file,
   } = args;
   let opts = default_options(index.as_path());
   let idx = Index::open(opts)?;
@@ -213,17 +229,10 @@ fn cmd_search(args: SearchArgs) -> Result<()> {
     vector_query: build_vector_query(vector_field, vector, alpha)?,
     return_stored,
     highlight_field: highlight,
+    aggs: load_aggs(aggs, aggs_file)?,
   };
   let result = reader.search(&request)?;
-  for hit in result.hits.iter() {
-    println!("doc {} score {:.3}", hit.doc_id, hit.score);
-    if let Some(fields) = &hit.fields {
-      println!("  fields: {}", fields);
-    }
-    if let Some(snippet) = &hit.snippet {
-      println!("  snippet: {}", snippet);
-    }
-  }
+  println!("{}", serde_json::to_string_pretty(&result)?);
   Ok(())
 }
 
@@ -250,6 +259,27 @@ fn parse_filter(input: &str) -> Option<Filter> {
     }
   }
   None
+}
+
+fn load_aggs(
+  aggs: Option<String>,
+  aggs_file: Option<PathBuf>,
+) -> Result<BTreeMap<String, Aggregation>> {
+  let raw = if let Some(path) = aggs_file {
+    Some(fs::read_to_string(&path).with_context(|| format!("reading aggs from {:?}", path))?)
+  } else {
+    aggs
+  };
+  if let Some(body) = raw {
+    if body.trim().is_empty() {
+      return Ok(BTreeMap::new());
+    }
+    let parsed: BTreeMap<String, Aggregation> =
+      serde_json::from_str(&body).with_context(|| "invalid aggregations JSON".to_string())?;
+    Ok(parsed)
+  } else {
+    Ok(BTreeMap::new())
+  }
 }
 
 fn parse_execution(value: &str) -> ExecutionStrategy {
@@ -364,6 +394,8 @@ mod tests {
       vector: None,
       #[cfg(feature = "vectors")]
       alpha: 0.5,
+      aggs: None,
+      aggs_file: None,
     })
     .unwrap();
     cmd_inspect(index.as_path()).unwrap();
