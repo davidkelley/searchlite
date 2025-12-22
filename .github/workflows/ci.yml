@@ -29,11 +29,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --all --all-features --all-targets -- -D warnings
       - name: Build
-        run: cargo build --workspace --all-features
+        run: cargo build --all --all-features
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --all --all-features
 
   bench:
     name: Benchmarks
