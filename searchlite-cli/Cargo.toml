@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
 description = "CLI for searchlite"
+publish = false
 
 [features]
 default = []
