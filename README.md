@@ -83,6 +83,26 @@ cargo run -p searchlite-cli -- search \
   --highlight body
 ```
 
+Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Provide inline JSON o
+r a file path; results are emitted as a single JSON blob containing `hits` and `aggregations`.
+
+```bash
+cat > /tmp/aggs.json <<'EOF'
+{
+  "langs": { "type": "terms", "field": "lang", "size": 5 },
+  "views_stats": { "type": "stats", "field": "year" }
+}
+EOF
+
+cargo run -p searchlite-cli -- search \
+  --index "$INDEX" \
+  --q "rust" \
+  --limit 0 \
+  --aggs-file /tmp/aggs.json
+```
+
+If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"}}'`.
+
 Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
 - Inspect or compact:
@@ -96,11 +116,11 @@ cargo run -p searchlite-cli -- compact --index "$INDEX"
 use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
     types::{
-        Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
+        Aggregation, Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
         SearchRequest, StorageType,
     },
 };
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 let path = PathBuf::from("./example_idx");
 let mut schema = Schema::default_text_body();
@@ -151,6 +171,19 @@ let results = reader.search(&SearchRequest {
     bmw_block_size: None,
     return_stored: true,
     highlight_field: Some("body".into()),
+    aggs: [(
+        "langs".to_string(),
+        Aggregation::Terms(Box::new(searchlite_core::api::types::TermsAggregation {
+            field: "lang".into(),
+            size: Some(3),
+            shard_size: None,
+            min_doc_count: None,
+            missing: None,
+            aggs: BTreeMap::new(),
+        })),
+    )]
+    .into_iter()
+    .collect(),
     #[cfg(feature = "vectors")]
     vector_query: None,
 })?;

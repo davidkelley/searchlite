@@ -213,6 +213,30 @@ impl FastFieldsReader {
       _ => false,
     }
   }
+
+  pub fn str_value(&self, field: &str, doc_id: DocId) -> Option<&str> {
+    match self.fields.get(field) {
+      Some(Column::Str { dict, values }) => values
+        .get(doc_id as usize)
+        .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
+        .map(|s| s.as_str()),
+      _ => None,
+    }
+  }
+
+  pub fn i64_value(&self, field: &str, doc_id: DocId) -> Option<i64> {
+    match self.fields.get(field) {
+      Some(Column::I64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      _ => None,
+    }
+  }
+
+  pub fn f64_value(&self, field: &str, doc_id: DocId) -> Option<f64> {
+    match self.fields.get(field) {
+      Some(Column::F64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
+      _ => None,
+    }
+  }
 }
 
 fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()> {

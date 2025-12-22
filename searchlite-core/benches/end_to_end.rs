@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
@@ -84,6 +86,7 @@ fn bench_search(c: &mut Criterion) {
         vector_query: None,
         return_stored: true,
         highlight_field: None,
+        aggs: BTreeMap::new(),
       };
       let _ = reader.search(&req).unwrap();
     });

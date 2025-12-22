@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use crate::api::types::ExecutionStrategy;
 use crate::index::postings::{PostingsReader, DEFAULT_BLOCK_SIZE};
 use crate::query::bm25::bm25;
+use crate::query::collector::DocCollector;
 use crate::DocId;
 
 const DOCID_END: DocId = u32::MAX;
@@ -248,29 +249,32 @@ fn with_stats(stats: &mut Option<&mut QueryStats>, f: impl FnOnce(&mut QueryStat
   }
 }
 
-pub fn execute_top_k<F: FnMut(DocId, f32) -> bool>(
+pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   terms: Vec<ScoredTerm>,
   k: usize,
   strategy: ExecutionStrategy,
   block_size: Option<usize>,
   accept: &mut F,
+  collector: Option<&mut C>,
 ) -> Vec<RankedDoc> {
-  execute_top_k_with_stats(terms, k, strategy, block_size, accept, None)
+  execute_top_k_with_stats(terms, k, strategy, block_size, accept, collector, None)
 }
 
-pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool>(
+pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   terms: Vec<ScoredTerm>,
   k: usize,
   strategy: ExecutionStrategy,
   block_size: Option<usize>,
   accept: &mut F,
+  collector: Option<&mut C>,
   stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
-  if k == 0 || terms.is_empty() {
+  let should_rank = k > 0;
+  if terms.is_empty() || (!should_rank && collector.is_none()) {
     return Vec::new();
   }
   if matches!(strategy, ExecutionStrategy::Bm25) {
-    return brute_force(&terms, k, accept, stats);
+    return brute_force(&terms, k, should_rank, accept, collector, stats);
   }
   let bsize = block_size.unwrap_or(DEFAULT_BLOCK_SIZE).max(1);
   let states: Vec<TermState> = terms
@@ -279,13 +283,23 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool>(
     .map(|t| TermState::new(t, bsize))
     .collect();
   let use_block_bounds = matches!(strategy, ExecutionStrategy::Bmw);
-  wand_loop(states, k, use_block_bounds, accept, stats)
+  wand_loop(
+    states,
+    k,
+    should_rank,
+    use_block_bounds,
+    accept,
+    collector,
+    stats,
+  )
 }
 
-fn brute_force<F: FnMut(DocId, f32) -> bool>(
+fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   terms: &[ScoredTerm],
   k: usize,
+  rank_hits: bool,
   accept: &mut F,
+  mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
   let mut scores: hashbrown::HashMap<DocId, f32> = hashbrown::HashMap::new();
@@ -315,16 +329,23 @@ fn brute_force<F: FnMut(DocId, f32) -> bool>(
     if !accept(doc_id, score) {
       continue;
     }
-    push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+    if let Some(collector) = collector.as_deref_mut() {
+      collector.collect(doc_id, score);
+    }
+    if rank_hits {
+      push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+    }
   }
   finalize_heap(heap)
 }
 
-fn wand_loop<F: FnMut(DocId, f32) -> bool>(
+fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector>(
   mut terms: Vec<TermState>,
   k: usize,
+  rank_hits: bool,
   use_block_bounds: bool,
   accept: &mut F,
+  mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
@@ -360,7 +381,12 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool>(
         s.scored_docs += 1;
       });
       if score > threshold && accept(doc_id, score) {
-        push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+        if let Some(collector) = collector.as_deref_mut() {
+          collector.collect(doc_id, score);
+        }
+        if rank_hits {
+          push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+        }
       }
       requeue_terms(&mut order, &terms, &mut mutated);
     } else {
@@ -502,18 +528,57 @@ mod tests {
       positions: smallvec![],
     }]);
     let mut accept = |_doc: DocId, _score: f32| true;
-    let brute = brute_force(&[term1.clone(), term2.clone()], 2, &mut accept, None);
-    let wand = execute_top_k(
+    let brute = brute_force::<_, crate::query::collector::MatchCountingCollector>(
+      &[term1.clone(), term2.clone()],
+      2,
+      true,
+      &mut accept,
+      None,
+      None,
+    );
+    let wand = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
       vec![term1, term2],
       2,
       ExecutionStrategy::Wand,
       None,
       &mut accept,
+      None,
     );
     assert_eq!(brute.len(), wand.len());
     for (a, b) in brute.iter().zip(wand.iter()) {
       assert_eq!(a.doc_id, b.doc_id);
       assert!((a.score - b.score).abs() < 1e-6);
     }
+  }
+
+  #[test]
+  fn collectors_receive_all_matched_docs() {
+    let term1 = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut collector = crate::query::collector::RecordingCollector::default();
+    let results = execute_top_k(
+      vec![term1],
+      1,
+      ExecutionStrategy::Bm25,
+      None,
+      &mut accept,
+      Some(&mut collector),
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(collector.docs.len(), 2);
+    let mut ids: Vec<DocId> = collector.docs.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
   }
 }

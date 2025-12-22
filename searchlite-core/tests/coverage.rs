@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, Filter, IndexOptions, KeywordField, NumericField, Schema,
@@ -100,6 +102,7 @@ fn search_with_phrase_filters_and_compaction() {
       vector_query: None,
       return_stored: true,
       highlight_field: Some("body".into()),
+      aggs: BTreeMap::new(),
     })
     .unwrap();
   assert_eq!(result.hits.len(), 2);

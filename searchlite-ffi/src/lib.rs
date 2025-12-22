@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -106,6 +107,8 @@ pub extern "C" fn searchlite_search(
   handle: *mut IndexHandle,
   query: *const c_char,
   limit: usize,
+  aggs_json: *const c_char,
+  aggs_len: usize,
   out_json_buf: *mut c_char,
   buf_cap: usize,
 ) -> usize {
@@ -120,6 +123,13 @@ pub extern "C" fn searchlite_search(
     Ok(r) => r,
     Err(_) => return 0,
   };
+  let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
+    let raw = unsafe { std::slice::from_raw_parts(aggs_json as *const u8, aggs_len) };
+    let body = String::from_utf8_lossy(raw).to_string();
+    serde_json::from_str(&body).unwrap_or_default()
+  } else {
+    BTreeMap::new()
+  };
   let req = SearchRequest {
     query: query_str,
     fields: None,
@@ -129,6 +139,7 @@ pub extern "C" fn searchlite_search(
     bmw_block_size: None,
     return_stored: true,
     highlight_field: None,
+    aggs: aggs_map,
     #[cfg(feature = "vectors")]
     vector_query: None,
   };
@@ -169,7 +180,15 @@ mod tests {
 
     let mut buf = vec![0 as c_char; 1024];
     let query = CString::new("hello").unwrap();
-    let written = searchlite_search(handle, query.as_ptr(), 5, buf.as_mut_ptr(), buf.len());
+    let written = searchlite_search(
+      handle,
+      query.as_ptr(),
+      5,
+      std::ptr::null(),
+      0,
+      buf.as_mut_ptr(),
+      buf.len(),
+    );
     assert!(written > 0);
     searchlite_index_close(handle);
   }

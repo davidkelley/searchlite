@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, IndexOptions, NumericField, Schema, SearchRequest, StorageType,
@@ -60,6 +62,7 @@ fn index_and_search() {
       vector_query: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
+      aggs: BTreeMap::new(),
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
@@ -104,6 +107,7 @@ fn in_memory_storage_keeps_disk_clean() {
       vector_query: None,
       return_stored: true,
       highlight_field: None,
+      aggs: BTreeMap::new(),
     })
     .unwrap();
   assert_eq!(resp.hits.len(), 1);

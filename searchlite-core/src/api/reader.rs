@@ -1,16 +1,20 @@
 use hashbrown::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::api::query::parse_query;
-use crate::api::types::{IndexOptions, SearchRequest};
+use crate::api::types::{Aggregation, AggregationResponse, IndexOptions, SearchRequest};
+use crate::api::AggregationError;
 use crate::index::highlight::make_snippet;
-use crate::index::manifest::Manifest;
+use crate::index::manifest::{Manifest, Schema};
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
+use crate::query::aggregation::AggregationPipeline;
+use crate::query::collector::DocCollector;
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
@@ -29,6 +33,8 @@ pub struct Hit {
 pub struct SearchResult {
   pub total_hits_estimate: u64,
   pub hits: Vec<Hit>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggregations: BTreeMap<String, AggregationResponse>,
 }
 
 pub struct IndexReader {
@@ -141,15 +147,31 @@ impl IndexReader {
       .collect();
 
     let mut hits: Vec<Hit> = Vec::new();
+    let mut agg_results = Vec::new();
+    validate_aggregations(&self.manifest.schema, &req.aggs)?;
+    let mut agg_pipeline = AggregationPipeline::from_request(&req.aggs);
     for seg in self.segments.iter() {
-      let mut seg_hits = self.search_segment(
-        seg,
-        &qualified_terms,
-        &qualified_not_terms,
-        &phrase_fields,
-        &highlight_terms,
-        req,
-      )?;
+      let mut agg_collector = agg_pipeline
+        .as_ref()
+        .map(|p| p.for_segment(seg))
+        .transpose()?;
+      let mut seg_hits = {
+        let agg_ref = agg_collector
+          .as_deref_mut()
+          .map(|collector| collector as &mut dyn DocCollector);
+        self.search_segment(
+          seg,
+          &qualified_terms,
+          &qualified_not_terms,
+          &phrase_fields,
+          &highlight_terms,
+          agg_ref,
+          req,
+        )?
+      };
+      if let Some(collector) = agg_collector {
+        agg_results.push(collector.finish());
+      }
       hits.append(&mut seg_hits);
     }
 
@@ -161,9 +183,15 @@ impl IndexReader {
     if hits.len() > req.limit {
       hits.truncate(req.limit);
     }
+    let aggregations = if let Some(pipeline) = agg_pipeline {
+      pipeline.merge(agg_results)?
+    } else {
+      BTreeMap::new()
+    };
     Ok(SearchResult {
       total_hits_estimate: hits.len() as u64,
       hits,
+      aggregations,
     })
   }
 
@@ -174,6 +202,7 @@ impl IndexReader {
     qualified_not_terms: &[String],
     phrase_fields: &[Vec<(String, Vec<String>)>],
     highlight_terms: &[String],
+    agg_collector: Option<&mut dyn DocCollector>,
     req: &SearchRequest,
   ) -> Result<Vec<Hit>> {
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
@@ -262,6 +291,7 @@ impl IndexReader {
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
+      agg_collector,
     );
 
     let need_doc = req.return_stored || req.highlight_field.is_some();
@@ -296,4 +326,82 @@ impl IndexReader {
     }
     Ok(hits)
   }
+}
+
+fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) -> Result<()> {
+  for (name, agg) in aggs.iter() {
+    match agg {
+      Aggregation::Terms(t) => {
+        ensure_keyword_fast(schema, &t.field, name)?;
+        validate_aggregations(schema, &t.aggs)?;
+      }
+      Aggregation::Range(r) => {
+        ensure_numeric_fast(schema, &r.field, name)?;
+        validate_aggregations(schema, &r.aggs)?;
+      }
+      Aggregation::DateRange(r) => {
+        ensure_numeric_fast(schema, &r.field, name)?;
+        validate_aggregations(schema, &r.aggs)?;
+      }
+      Aggregation::Histogram(h) => {
+        ensure_numeric_fast(schema, &h.field, name)?;
+        validate_aggregations(schema, &h.aggs)?;
+      }
+      Aggregation::DateHistogram(h) => {
+        ensure_numeric_fast(schema, &h.field, name)?;
+        validate_aggregations(schema, &h.aggs)?;
+      }
+      Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
+        ensure_numeric_fast(schema, &m.field, name)?
+      }
+      Aggregation::TopHits(_) => {}
+    }
+  }
+  Ok(())
+}
+
+fn ensure_keyword_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
+  if let Some(def) = schema.keyword_fields.iter().find(|f| f.name == field) {
+    if def.fast {
+      Ok(())
+    } else {
+      Err(
+        AggregationError::MissingFastField {
+          field: field.to_string(),
+        }
+        .into(),
+      )
+    }
+  } else {
+    Err(
+      AggregationError::UnsupportedFieldType {
+        agg: agg.to_string(),
+        field: field.to_string(),
+        expected: "fast keyword field".to_string(),
+      }
+      .into(),
+    )
+  }
+}
+
+fn ensure_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
+  if let Some(def) = schema.numeric_fields.iter().find(|f| f.name == field) {
+    if def.fast {
+      return Ok(());
+    }
+    return Err(
+      AggregationError::MissingFastField {
+        field: field.to_string(),
+      }
+      .into(),
+    );
+  }
+  Err(
+    AggregationError::UnsupportedFieldType {
+      agg: agg.to_string(),
+      field: field.to_string(),
+      expected: "fast numeric field".to_string(),
+    }
+    .into(),
+  )
 }

@@ -154,14 +154,16 @@ fn run_strategy(
         continue;
       }
       let mut accept = |_doc: searchlite_core::DocId, _score: f32| true;
-      let _ = execute_top_k_with_stats(
-        terms,
-        k,
-        strategy.clone(),
-        block_size,
-        &mut accept,
-        Some(&mut stats),
-      );
+      let _ =
+        execute_top_k_with_stats::<_, searchlite_core::query::collector::MatchCountingCollector>(
+          terms,
+          k,
+          strategy.clone(),
+          block_size,
+          &mut accept,
+          None,
+          Some(&mut stats),
+        );
     }
   }
   BenchOutcome {
