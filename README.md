@@ -52,6 +52,7 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
 ```
 
 `stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
+Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
 
 ## CLI workflow examples
 Set an index location once:
@@ -81,13 +82,20 @@ cargo run -p searchlite-cli -- commit "$INDEX"
 
 - Query the index (field scoping, filters, stored fields, snippets):
 ```bash
-cargo run -p searchlite-cli -- search "$INDEX" \
-  --q "body:rust language" \
-  --limit 5 \
-  --filter "lang:en" \
-  --filter "year:[2020 TO 2025]" \
-  --return-stored \
-  --highlight body
+cat > /tmp/request.json <<'EOF'
+{
+  "query": "body:rust language",
+  "fields": ["body","title"],
+  "filters": [
+    { "KeywordEq": { "field": "lang", "value": "en" } },
+    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
+  ],
+  "limit": 5,
+  "return_stored": true,
+  "highlight_field": "body"
+}
+EOF
+cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```
 
 Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Provide inline JSON o

@@ -15,6 +15,10 @@ pub enum FastValue {
   I64List(Vec<i64>),
   F64List(Vec<f64>),
   StrList(Vec<String>),
+  I64Nested { object: usize, values: Vec<i64> },
+  F64Nested { object: usize, values: Vec<f64> },
+  StrNested { object: usize, values: Vec<String> },
+  NestedCount { objects: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +29,10 @@ enum FieldType {
   I64List,
   F64List,
   StrList,
+  I64Nested,
+  F64Nested,
+  StrNested,
+  NestedCount,
 }
 
 impl FieldType {
@@ -36,6 +44,10 @@ impl FieldType {
       FieldType::I64List => 3,
       FieldType::F64List => 4,
       FieldType::StrList => 5,
+      FieldType::I64Nested => 6,
+      FieldType::F64Nested => 7,
+      FieldType::StrNested => 8,
+      FieldType::NestedCount => 9,
     }
   }
 
@@ -47,6 +59,10 @@ impl FieldType {
       3 => Some(FieldType::I64List),
       4 => Some(FieldType::F64List),
       5 => Some(FieldType::StrList),
+      6 => Some(FieldType::I64Nested),
+      7 => Some(FieldType::F64Nested),
+      8 => Some(FieldType::StrNested),
+      9 => Some(FieldType::NestedCount),
       _ => None,
     }
   }
@@ -104,14 +120,50 @@ impl StrListColumnBuilder {
   }
 }
 
+#[derive(Debug, Default)]
+struct StrNestedColumnBuilder {
+  dict: Vec<String>,
+  dict_index: HashMap<String, u32>,
+  values: Vec<Vec<Vec<u32>>>,
+}
+
+impl StrNestedColumnBuilder {
+  fn push(&mut self, doc_id: usize, object: usize, entries: &[String]) {
+    if self.values.len() <= doc_id {
+      self.values.resize(doc_id + 1, Vec::new());
+    }
+    let doc_entries = &mut self.values[doc_id];
+    if doc_entries.len() <= object {
+      doc_entries.resize(object + 1, Vec::new());
+    }
+    let target = &mut doc_entries[object];
+    target.clear();
+    for value in entries {
+      let idx = if let Some(&idx) = self.dict_index.get(value) {
+        idx
+      } else {
+        let idx = self.dict.len() as u32;
+        self.dict.push(value.to_string());
+        self.dict_index.insert(value.to_string(), idx);
+        idx
+      };
+      target.push(idx);
+    }
+  }
+}
+
 #[derive(Debug)]
 enum ColumnBuilder {
   I64(Vec<Option<i64>>),
   I64List(Vec<Vec<i64>>),
+  I64Nested(Vec<Vec<Vec<i64>>>),
   F64(Vec<Option<f64>>),
   F64List(Vec<Vec<f64>>),
+  F64Nested(Vec<Vec<Vec<f64>>>),
   Str(StrColumnBuilder),
   StrList(StrListColumnBuilder),
+  StrNested(StrNestedColumnBuilder),
+  NestedCount(Vec<u32>),
 }
 
 pub struct FastFieldsWriter {
@@ -173,6 +225,25 @@ impl FastFieldsWriter {
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
+      FastValue::I64Nested { object, values } => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::I64Nested(Vec::new()));
+        match col {
+          ColumnBuilder::I64Nested(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            let doc_entries = &mut entries[idx];
+            if doc_entries.len() <= object {
+              doc_entries.resize(object + 1, Vec::new());
+            }
+            doc_entries[object] = values;
+          }
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
       FastValue::F64List(values) => {
         let col = self
           .data
@@ -184,6 +255,25 @@ impl FastFieldsWriter {
               entries.resize(idx + 1, Vec::new());
             }
             entries[idx] = values;
+          }
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::F64Nested { object, values } => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::F64Nested(Vec::new()));
+        match col {
+          ColumnBuilder::F64Nested(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            let doc_entries = &mut entries[idx];
+            if doc_entries.len() <= object {
+              doc_entries.resize(object + 1, Vec::new());
+            }
+            doc_entries[object] = values;
           }
           _ => panic!("fast field type mismatch for {}", field),
         }
@@ -205,6 +295,31 @@ impl FastFieldsWriter {
           .or_insert_with(|| ColumnBuilder::StrList(StrListColumnBuilder::default()));
         match col {
           ColumnBuilder::StrList(builder) => builder.push(idx, &values),
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::StrNested { object, values } => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::StrNested(StrNestedColumnBuilder::default()));
+        match col {
+          ColumnBuilder::StrNested(builder) => builder.push(idx, object, &values),
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::NestedCount { objects } => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::NestedCount(Vec::new()));
+        match col {
+          ColumnBuilder::NestedCount(counts) => {
+            if counts.len() <= idx {
+              counts.resize(idx + 1, 0);
+            }
+            counts[idx] = objects as u32;
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -232,17 +347,41 @@ impl FastFieldsWriter {
 #[derive(Debug)]
 enum Column {
   I64(Vec<Option<i64>>),
-  I64List(Vec<Vec<i64>>),
+  I64List {
+    offsets: Vec<u32>,
+    values: Vec<i64>,
+  },
+  I64Nested {
+    doc_offsets: Vec<u32>,
+    object_offsets: Vec<u32>,
+    values: Vec<i64>,
+  },
   F64(Vec<Option<f64>>),
-  F64List(Vec<Vec<f64>>),
+  F64List {
+    offsets: Vec<u32>,
+    values: Vec<f64>,
+  },
+  F64Nested {
+    doc_offsets: Vec<u32>,
+    object_offsets: Vec<u32>,
+    values: Vec<f64>,
+  },
   Str {
     dict: Vec<String>,
     values: Vec<Option<u32>>,
   },
   StrList {
     dict: Vec<String>,
-    values: Vec<Vec<u32>>,
+    offsets: Vec<u32>,
+    values: Vec<u32>,
   },
+  StrNested {
+    dict: Vec<String>,
+    doc_offsets: Vec<u32>,
+    object_offsets: Vec<u32>,
+    values: Vec<u32>,
+  },
+  NestedCount(Vec<u32>),
 }
 
 pub struct FastFieldsReader {
@@ -263,14 +402,39 @@ impl FastFieldsReader {
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| s == value)
         .unwrap_or(false),
-      Some(Column::StrList { dict, values }) => values
-        .get(doc_id as usize)
-        .map(|vals| {
-          vals
+      Some(Column::StrList {
+        dict,
+        offsets,
+        values,
+      }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end]
             .iter()
             .any(|idx| dict.get(*idx as usize).map(|s| s == value).unwrap_or(false))
-        })
-        .unwrap_or(false),
+        } else {
+          false
+        }
+      }
+      Some(Column::StrNested {
+        dict,
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              if values[start..end]
+                .iter()
+                .any(|idx| dict.get(*idx as usize).map(|s| s == value).unwrap_or(false))
+              {
+                return true;
+              }
+            }
+          }
+        }
+        false
+      }
       _ => false,
     }
   }
@@ -287,18 +451,42 @@ impl FastFieldsReader {
         .unwrap_or(false),
       Some(Column::StrList {
         dict,
+        offsets,
         values: lookup,
-      }) => lookup
-        .get(doc_id as usize)
-        .map(|items| {
-          items.iter().any(|idx| {
+      }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          lookup[start..end].iter().any(|idx| {
             dict
               .get(*idx as usize)
               .map(|s| values.iter().any(|v| v == s))
               .unwrap_or(false)
           })
-        })
-        .unwrap_or(false),
+        } else {
+          false
+        }
+      }
+      Some(Column::StrNested {
+        dict,
+        doc_offsets,
+        object_offsets,
+        values: lookup,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              if lookup[start..end].iter().any(|idx| {
+                dict
+                  .get(*idx as usize)
+                  .map(|s| values.iter().any(|v| v == s))
+                  .unwrap_or(false)
+              }) {
+                return true;
+              }
+            }
+          }
+        }
+        false
+      }
       _ => false,
     }
   }
@@ -310,10 +498,29 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| v >= min && v <= max)
         .unwrap_or(false),
-      Some(Column::I64List(values)) => values
-        .get(doc_id as usize)
-        .map(|vals| vals.iter().any(|v| *v >= min && *v <= max))
-        .unwrap_or(false),
+      Some(Column::I64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].iter().any(|v| *v >= min && *v <= max)
+        } else {
+          false
+        }
+      }
+      Some(Column::I64Nested {
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              if values[start..end].iter().any(|v| *v >= min && *v <= max) {
+                return true;
+              }
+            }
+          }
+        }
+        false
+      }
       _ => false,
     }
   }
@@ -325,10 +532,29 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| v >= min && v <= max)
         .unwrap_or(false),
-      Some(Column::F64List(values)) => values
-        .get(doc_id as usize)
-        .map(|vals| vals.iter().any(|v| *v >= min && *v <= max))
-        .unwrap_or(false),
+      Some(Column::F64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].iter().any(|v| *v >= min && *v <= max)
+        } else {
+          false
+        }
+      }
+      Some(Column::F64Nested {
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              if values[start..end].iter().any(|v| *v >= min && *v <= max) {
+                return true;
+              }
+            }
+          }
+        }
+        false
+      }
       _ => false,
     }
   }
@@ -339,11 +565,20 @@ impl FastFieldsReader {
         .get(doc_id as usize)
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| s.as_str()),
-      Some(Column::StrList { dict, values }) => values
-        .get(doc_id as usize)
-        .and_then(|vals| vals.first())
-        .and_then(|idx| dict.get(*idx as usize))
-        .map(|s| s.as_str()),
+      Some(Column::StrList {
+        dict,
+        offsets,
+        values,
+      }) => {
+        if let Some((start, _end)) = doc_range(offsets, doc_id as usize) {
+          values
+            .get(start)
+            .and_then(|idx| dict.get(*idx as usize))
+            .map(|s| s.as_str())
+        } else {
+          None
+        }
+      }
       _ => None,
     }
   }
@@ -351,10 +586,13 @@ impl FastFieldsReader {
   pub fn i64_value(&self, field: &str, doc_id: DocId) -> Option<i64> {
     match self.fields.get(field) {
       Some(Column::I64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
-      Some(Column::I64List(values)) => values
-        .get(doc_id as usize)
-        .and_then(|vals| vals.first())
-        .copied(),
+      Some(Column::I64List { offsets, values }) => {
+        if let Some((start, _)) = doc_range(offsets, doc_id as usize) {
+          values.get(start).copied()
+        } else {
+          None
+        }
+      }
       _ => None,
     }
   }
@@ -362,10 +600,13 @@ impl FastFieldsReader {
   pub fn f64_value(&self, field: &str, doc_id: DocId) -> Option<f64> {
     match self.fields.get(field) {
       Some(Column::F64(values)) => values.get(doc_id as usize).and_then(|opt| *opt),
-      Some(Column::F64List(values)) => values
-        .get(doc_id as usize)
-        .and_then(|vals| vals.first())
-        .copied(),
+      Some(Column::F64List { offsets, values }) => {
+        if let Some((start, _)) = doc_range(offsets, doc_id as usize) {
+          values.get(start).copied()
+        } else {
+          None
+        }
+      }
       _ => None,
     }
   }
@@ -377,15 +618,20 @@ impl FastFieldsReader {
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
         .map(|s| vec![s.as_str()])
         .unwrap_or_default(),
-      Some(Column::StrList { dict, values }) => values
-        .get(doc_id as usize)
-        .map(|vals| {
-          vals
+      Some(Column::StrList {
+        dict,
+        offsets,
+        values,
+      }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end]
             .iter()
             .filter_map(|idx| dict.get(*idx as usize).map(|s| s.as_str()))
             .collect()
-        })
-        .unwrap_or_default(),
+        } else {
+          Vec::new()
+        }
+      }
       _ => Vec::new(),
     }
   }
@@ -397,7 +643,13 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| vec![v])
         .unwrap_or_default(),
-      Some(Column::I64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      Some(Column::I64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].to_vec()
+        } else {
+          Vec::new()
+        }
+      }
       _ => Vec::new(),
     }
   }
@@ -409,7 +661,13 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| vec![v])
         .unwrap_or_default(),
-      Some(Column::F64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      Some(Column::F64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].to_vec()
+        } else {
+          Vec::new()
+        }
+      }
       _ => Vec::new(),
     }
   }
@@ -421,16 +679,109 @@ impl FastFieldsReader {
         .and_then(|opt| *opt)
         .map(|v| vec![v])
         .unwrap_or_default(),
-      Some(Column::F64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      Some(Column::F64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].to_vec()
+        } else {
+          Vec::new()
+        }
+      }
       Some(Column::I64(values)) => values
         .get(doc_id as usize)
         .and_then(|opt| *opt)
         .map(|v| vec![v as f64])
         .unwrap_or_default(),
-      Some(Column::I64List(values)) => values
-        .get(doc_id as usize)
-        .map(|vals| vals.iter().map(|v| *v as f64).collect())
-        .unwrap_or_default(),
+      Some(Column::I64List { offsets, values }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          values[start..end].iter().map(|v| *v as f64).collect()
+        } else {
+          Vec::new()
+        }
+      }
+      _ => Vec::new(),
+    }
+  }
+
+  pub fn nested_object_count(&self, path: &str, doc_id: DocId) -> usize {
+    let key = nested_count_key(path);
+    match self.fields.get(&key) {
+      Some(Column::NestedCount(counts)) => {
+        counts.get(doc_id as usize).copied().unwrap_or(0) as usize
+      }
+      _ => 0,
+    }
+  }
+
+  pub fn nested_str_values(&self, field: &str, doc_id: DocId) -> Vec<Vec<&str>> {
+    match self.fields.get(field) {
+      Some(Column::StrNested {
+        dict,
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          let mut out = Vec::with_capacity(obj_end.saturating_sub(obj_start));
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              let vals = values[start..end]
+                .iter()
+                .filter_map(|idx| dict.get(*idx as usize).map(|s| s.as_str()))
+                .collect();
+              out.push(vals);
+            }
+          }
+          out
+        } else {
+          Vec::new()
+        }
+      }
+      _ => Vec::new(),
+    }
+  }
+
+  pub fn nested_i64_values(&self, field: &str, doc_id: DocId) -> Vec<Vec<i64>> {
+    match self.fields.get(field) {
+      Some(Column::I64Nested {
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          let mut out = Vec::with_capacity(obj_end.saturating_sub(obj_start));
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              out.push(values[start..end].to_vec());
+            }
+          }
+          out
+        } else {
+          Vec::new()
+        }
+      }
+      _ => Vec::new(),
+    }
+  }
+
+  pub fn nested_f64_values(&self, field: &str, doc_id: DocId) -> Vec<Vec<f64>> {
+    match self.fields.get(field) {
+      Some(Column::F64Nested {
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          let mut out = Vec::with_capacity(obj_end.saturating_sub(obj_start));
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              out.push(values[start..end].to_vec());
+            }
+          }
+          out
+        } else {
+          Vec::new()
+        }
+      }
       _ => Vec::new(),
     }
   }
@@ -452,10 +803,47 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
     ColumnBuilder::I64List(values) => {
       buf.push(FieldType::I64List.as_u8());
       buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      let mut offsets = Vec::with_capacity(values.len() + 1);
+      offsets.push(0);
       for vals in values.iter() {
-        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        let next = *offsets.last().unwrap() + vals.len() as u32;
+        offsets.push(next);
+      }
+      for off in offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for vals in values.iter() {
         for v in vals.iter() {
           buf.extend_from_slice(&v.to_le_bytes());
+        }
+      }
+    }
+    ColumnBuilder::I64Nested(values) => {
+      buf.push(FieldType::I64Nested.as_u8());
+      buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      let mut doc_offsets = Vec::with_capacity(values.len() + 1);
+      doc_offsets.push(0);
+      let mut object_offsets: Vec<u32> = Vec::new();
+      object_offsets.push(0);
+      for objects in values.iter() {
+        let next = *doc_offsets.last().unwrap() + objects.len() as u32;
+        doc_offsets.push(next);
+        for vals in objects.iter() {
+          let next_obj = *object_offsets.last().unwrap() + vals.len() as u32;
+          object_offsets.push(next_obj);
+        }
+      }
+      for off in doc_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for off in object_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for objects in values.iter() {
+        for vals in objects.iter() {
+          for v in vals.iter() {
+            buf.extend_from_slice(&v.to_le_bytes());
+          }
         }
       }
     }
@@ -470,10 +858,47 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
     ColumnBuilder::F64List(values) => {
       buf.push(FieldType::F64List.as_u8());
       buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      let mut offsets = Vec::with_capacity(values.len() + 1);
+      offsets.push(0);
       for vals in values.iter() {
-        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        let next = *offsets.last().unwrap() + vals.len() as u32;
+        offsets.push(next);
+      }
+      for off in offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for vals in values.iter() {
         for v in vals.iter() {
           buf.extend_from_slice(&v.to_le_bytes());
+        }
+      }
+    }
+    ColumnBuilder::F64Nested(values) => {
+      buf.push(FieldType::F64Nested.as_u8());
+      buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      let mut doc_offsets = Vec::with_capacity(values.len() + 1);
+      doc_offsets.push(0);
+      let mut object_offsets: Vec<u32> = Vec::new();
+      object_offsets.push(0);
+      for objects in values.iter() {
+        let next = *doc_offsets.last().unwrap() + objects.len() as u32;
+        doc_offsets.push(next);
+        for vals in objects.iter() {
+          let next_obj = *object_offsets.last().unwrap() + vals.len() as u32;
+          object_offsets.push(next_obj);
+        }
+      }
+      for off in doc_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for off in object_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for objects in values.iter() {
+        for vals in objects.iter() {
+          for v in vals.iter() {
+            buf.extend_from_slice(&v.to_le_bytes());
+          }
         }
       }
     }
@@ -502,11 +927,62 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
         buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
         buf.extend_from_slice(b);
       }
+      let mut offsets = Vec::with_capacity(builder.values.len() + 1);
+      offsets.push(0);
       for vals in builder.values.iter() {
-        buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        let next = *offsets.last().unwrap() + vals.len() as u32;
+        offsets.push(next);
+      }
+      for off in offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for vals in builder.values.iter() {
         for idx in vals.iter() {
           buf.extend_from_slice(&idx.to_le_bytes());
         }
+      }
+    }
+    ColumnBuilder::StrNested(builder) => {
+      buf.push(FieldType::StrNested.as_u8());
+      buf.extend_from_slice(&(builder.values.len() as u32).to_le_bytes());
+      let dict_len = builder.dict.len() as u32;
+      buf.extend_from_slice(&dict_len.to_le_bytes());
+      for entry in builder.dict.iter() {
+        let b = entry.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+      }
+      let mut doc_offsets = Vec::with_capacity(builder.values.len() + 1);
+      doc_offsets.push(0);
+      let mut object_offsets: Vec<u32> = Vec::new();
+      object_offsets.push(0);
+      for objects in builder.values.iter() {
+        let next = *doc_offsets.last().unwrap() + objects.len() as u32;
+        doc_offsets.push(next);
+        for vals in objects.iter() {
+          let next_obj = *object_offsets.last().unwrap() + vals.len() as u32;
+          object_offsets.push(next_obj);
+        }
+      }
+      for off in doc_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for off in object_offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for objects in builder.values.iter() {
+        for vals in objects.iter() {
+          for idx in vals.iter() {
+            buf.extend_from_slice(&idx.to_le_bytes());
+          }
+        }
+      }
+    }
+    ColumnBuilder::NestedCount(counts) => {
+      buf.push(FieldType::NestedCount.as_u8());
+      buf.extend_from_slice(&(counts.len() as u32).to_le_bytes());
+      for count in counts.iter() {
+        buf.extend_from_slice(&count.to_le_bytes());
       }
     }
   }
@@ -517,6 +993,28 @@ fn write_presence(iter: impl Iterator<Item = bool>, buf: &mut Vec<u8>) {
   for present in iter {
     buf.push(present as u8);
   }
+}
+
+fn doc_range(offsets: &[u32], doc: usize) -> Option<(usize, usize)> {
+  if offsets.len() < doc + 2 {
+    return None;
+  }
+  let start = offsets[doc] as usize;
+  let end = offsets[doc + 1] as usize;
+  Some((start, end))
+}
+
+fn object_range(offsets: &[u32], object_idx: usize) -> Option<(usize, usize)> {
+  if offsets.len() < object_idx + 2 {
+    return None;
+  }
+  let start = offsets[object_idx] as usize;
+  let end = offsets[object_idx + 1] as usize;
+  Some((start, end))
+}
+
+pub fn nested_count_key(path: &str) -> String {
+  format!("_nested_count:{path}")
 }
 
 fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
@@ -559,22 +1057,52 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         Column::I64(vals)
       }
       FieldType::I64List => {
-        let mut rows = Vec::with_capacity(doc_len);
-        for _ in 0..doc_len {
-          let entry_len = read_u32(&mut cursor, data)? as usize;
-          let mut vals = Vec::with_capacity(entry_len);
-          for _ in 0..entry_len {
-            if cursor + 8 > data.len() {
-              return Err(anyhow!("unexpected end of fast field i64 list"));
-            }
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&data[cursor..cursor + 8]);
-            cursor += 8;
-            vals.push(i64::from_le_bytes(arr));
-          }
-          rows.push(vals);
+        let mut offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          offsets.push(read_u32(&mut cursor, data)?);
         }
-        Column::I64List(rows)
+        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          if cursor + 8 > data.len() {
+            return Err(anyhow!("unexpected end of fast field i64 list"));
+          }
+          let mut arr = [0u8; 8];
+          arr.copy_from_slice(&data[cursor..cursor + 8]);
+          cursor += 8;
+          vals.push(i64::from_le_bytes(arr));
+        }
+        Column::I64List {
+          offsets,
+          values: vals,
+        }
+      }
+      FieldType::I64Nested => {
+        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          doc_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
+        let mut object_offsets = Vec::with_capacity(total_objects + 1);
+        for _ in 0..total_objects + 1 {
+          object_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          if cursor + 8 > data.len() {
+            return Err(anyhow!("unexpected end of fast field nested i64"));
+          }
+          let mut arr = [0u8; 8];
+          arr.copy_from_slice(&data[cursor..cursor + 8]);
+          cursor += 8;
+          vals.push(i64::from_le_bytes(arr));
+        }
+        Column::I64Nested {
+          doc_offsets,
+          object_offsets,
+          values: vals,
+        }
       }
       FieldType::F64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
@@ -595,22 +1123,52 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         Column::F64(vals)
       }
       FieldType::F64List => {
-        let mut rows = Vec::with_capacity(doc_len);
-        for _ in 0..doc_len {
-          let entry_len = read_u32(&mut cursor, data)? as usize;
-          let mut vals = Vec::with_capacity(entry_len);
-          for _ in 0..entry_len {
-            if cursor + 8 > data.len() {
-              return Err(anyhow!("unexpected end of fast field f64 list"));
-            }
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&data[cursor..cursor + 8]);
-            cursor += 8;
-            vals.push(f64::from_le_bytes(arr));
-          }
-          rows.push(vals);
+        let mut offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          offsets.push(read_u32(&mut cursor, data)?);
         }
-        Column::F64List(rows)
+        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          if cursor + 8 > data.len() {
+            return Err(anyhow!("unexpected end of fast field f64 list"));
+          }
+          let mut arr = [0u8; 8];
+          arr.copy_from_slice(&data[cursor..cursor + 8]);
+          cursor += 8;
+          vals.push(f64::from_le_bytes(arr));
+        }
+        Column::F64List {
+          offsets,
+          values: vals,
+        }
+      }
+      FieldType::F64Nested => {
+        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          doc_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
+        let mut object_offsets = Vec::with_capacity(total_objects + 1);
+        for _ in 0..total_objects + 1 {
+          object_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          if cursor + 8 > data.len() {
+            return Err(anyhow!("unexpected end of fast field nested f64"));
+          }
+          let mut arr = [0u8; 8];
+          arr.copy_from_slice(&data[cursor..cursor + 8]);
+          cursor += 8;
+          vals.push(f64::from_le_bytes(arr));
+        }
+        Column::F64Nested {
+          doc_offsets,
+          object_offsets,
+          values: vals,
+        }
       }
       FieldType::Str => {
         let dict_len = read_u32(&mut cursor, data)? as usize;
@@ -650,20 +1208,68 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           cursor += slen;
           dict.push(s);
         }
-        let mut vals = Vec::with_capacity(doc_len);
-        for _ in 0..doc_len {
-          let entry_len = read_u32(&mut cursor, data)? as usize;
-          let mut row = Vec::with_capacity(entry_len);
-          for _ in 0..entry_len {
-            let idx = read_u32(&mut cursor, data)?;
-            if idx as usize >= dict.len() {
-              return Err(anyhow!("invalid fast field dict index"));
-            }
-            row.push(idx);
-          }
-          vals.push(row);
+        let mut offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          offsets.push(read_u32(&mut cursor, data)?);
         }
-        Column::StrList { dict, values: vals }
+        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          let idx = read_u32(&mut cursor, data)?;
+          if idx as usize >= dict.len() {
+            return Err(anyhow!("invalid fast field dict index"));
+          }
+          vals.push(idx);
+        }
+        Column::StrList {
+          dict,
+          offsets,
+          values: vals,
+        }
+      }
+      FieldType::StrNested => {
+        let dict_len = read_u32(&mut cursor, data)? as usize;
+        let mut dict = Vec::with_capacity(dict_len);
+        for _ in 0..dict_len {
+          let slen = read_u32(&mut cursor, data)? as usize;
+          if cursor + slen > data.len() {
+            return Err(anyhow!("unexpected end of fast field dict"));
+          }
+          let s = String::from_utf8_lossy(&data[cursor..cursor + slen]).into_owned();
+          cursor += slen;
+          dict.push(s);
+        }
+        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          doc_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
+        let mut object_offsets = Vec::with_capacity(total_objects + 1);
+        for _ in 0..total_objects + 1 {
+          object_offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let mut vals = Vec::with_capacity(total_vals);
+        for _ in 0..total_vals {
+          let idx = read_u32(&mut cursor, data)?;
+          if idx as usize >= dict.len() {
+            return Err(anyhow!("invalid fast field dict index"));
+          }
+          vals.push(idx);
+        }
+        Column::StrNested {
+          dict,
+          doc_offsets,
+          object_offsets,
+          values: vals,
+        }
+      }
+      FieldType::NestedCount => {
+        let mut counts = Vec::with_capacity(doc_len);
+        for _ in 0..doc_len {
+          counts.push(read_u32(&mut cursor, data)?);
+        }
+        Column::NestedCount(counts)
       }
     };
     fields.insert(name, column);
@@ -720,6 +1326,35 @@ mod tests {
     writer.set("years", 0, FastValue::I64List(vec![2022, 2024]));
     writer.set("score", 0, FastValue::F64(0.42));
     writer.set("scores", 0, FastValue::F64List(vec![0.1, 0.42]));
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["bob".into()],
+      },
+    );
+    writer.set(
+      "comment.score",
+      0,
+      FastValue::I64Nested {
+        object: 0,
+        values: vec![10],
+      },
+    );
     writer.write_to(&storage, &path).unwrap();
 
     let reader = FastFieldsReader::open(&storage, &path).unwrap();
@@ -739,5 +1374,12 @@ mod tests {
     assert_eq!(reader.numeric_values("years", 0), vec![2022.0, 2024.0]);
     assert_eq!(reader.numeric_values("score", 0), vec![0.42]);
     assert_eq!(reader.numeric_values("scores", 0), vec![0.1, 0.42]);
+    assert_eq!(reader.nested_object_count("comment", 0), 2);
+    let nested = reader.nested_str_values("comment.author", 0);
+    assert_eq!(nested.len(), 2);
+    assert!(nested[0].contains(&"alice"));
+    assert!(nested[1].contains(&"bob"));
+    let nested_nums = reader.nested_i64_values("comment.score", 0);
+    assert_eq!(nested_nums[0], vec![10]);
   }
 }

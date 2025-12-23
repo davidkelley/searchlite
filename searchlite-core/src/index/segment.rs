@@ -6,7 +6,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ use crate::analysis::tokenizer::tokenize;
 use crate::api::types::Document;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
-use crate::index::fastfields::{FastFieldsReader, FastFieldsWriter, FastValue};
+use crate::index::fastfields::{nested_count_key, FastFieldsReader, FastFieldsWriter, FastValue};
 use crate::index::manifest::{
   FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
 };
@@ -41,6 +41,11 @@ struct CollectedDocument {
   i64s: HashMap<String, Vec<i64>>,
   f64s: HashMap<String, Vec<f64>>,
   stored: HashMap<String, Vec<serde_json::Value>>,
+  nested_keywords: HashMap<String, Vec<Vec<String>>>,
+  nested_i64s: HashMap<String, Vec<Vec<i64>>>,
+  nested_f64s: HashMap<String, Vec<Vec<f64>>>,
+  nested_counts: HashMap<String, usize>,
+  nested_stored: HashMap<String, serde_json::Value>,
 }
 
 impl CollectedDocument {
@@ -50,7 +55,7 @@ impl CollectedDocument {
   }
 
   fn finalize_stored(self) -> serde_json::Map<String, serde_json::Value> {
-    self
+    let mut out: serde_json::Map<String, serde_json::Value> = self
       .stored
       .into_iter()
       .map(|(k, vals)| {
@@ -61,7 +66,11 @@ impl CollectedDocument {
         };
         (k, value)
       })
-      .collect()
+      .collect();
+    for (k, v) in self.nested_stored.into_iter() {
+      out.insert(k, v);
+    }
+    out
   }
 }
 
@@ -96,6 +105,7 @@ fn handle_field(
   meta: &ResolvedField,
   value: &serde_json::Value,
   collected: &mut CollectedDocument,
+  store_value: bool,
 ) {
   match meta.kind {
     FieldKind::Text => {
@@ -107,7 +117,7 @@ fn handle_field(
           .or_default()
           .extend(vals.iter().cloned());
       }
-      if meta.stored {
+      if meta.stored && store_value {
         collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::String));
       }
     }
@@ -120,7 +130,7 @@ fn handle_field(
           .or_default()
           .extend(vals.iter().cloned());
       }
-      if meta.stored {
+      if meta.stored && store_value {
         collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::String));
       }
     }
@@ -134,7 +144,7 @@ fn handle_field(
             .or_default()
             .extend(vals.iter().cloned());
         }
-        if meta.stored {
+        if meta.stored && store_value {
           collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::from));
         }
       } else {
@@ -146,7 +156,7 @@ fn handle_field(
             .or_default()
             .extend(vals.iter().cloned());
         }
-        if meta.stored {
+        if meta.stored && store_value {
           collected.push_stored(&meta.path, vals.into_iter().map(serde_json::Value::from));
         }
       }
@@ -161,45 +171,224 @@ fn collect_nested(
   value: &serde_json::Value,
   prefix: &str,
   collected: &mut CollectedDocument,
+  resolved: &FastHashMap<String, ResolvedField>,
+  store_value: bool,
 ) -> Result<()> {
   match value {
     serde_json::Value::Array(arr) => {
-      for v in arr.iter() {
-        collect_nested(schema, nested, v, prefix, collected)?;
+      collected
+        .nested_counts
+        .insert(prefix.to_string(), arr.len());
+      for (idx, v) in arr.iter().enumerate() {
+        let map = v
+          .as_object()
+          .ok_or_else(|| anyhow!("nested field {prefix} must contain objects"))?;
+        collect_nested_object(schema, nested, map, prefix, idx, collected, resolved)?;
       }
     }
     serde_json::Value::Object(map) => {
-      for (k, v) in map.iter() {
-        if let Some(prop) = nested.fields.iter().find(|p| p.name() == k) {
-          match prop {
-            NestedProperty::Object(obj) => {
-              let next_prefix = format!("{prefix}.{}", obj.name);
-              collect_nested(schema, obj, v, &next_prefix, collected)?;
-            }
-            _ => {
-              let full_path = format!("{prefix}.{k}");
-              if let Some(meta) = schema.field_meta(&full_path) {
-                handle_field(&meta, v, collected);
-              }
-            }
-          }
-        } else {
-          bail!("unknown nested field {prefix}.{k}");
-        }
-      }
+      collected.nested_counts.insert(prefix.to_string(), 1);
+      collect_nested_object(schema, nested, map, prefix, 0, collected, resolved)?;
     }
-    _ => {}
+    _ => bail!("nested field {prefix} must be object or array"),
+  }
+  if store_value {
+    if let Some(filtered) = stored_nested_value(nested, value) {
+      collected.nested_stored.insert(prefix.to_string(), filtered);
+    }
   }
   Ok(())
 }
 
-fn collect_document(schema: &Schema, doc: &Document) -> Result<CollectedDocument> {
+fn record_nested_strings(
+  collected: &mut CollectedDocument,
+  field: &str,
+  object_count: usize,
+  object_idx: usize,
+  values: Vec<String>,
+) {
+  let entry = collected
+    .nested_keywords
+    .entry(field.to_string())
+    .or_insert_with(|| vec![Vec::new(); object_count]);
+  if entry.len() < object_count {
+    entry.resize(object_count, Vec::new());
+  }
+  if object_idx < entry.len() {
+    entry[object_idx].extend(values);
+  }
+}
+
+fn record_nested_i64(
+  collected: &mut CollectedDocument,
+  field: &str,
+  object_count: usize,
+  object_idx: usize,
+  values: Vec<i64>,
+) {
+  let entry = collected
+    .nested_i64s
+    .entry(field.to_string())
+    .or_insert_with(|| vec![Vec::new(); object_count]);
+  if entry.len() < object_count {
+    entry.resize(object_count, Vec::new());
+  }
+  if object_idx < entry.len() {
+    entry[object_idx].extend(values);
+  }
+}
+
+fn record_nested_f64(
+  collected: &mut CollectedDocument,
+  field: &str,
+  object_count: usize,
+  object_idx: usize,
+  values: Vec<f64>,
+) {
+  let entry = collected
+    .nested_f64s
+    .entry(field.to_string())
+    .or_insert_with(|| vec![Vec::new(); object_count]);
+  if entry.len() < object_count {
+    entry.resize(object_count, Vec::new());
+  }
+  if object_idx < entry.len() {
+    entry[object_idx].extend(values);
+  }
+}
+
+fn collect_nested_object(
+  schema: &Schema,
+  nested: &NestedField,
+  map: &serde_json::Map<String, serde_json::Value>,
+  prefix: &str,
+  object_idx: usize,
+  collected: &mut CollectedDocument,
+  resolved: &FastHashMap<String, ResolvedField>,
+) -> Result<()> {
+  let object_count = *collected.nested_counts.get(prefix).unwrap_or(&0);
+  for (k, v) in map.iter() {
+    if let Some(prop) = nested.fields.iter().find(|p| p.name() == k) {
+      match prop {
+        NestedProperty::Object(obj) => {
+          let next_prefix = format!("{prefix}.{}", obj.name);
+          collect_nested(schema, obj, v, &next_prefix, collected, resolved, false)?;
+        }
+        _ => {
+          let full_path = format!("{prefix}.{k}");
+          if let Some(meta) = resolved.get(&full_path) {
+            handle_field(meta, v, collected, false);
+            if meta.fast {
+              match meta.kind {
+                FieldKind::Keyword => {
+                  let vals = collect_strings(v);
+                  if !vals.is_empty() {
+                    record_nested_strings(collected, &full_path, object_count, object_idx, vals);
+                  }
+                }
+                FieldKind::Numeric => {
+                  if meta.numeric_i64.unwrap_or(false) {
+                    let vals = collect_i64s(v);
+                    if !vals.is_empty() {
+                      record_nested_i64(collected, &full_path, object_count, object_idx, vals);
+                    }
+                  } else {
+                    let vals = collect_f64s(v);
+                    if !vals.is_empty() {
+                      record_nested_f64(collected, &full_path, object_count, object_idx, vals);
+                    }
+                  }
+                }
+                FieldKind::Text | FieldKind::Unknown => {}
+              }
+            }
+          } else {
+            bail!("unknown nested field {prefix}.{k}");
+          }
+        }
+      }
+    } else {
+      bail!("unknown nested field {prefix}.{k}");
+    }
+  }
+  Ok(())
+}
+
+fn stored_nested_value(
+  nested: &NestedField,
+  value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+  match value {
+    serde_json::Value::Array(arr) => {
+      let mut filtered = Vec::new();
+      for v in arr.iter() {
+        if let Some(v) = stored_nested_value(nested, v) {
+          filtered.push(v);
+        }
+      }
+      if filtered.is_empty() {
+        None
+      } else {
+        Some(serde_json::Value::Array(filtered))
+      }
+    }
+    serde_json::Value::Object(map) => {
+      let mut out = serde_json::Map::new();
+      for prop in nested.fields.iter() {
+        if let Some(raw) = map.get(prop.name()) {
+          match prop {
+            NestedProperty::Text(f) => {
+              if f.stored {
+                out.insert(prop.name().to_string(), raw.clone());
+              }
+            }
+            NestedProperty::Keyword(f) => {
+              if f.stored {
+                out.insert(prop.name().to_string(), raw.clone());
+              }
+            }
+            NestedProperty::Numeric(f) => {
+              if f.stored {
+                out.insert(prop.name().to_string(), raw.clone());
+              }
+            }
+            NestedProperty::Object(obj) => {
+              if let Some(child) = stored_nested_value(obj, raw) {
+                out.insert(prop.name().to_string(), child);
+              }
+            }
+          }
+        }
+      }
+      if out.is_empty() {
+        None
+      } else {
+        Some(serde_json::Value::Object(out))
+      }
+    }
+    _ => None,
+  }
+}
+
+fn collect_document(
+  schema: &Schema,
+  doc: &Document,
+  resolved: &FastHashMap<String, ResolvedField>,
+) -> Result<CollectedDocument> {
   let mut collected = CollectedDocument::default();
   for (field, value) in doc.fields.iter() {
-    if let Some(meta) = schema.field_meta(field) {
-      handle_field(&meta, value, &mut collected);
+    if let Some(meta) = resolved.get(field) {
+      handle_field(meta, value, &mut collected, true);
     } else if let Some(nested) = schema.nested_fields.iter().find(|n| n.name == *field) {
-      collect_nested(schema, nested, value, &nested.name, &mut collected)?;
+      collect_nested(
+        schema,
+        nested,
+        value,
+        &nested.name,
+        &mut collected,
+        resolved,
+        true,
+      )?;
     } else {
       #[cfg(feature = "vectors")]
       if schema.vector_fields.iter().any(|vf| vf.name == *field) {
@@ -269,7 +458,7 @@ impl<'a> SegmentWriter<'a> {
     for (doc_id_u64, doc) in docs.iter().enumerate() {
       let doc_id = doc_id_u64 as DocId;
       self.schema.validate_document(doc)?;
-      let collected = collect_document(self.schema, doc)?;
+      let collected = collect_document(self.schema, doc, &resolved)?;
 
       for (field, values) in collected.text.iter() {
         if let Some(meta) = resolved.get(field) {
@@ -303,6 +492,7 @@ impl<'a> SegmentWriter<'a> {
       for (field, values) in collected.keywords.iter() {
         let mut seen_terms = FastHashSet::new();
         let indexed = resolved.get(field).map(|m| m.indexed).unwrap_or(true);
+        let is_nested_field = field.contains('.');
         for value in values.iter() {
           if indexed {
             let lower = value.to_ascii_lowercase();
@@ -315,7 +505,7 @@ impl<'a> SegmentWriter<'a> {
             }
           }
         }
-        if keyword_fast.contains(field.as_str()) {
+        if keyword_fast.contains(field.as_str()) && !is_nested_field {
           if values.len() == 1 {
             fast_writer.set(field, doc_id, FastValue::Str(values[0].clone()));
           } else {
@@ -326,7 +516,7 @@ impl<'a> SegmentWriter<'a> {
 
       for (field, values) in collected.i64s.iter() {
         if let Some((_, fast)) = numeric_info.get(field.as_str()) {
-          if *fast {
+          if *fast && !field.contains('.') {
             if values.len() == 1 {
               fast_writer.set(field, doc_id, FastValue::I64(values[0]));
             } else {
@@ -338,12 +528,65 @@ impl<'a> SegmentWriter<'a> {
 
       for (field, values) in collected.f64s.iter() {
         if let Some((_, fast)) = numeric_info.get(field.as_str()) {
-          if *fast {
+          if *fast && !field.contains('.') {
             if values.len() == 1 {
               fast_writer.set(field, doc_id, FastValue::F64(values[0]));
             } else {
               fast_writer.set(field, doc_id, FastValue::F64List(values.clone()));
             }
+          }
+        }
+      }
+
+      for (path, count) in collected.nested_counts.iter() {
+        fast_writer.set(
+          &nested_count_key(path),
+          doc_id,
+          FastValue::NestedCount { objects: *count },
+        );
+      }
+
+      for (field, objects) in collected.nested_keywords.iter() {
+        for (object_idx, vals) in objects.iter().enumerate() {
+          if !vals.is_empty() {
+            fast_writer.set(
+              field,
+              doc_id,
+              FastValue::StrNested {
+                object: object_idx,
+                values: vals.clone(),
+              },
+            );
+          }
+        }
+      }
+
+      for (field, objects) in collected.nested_i64s.iter() {
+        for (object_idx, vals) in objects.iter().enumerate() {
+          if !vals.is_empty() {
+            fast_writer.set(
+              field,
+              doc_id,
+              FastValue::I64Nested {
+                object: object_idx,
+                values: vals.clone(),
+              },
+            );
+          }
+        }
+      }
+
+      for (field, objects) in collected.nested_f64s.iter() {
+        for (object_idx, vals) in objects.iter().enumerate() {
+          if !vals.is_empty() {
+            fast_writer.set(
+              field,
+              doc_id,
+              FastValue::F64Nested {
+                object: object_idx,
+                values: vals.clone(),
+              },
+            );
           }
         }
       }
