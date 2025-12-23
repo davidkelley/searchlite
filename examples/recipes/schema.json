@@ -2,7 +2,8 @@
   "text_fields": [
     { "name": "text", "tokenizer": "default", "stored": true, "indexed": true },
     { "name": "title", "tokenizer": "default", "stored": true, "indexed": true },
-    { "name": "description", "tokenizer": "default", "stored": true, "indexed": true }
+    { "name": "description", "tokenizer": "default", "stored": true, "indexed": true },
+    { "name": "instructions", "tokenizer": "default", "stored": true, "indexed": true }
   ],
   "keyword_fields": [
     { "name": "doc_id", "stored": true, "indexed": true, "fast": true },
@@ -24,6 +25,35 @@
     { "name": "cook_time_minutes", "i64": true, "fast": true, "stored": true },
     { "name": "total_time_minutes", "i64": true, "fast": true, "stored": true },
     { "name": "servings", "i64": true, "fast": true, "stored": true }
+  ],
+  "nested_fields": [
+    {
+      "name": "ingredients",
+      "fields": [
+        { "type": "keyword", "name": "item", "stored": true, "indexed": true, "fast": true },
+        { "type": "numeric", "name": "quantity", "i64": false, "fast": true, "stored": true },
+        { "type": "keyword", "name": "unit", "stored": true, "indexed": true, "fast": true },
+        { "type": "keyword", "name": "prep", "stored": true, "indexed": true, "fast": true }
+      ]
+    },
+    {
+      "name": "nutrition",
+      "fields": [
+        {
+          "type": "object",
+          "name": "per_serving",
+          "fields": [
+            { "type": "numeric", "name": "calories", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "protein_g", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "carbs_g", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "fat_g", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "fiber_g", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "sodium_mg", "i64": true, "fast": true, "stored": true },
+            { "type": "numeric", "name": "sugar_g", "i64": true, "fast": true, "stored": true }
+          ]
+        }
+      ]
+    }
   ],
   "vector_fields": []
 }

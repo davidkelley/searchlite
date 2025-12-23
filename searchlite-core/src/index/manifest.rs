@@ -89,6 +89,7 @@ impl Schema {
         tokenizer: "default".to_string(),
         stored: true,
         indexed: true,
+        nullable: false,
       }],
       keyword_fields: Vec::new(),
       numeric_fields: Vec::new(),
@@ -204,18 +205,21 @@ mod tests {
         tokenizer: "default".into(),
         stored: true,
         indexed: true,
+        nullable: false,
       }],
       keyword_fields: vec![KeywordField {
         name: "tag".into(),
         stored: true,
         indexed: true,
         fast: true,
+        nullable: false,
       }],
       numeric_fields: vec![NumericField {
         name: "year".into(),
         i64: true,
         fast: true,
         stored: true,
+        nullable: false,
       }],
       nested_fields: vec![NestedField {
         name: "comment".into(),
@@ -224,7 +228,9 @@ mod tests {
           stored: true,
           indexed: true,
           fast: true,
+          nullable: false,
         })],
+        nullable: false,
       }],
       #[cfg(feature = "vectors")]
       vector_fields: Vec::new(),
@@ -254,6 +260,74 @@ mod tests {
       FieldKind::Keyword
     ));
   }
+
+  #[test]
+  fn nested_nullable_fields_are_explicit() {
+    let base_schema = Schema {
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "game".into(),
+        fields: vec![
+          NestedProperty::Keyword(KeywordField {
+            name: "name".into(),
+            stored: true,
+            indexed: true,
+            fast: true,
+            nullable: false,
+          }),
+          NestedProperty::Keyword(KeywordField {
+            name: "franchise".into(),
+            stored: true,
+            indexed: false,
+            fast: true,
+            nullable: true,
+          }),
+        ],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    let ok = crate::api::types::Document {
+      fields: [(
+        "game".into(),
+        serde_json::json!({ "name": "Skyline of Void", "franchise": null }),
+      )]
+      .into_iter()
+      .collect(),
+    };
+    base_schema.validate_document(&ok).expect("nullable ok");
+
+    let bad_null = crate::api::types::Document {
+      fields: [(
+        "game".into(),
+        serde_json::json!({ "name": null, "franchise": "Series" }),
+      )]
+      .into_iter()
+      .collect(),
+    };
+    assert!(base_schema.validate_document(&bad_null).is_err());
+
+    let nullable_game_schema = Schema {
+      nested_fields: vec![NestedField {
+        name: "game".into(),
+        fields: vec![],
+        nullable: true,
+      }],
+      ..base_schema.clone()
+    };
+    let null_game = crate::api::types::Document {
+      fields: [("game".into(), serde_json::Value::Null)]
+        .into_iter()
+        .collect(),
+    };
+    nullable_game_schema
+      .validate_document(&null_game)
+      .expect("nullable container ok");
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +354,8 @@ pub struct TextField {
   pub tokenizer: String,
   pub stored: bool,
   pub indexed: bool,
+  #[serde(default)]
+  pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +364,8 @@ pub struct KeywordField {
   pub stored: bool,
   pub indexed: bool,
   pub fast: bool,
+  #[serde(default)]
+  pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +375,8 @@ pub struct NumericField {
   pub fast: bool,
   #[serde(default)]
   pub stored: bool,
+  #[serde(default)]
+  pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,11 +384,19 @@ pub struct NestedField {
   pub name: String,
   #[serde(default)]
   pub fields: Vec<NestedProperty>,
+  #[serde(default)]
+  pub nullable: bool,
 }
 
 impl NestedField {
   fn validate(&self, value: &serde_json::Value) -> anyhow::Result<()> {
     match value {
+      serde_json::Value::Null => {
+        if self.nullable {
+          return Ok(());
+        }
+        Err(anyhow!("nested field {} cannot be null", self.name))
+      }
       serde_json::Value::Array(arr) => {
         for v in arr.iter() {
           self.validate(v)?;
@@ -320,21 +408,7 @@ impl NestedField {
           let Some(prop) = self.fields.iter().find(|p| p.name() == k) else {
             return Err(anyhow!("unknown nested field {k}"));
           };
-          match prop {
-            NestedProperty::Text(_) | NestedProperty::Keyword(_) => {
-              if !(v.is_string() || v.is_array()) {
-                return Err(anyhow!("nested field {k} must be string or array"));
-              }
-            }
-            NestedProperty::Numeric(_) => {
-              if !(v.is_number() || v.is_array()) {
-                return Err(anyhow!("nested field {k} must be number or array"));
-              }
-            }
-            NestedProperty::Object(obj) => {
-              obj.validate(v)?;
-            }
-          }
+          prop.validate_value(k, v)?;
         }
         Ok(())
       }
@@ -374,6 +448,56 @@ impl NestedProperty {
       NestedProperty::Keyword(f) => &f.name,
       NestedProperty::Numeric(f) => &f.name,
       NestedProperty::Object(f) => &f.name,
+    }
+  }
+
+  fn validate_value(&self, key: &str, v: &serde_json::Value) -> anyhow::Result<()> {
+    match self {
+      NestedProperty::Text(f) => {
+        if v.is_null() {
+          if f.nullable {
+            return Ok(());
+          }
+          return Err(anyhow!("nested field {key} cannot be null"));
+        }
+        if !(v.is_string() || v.is_array()) {
+          return Err(anyhow!("nested field {key} must be string or array"));
+        }
+        Ok(())
+      }
+      NestedProperty::Keyword(f) => {
+        if v.is_null() {
+          if f.nullable {
+            return Ok(());
+          }
+          return Err(anyhow!("nested field {key} cannot be null"));
+        }
+        if !(v.is_string() || v.is_array()) {
+          return Err(anyhow!("nested field {key} must be string or array"));
+        }
+        Ok(())
+      }
+      NestedProperty::Numeric(f) => {
+        if v.is_null() {
+          if f.nullable {
+            return Ok(());
+          }
+          return Err(anyhow!("nested field {key} cannot be null"));
+        }
+        if !(v.is_number() || v.is_array()) {
+          return Err(anyhow!("nested field {key} must be number or array"));
+        }
+        Ok(())
+      }
+      NestedProperty::Object(obj) => {
+        if v.is_null() {
+          if obj.nullable {
+            return Ok(());
+          }
+          return Err(anyhow!("nested field {key} cannot be null"));
+        }
+        obj.validate(v)
+      }
     }
   }
 

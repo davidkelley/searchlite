@@ -31,7 +31,14 @@ fn passes_filters_at<'a>(
     }
   }
   for (path, group) in nested.into_iter() {
-    if !nested_group_passes(reader, doc_id, base_path, path, group.as_slice()) {
+    if !nested_group_passes(
+      reader,
+      doc_id,
+      base_path,
+      path,
+      object_idx,
+      group.as_slice(),
+    ) {
       return false;
     }
   }
@@ -43,6 +50,7 @@ fn nested_group_passes(
   doc_id: DocId,
   base_path: &str,
   path: &str,
+  parent_idx: Option<usize>,
   filters: &[&Filter],
 ) -> bool {
   let full_path = if base_path.is_empty() {
@@ -55,7 +63,13 @@ fn nested_group_passes(
     return false;
   }
   let owned: Vec<Filter> = filters.iter().map(|f| (*f).clone()).collect();
+  let parents = reader.nested_parents(&full_path, doc_id);
   for idx in 0..object_count {
+    if let Some(p) = parent_idx {
+      if parents.get(idx).and_then(|v| *v) != Some(p) {
+        continue;
+      }
+    }
     if passes_filters_at(reader, doc_id, &owned, &full_path, Some(idx)) {
       return true;
     }
@@ -130,7 +144,9 @@ fn qualified_field(base: &str, field: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::index::fastfields::{nested_count_key, FastFieldsWriter, FastValue};
+  use crate::index::fastfields::{
+    nested_count_key, nested_parent_key, FastFieldsWriter, FastValue,
+  };
   use tempfile::tempdir;
 
   #[test]
@@ -252,5 +268,250 @@ mod tests {
       }),
     }];
     assert!(passes_filters(&reader, 0, &aligned));
+  }
+
+  #[test]
+  fn nested_filters_bind_to_parent_objects() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      &nested_parent_key("comment"),
+      0,
+      FastValue::NestedParent {
+        object: 0,
+        parent: u32::MAX as usize,
+      },
+    );
+    writer.set(
+      &nested_parent_key("comment"),
+      0,
+      FastValue::NestedParent {
+        object: 1,
+        parent: u32::MAX as usize,
+      },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["bob".into()],
+      },
+    );
+    writer.set(
+      &nested_count_key("comment.reply"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      &nested_parent_key("comment.reply"),
+      0,
+      FastValue::NestedParent {
+        object: 0,
+        parent: 0,
+      },
+    );
+    writer.set(
+      &nested_parent_key("comment.reply"),
+      0,
+      FastValue::NestedParent {
+        object: 1,
+        parent: 1,
+      },
+    );
+    writer.set(
+      "comment.reply.tag",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["x".into()],
+      },
+    );
+    writer.set(
+      "comment.reply.tag",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["y".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filters = vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::Nested {
+          path: "reply".into(),
+          filter: Box::new(Filter::KeywordEq {
+            field: "tag".into(),
+            value: "y".into(),
+          }),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+    ];
+
+    // Should not pass because the reply with tag "y" belongs to the bob comment.
+    assert!(!passes_filters(&reader, 0, &filters));
+
+    let aligned = vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "bob".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::Nested {
+          path: "reply".into(),
+          filter: Box::new(Filter::KeywordEq {
+            field: "tag".into(),
+            value: "y".into(),
+          }),
+        }),
+      },
+    ];
+    assert!(passes_filters(&reader, 0, &aligned));
+  }
+
+  #[test]
+  fn nested_numeric_filters_scope_to_same_object() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["bob".into()],
+      },
+    );
+    writer.set(
+      "comment.stars",
+      0,
+      FastValue::I64Nested {
+        object: 0,
+        values: vec![5],
+      },
+    );
+    writer.set(
+      "comment.stars",
+      0,
+      FastValue::I64Nested {
+        object: 1,
+        values: vec![9],
+      },
+    );
+    writer.set(
+      "comment.score",
+      0,
+      FastValue::F64Nested {
+        object: 0,
+        values: vec![0.72],
+      },
+    );
+    writer.set(
+      "comment.score",
+      0,
+      FastValue::F64Nested {
+        object: 1,
+        values: vec![0.21],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let passing = vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::I64Range {
+          field: "stars".into(),
+          min: 5,
+          max: 7,
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::F64Range {
+          field: "score".into(),
+          min: 0.7,
+          max: 0.8,
+        }),
+      },
+    ];
+    assert!(passes_filters(&reader, 0, &passing));
+
+    let failing = vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::I64Range {
+          field: "stars".into(),
+          min: 8,
+          max: 10,
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::F64Range {
+          field: "score".into(),
+          min: 0.2,
+          max: 0.3,
+        }),
+      },
+    ];
+    assert!(!passes_filters(&reader, 0, &failing));
   }
 }

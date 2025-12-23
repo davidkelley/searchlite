@@ -1,0 +1,49 @@
+{
+  "query": "fruit crisp oat topping",
+  "fields": [
+    "title"
+  ],
+  "filters": [
+    {
+      "KeywordEq": {
+        "field": "language",
+        "value": "en"
+      }
+    },
+    {
+      "KeywordEq": {
+        "field": "meal_type",
+        "value": "dessert"
+      }
+    },
+    {
+      "KeywordEq": {
+        "field": "dietary_tags",
+        "value": "gluten-free"
+      }
+    },
+    {
+      "I64Range": {
+        "field": "total_time_minutes",
+        "min": 0,
+        "max": 55
+      }
+    },
+    {
+      "Nested": {
+        "path": "ingredients",
+        "filter": {
+          "KeywordEq": {
+            "field": "item",
+            "value": "rolled oats"
+          }
+        }
+      }
+    }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "instructions"
+}

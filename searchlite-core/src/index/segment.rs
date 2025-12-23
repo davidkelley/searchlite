@@ -15,7 +15,9 @@ use crate::analysis::tokenizer::tokenize;
 use crate::api::types::Document;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
-use crate::index::fastfields::{nested_count_key, FastFieldsReader, FastFieldsWriter, FastValue};
+use crate::index::fastfields::{
+  nested_count_key, nested_parent_key, FastFieldsReader, FastFieldsWriter, FastValue,
+};
 use crate::index::manifest::{
   FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
 };
@@ -45,6 +47,7 @@ struct CollectedDocument {
   nested_i64s: HashMap<String, Vec<Vec<i64>>>,
   nested_f64s: HashMap<String, Vec<Vec<f64>>>,
   nested_counts: HashMap<String, usize>,
+  nested_parents: HashMap<String, Vec<usize>>,
   nested_stored: HashMap<String, serde_json::Value>,
 }
 
@@ -165,6 +168,7 @@ fn handle_field(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_nested(
   schema: &Schema,
   nested: &NestedField,
@@ -173,13 +177,43 @@ fn collect_nested(
   collected: &mut CollectedDocument,
   resolved: &FastHashMap<String, ResolvedField>,
   store_value: bool,
+  parent_idx: Option<usize>,
 ) -> Result<()> {
   match value {
+    serde_json::Value::Null => {
+      if nested.nullable {
+        return Ok(());
+      }
+      bail!("nested field {prefix} cannot be null");
+    }
     serde_json::Value::Array(arr) => {
       collected
         .nested_counts
         .insert(prefix.to_string(), arr.len());
+      if let Some(p) = parent_idx {
+        let entry = collected
+          .nested_parents
+          .entry(prefix.to_string())
+          .or_insert_with(|| vec![usize::MAX; arr.len()]);
+        if entry.len() < arr.len() {
+          entry.resize(arr.len(), usize::MAX);
+        }
+        for slot in entry.iter_mut().take(arr.len()) {
+          *slot = p;
+        }
+      } else {
+        collected
+          .nested_parents
+          .entry(prefix.to_string())
+          .or_insert_with(|| vec![usize::MAX; arr.len()]);
+      }
       for (idx, v) in arr.iter().enumerate() {
+        if v.is_null() {
+          if nested.nullable {
+            continue;
+          }
+          bail!("nested field {prefix} cannot be null");
+        }
         let map = v
           .as_object()
           .ok_or_else(|| anyhow!("nested field {prefix} must contain objects"))?;
@@ -188,6 +222,10 @@ fn collect_nested(
     }
     serde_json::Value::Object(map) => {
       collected.nested_counts.insert(prefix.to_string(), 1);
+      collected
+        .nested_parents
+        .entry(prefix.to_string())
+        .or_insert_with(|| vec![parent_idx.unwrap_or(usize::MAX)]);
       collect_nested_object(schema, nested, map, prefix, 0, collected, resolved)?;
     }
     _ => bail!("nested field {prefix} must be object or array"),
@@ -272,7 +310,22 @@ fn collect_nested_object(
       match prop {
         NestedProperty::Object(obj) => {
           let next_prefix = format!("{prefix}.{}", obj.name);
-          collect_nested(schema, obj, v, &next_prefix, collected, resolved, false)?;
+          if v.is_null() {
+            if obj.nullable {
+              continue;
+            }
+            bail!("nested field {next_prefix} cannot be null");
+          }
+          collect_nested(
+            schema,
+            obj,
+            v,
+            &next_prefix,
+            collected,
+            resolved,
+            false,
+            Some(object_idx),
+          )?;
         }
         _ => {
           let full_path = format!("{prefix}.{k}");
@@ -338,21 +391,33 @@ fn stored_nested_value(
         if let Some(raw) = map.get(prop.name()) {
           match prop {
             NestedProperty::Text(f) => {
+              if raw.is_null() {
+                continue;
+              }
               if f.stored {
                 out.insert(prop.name().to_string(), raw.clone());
               }
             }
             NestedProperty::Keyword(f) => {
+              if raw.is_null() {
+                continue;
+              }
               if f.stored {
                 out.insert(prop.name().to_string(), raw.clone());
               }
             }
             NestedProperty::Numeric(f) => {
+              if raw.is_null() {
+                continue;
+              }
               if f.stored {
                 out.insert(prop.name().to_string(), raw.clone());
               }
             }
             NestedProperty::Object(obj) => {
+              if raw.is_null() {
+                continue;
+              }
               if let Some(child) = stored_nested_value(obj, raw) {
                 out.insert(prop.name().to_string(), child);
               }
@@ -380,6 +445,12 @@ fn collect_document(
     if let Some(meta) = resolved.get(field) {
       handle_field(meta, value, &mut collected, true);
     } else if let Some(nested) = schema.nested_fields.iter().find(|n| n.name == *field) {
+      if value.is_null() {
+        if nested.nullable {
+          continue;
+        }
+        bail!("nested field {} cannot be null", nested.name);
+      }
       collect_nested(
         schema,
         nested,
@@ -388,6 +459,7 @@ fn collect_document(
         &mut collected,
         resolved,
         true,
+        None,
       )?;
     } else {
       #[cfg(feature = "vectors")]
@@ -508,7 +580,7 @@ impl<'a> SegmentWriter<'a> {
         if keyword_fast.contains(field.as_str()) && !is_nested_field {
           if values.len() == 1 {
             fast_writer.set(field, doc_id, FastValue::Str(values[0].clone()));
-          } else {
+          } else if !values.is_empty() {
             fast_writer.set(field, doc_id, FastValue::StrList(values.clone()));
           }
         }
@@ -544,6 +616,19 @@ impl<'a> SegmentWriter<'a> {
           doc_id,
           FastValue::NestedCount { objects: *count },
         );
+      }
+
+      for (path, parents) in collected.nested_parents.iter() {
+        for (object_idx, parent) in parents.iter().enumerate() {
+          fast_writer.set(
+            &nested_parent_key(path),
+            doc_id,
+            FastValue::NestedParent {
+              object: object_idx,
+              parent: *parent,
+            },
+          );
+        }
       }
 
       for (field, objects) in collected.nested_keywords.iter() {
@@ -795,18 +880,21 @@ mod tests {
         tokenizer: "default".into(),
         stored: true,
         indexed: true,
+        nullable: false,
       }],
       keyword_fields: vec![crate::index::manifest::KeywordField {
         name: "tag".into(),
         stored: true,
         indexed: true,
         fast: true,
+        nullable: false,
       }],
       numeric_fields: vec![crate::index::manifest::NumericField {
         name: "year".into(),
         i64: true,
         fast: true,
         stored: true,
+        nullable: false,
       }],
       nested_fields: Vec::new(),
       #[cfg(feature = "vectors")]

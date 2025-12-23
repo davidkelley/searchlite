@@ -41,12 +41,14 @@ fn search_with_phrase_filters_and_compaction() {
     stored: true,
     indexed: true,
     fast: true,
+    nullable: false,
   });
   schema.numeric_fields.push(NumericField {
     name: "year".into(),
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let index = IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
 

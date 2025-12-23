@@ -1,0 +1,26 @@
+{
+  "query": "platinum trophy missable roadmap",
+  "fields": ["text", "summary", "achievements.name", "achievements.description"],
+  "filters": [
+    { "KeywordEq": { "field": "doc_type", "value": "achievement_guide" } },
+    { "KeywordIn": { "field": "era", "values": ["modern", "classic"] } },
+    { "KeywordEq": { "field": "language", "value": "en" } },
+    {
+      "Nested": {
+        "path": "achievements",
+        "filter": { "KeywordEq": { "field": "tier", "value": "platinum" } }
+      }
+    },
+    {
+      "Nested": {
+        "path": "estimated_hours",
+        "filter": { "I64Range": { "field": "completionist", "min": 0, "max": 50 } }
+      }
+    }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "achievements.description"
+}

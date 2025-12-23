@@ -1,0 +1,15 @@
+{
+  "query": "CRT shader desync",
+  "fields": ["text", "settings", "known_issues", "compatibility"],
+  "filters": [
+    { "KeywordEq": { "field": "doc_type", "value": "emulation_notes" } },
+    { "KeywordEq": { "field": "era", "value": "retro" } },
+    { "KeywordEq": { "field": "accuracy_grade", "value": "Low" } },
+    { "KeywordIn": { "field": "platforms", "values": ["Neo Geo", "SNES", "Genesis"] } }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "settings"
+}

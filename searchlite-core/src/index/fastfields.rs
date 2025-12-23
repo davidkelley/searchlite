@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
+use std::mem;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -19,6 +20,7 @@ pub enum FastValue {
   F64Nested { object: usize, values: Vec<f64> },
   StrNested { object: usize, values: Vec<String> },
   NestedCount { objects: usize },
+  NestedParent { object: usize, parent: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,7 @@ enum FieldType {
   F64Nested,
   StrNested,
   NestedCount,
+  NestedParent,
 }
 
 impl FieldType {
@@ -48,6 +51,7 @@ impl FieldType {
       FieldType::F64Nested => 7,
       FieldType::StrNested => 8,
       FieldType::NestedCount => 9,
+      FieldType::NestedParent => 10,
     }
   }
 
@@ -63,6 +67,7 @@ impl FieldType {
       7 => Some(FieldType::F64Nested),
       8 => Some(FieldType::StrNested),
       9 => Some(FieldType::NestedCount),
+      10 => Some(FieldType::NestedParent),
       _ => None,
     }
   }
@@ -164,6 +169,7 @@ enum ColumnBuilder {
   StrList(StrListColumnBuilder),
   StrNested(StrNestedColumnBuilder),
   NestedCount(Vec<u32>),
+  NestedParent(Vec<Vec<u32>>),
 }
 
 pub struct FastFieldsWriter {
@@ -192,6 +198,12 @@ impl FastFieldsWriter {
             }
             values[idx] = Some(v);
           }
+          ColumnBuilder::I64List(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            entries[idx] = vec![v];
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -207,6 +219,12 @@ impl FastFieldsWriter {
             }
             values[idx] = Some(v);
           }
+          ColumnBuilder::F64List(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            entries[idx] = vec![v];
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -221,6 +239,18 @@ impl FastFieldsWriter {
               entries.resize(idx + 1, Vec::new());
             }
             entries[idx] = values;
+          }
+          ColumnBuilder::I64(existing) => {
+            let existing_values = mem::take(existing);
+            let mut list_entries: Vec<Vec<i64>> = existing_values
+              .into_iter()
+              .map(|opt| opt.map(|v| vec![v]).unwrap_or_default())
+              .collect();
+            if list_entries.len() <= idx {
+              list_entries.resize(idx + 1, Vec::new());
+            }
+            list_entries[idx] = values;
+            *col = ColumnBuilder::I64List(list_entries);
           }
           _ => panic!("fast field type mismatch for {}", field),
         }
@@ -256,6 +286,18 @@ impl FastFieldsWriter {
             }
             entries[idx] = values;
           }
+          ColumnBuilder::F64(existing) => {
+            let existing_values = mem::take(existing);
+            let mut list_entries: Vec<Vec<f64>> = existing_values
+              .into_iter()
+              .map(|opt| opt.map(|v| vec![v]).unwrap_or_default())
+              .collect();
+            if list_entries.len() <= idx {
+              list_entries.resize(idx + 1, Vec::new());
+            }
+            list_entries[idx] = values;
+            *col = ColumnBuilder::F64List(list_entries);
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -285,6 +327,10 @@ impl FastFieldsWriter {
           .or_insert_with(|| ColumnBuilder::Str(StrColumnBuilder::default()));
         match col {
           ColumnBuilder::Str(builder) => builder.push(idx, &v),
+          ColumnBuilder::StrList(builder) => {
+            let single = [v];
+            builder.push(idx, &single);
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -295,6 +341,21 @@ impl FastFieldsWriter {
           .or_insert_with(|| ColumnBuilder::StrList(StrListColumnBuilder::default()));
         match col {
           ColumnBuilder::StrList(builder) => builder.push(idx, &values),
+          ColumnBuilder::Str(existing) => {
+            let dict = mem::take(&mut existing.dict);
+            let dict_index = mem::take(&mut existing.dict_index);
+            let existing_values = mem::take(&mut existing.values);
+            let mut list_builder = StrListColumnBuilder {
+              dict,
+              dict_index,
+              values: existing_values
+                .into_iter()
+                .map(|opt| opt.map(|v| vec![v]).unwrap_or_default())
+                .collect(),
+            };
+            list_builder.push(idx, &values);
+            *col = ColumnBuilder::StrList(list_builder);
+          }
           _ => panic!("fast field type mismatch for {}", field),
         }
       }
@@ -319,6 +380,25 @@ impl FastFieldsWriter {
               counts.resize(idx + 1, 0);
             }
             counts[idx] = objects as u32;
+          }
+          _ => panic!("fast field type mismatch for {}", field),
+        }
+      }
+      FastValue::NestedParent { object, parent } => {
+        let col = self
+          .data
+          .entry(field.to_string())
+          .or_insert_with(|| ColumnBuilder::NestedParent(Vec::new()));
+        match col {
+          ColumnBuilder::NestedParent(entries) => {
+            if entries.len() <= idx {
+              entries.resize(idx + 1, Vec::new());
+            }
+            let doc_entries = &mut entries[idx];
+            if doc_entries.len() <= object {
+              doc_entries.resize(object + 1, u32::MAX);
+            }
+            doc_entries[object] = parent as u32;
           }
           _ => panic!("fast field type mismatch for {}", field),
         }
@@ -382,6 +462,10 @@ enum Column {
     values: Vec<u32>,
   },
   NestedCount(Vec<u32>),
+  NestedParent {
+    offsets: Vec<u32>,
+    parents: Vec<u32>,
+  },
 }
 
 pub struct FastFieldsReader {
@@ -785,6 +869,29 @@ impl FastFieldsReader {
       _ => Vec::new(),
     }
   }
+
+  pub fn nested_parents(&self, path: &str, doc_id: DocId) -> Vec<Option<usize>> {
+    let key = nested_parent_key(path);
+    match self.fields.get(&key) {
+      Some(Column::NestedParent { offsets, parents }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          parents[start..end]
+            .iter()
+            .map(|p| {
+              if *p == u32::MAX {
+                None
+              } else {
+                Some(*p as usize)
+              }
+            })
+            .collect()
+        } else {
+          Vec::new()
+        }
+      }
+      _ => Vec::new(),
+    }
+  }
 }
 
 fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()> {
@@ -985,6 +1092,24 @@ fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()>
         buf.extend_from_slice(&count.to_le_bytes());
       }
     }
+    ColumnBuilder::NestedParent(values) => {
+      buf.push(FieldType::NestedParent.as_u8());
+      buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+      let mut offsets = Vec::with_capacity(values.len() + 1);
+      offsets.push(0);
+      for parents in values.iter() {
+        let next = *offsets.last().unwrap() + parents.len() as u32;
+        offsets.push(next);
+      }
+      for off in offsets.iter() {
+        buf.extend_from_slice(&off.to_le_bytes());
+      }
+      for parents in values.iter() {
+        for p in parents.iter() {
+          buf.extend_from_slice(&p.to_le_bytes());
+        }
+      }
+    }
   }
   Ok(())
 }
@@ -1015,6 +1140,10 @@ fn object_range(offsets: &[u32], object_idx: usize) -> Option<(usize, usize)> {
 
 pub fn nested_count_key(path: &str) -> String {
   format!("_nested_count:{path}")
+}
+
+pub fn nested_parent_key(path: &str) -> String {
+  format!("_nested_parent:{path}")
 }
 
 fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
@@ -1271,6 +1400,18 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
         Column::NestedCount(counts)
       }
+      FieldType::NestedParent => {
+        let mut offsets = Vec::with_capacity(doc_len + 1);
+        for _ in 0..doc_len + 1 {
+          offsets.push(read_u32(&mut cursor, data)?);
+        }
+        let total = *offsets.last().unwrap_or(&0) as usize;
+        let mut parents = Vec::with_capacity(total);
+        for _ in 0..total {
+          parents.push(read_u32(&mut cursor, data)?);
+        }
+        Column::NestedParent { offsets, parents }
+      }
     };
     fields.insert(name, column);
   }
@@ -1332,11 +1473,40 @@ mod tests {
       FastValue::NestedCount { objects: 2 },
     );
     writer.set(
+      &nested_parent_key("comment"),
+      0,
+      FastValue::NestedParent {
+        object: 0,
+        parent: u32::MAX as usize,
+      },
+    );
+    writer.set(
+      &nested_parent_key("comment"),
+      0,
+      FastValue::NestedParent {
+        object: 1,
+        parent: u32::MAX as usize,
+      },
+    );
+    writer.set(
+      &nested_count_key("comment.reply"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
       "comment.author",
       0,
       FastValue::StrNested {
         object: 0,
         values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      &nested_parent_key("comment.reply"),
+      0,
+      FastValue::NestedParent {
+        object: 0,
+        parent: 0,
       },
     );
     writer.set(
@@ -1381,5 +1551,10 @@ mod tests {
     assert!(nested[1].contains(&"bob"));
     let nested_nums = reader.nested_i64_values("comment.score", 0);
     assert_eq!(nested_nums[0], vec![10]);
+    let parents = reader.nested_parents("comment", 0);
+    assert_eq!(parents.len(), 2);
+    assert!(parents.iter().all(|p| p.is_none()));
+    let reply_parents = reader.nested_parents("comment.reply", 0);
+    assert_eq!(reply_parents, vec![Some(0)]);
   }
 }

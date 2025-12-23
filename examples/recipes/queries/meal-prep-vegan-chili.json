@@ -1,0 +1,28 @@
+{
+  "query": "meal prep chili instant pot vegan",
+  "fields": ["title", "description", "text"],
+  "filters": [
+    { "KeywordEq": { "field": "language", "value": "en" } },
+    { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+    { "KeywordEq": { "field": "dietary_tags", "value": "vegan" } },
+    { "KeywordEq": { "field": "keywords", "value": "instant pot" } },
+    { "I64Range": { "field": "servings", "min": 6, "max": 10 } },
+    { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 60 } },
+    {
+      "Nested": {
+        "path": "ingredients",
+        "filter": {
+          "KeywordIn": {
+            "field": "item",
+            "values": ["black beans", "beans", "chickpeas", "mushrooms"]
+          }
+        }
+      }
+    }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "text"
+}

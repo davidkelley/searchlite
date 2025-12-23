@@ -148,6 +148,177 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.jso
 ```
 Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
 
+## Filters: examples
+Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
+
+### Basic keyword equality
+```json
+{
+  "filters": [
+    { "KeywordEq": { "field": "lang", "value": "en" } }
+  ]
+}
+```
+
+### Keyword membership (`IN`)
+```json
+{
+  "filters": [
+    { "KeywordIn": { "field": "lang", "values": ["en", "fr"] } }
+  ]
+}
+```
+
+### Numeric ranges (i64 and f64)
+```json
+{
+  "filters": [
+    { "I64Range": { "field": "year", "min": 2018, "max": 2024 } },
+    { "F64Range": { "field": "score", "min": 0.25, "max": 0.9 } }
+  ]
+}
+```
+
+### Multi-valued fast fields
+If your document has `tags: ["rust", "search"]` and `tags` is a fast keyword field:
+```json
+{
+  "filters": [
+    { "KeywordEq": { "field": "tags", "value": "rust" } }
+  ]
+}
+```
+Any value in the multi-valued column can satisfy the clause.
+
+### Nested objects (single level)
+Schema excerpt:
+```json
+{
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
+        { "type": "keyword", "name": "tag",    "fast": true, "stored": true, "indexed": true }
+      ]
+    }
+  ]
+}
+```
+
+Filter: match documents with any comment whose author is `alice` and tag is `rust`:
+```json
+{
+  "filters": [
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "alice" }
+        }
+      }
+    },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "tag", "value": "rust" }
+        }
+      }
+    }
+  ]
+}
+```
+Because nested filters are scoped to the same object, this only passes when a single `comment` object has both `author=alice` and `tag=rust`.
+
+### Deeply nested hierarchy
+Schema excerpt:
+```json
+{
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
+        {
+          "type": "object",
+          "name": "reply",
+          "fields": [
+            { "type": "keyword", "name": "tag", "fast": true, "stored": true, "indexed": true }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Filter: require a comment with `author=bob` that has a reply tagged `y` (parent-child binding is enforced):
+```json
+{
+  "filters": [
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "bob" }
+        }
+      }
+    },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "Nested": {
+            "path": "reply",
+            "filter": {
+              "KeywordEq": { "field": "tag", "value": "y" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+```
+The inner `Nested` is evaluated only against replies belonging to the same `comment` object that satisfies the outer `Nested`.
+
+### Numeric fields inside nested objects
+Filter on nested numeric properties alongside keywords:
+```json
+{
+  "filters": [
+    { "Nested": { "path": "review", "filter": { "KeywordEq": { "field": "user", "value": "alice" } } } },
+    { "Nested": { "path": "review", "filter": { "I64Range": { "field": "rating", "min": 5, "max": 8 } } } },
+    { "Nested": { "path": "review", "filter": { "F64Range": { "field": "score", "min": 0.7, "max": 0.8 } } } }
+  ]
+}
+```
+All three clauses must match the same `review` object.
+
+### Mixed nested and non-nested filters
+Combine a top-level numeric range with nested filters:
+```json
+{
+  "filters": [
+    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "alice" }
+        }
+      }
+    }
+  ]
+}
+```
+
+### Quick tips
+- Mark filterable fields with `"fast": true` in the schema.
+- For nested filters, wrap child clauses in `Nested` blocks; use additional nested blocks for deeper levels.
+- Stored nested fields preserve structure; unstored fields are omitted in responses.
+
 - Inspect or compact:
 ```bash
 cargo run -p searchlite-cli -- inspect "$INDEX"
