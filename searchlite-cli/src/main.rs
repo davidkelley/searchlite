@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
@@ -29,8 +30,8 @@ enum Commands {
   /// Execute a search query
   Search {
     index: PathBuf,
-    #[arg(short = 'q')]
-    query: String,
+    #[arg(short = 'q', long = "query")]
+    query: Option<String>,
     #[arg(long, default_value_t = 10)]
     limit: usize,
     #[arg(long, default_value = "wand")]
@@ -45,6 +46,10 @@ enum Commands {
     return_stored: bool,
     #[arg(long)]
     highlight: Option<String>,
+    #[arg(long)]
+    request: Option<PathBuf>,
+    #[arg(long, conflicts_with = "request")]
+    request_stdin: bool,
     #[cfg(feature = "vectors")]
     #[arg(long)]
     vector_field: Option<String>,
@@ -84,6 +89,8 @@ fn main() -> Result<()> {
       filter,
       return_stored,
       highlight,
+      request,
+      request_stdin,
       #[cfg(feature = "vectors")]
       vector_field,
       #[cfg(feature = "vectors")]
@@ -92,25 +99,31 @@ fn main() -> Result<()> {
       alpha,
       aggs,
       aggs_file,
-    } => cmd_search(SearchArgs {
-      index,
-      query,
-      limit,
-      execution,
-      bmw_block_size,
-      fields,
-      filters: filter,
-      return_stored,
-      highlight,
-      #[cfg(feature = "vectors")]
-      vector_field,
-      #[cfg(feature = "vectors")]
-      vector,
-      #[cfg(feature = "vectors")]
-      alpha,
-      aggs,
-      aggs_file,
-    }),
+    } => {
+      let request = if let Some(req) = read_request(request, request_stdin)? {
+        req
+      } else {
+        build_search_request_from_cli(SearchCliArgs {
+          query,
+          limit,
+          execution,
+          bmw_block_size,
+          fields,
+          filters: filter,
+          return_stored,
+          highlight,
+          #[cfg(feature = "vectors")]
+          vector_field,
+          #[cfg(feature = "vectors")]
+          vector,
+          #[cfg(feature = "vectors")]
+          alpha,
+          aggs,
+          aggs_file,
+        })?
+      };
+      cmd_search(index, request)
+    }
     Commands::Inspect { index } => cmd_inspect(index.as_path()),
     Commands::Compact { index } => cmd_compact(index.as_path()),
   }
@@ -129,9 +142,8 @@ fn default_options(path: &Path) -> IndexOptions {
   }
 }
 
-struct SearchArgs {
-  index: PathBuf,
-  query: String,
+struct SearchCliArgs {
+  query: Option<String>,
   limit: usize,
   execution: String,
   bmw_block_size: Option<usize>,
@@ -191,9 +203,17 @@ fn cmd_commit(index: &Path) -> Result<()> {
   Ok(())
 }
 
-fn cmd_search(args: SearchArgs) -> Result<()> {
-  let SearchArgs {
-    index,
+fn cmd_search(index: PathBuf, request: SearchRequest) -> Result<()> {
+  let opts = default_options(index.as_path());
+  let idx = Index::open(opts)?;
+  let reader = idx.reader()?;
+  let result = reader.search(&request)?;
+  println!("{}", serde_json::to_string_pretty(&result)?);
+  Ok(())
+}
+
+fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
+  let SearchCliArgs {
     query,
     limit,
     execution,
@@ -211,14 +231,15 @@ fn cmd_search(args: SearchArgs) -> Result<()> {
     aggs,
     aggs_file,
   } = args;
-  let opts = default_options(index.as_path());
-  let idx = Index::open(opts)?;
-  let reader = idx.reader()?;
+  let query = match query {
+    Some(q) => q,
+    None => bail!("search query is required unless --request or --request-stdin is provided"),
+  };
   let parsed_filters = filters
     .iter()
     .filter_map(|f| parse_filter(f))
     .collect::<Vec<_>>();
-  let request = SearchRequest {
+  Ok(SearchRequest {
     query,
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
     filters: parsed_filters,
@@ -230,10 +251,27 @@ fn cmd_search(args: SearchArgs) -> Result<()> {
     return_stored,
     highlight_field: highlight,
     aggs: load_aggs(aggs, aggs_file)?,
-  };
-  let result = reader.search(&request)?;
-  println!("{}", serde_json::to_string_pretty(&result)?);
-  Ok(())
+  })
+}
+
+fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<SearchRequest>> {
+  if let Some(p) = path {
+    let contents =
+      fs::read_to_string(&p).with_context(|| format!("reading search request from {:?}", p))?;
+    let request = serde_json::from_str::<SearchRequest>(&contents)
+      .with_context(|| format!("parsing search request JSON from {:?}", p))?;
+    return Ok(Some(request));
+  }
+  if request_stdin {
+    let mut buf = String::new();
+    io::stdin()
+      .read_to_string(&mut buf)
+      .context("reading search request from stdin")?;
+    let request = serde_json::from_str::<SearchRequest>(&buf)
+      .context("parsing search request JSON from stdin")?;
+    return Ok(Some(request));
+  }
+  Ok(None)
 }
 
 fn parse_filter(input: &str) -> Option<Filter> {
@@ -378,9 +416,8 @@ mod tests {
     .unwrap();
     cmd_add(index.as_path(), docs_path.as_path()).unwrap();
     cmd_commit(index.as_path()).unwrap();
-    cmd_search(SearchArgs {
-      index: index.clone(),
-      query: "rust".to_string(),
+    let request = build_search_request_from_cli(SearchCliArgs {
+      query: Some("rust".to_string()),
       limit: 5,
       execution: "wand".to_string(),
       bmw_block_size: None,
@@ -398,7 +435,42 @@ mod tests {
       aggs_file: None,
     })
     .unwrap();
+    cmd_search(index.clone(), request).unwrap();
     cmd_inspect(index.as_path()).unwrap();
     cmd_compact(index.as_path()).unwrap();
+  }
+
+  #[test]
+  fn search_request_from_json_file() {
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx");
+    let schema_path = dir.path().join("schema.json");
+    let schema = searchlite_core::api::types::Schema::default_text_body();
+    fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
+
+    let docs_path = dir.path().join("docs.jsonl");
+    fs::write(&docs_path, "{\"body\":\"Rust search\"}\n").unwrap();
+    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
+    cmd_commit(index.as_path()).unwrap();
+
+    let request = SearchRequest {
+      query: "rust".to_string(),
+      fields: None,
+      filters: vec![],
+      limit: 5,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: true,
+      highlight_field: Some("body".to_string()),
+      aggs: BTreeMap::new(),
+    };
+    let request_path = dir.path().join("request.json");
+    fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
+
+    let parsed = read_request(Some(request_path), false).unwrap().unwrap();
+    cmd_search(index.clone(), parsed).unwrap();
   }
 }

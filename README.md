@@ -18,7 +18,7 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - Rust toolchain is pinned to `1.78.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
 - Build everything with `cargo build --all --all-features` (or `just build`).
 - Code quality: `cargo fmt --all`, `cargo clippy --all --all-features -- -D warnings`.
-- The CLI runs directly from the workspace: `cargo run -p searchlite-cli -- <subcommand>`.
+- The CLI runs directly from the workspace: `cargo run -p searchlite-cli -- <subcommand> <index> ...` (e.g., `cargo run -p searchlite-cli -- init /tmp/idx schema.json`).
 
 ## Testing & benchmarks
 - Tests: `cargo test --all --all-features` (or `just test`).
@@ -61,7 +61,7 @@ INDEX=/tmp/searchlite_idx
 
 - Create an index from a schema:
 ```bash
-cargo run -p searchlite-cli -- init --index "$INDEX" --schema schema.json
+cargo run -p searchlite-cli -- init "$INDEX" schema.json
 ```
 
 - Add a single document (newline-delimited JSON):
@@ -69,20 +69,19 @@ cargo run -p searchlite-cli -- init --index "$INDEX" --schema schema.json
 cat > /tmp/one.jsonl <<'EOF'
 {"body":"Rust is a systems programming language","lang":"en","year":2024}
 EOF
-cargo run -p searchlite-cli -- add --index "$INDEX" --doc /tmp/one.jsonl
-cargo run -p searchlite-cli -- commit --index "$INDEX"
+cargo run -p searchlite-cli -- add "$INDEX" /tmp/one.jsonl
+cargo run -p searchlite-cli -- commit "$INDEX"
 ```
 
 - Add multiple documents (uses the included sample):
 ```bash
-cargo run -p searchlite-cli -- add --index "$INDEX" --doc docs.jsonl
-cargo run -p searchlite-cli -- commit --index "$INDEX"
+cargo run -p searchlite-cli -- add "$INDEX" docs.jsonl
+cargo run -p searchlite-cli -- commit "$INDEX"
 ```
 
 - Query the index (field scoping, filters, stored fields, snippets):
 ```bash
-cargo run -p searchlite-cli -- search \
-  --index "$INDEX" \
+cargo run -p searchlite-cli -- search "$INDEX" \
   --q "body:rust language" \
   --limit 5 \
   --filter "lang:en" \
@@ -119,10 +118,31 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
+- You can also pass the full search payload as JSON (same shape used by the upcoming HTTP service):
+```bash
+cat > /tmp/search_request.json <<'EOF'
+{
+  "query": "body:rust language",
+  "fields": null,
+  "filters": [
+    { "KeywordEq": { "field": "lang", "value": "en" } },
+    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "body"
+}
+EOF
+cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.json
+```
+Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
+
 - Inspect or compact:
 ```bash
-cargo run -p searchlite-cli -- inspect --index "$INDEX"
-cargo run -p searchlite-cli -- compact --index "$INDEX"
+cargo run -p searchlite-cli -- inspect "$INDEX"
+cargo run -p searchlite-cli -- compact "$INDEX"
 ```
 
 ## Using the Rust API

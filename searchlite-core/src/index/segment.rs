@@ -472,6 +472,12 @@ impl SegmentReader {
     let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
     let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    #[cfg(not(feature = "zstd"))]
+    if seg_meta.use_zstd {
+      eprintln!(
+        "warning: index uses zstd-compressed docstore, but this binary was built without the `zstd` feature; stored fields may be unavailable"
+      );
+    }
     let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
     let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
     Ok(Self {
