@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{
   btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, BinaryHeap, HashMap,
+  HashSet,
 };
 use std::hash::{Hash, Hasher};
 
@@ -70,27 +71,19 @@ pub struct ValueCountState {
   pub value: u64,
 }
 
-fn numeric_value(
+fn numeric_values(
   fast_fields: &FastFieldsReader,
   field: &str,
   doc_id: DocId,
   missing: Option<f64>,
-) -> Option<f64> {
-  fast_fields
-    .f64_value(field, doc_id)
-    .or_else(|| fast_fields.i64_value(field, doc_id).map(|v| v as f64))
-    .or(missing)
-}
-
-fn has_numeric_value(
-  fast_fields: &FastFieldsReader,
-  field: &str,
-  doc_id: DocId,
-  allow_missing: bool,
-) -> bool {
-  fast_fields.f64_value(field, doc_id).is_some()
-    || fast_fields.i64_value(field, doc_id).is_some()
-    || allow_missing
+) -> Vec<f64> {
+  let mut values = fast_fields.numeric_values(field, doc_id);
+  if values.is_empty() {
+    if let Some(m) = missing {
+      values.push(m);
+    }
+  }
+  values
 }
 
 #[derive(Clone)]
@@ -295,15 +288,21 @@ impl<'a> TermsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if let Some(val) = self.ctx.fast_fields.str_value(&self.field, doc_id) {
-      let bucket = self.get_bucket(BucketKey::Borrowed(val), || {
-        serde_json::Value::String(val.to_string())
-      });
-      bucket.doc_count += 1;
-      for child in bucket.aggs.values_mut() {
-        child.collect(doc_id, score);
+    let values = self.ctx.fast_fields.str_values(&self.field, doc_id);
+    if !values.is_empty() {
+      let mut seen = HashSet::new();
+      for val in values.into_iter().filter(|v| seen.insert(*v)) {
+        let bucket = self.get_bucket(BucketKey::Borrowed(val), || {
+          serde_json::Value::String(val.to_string())
+        });
+        bucket.doc_count += 1;
+        for child in bucket.aggs.values_mut() {
+          child.collect(doc_id, score);
+        }
       }
-      return;
+      if !seen.is_empty() {
+        return;
+      }
     }
     let Some(missing) = self.missing.as_ref() else {
       return;
@@ -392,14 +391,16 @@ impl<'a> RangeCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    let value = numeric_value(self.ctx.fast_fields, &self.field, doc_id, self.missing);
-    let Some(val) = value else {
+    let values = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
+    if values.is_empty() {
       return;
-    };
+    }
     for entry in self.ranges.iter_mut() {
-      let ge_from = entry.from.map(|f| val >= f).unwrap_or(true);
-      let lt_to = entry.to.map(|t| val <= t).unwrap_or(true);
-      if ge_from && lt_to {
+      if values.iter().any(|val| {
+        let ge_from = entry.from.map(|f| *val >= f).unwrap_or(true);
+        let lt_to = entry.to.map(|t| *val <= t).unwrap_or(true);
+        ge_from && lt_to
+      }) {
         entry.bucket.doc_count += 1;
         for child in entry.bucket.aggs.values_mut() {
           child.collect(doc_id, score);
@@ -522,33 +523,39 @@ impl<'a> HistogramCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    let value = numeric_value(self.ctx.fast_fields, &self.field, doc_id, self.missing);
-    let Some(val) = value else {
+    let values = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
+    if values.is_empty() {
       return;
-    };
-    if let Some((min, max)) = self.hard_bounds {
-      if val < min || val > max {
-        return;
+    }
+    let mut seen = HashSet::new();
+    for val in values {
+      if let Some((min, max)) = self.hard_bounds {
+        if val < min || val > max {
+          continue;
+        }
       }
-    }
-    let bucket_id = self.bucket_key(val);
-    let bucket = self
-      .buckets
-      .entry(bucket_id)
-      .or_insert_with(|| BucketState {
-        key: serde_json::Value::Number(
-          serde_json::Number::from_f64(bucket_id as f64 * self.interval + self.offset)
-            .unwrap_or_else(|| serde_json::Number::from(0)),
-        ),
-        doc_count: 0,
-        aggs: build_children(&self.ctx, &self.sub_aggs),
-      });
-    if bucket.aggs.is_empty() && !self.sub_aggs.is_empty() {
-      bucket.aggs = build_children(&self.ctx, &self.sub_aggs);
-    }
-    bucket.doc_count += 1;
-    for child in bucket.aggs.values_mut() {
-      child.collect(doc_id, score);
+      let bucket_id = self.bucket_key(val);
+      if !seen.insert(bucket_id) {
+        continue;
+      }
+      let bucket = self
+        .buckets
+        .entry(bucket_id)
+        .or_insert_with(|| BucketState {
+          key: serde_json::Value::Number(
+            serde_json::Number::from_f64(bucket_id as f64 * self.interval + self.offset)
+              .unwrap_or_else(|| serde_json::Number::from(0)),
+          ),
+          doc_count: 0,
+          aggs: build_children(&self.ctx, &self.sub_aggs),
+        });
+      if bucket.aggs.is_empty() && !self.sub_aggs.is_empty() {
+        bucket.aggs = build_children(&self.ctx, &self.sub_aggs);
+      }
+      bucket.doc_count += 1;
+      for child in bucket.aggs.values_mut() {
+        child.collect(doc_id, score);
+      }
     }
   }
 
@@ -654,39 +661,47 @@ impl<'a> DateHistogramCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    let value = numeric_value(
+    let values: Vec<i64> = numeric_values(
       self.ctx.fast_fields,
       &self.field,
       doc_id,
       self.missing.map(|v| v as f64),
     )
-    .map(|v| v as i64);
-    let Some(val) = value else {
+    .into_iter()
+    .map(|v| v as i64)
+    .collect();
+    if values.is_empty() {
       return;
-    };
-    if let Some((min, max)) = self.hard_bounds {
-      if val < min || val > max {
-        return;
+    }
+    let mut seen = HashSet::new();
+    for val in values {
+      if let Some((min, max)) = self.hard_bounds {
+        if val < min || val > max {
+          continue;
+        }
       }
-    }
-    let bucket_start = match bucket_start(val, self.offset_millis, &self.interval) {
-      Some(v) => v,
-      None => return,
-    };
-    let bucket_entry = self
-      .buckets
-      .entry(bucket_start)
-      .or_insert_with(|| BucketState {
-        key: serde_json::Value::Number(serde_json::Number::from(bucket_start)),
-        doc_count: 0,
-        aggs: build_children(&self.ctx, &self.sub_aggs),
-      });
-    if bucket_entry.aggs.is_empty() && !self.sub_aggs.is_empty() {
-      bucket_entry.aggs = build_children(&self.ctx, &self.sub_aggs);
-    }
-    bucket_entry.doc_count += 1;
-    for child in bucket_entry.aggs.values_mut() {
-      child.collect(doc_id, score);
+      let bucket_start = match bucket_start(val, self.offset_millis, &self.interval) {
+        Some(v) => v,
+        None => continue,
+      };
+      if !seen.insert(bucket_start) {
+        continue;
+      }
+      let bucket_entry = self
+        .buckets
+        .entry(bucket_start)
+        .or_insert_with(|| BucketState {
+          key: serde_json::Value::Number(serde_json::Number::from(bucket_start)),
+          doc_count: 0,
+          aggs: build_children(&self.ctx, &self.sub_aggs),
+        });
+      if bucket_entry.aggs.is_empty() && !self.sub_aggs.is_empty() {
+        bucket_entry.aggs = build_children(&self.ctx, &self.sub_aggs);
+      }
+      bucket_entry.doc_count += 1;
+      for child in bucket_entry.aggs.values_mut() {
+        child.collect(doc_id, score);
+      }
     }
   }
 
@@ -749,20 +764,20 @@ impl<'a> StatsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, _score: f32) {
-    let value = numeric_value(self.ctx.fast_fields, &self.field, doc_id, self.missing);
-    let Some(val) = value else {
-      return;
-    };
-    self.stats = merge_stats(
-      self.stats,
-      StatsState {
-        count: 1,
-        min: val,
-        max: val,
-        sum: val,
-        m2: 0.0,
-      },
-    );
+    // Aggregate over every value; multi-valued fields contribute each entry (bucket doc_count
+    // remains per-document).
+    for val in numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing) {
+      self.stats = merge_stats(
+        self.stats,
+        StatsState {
+          count: 1,
+          min: val,
+          max: val,
+          sum: val,
+          m2: 0.0,
+        },
+      );
+    }
   }
 
   fn finish(self) -> StatsState {
@@ -791,15 +806,8 @@ impl<'a> ValueCountCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, _score: f32) {
-    let present = has_numeric_value(
-      self.ctx.fast_fields,
-      &self.field,
-      doc_id,
-      self.missing.is_some(),
-    );
-    if present {
-      self.state.value += 1;
-    }
+    let values = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
+    self.state.value += values.len() as u64;
   }
 
   fn finish(self) -> ValueCountState {

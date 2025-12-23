@@ -1,0 +1,406 @@
+{
+  "text_fields": [
+    {
+      "name": "text",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "title",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "summary",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "tips",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "notes",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "changes",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "pros",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "cons",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "settings",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "known_issues",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "installation_steps",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "steps",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "techniques",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "compatibility",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "legal_note",
+      "tokenizer": "default",
+      "stored": true,
+      "indexed": true
+    }
+  ],
+  "keyword_fields": [
+    {
+      "name": "doc_id",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "doc_type",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "developer",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "publisher",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "era",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "platforms",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "genres",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "rating_board",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "region",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "language",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "source",
+      "stored": true,
+      "indexed": true,
+      "fast": false
+    },
+    {
+      "name": "tags",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "keywords",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "entities",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "difficulty_estimate",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "category",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "version",
+      "stored": true,
+      "indexed": true,
+      "fast": false
+    },
+    {
+      "name": "accuracy_grade",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "recommended_core",
+      "stored": true,
+      "indexed": true,
+      "fast": false
+    },
+    {
+      "name": "mod_name",
+      "stored": true,
+      "indexed": true,
+      "fast": false
+    },
+    {
+      "name": "created_at",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "name": "updated_at",
+      "stored": true,
+      "indexed": true,
+      "fast": true
+    }
+  ],
+  "numeric_fields": [
+    {
+      "name": "release_year",
+      "i64": true,
+      "fast": true,
+      "stored": true
+    },
+    {
+      "name": "review_score_out_of_10",
+      "i64": false,
+      "fast": true,
+      "stored": true
+    },
+    {
+      "name": "target_time_minutes",
+      "i64": true,
+      "fast": true,
+      "stored": true
+    }
+  ],
+  "nested_fields": [
+    {
+      "name": "game",
+      "fields": [
+        {
+          "type": "keyword",
+          "name": "game_id",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        },
+        {
+          "type": "keyword",
+          "name": "name",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        },
+        {
+          "type": "keyword",
+          "name": "franchise",
+          "stored": true,
+          "indexed": false,
+          "fast": true,
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "sections",
+      "fields": [
+        {
+          "type": "text",
+          "name": "heading",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        },
+        {
+          "type": "text",
+          "name": "content",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        }
+      ]
+    },
+    {
+      "name": "achievements",
+      "fields": [
+        {
+          "type": "text",
+          "name": "name",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        },
+        {
+          "type": "keyword",
+          "name": "tier",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        },
+        {
+          "type": "text",
+          "name": "description",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        }
+      ]
+    },
+    {
+      "name": "estimated_hours",
+      "fields": [
+        {
+          "type": "numeric",
+          "name": "main",
+          "i64": true,
+          "fast": true,
+          "stored": true
+        },
+        {
+          "type": "numeric",
+          "name": "completionist",
+          "i64": true,
+          "fast": true,
+          "stored": true
+        }
+      ]
+    },
+    {
+      "name": "tier_list",
+      "fields": [
+        {
+          "type": "keyword",
+          "name": "S",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        },
+        {
+          "type": "keyword",
+          "name": "A",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        },
+        {
+          "type": "keyword",
+          "name": "B",
+          "stored": true,
+          "indexed": true,
+          "fast": true
+        }
+      ]
+    },
+    {
+      "name": "codes",
+      "fields": [
+        {
+          "type": "text",
+          "name": "input",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        },
+        {
+          "type": "text",
+          "name": "effect",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        }
+      ]
+    },
+    {
+      "name": "splits",
+      "fields": [
+        {
+          "type": "text",
+          "name": "split",
+          "tokenizer": "default",
+          "stored": true,
+          "indexed": true
+        },
+        {
+          "type": "numeric",
+          "name": "target_time_min",
+          "i64": true,
+          "fast": true,
+          "stored": true
+        }
+      ]
+    }
+  ],
+  "vector_fields": []
+}

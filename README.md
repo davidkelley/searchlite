@@ -39,11 +39,20 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
   "numeric_fields": [
     { "name": "year", "i64": true, "fast": true }
   ],
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "stored": true, "indexed": true, "fast": true }
+      ]
+    }
+  ],
   "vector_fields": []
 }
 ```
 
-`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`.
+`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
+Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
 
 ## CLI workflow examples
 Set an index location once:
@@ -73,13 +82,20 @@ cargo run -p searchlite-cli -- commit "$INDEX"
 
 - Query the index (field scoping, filters, stored fields, snippets):
 ```bash
-cargo run -p searchlite-cli -- search "$INDEX" \
-  --q "body:rust language" \
-  --limit 5 \
-  --filter "lang:en" \
-  --filter "year:[2020 TO 2025]" \
-  --return-stored \
-  --highlight body
+cat > /tmp/request.json <<'EOF'
+{
+  "query": "body:rust language",
+  "fields": ["body","title"],
+  "filters": [
+    { "KeywordEq": { "field": "lang", "value": "en" } },
+    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
+  ],
+  "limit": 5,
+  "return_stored": true,
+  "highlight_field": "body"
+}
+EOF
+cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```
 
 Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Provide inline JSON o
@@ -104,6 +120,8 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 ### Aggregations quick reference
 - Field requirements: `terms` needs a fast keyword field; `range`, `histogram`, `stats`, `date_histogram` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `top_hits` has no field requirement but returns stored fields/snippets when enabled.
+- Stats semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value).
+- Value count semantics: `value_count` counts field values (each entry from multi-valued fields, plus one per `missing` fill), not documents-with-values; this mirrors Elasticsearch's `value_count`.
 - Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`.
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations`.
@@ -130,6 +148,177 @@ EOF
 cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.json
 ```
 Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
+
+## Filters: examples
+Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
+
+### Basic keyword equality
+```json
+{
+  "filters": [
+    { "KeywordEq": { "field": "lang", "value": "en" } }
+  ]
+}
+```
+
+### Keyword membership (`IN`)
+```json
+{
+  "filters": [
+    { "KeywordIn": { "field": "lang", "values": ["en", "fr"] } }
+  ]
+}
+```
+
+### Numeric ranges (i64 and f64)
+```json
+{
+  "filters": [
+    { "I64Range": { "field": "year", "min": 2018, "max": 2024 } },
+    { "F64Range": { "field": "score", "min": 0.25, "max": 0.9 } }
+  ]
+}
+```
+
+### Multi-valued fast fields
+If your document has `tags: ["rust", "search"]` and `tags` is a fast keyword field:
+```json
+{
+  "filters": [
+    { "KeywordEq": { "field": "tags", "value": "rust" } }
+  ]
+}
+```
+Any value in the multi-valued column can satisfy the clause.
+
+### Nested objects (single level)
+Schema excerpt:
+```json
+{
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
+        { "type": "keyword", "name": "tag",    "fast": true, "stored": true, "indexed": true }
+      ]
+    }
+  ]
+}
+```
+
+Filter: match documents with any comment whose author is `alice` and tag is `rust`:
+```json
+{
+  "filters": [
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "alice" }
+        }
+      }
+    },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "tag", "value": "rust" }
+        }
+      }
+    }
+  ]
+}
+```
+Because nested filters are scoped to the same object, this only passes when a single `comment` object has both `author=alice` and `tag=rust`.
+
+### Deeply nested hierarchy
+Schema excerpt:
+```json
+{
+  "nested_fields": [
+    {
+      "name": "comment",
+      "fields": [
+        { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
+        {
+          "type": "object",
+          "name": "reply",
+          "fields": [
+            { "type": "keyword", "name": "tag", "fast": true, "stored": true, "indexed": true }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Filter: require a comment with `author=bob` that has a reply tagged `y` (parent-child binding is enforced):
+```json
+{
+  "filters": [
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "bob" }
+        }
+      }
+    },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "Nested": {
+            "path": "reply",
+            "filter": {
+              "KeywordEq": { "field": "tag", "value": "y" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+```
+The inner `Nested` is evaluated only against replies belonging to the same `comment` object that satisfies the outer `Nested`.
+
+### Numeric fields inside nested objects
+Filter on nested numeric properties alongside keywords:
+```json
+{
+  "filters": [
+    { "Nested": { "path": "review", "filter": { "KeywordEq": { "field": "user", "value": "alice" } } } },
+    { "Nested": { "path": "review", "filter": { "I64Range": { "field": "rating", "min": 5, "max": 8 } } } },
+    { "Nested": { "path": "review", "filter": { "F64Range": { "field": "score", "min": 0.7, "max": 0.8 } } } }
+  ]
+}
+```
+All three clauses must match the same `review` object.
+
+### Mixed nested and non-nested filters
+Combine a top-level numeric range with nested filters:
+```json
+{
+  "filters": [
+    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } },
+    {
+      "Nested": {
+        "path": "comment",
+        "filter": {
+          "KeywordEq": { "field": "author", "value": "alice" }
+        }
+      }
+    }
+  ]
+}
+```
+
+### Quick tips
+- Mark filterable fields with `"fast": true` in the schema.
+- For nested filters, wrap child clauses in `Nested` blocks; use additional nested blocks for deeper levels.
+- Stored nested fields preserve structure; unstored fields are omitted in responses.
 
 - Inspect or compact:
 ```bash

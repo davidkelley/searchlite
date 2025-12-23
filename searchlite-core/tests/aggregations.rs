@@ -21,12 +21,14 @@ fn terms_and_stats_aggregations() {
       stored: true,
       indexed: true,
       fast: true,
+      nullable: false,
     });
   schema.numeric_fields.push(NumericField {
     name: "views".into(),
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let opts = IndexOptions {
     path: path.clone(),
@@ -138,6 +140,7 @@ fn aggregation_requires_fast_field() {
       stored: true,
       indexed: true,
       fast: false,
+      nullable: false,
     });
   let idx = IndexBuilder::create(
     &path,
@@ -195,6 +198,7 @@ fn histogram_bucket_generation() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -273,6 +277,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -356,6 +361,7 @@ fn range_aggregation_counts() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -443,6 +449,7 @@ fn date_range_missing_and_keyed() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -541,6 +548,7 @@ fn extended_stats_and_value_count_include_missing() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -629,6 +637,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -730,6 +739,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(
     &path,
@@ -825,6 +835,7 @@ fn terms_size_applied_after_merge() {
       stored: true,
       indexed: true,
       fast: true,
+      nullable: false,
     });
   let idx = IndexBuilder::create(
     &path,

@@ -3,8 +3,11 @@ use std::collections::BTreeMap;
 use criterion::{criterion_group, criterion_main, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, Schema, SearchRequest, StorageType,
+  Document, ExecutionStrategy, IndexOptions, KeywordField, NestedField, NestedProperty,
+  NumericField, Schema, SearchRequest, StorageType,
 };
+use searchlite_core::api::Filter;
+use serde_json::json;
 
 fn bench_indexing(c: &mut Criterion) {
   c.bench_function("index_small", |b| {
@@ -94,5 +97,104 @@ fn bench_search(c: &mut Criterion) {
   });
 }
 
-criterion_group!(benches, bench_indexing, bench_search);
+fn bench_nested_filters(c: &mut Criterion) {
+  c.bench_function("search_nested_filters", |b| {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.nested_fields.push(NestedField {
+      name: "review".into(),
+      fields: vec![
+        NestedProperty::Keyword(KeywordField {
+          name: "user".into(),
+          stored: true,
+          indexed: true,
+          fast: true,
+          nullable: false,
+        }),
+        NestedProperty::Numeric(NumericField {
+          name: "rating".into(),
+          i64: true,
+          fast: true,
+          stored: true,
+          nullable: false,
+        }),
+        NestedProperty::Numeric(NumericField {
+          name: "score".into(),
+          i64: false,
+          fast: true,
+          stored: false,
+          nullable: false,
+        }),
+      ],
+      nullable: false,
+    });
+    let opts = IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    };
+    let idx = IndexBuilder::create(&path, schema, opts).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      for i in 0..40u32 {
+        let reviews = json!([
+          { "user": "user_a", "rating": (i % 6) + 1, "score": 0.5 + (i as f64 % 5.0) * 0.05 },
+          { "user": "user_b", "rating": 9, "score": 0.2 }
+        ]);
+        writer
+          .add_document(&Document {
+            fields: [
+              ("body".into(), json!(format!("rust nested {}", i))),
+              ("review".into(), reviews),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    b.iter(|| {
+      let reader = idx.reader().unwrap();
+      let req = SearchRequest {
+        query: "rust".into(),
+        fields: None,
+        filters: vec![
+          Filter::Nested {
+            path: "review".into(),
+            filter: Box::new(Filter::KeywordEq {
+              field: "user".into(),
+              value: "user_a".into(),
+            }),
+          },
+          Filter::Nested {
+            path: "review".into(),
+            filter: Box::new(Filter::I64Range {
+              field: "rating".into(),
+              min: 3,
+              max: 6,
+            }),
+          },
+        ],
+        limit: 5,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        return_stored: true,
+        highlight_field: None,
+        aggs: BTreeMap::new(),
+      };
+      let _ = reader.search(&req).unwrap();
+    });
+  });
+}
+
+criterion_group!(benches, bench_indexing, bench_search, bench_nested_filters);
 criterion_main!(benches);

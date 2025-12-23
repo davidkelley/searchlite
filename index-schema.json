@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/davidkelley/searchlite/index-schema.json",
+  "title": "Searchlite Index Schema",
+  "description": "Defines the structure of schema.json files used to build Searchlite indexes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text_fields", "keyword_fields", "numeric_fields"],
+  "properties": {
+    "text_fields": {
+      "type": "array",
+      "description": "Top-level text fields to tokenize and index.",
+      "items": { "$ref": "#/$defs/text_field" },
+      "default": []
+    },
+    "keyword_fields": {
+      "type": "array",
+      "description": "Top-level keyword fields for exact matches and filters.",
+      "items": { "$ref": "#/$defs/keyword_field" },
+      "default": []
+    },
+    "numeric_fields": {
+      "type": "array",
+      "description": "Top-level numeric fields for range queries and aggregations.",
+      "items": { "$ref": "#/$defs/numeric_field" },
+      "default": []
+    },
+    "nested_fields": {
+      "type": "array",
+      "description": "Nested objects whose child fields are flattened to dotted paths.",
+      "items": { "$ref": "#/$defs/nested_field" },
+      "default": []
+    },
+    "vector_fields": {
+      "type": "array",
+      "description": "Optional dense vector fields (requires the `vectors` feature).",
+      "items": { "$ref": "#/$defs/vector_field" },
+      "default": []
+    }
+  },
+  "$defs": {
+    "text_field": {
+      "type": "object",
+      "description": "Tokenized text column stored in postings and optionally in the doc store.",
+      "additionalProperties": false,
+      "required": ["name", "tokenizer", "stored", "indexed"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name used in documents and queries."
+        },
+        "tokenizer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tokenizer identifier (e.g., `default`)."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep raw field values for retrieval and snippets."
+        },
+        "indexed": {
+          "type": "boolean",
+          "description": "Index tokenized terms to make the field searchable."
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "keyword_field": {
+      "type": "object",
+      "description": "Keyword (untokenized) field for exact matches and fast filtering.",
+      "additionalProperties": false,
+      "required": ["name", "stored", "indexed", "fast"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name used in documents and filters."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep raw keyword values for retrieval."
+        },
+        "indexed": {
+          "type": "boolean",
+          "description": "Index keyword terms for matching."
+        },
+        "fast": {
+          "type": "boolean",
+          "description": "Expose as a fast field to enable filters and aggregations."
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "numeric_field": {
+      "type": "object",
+      "description": "Numeric field (i64 or f64) used for range queries and aggregations.",
+      "additionalProperties": false,
+      "required": ["name", "i64", "fast"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name used in documents and filters."
+        },
+        "i64": {
+          "type": "boolean",
+          "description": "When true store as a signed 64-bit integer; otherwise store as f64."
+        },
+        "fast": {
+          "type": "boolean",
+          "description": "Expose as a fast field to enable filters and aggregations."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep numeric values in the doc store for retrieval.",
+          "default": false
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "nested_field": {
+      "type": "object",
+      "description": "Nested object whose child fields are validated per object and stored separately.",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the nested object as it appears in documents."
+        },
+        "fields": {
+          "type": "array",
+          "description": "Fields contained within this nested object.",
+          "items": { "$ref": "#/$defs/nested_property" },
+          "default": []
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Allow the entire object to be null in documents.",
+          "default": false
+        }
+      }
+    },
+    "nested_property": {
+      "description": "Field definitions allowed inside a nested object. Each entry must declare its type.",
+      "oneOf": [
+        { "$ref": "#/$defs/nested_text_property" },
+        { "$ref": "#/$defs/nested_keyword_property" },
+        { "$ref": "#/$defs/nested_numeric_property" },
+        { "$ref": "#/$defs/nested_object_property" }
+      ]
+    },
+    "nested_text_property": {
+      "type": "object",
+      "description": "Text field within a nested object.",
+      "additionalProperties": false,
+      "required": ["type", "name", "tokenizer", "stored", "indexed"],
+      "properties": {
+        "type": {
+          "const": "text",
+          "description": "Marks this nested field as text."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name relative to its parent object."
+        },
+        "tokenizer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tokenizer identifier (e.g., `default`)."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep raw field values for retrieval and snippets."
+        },
+        "indexed": {
+          "type": "boolean",
+          "description": "Index tokenized terms to make the field searchable."
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "nested_keyword_property": {
+      "type": "object",
+      "description": "Keyword field within a nested object.",
+      "additionalProperties": false,
+      "required": ["type", "name", "stored", "indexed", "fast"],
+      "properties": {
+        "type": {
+          "const": "keyword",
+          "description": "Marks this nested field as keyword."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name relative to its parent object."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep raw keyword values for retrieval."
+        },
+        "indexed": {
+          "type": "boolean",
+          "description": "Index keyword terms for matching."
+        },
+        "fast": {
+          "type": "boolean",
+          "description": "Expose as a fast field to enable filters and aggregations."
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "nested_numeric_property": {
+      "type": "object",
+      "description": "Numeric field within a nested object.",
+      "additionalProperties": false,
+      "required": ["type", "name", "i64", "fast"],
+      "properties": {
+        "type": {
+          "const": "numeric",
+          "description": "Marks this nested field as numeric."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name relative to its parent object."
+        },
+        "i64": {
+          "type": "boolean",
+          "description": "When true store as a signed 64-bit integer; otherwise store as f64."
+        },
+        "fast": {
+          "type": "boolean",
+          "description": "Expose as a fast field to enable filters and aggregations."
+        },
+        "stored": {
+          "type": "boolean",
+          "description": "Keep numeric values in the doc store for retrieval.",
+          "default": false
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Permit null values in documents for this field.",
+          "default": false
+        }
+      }
+    },
+    "nested_object_property": {
+      "type": "object",
+      "description": "Nested object contained within another nested object.",
+      "additionalProperties": false,
+      "required": ["type", "name"],
+      "properties": {
+        "type": {
+          "const": "object",
+          "description": "Marks this nested entry as another nested object."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the nested object relative to its parent."
+        },
+        "fields": {
+          "type": "array",
+          "description": "Child fields contained in this nested object.",
+          "items": { "$ref": "#/$defs/nested_property" },
+          "default": []
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Allow the entire nested object to be null in documents.",
+          "default": false
+        }
+      }
+    },
+    "vector_field": {
+      "type": "object",
+      "description": "Dense vector field configuration (requires the `vectors` feature).",
+      "additionalProperties": false,
+      "required": ["name", "dim", "metric"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name for vector embeddings."
+        },
+        "dim": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Dimensionality of each vector."
+        },
+        "metric": {
+          "type": "string",
+          "enum": ["Cosine", "L2"],
+          "description": "Similarity metric used for vector search."
+        }
+      }
+    }
+  }
+}

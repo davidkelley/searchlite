@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, Filter, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -40,8 +40,6 @@ enum Commands {
     bmw_block_size: Option<usize>,
     #[arg(long)]
     fields: Option<String>,
-    #[arg(long)]
-    filter: Vec<String>,
     #[arg(long)]
     return_stored: bool,
     #[arg(long)]
@@ -86,7 +84,6 @@ fn main() -> Result<()> {
       execution,
       bmw_block_size,
       fields,
-      filter,
       return_stored,
       highlight,
       request,
@@ -109,7 +106,6 @@ fn main() -> Result<()> {
           execution,
           bmw_block_size,
           fields,
-          filters: filter,
           return_stored,
           highlight,
           #[cfg(feature = "vectors")]
@@ -148,7 +144,6 @@ struct SearchCliArgs {
   execution: String,
   bmw_block_size: Option<usize>,
   fields: Option<String>,
-  filters: Vec<String>,
   return_stored: bool,
   highlight: Option<String>,
   #[cfg(feature = "vectors")]
@@ -219,7 +214,6 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     execution,
     bmw_block_size,
     fields,
-    filters,
     return_stored,
     highlight,
     #[cfg(feature = "vectors")]
@@ -235,14 +229,10 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     Some(q) => q,
     None => bail!("search query is required unless --request or --request-stdin is provided"),
   };
-  let parsed_filters = filters
-    .iter()
-    .filter_map(|f| parse_filter(f))
-    .collect::<Vec<_>>();
   Ok(SearchRequest {
     query,
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
-    filters: parsed_filters,
+    filters: Vec::new(),
     limit,
     execution: parse_execution(&execution),
     bmw_block_size,
@@ -272,31 +262,6 @@ fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<Sea
     return Ok(Some(request));
   }
   Ok(None)
-}
-
-fn parse_filter(input: &str) -> Option<Filter> {
-  if let Some(eq_idx) = input.find(':') {
-    let field = input[..eq_idx].to_string();
-    let rest = &input[eq_idx + 1..];
-    if let Some(range_idx) = rest.find("[") {
-      let body = &rest[range_idx + 1..rest.len() - 1];
-      let parts: Vec<&str> = body.split_whitespace().collect();
-      if parts.len() == 3 && parts[1].eq_ignore_ascii_case("TO") {
-        if let (Ok(min), Ok(max)) = (parts[0].parse::<i64>(), parts[2].parse::<i64>()) {
-          return Some(Filter::I64Range { field, min, max });
-        }
-      }
-    } else if rest.contains(',') {
-      let values = rest.split(',').map(|s| s.trim().to_string()).collect();
-      return Some(Filter::KeywordIn { field, values });
-    } else {
-      return Some(Filter::KeywordEq {
-        field,
-        value: rest.to_string(),
-      });
-    }
-  }
-  None
 }
 
 fn load_aggs(
@@ -373,33 +338,6 @@ mod tests {
   use tempfile::tempdir;
 
   #[test]
-  fn parses_filter_variants() {
-    match parse_filter("tag:rust") {
-      Some(Filter::KeywordEq { field, value }) => {
-        assert_eq!(field, "tag");
-        assert_eq!(value, "rust");
-      }
-      other => panic!("unexpected filter {:?}", other),
-    }
-    match parse_filter("tag:rust,systems") {
-      Some(Filter::KeywordIn { field, values }) => {
-        assert_eq!(field, "tag");
-        assert_eq!(values, vec!["rust".to_string(), "systems".to_string()]);
-      }
-      other => panic!("unexpected filter {:?}", other),
-    }
-    match parse_filter("year:[2010 TO 2020]") {
-      Some(Filter::I64Range { field, min, max }) => {
-        assert_eq!(field, "year");
-        assert_eq!(min, 2010);
-        assert_eq!(max, 2020);
-      }
-      other => panic!("unexpected filter {:?}", other),
-    }
-    assert!(parse_filter("invalid").is_none());
-  }
-
-  #[test]
   fn runs_cli_commands_end_to_end() {
     let dir = tempdir().unwrap();
     let index = dir.path().join("idx");
@@ -422,7 +360,6 @@ mod tests {
       execution: "wand".to_string(),
       bmw_block_size: None,
       fields: None,
-      filters: vec![],
       return_stored: true,
       highlight: Some("body".to_string()),
       #[cfg(feature = "vectors")]

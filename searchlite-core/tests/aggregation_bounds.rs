@@ -33,6 +33,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
   {
@@ -111,6 +112,7 @@ fn histogram_requires_positive_interval() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
 
@@ -157,12 +159,14 @@ fn nested_terms_stats_aggregation() {
     stored: true,
     indexed: true,
     fast: true,
+    nullable: false,
   });
   schema.numeric_fields.push(NumericField {
     name: "stars".into(),
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
   {
@@ -260,6 +264,7 @@ fn date_histogram_rejects_invalid_config() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
 
@@ -342,7 +347,14 @@ fn date_histogram_rejects_invalid_config() {
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
-  let schema = Schema::default_text_body();
+  let mut schema = Schema::default_text_body();
+  schema.keyword_fields.push(KeywordField {
+    name: "tag".into(),
+    stored: true,
+    indexed: true,
+    fast: false,
+    nullable: false,
+  });
   let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
   {
     let mut writer = idx.writer().unwrap();
@@ -418,6 +430,7 @@ fn date_histogram_calendar_month_interval() {
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
   let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
 

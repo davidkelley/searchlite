@@ -23,12 +23,14 @@ fn build_bench_index(doc_count: usize, cardinality: usize) -> BenchIndex {
     stored: true,
     indexed: true,
     fast: true,
+    nullable: false,
   });
   schema.numeric_fields.push(NumericField {
     name: "score".into(),
     i64: true,
     fast: true,
     stored: true,
+    nullable: false,
   });
 
   let opts = IndexOptions {

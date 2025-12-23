@@ -1,0 +1,33 @@
+{
+  "query": "shrimp spinach curry coconut",
+  "fields": ["text", "instructions"],
+  "filters": [
+    { "KeywordEq": { "field": "language", "value": "en" } },
+    { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+    { "KeywordEq": { "field": "dietary_tags", "value": "pescatarian" } },
+    { "KeywordEq": { "field": "region", "value": "South Asia" } },
+    { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 60 } },
+    {
+      "Nested": {
+        "path": "ingredients",
+        "filter": { "KeywordEq": { "field": "item", "value": "shrimp" } }
+      }
+    },
+    {
+      "Nested": {
+        "path": "nutrition",
+        "filter": {
+          "Nested": {
+            "path": "per_serving",
+            "filter": { "I64Range": { "field": "protein_g", "min": 25, "max": 60 } }
+          }
+        }
+      }
+    }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "text"
+}
