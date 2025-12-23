@@ -1,0 +1,14 @@
+{
+  "query": "text:(chocolate dessert) OR title:chocolate",
+  "fields": null,
+  "filters": [
+    { "KeywordEq": { "field": "language", "value": "en" } },
+    { "KeywordEq": { "field": "meal_type", "value": "dessert" } },
+    { "KeywordEq": { "field": "dietary_tags", "value": "gluten-free" } }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "text"
+}

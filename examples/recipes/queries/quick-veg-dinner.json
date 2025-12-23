@@ -1,0 +1,15 @@
+{
+  "query": "text:(vegetarian quick dinner) OR title:weeknight",
+  "fields": null,
+  "filters": [
+    { "KeywordEq": { "field": "language", "value": "en" } },
+    { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+    { "KeywordEq": { "field": "dietary_tags", "value": "vegetarian" } },
+    { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 30 } }
+  ],
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "text"
+}
