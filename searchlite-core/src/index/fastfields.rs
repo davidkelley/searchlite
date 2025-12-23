@@ -413,6 +413,27 @@ impl FastFieldsReader {
       _ => Vec::new(),
     }
   }
+
+  pub fn numeric_values(&self, field: &str, doc_id: DocId) -> Vec<f64> {
+    match self.fields.get(field) {
+      Some(Column::F64(values)) => values
+        .get(doc_id as usize)
+        .and_then(|opt| *opt)
+        .map(|v| vec![v])
+        .unwrap_or_default(),
+      Some(Column::F64List(values)) => values.get(doc_id as usize).cloned().unwrap_or_default(),
+      Some(Column::I64(values)) => values
+        .get(doc_id as usize)
+        .and_then(|opt| *opt)
+        .map(|v| vec![v as f64])
+        .unwrap_or_default(),
+      Some(Column::I64List(values)) => values
+        .get(doc_id as usize)
+        .map(|vals| vals.iter().map(|v| *v as f64).collect())
+        .unwrap_or_default(),
+      _ => Vec::new(),
+    }
+  }
 }
 
 fn write_field(name: &str, col: &ColumnBuilder, buf: &mut Vec<u8>) -> Result<()> {
@@ -714,5 +735,9 @@ mod tests {
     assert_eq!(reader.str_values("tags", 0).len(), 2);
     assert_eq!(reader.i64_values("years", 0), vec![2022, 2024]);
     assert_eq!(reader.f64_values("scores", 0), vec![0.1, 0.42]);
+    assert_eq!(reader.numeric_values("year", 0), vec![2024.0]);
+    assert_eq!(reader.numeric_values("years", 0), vec![2022.0, 2024.0]);
+    assert_eq!(reader.numeric_values("score", 0), vec![0.42]);
+    assert_eq!(reader.numeric_values("scores", 0), vec![0.1, 0.42]);
   }
 }

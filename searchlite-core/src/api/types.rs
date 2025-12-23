@@ -155,6 +155,9 @@ pub struct DateHistogramAggregation {
   pub aggs: BTreeMap<String, Aggregation>,
 }
 
+/// Metric aggregations operate on numeric fast fields. When the field is
+/// multi-valued each value contributes to stats/extended_stats; `BucketResponse::doc_count`
+/// remains per-document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MetricAggregation {
   pub field: String,
@@ -234,8 +237,11 @@ pub enum AggregationResponse {
   TopHits(TopHitsResponse),
 }
 
+/// Aggregate statistics over the numeric field values contributing to the bucket.
+/// For multi-valued fields all values are included.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsResponse {
+  /// Number of field values included (multi-valued fields contribute each entry).
   pub count: u64,
   pub min: f64,
   pub max: f64,
@@ -243,6 +249,8 @@ pub struct StatsResponse {
   pub avg: f64,
 }
 
+/// Extended stats computed over all numeric field values contributing to the bucket.
+/// For multi-valued fields all values are included.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtendedStatsResponse {
   pub count: u64,

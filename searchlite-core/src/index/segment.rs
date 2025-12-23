@@ -6,7 +6,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -161,11 +161,11 @@ fn collect_nested(
   value: &serde_json::Value,
   prefix: &str,
   collected: &mut CollectedDocument,
-) {
+) -> Result<()> {
   match value {
     serde_json::Value::Array(arr) => {
       for v in arr.iter() {
-        collect_nested(schema, nested, v, prefix, collected);
+        collect_nested(schema, nested, v, prefix, collected)?;
       }
     }
     serde_json::Value::Object(map) => {
@@ -174,7 +174,7 @@ fn collect_nested(
           match prop {
             NestedProperty::Object(obj) => {
               let next_prefix = format!("{prefix}.{}", obj.name);
-              collect_nested(schema, obj, v, &next_prefix, collected);
+              collect_nested(schema, obj, v, &next_prefix, collected)?;
             }
             _ => {
               let full_path = format!("{prefix}.{k}");
@@ -183,23 +183,32 @@ fn collect_nested(
               }
             }
           }
+        } else {
+          bail!("unknown nested field {prefix}.{k}");
         }
       }
     }
     _ => {}
   }
+  Ok(())
 }
 
-fn collect_document(schema: &Schema, doc: &Document) -> CollectedDocument {
+fn collect_document(schema: &Schema, doc: &Document) -> Result<CollectedDocument> {
   let mut collected = CollectedDocument::default();
   for (field, value) in doc.fields.iter() {
     if let Some(meta) = schema.field_meta(field) {
       handle_field(&meta, value, &mut collected);
     } else if let Some(nested) = schema.nested_fields.iter().find(|n| n.name == *field) {
-      collect_nested(schema, nested, value, &nested.name, &mut collected);
+      collect_nested(schema, nested, value, &nested.name, &mut collected)?;
+    } else {
+      #[cfg(feature = "vectors")]
+      if schema.vector_fields.iter().any(|vf| vf.name == *field) {
+        continue;
+      }
+      bail!("unknown field {field}");
     }
   }
-  collected
+  Ok(collected)
 }
 
 pub struct SegmentWriter<'a> {
@@ -260,7 +269,7 @@ impl<'a> SegmentWriter<'a> {
     for (doc_id_u64, doc) in docs.iter().enumerate() {
       let doc_id = doc_id_u64 as DocId;
       self.schema.validate_document(doc)?;
-      let collected = collect_document(self.schema, doc);
+      let collected = collect_document(self.schema, doc)?;
 
       for (field, values) in collected.text.iter() {
         if let Some(meta) = resolved.get(field) {
@@ -598,6 +607,23 @@ mod tests {
     let stored_doc = reader.get_doc(0).unwrap();
     assert_eq!(stored_doc["tag"], "news");
     assert!(reader.avg_field_length("body") > 0.0);
+  }
+
+  #[test]
+  fn rejects_unknown_fields() {
+    let dir = tempdir().unwrap();
+    let schema = sample_schema();
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage);
+    let mut bad_doc = doc("Rust search engine", "news", 2024);
+    bad_doc
+      .fields
+      .insert("unexpected".into(), serde_json::json!("oops"));
+    let err = writer.write_segment(&[bad_doc], 1).unwrap_err();
+    assert!(
+      err.to_string().contains("unknown field unexpected"),
+      "unexpected error: {err}"
+    );
   }
 
   #[test]

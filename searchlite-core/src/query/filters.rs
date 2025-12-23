@@ -3,47 +3,46 @@ use crate::index::fastfields::FastFieldsReader;
 use crate::DocId;
 
 pub fn passes_filters(reader: &FastFieldsReader, doc_id: DocId, filters: &[Filter]) -> bool {
-  filters.iter().all(|f| filter_passes(reader, doc_id, f))
+  let mut path_buf = String::new();
+  filters
+    .iter()
+    .all(|f| filter_passes(reader, doc_id, f, &mut path_buf))
 }
 
-fn filter_passes(reader: &FastFieldsReader, doc_id: DocId, filter: &Filter) -> bool {
+fn filter_passes(
+  reader: &FastFieldsReader,
+  doc_id: DocId,
+  filter: &Filter,
+  path_buf: &mut String,
+) -> bool {
   match filter {
-    Filter::KeywordEq { field, value } => reader.matches_keyword(field, doc_id, value),
-    Filter::KeywordIn { field, values } => reader.matches_keyword_in(field, doc_id, values),
-    Filter::I64Range { field, min, max } => reader.matches_i64_range(field, doc_id, *min, *max),
-    Filter::F64Range { field, min, max } => reader.matches_f64_range(field, doc_id, *min, *max),
-    Filter::Nested { path, filter } => {
-      let prefixed = prefix_filter(path, filter);
-      filter_passes(reader, doc_id, &prefixed)
-    }
+    Filter::KeywordEq { field, value } => with_prefix(path_buf, field, |full| {
+      reader.matches_keyword(full, doc_id, value)
+    }),
+    Filter::KeywordIn { field, values } => with_prefix(path_buf, field, |full| {
+      reader.matches_keyword_in(full, doc_id, values)
+    }),
+    Filter::I64Range { field, min, max } => with_prefix(path_buf, field, |full| {
+      reader.matches_i64_range(full, doc_id, *min, *max)
+    }),
+    Filter::F64Range { field, min, max } => with_prefix(path_buf, field, |full| {
+      reader.matches_f64_range(full, doc_id, *min, *max)
+    }),
+    Filter::Nested { path, filter } => with_prefix(path_buf, path, |prefixed| {
+      filter_passes(reader, doc_id, filter, prefixed)
+    }),
   }
 }
 
-fn prefix_filter(prefix: &str, filter: &Filter) -> Filter {
-  match filter {
-    Filter::KeywordEq { field, value } => Filter::KeywordEq {
-      field: format!("{prefix}.{field}"),
-      value: value.clone(),
-    },
-    Filter::KeywordIn { field, values } => Filter::KeywordIn {
-      field: format!("{prefix}.{field}"),
-      values: values.clone(),
-    },
-    Filter::I64Range { field, min, max } => Filter::I64Range {
-      field: format!("{prefix}.{field}"),
-      min: *min,
-      max: *max,
-    },
-    Filter::F64Range { field, min, max } => Filter::F64Range {
-      field: format!("{prefix}.{field}"),
-      min: *min,
-      max: *max,
-    },
-    Filter::Nested { path, filter } => {
-      let nested_prefix = format!("{prefix}.{path}");
-      prefix_filter(&nested_prefix, filter)
-    }
+fn with_prefix<T>(prefix: &mut String, segment: &str, f: impl FnOnce(&mut String) -> T) -> T {
+  let original_len = prefix.len();
+  if !prefix.is_empty() {
+    prefix.push('.');
   }
+  prefix.push_str(segment);
+  let res = f(prefix);
+  prefix.truncate(original_len);
+  res
 }
 
 #[cfg(test)]

@@ -77,13 +77,7 @@ fn numeric_values(
   doc_id: DocId,
   missing: Option<f64>,
 ) -> Vec<f64> {
-  let mut values = fast_fields.f64_values(field, doc_id);
-  values.extend(
-    fast_fields
-      .i64_values(field, doc_id)
-      .into_iter()
-      .map(|v| v as f64),
-  );
+  let mut values = fast_fields.numeric_values(field, doc_id);
   if values.is_empty() {
     if let Some(m) = missing {
       values.push(m);
@@ -770,6 +764,8 @@ impl<'a> StatsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, _score: f32) {
+    // Aggregate over every value; multi-valued fields contribute each entry (bucket doc_count
+    // remains per-document).
     for val in numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing) {
       self.stats = merge_stats(
         self.stats,

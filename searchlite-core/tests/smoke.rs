@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, IndexOptions, NumericField, Schema, SearchRequest, StorageType,
+  TextField,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -17,6 +18,12 @@ fn index_and_search() {
     i64: true,
     fast: true,
     stored: true,
+  });
+  schema.text_fields.push(TextField {
+    name: "title".to_string(),
+    tokenizer: "default".to_string(),
+    stored: true,
+    indexed: true,
   });
   let opts = IndexOptions {
     path: path.clone(),
