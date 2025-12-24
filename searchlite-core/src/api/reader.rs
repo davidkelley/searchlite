@@ -2,7 +2,7 @@ use hashbrown::{HashMap, HashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::query::parse_query;
@@ -25,6 +25,8 @@ use crate::query::planner::{expand_not_terms, expand_terms};
 use crate::query::wand::{execute_top_k, ScoredTerm};
 use crate::DocId;
 
+const MAX_CURSOR_ADVANCE: usize = 50_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
   pub doc_id: DocId,
@@ -37,18 +39,142 @@ pub struct Hit {
 pub struct SearchResult {
   pub total_hits_estimate: u64,
   pub hits: Vec<Hit>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub next_cursor: Option<String>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggregations: BTreeMap<String, AggregationResponse>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortKey {
+  score_bits: u32,
+  segment_ord: u32,
+  doc_id: DocId,
+}
+
+impl SortKey {
+  fn new(score: f32, segment_ord: u32, doc_id: DocId) -> Self {
+    Self {
+      score_bits: score.to_bits(),
+      segment_ord,
+      doc_id,
+    }
+  }
+
+  fn ordering(&self, other: &Self) -> std::cmp::Ordering {
+    other
+      .score()
+      .total_cmp(&self.score())
+      .then_with(|| self.segment_ord.cmp(&other.segment_ord))
+      .then_with(|| self.doc_id.cmp(&other.doc_id))
+  }
+
+  fn score(&self) -> f32 {
+    f32::from_bits(self.score_bits)
+  }
+}
+
+impl Ord for SortKey {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    self.ordering(other)
+  }
+}
+
+impl PartialOrd for SortKey {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_BYTES: usize = 21;
+const CURSOR_HEX_LEN: usize = CURSOR_BYTES * 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaginationCursor {
+  version: u8,
+  generation: u32,
+  key: SortKey,
+  returned: u32,
+}
+
+impl PaginationCursor {
+  fn encode(&self) -> String {
+    let mut buf = [0u8; CURSOR_BYTES];
+    buf[0] = self.version;
+    buf[1..5].copy_from_slice(&self.generation.to_be_bytes());
+    buf[5..9].copy_from_slice(&self.key.score_bits.to_be_bytes());
+    buf[9..13].copy_from_slice(&self.key.segment_ord.to_be_bytes());
+    buf[13..17].copy_from_slice(&self.key.doc_id.to_be_bytes());
+    buf[17..].copy_from_slice(&self.returned.to_be_bytes());
+    let mut encoded = String::with_capacity(CURSOR_HEX_LEN);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in buf {
+      encoded.push(HEX[(byte >> 4) as usize] as char);
+      encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+  }
+
+  fn decode(raw: &str) -> Result<Self> {
+    if raw.len() != CURSOR_HEX_LEN {
+      bail!(
+        "invalid cursor length: expected {CURSOR_HEX_LEN} hex chars, got {}",
+        raw.len()
+      );
+    }
+    let mut bytes = [0u8; CURSOR_BYTES];
+    for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+      let hex = std::str::from_utf8(chunk).unwrap();
+      let value = u8::from_str_radix(hex, 16)
+        .with_context(|| format!("decoding cursor at byte index {i}"))?;
+      bytes[i] = value;
+    }
+    let version = bytes[0];
+    if version != CURSOR_VERSION {
+      bail!("unsupported cursor version {version}");
+    }
+    let generation = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+    let score_bits = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+    let segment_ord = u32::from_be_bytes(bytes[9..13].try_into().unwrap());
+    let doc_id = u32::from_be_bytes(bytes[13..17].try_into().unwrap());
+    let returned = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
+    if returned as usize > MAX_CURSOR_ADVANCE {
+      bail!(
+        "cursor requests {} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}",
+        returned
+      );
+    }
+    Ok(Self {
+      version,
+      generation,
+      key: SortKey {
+        score_bits,
+        segment_ord,
+        doc_id,
+      },
+      returned,
+    })
+  }
+}
+
+#[derive(Clone, Debug)]
+struct RankedHit {
+  key: SortKey,
+  score: f32,
 }
 
 struct SegmentSearchParams<'a> {
   qualified_terms: &'a [(String, String, String)],
   qualified_not_terms: &'a [String],
   phrase_fields: &'a [Vec<(String, Vec<String>)>],
-  highlight_terms: &'a [String],
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
   req: &'a SearchRequest,
+  segment_ord: u32,
+  limit: usize,
+  cursor_key: Option<SortKey>,
+  saw_cursor: &'a mut bool,
 }
 
 pub struct IndexReader {
@@ -85,6 +211,37 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
+    if req.limit == 0 && req.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0; set a positive limit to page results");
+    }
+    let manifest_generation = self
+      .manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
+    let cursor = req
+      .cursor
+      .as_deref()
+      .map(PaginationCursor::decode)
+      .transpose()?;
+    if let Some(cur) = &cursor {
+      if cur.generation != manifest_generation {
+        bail!(
+          "stale cursor for this index generation: expected {}, got {}",
+          manifest_generation,
+          cur.generation
+        );
+      }
+    }
+    let cursor_key = cursor.as_ref().map(|c| c.key);
+    let cursor_returned = cursor.as_ref().map(|c| c.returned as usize).unwrap_or(0);
+    let top_k = if req.limit == 0 {
+      0
+    } else {
+      req.limit.saturating_add(1)
+    };
     let parsed = parse_query(&req.query);
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
@@ -160,12 +317,13 @@ impl IndexReader {
       })
       .collect();
 
-    let mut hits: Vec<Hit> = Vec::new();
+    let mut hits: Vec<RankedHit> = Vec::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
+    let mut saw_cursor = cursor.is_none() || req.limit == 0;
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
     let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
-    for seg in self.segments.iter() {
+    for (segment_ord, seg) in self.segments.iter().enumerate() {
       let mut agg_collector = agg_pipeline
         .as_ref()
         .map(|p| p.for_segment(seg))
@@ -183,10 +341,13 @@ impl IndexReader {
           qualified_terms: &qualified_terms,
           qualified_not_terms: &qualified_not_terms,
           phrase_fields: &phrase_fields,
-          highlight_terms: &highlight_terms,
           agg_collector: agg_ref,
           match_counter: counter,
           req,
+          segment_ord: segment_ord as u32,
+          limit: top_k,
+          cursor_key,
+          saw_cursor: &mut saw_cursor,
         };
         self.search_segment(seg, params)?
       };
@@ -196,14 +357,32 @@ impl IndexReader {
       hits.append(&mut seg_hits);
     }
 
-    hits.sort_by(|a, b| {
-      b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
-    if hits.len() > req.limit {
+    if !saw_cursor {
+      bail!("stale or invalid cursor for this result set");
+    }
+    hits.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut next_cursor = None;
+    if req.limit > 0 && hits.len() > req.limit {
+      let last = &hits[req.limit - 1];
+      let returned = cursor_returned
+        .saturating_add(req.limit)
+        .try_into()
+        .unwrap_or(u32::MAX);
+      next_cursor = Some(
+        PaginationCursor {
+          version: CURSOR_VERSION,
+          generation: manifest_generation,
+          key: last.key,
+          returned,
+        }
+        .encode(),
+      );
       hits.truncate(req.limit);
     }
+    let hits: Vec<Hit> = hits
+      .into_iter()
+      .filter_map(|h| self.materialize_hit(h, req, &highlight_terms))
+      .collect();
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
     } else {
@@ -216,6 +395,7 @@ impl IndexReader {
         hits.len() as u64
       },
       hits,
+      next_cursor,
       aggregations,
     })
   }
@@ -224,15 +404,18 @@ impl IndexReader {
     &self,
     seg: &SegmentReader,
     params: SegmentSearchParams<'_>,
-  ) -> Result<Vec<Hit>> {
+  ) -> Result<Vec<RankedHit>> {
     let SegmentSearchParams {
       qualified_terms,
       qualified_not_terms,
       phrase_fields,
-      highlight_terms,
       agg_collector,
       match_counter,
       req,
+      segment_ord,
+      limit,
+      cursor_key,
+      saw_cursor,
     } = params;
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
@@ -288,7 +471,16 @@ impl IndexReader {
       .collect();
 
     let mut match_counter = match_counter;
-    let mut accept = |doc_id: DocId, _score: f32| -> bool {
+    let mut accept = |doc_id: DocId, score: f32| -> bool {
+      if let Some(cur) = cursor_key {
+        let key = SortKey::new(score, segment_ord, doc_id);
+        if key <= cur {
+          if key == cur {
+            *saw_cursor = true;
+          }
+          return false;
+        }
+      }
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
       }
@@ -320,44 +512,59 @@ impl IndexReader {
 
     let ranked = execute_top_k(
       terms,
-      req.limit,
+      limit,
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
       agg_collector,
     );
 
+    Ok(
+      ranked
+        .into_iter()
+        .map(|rd| RankedHit {
+          key: SortKey::new(rd.score, segment_ord, rd.doc_id),
+          score: rd.score,
+        })
+        .collect(),
+    )
+  }
+
+  fn materialize_hit(
+    &self,
+    ranked: RankedHit,
+    req: &SearchRequest,
+    highlight_terms: &[String],
+  ) -> Option<Hit> {
+    let seg = self.segments.get(ranked.key.segment_ord as usize)?;
     let need_doc = req.return_stored || req.highlight_field.is_some();
-    let mut hits = Vec::with_capacity(ranked.len());
-    for rd in ranked.into_iter() {
-      let mut doc_cache = None;
-      if need_doc {
-        doc_cache = seg.get_doc(rd.doc_id).ok();
-      }
-
-      let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
-        if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
-          make_snippet(text_val, highlight_terms)
-        } else {
-          None
-        }
-      } else {
-        None
-      };
-
-      let fields_val = if req.return_stored {
-        doc_cache.clone()
-      } else {
-        None
-      };
-      hits.push(Hit {
-        doc_id: rd.doc_id,
-        score: rd.score,
-        fields: fields_val,
-        snippet,
-      });
+    let mut doc_cache = None;
+    if need_doc {
+      doc_cache = seg.get_doc(ranked.key.doc_id).ok();
     }
-    Ok(hits)
+
+    let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
+      if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
+        make_snippet(text_val, highlight_terms)
+      } else {
+        None
+      }
+    } else {
+      None
+    };
+
+    let fields_val = if req.return_stored {
+      doc_cache.clone()
+    } else {
+      None
+    };
+
+    Some(Hit {
+      doc_id: ranked.key.doc_id,
+      score: ranked.score,
+      fields: fields_val,
+      snippet,
+    })
   }
 }
 
@@ -581,4 +788,53 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
     }
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+      out.push(HEX[(byte >> 4) as usize] as char);
+      out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+  }
+
+  #[test]
+  fn pagination_cursor_roundtrips() {
+    let cursor = PaginationCursor {
+      version: CURSOR_VERSION,
+      generation: 2,
+      key: SortKey::new(1.5, 2, 3),
+      returned: 42,
+    };
+    let encoded = cursor.encode();
+    let decoded = PaginationCursor::decode(&encoded).unwrap();
+    assert_eq!(decoded, cursor);
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_bad_length() {
+    assert!(PaginationCursor::decode("deadbeef").is_err());
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_non_hex() {
+    let invalid = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"; // 42 chars, not hex
+    assert!(PaginationCursor::decode(invalid).is_err());
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_excessive_advance() {
+    let mut buf = [0u8; CURSOR_BYTES];
+    buf[0] = CURSOR_VERSION;
+    let returned = (MAX_CURSOR_ADVANCE as u32).saturating_add(1);
+    buf[17..].copy_from_slice(&returned.to_be_bytes());
+    let encoded = hex_encode(&buf);
+    assert!(PaginationCursor::decode(&encoded).is_err());
+  }
 }

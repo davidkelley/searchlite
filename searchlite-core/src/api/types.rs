@@ -58,6 +58,8 @@ pub struct SearchRequest {
   pub filters: Vec<Filter>,
   pub limit: usize,
   #[serde(default)]
+  pub cursor: Option<String>,
+  #[serde(default)]
   pub execution: ExecutionStrategy,
   #[serde(default)]
   pub bmw_block_size: Option<usize>,

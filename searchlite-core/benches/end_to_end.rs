@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, IndexOptions, KeywordField, NestedField, NestedProperty,
@@ -84,6 +84,7 @@ fn bench_search(c: &mut Criterion) {
         fields: None,
         filters: vec![],
         limit: 5,
+        cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         #[cfg(feature = "vectors")]
@@ -183,6 +184,7 @@ fn bench_nested_filters(c: &mut Criterion) {
           },
         ],
         limit: 5,
+        cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         #[cfg(feature = "vectors")]
@@ -196,5 +198,77 @@ fn bench_nested_filters(c: &mut Criterion) {
   });
 }
 
-criterion_group!(benches, bench_indexing, bench_search, bench_nested_filters);
+fn bench_cursor_pagination(c: &mut Criterion) {
+  c.bench_function("search_cursor_pagination", |b| {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().to_path_buf();
+    let schema = Schema::default_text_body();
+    let opts = IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    };
+    let idx = IndexBuilder::create(&path, schema, opts).unwrap();
+    for batch in 0..5 {
+      let mut writer = idx.writer().unwrap();
+      for i in 0..500u32 {
+        let doc = Document {
+          fields: [
+            (
+              "body".to_string(),
+              serde_json::json!(format!("rust {}", i + batch * 500)),
+            ),
+            ("year".to_string(), serde_json::json!(2020 + (i % 5))),
+          ]
+          .into_iter()
+          .collect(),
+        };
+        writer.add_document(&doc).unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    b.iter(|| {
+      let reader = idx.reader().unwrap();
+      let mut cursor = None;
+      let mut total = 0usize;
+      loop {
+        let req = SearchRequest {
+          query: "rust".into(),
+          fields: None,
+          filters: vec![],
+          limit: 20,
+          cursor,
+          execution: ExecutionStrategy::Wand,
+          bmw_block_size: None,
+          #[cfg(feature = "vectors")]
+          vector_query: None,
+          return_stored: false,
+          highlight_field: None,
+          aggs: BTreeMap::new(),
+        };
+        let res = reader.search(&req).unwrap();
+        total += res.hits.len();
+        if let Some(next) = res.next_cursor {
+          cursor = Some(next);
+        } else {
+          break;
+        }
+      }
+      black_box(total);
+    });
+  });
+}
+
+criterion_group!(
+  benches,
+  bench_indexing,
+  bench_search,
+  bench_nested_filters,
+  bench_cursor_pagination
+);
 criterion_main!(benches);

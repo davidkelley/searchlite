@@ -58,6 +58,7 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       fields: None,
       filters: vec![],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Bm25,
       bmw_block_size: Some(4),
       #[cfg(feature = "vectors")]
@@ -99,6 +100,7 @@ fn empty_query_returns_no_hits() {
     fields: None,
     filters: vec![],
     limit: 5,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]

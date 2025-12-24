@@ -45,6 +45,8 @@ enum Commands {
     #[arg(long)]
     highlight: Option<String>,
     #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long)]
     request: Option<PathBuf>,
     #[arg(long, conflicts_with = "request")]
     request_stdin: bool,
@@ -86,6 +88,7 @@ fn main() -> Result<()> {
       fields,
       return_stored,
       highlight,
+      cursor,
       request,
       request_stdin,
       #[cfg(feature = "vectors")]
@@ -108,6 +111,7 @@ fn main() -> Result<()> {
           fields,
           return_stored,
           highlight,
+          cursor,
           #[cfg(feature = "vectors")]
           vector_field,
           #[cfg(feature = "vectors")]
@@ -146,6 +150,7 @@ struct SearchCliArgs {
   fields: Option<String>,
   return_stored: bool,
   highlight: Option<String>,
+  cursor: Option<String>,
   #[cfg(feature = "vectors")]
   vector_field: Option<String>,
   #[cfg(feature = "vectors")]
@@ -216,6 +221,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     fields,
     return_stored,
     highlight,
+    cursor,
     #[cfg(feature = "vectors")]
     vector_field,
     #[cfg(feature = "vectors")]
@@ -240,6 +246,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     vector_query: build_vector_query(vector_field, vector, alpha)?,
     return_stored,
     highlight_field: highlight,
+    cursor,
     aggs: load_aggs(aggs, aggs_file)?,
   })
 }
@@ -357,6 +364,7 @@ mod tests {
     let request = build_search_request_from_cli(SearchCliArgs {
       query: Some("rust".to_string()),
       limit: 5,
+      cursor: None,
       execution: "wand".to_string(),
       bmw_block_size: None,
       fields: None,
@@ -396,6 +404,7 @@ mod tests {
       fields: None,
       filters: vec![],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]

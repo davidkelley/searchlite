@@ -134,7 +134,7 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 - Value count semantics: `value_count` counts field values (each entry from multi-valued fields, plus one per `missing` fill), not documents-with-values; this mirrors Elasticsearch's `value_count`.
 - Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`.
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
-- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations`.
+- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
 
 Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
@@ -392,6 +392,7 @@ let results = reader.search(&SearchRequest {
     fields: None,
     filters: vec![Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }],
     limit: 5,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     return_stored: true,
@@ -416,6 +417,12 @@ for hit in results.hits {
     println!("doc {} score {:.3} fields {:?}", hit.doc_id, hit.score, hit.fields);
 }
 ```
+
+Search responses include a `next_cursor` when additional hits remain.
+- JSON/SDK: send that value in the `cursor` field to fetch the next page without computing offsets.
+- CLI: `cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 5 --cursor "$NEXT_CURSOR"`.
+- FFI: pass the cursor string to the `cursor` argument.
+- Cursors are opaque and bounded (up to ~50k returned hits) to avoid unbounded memory use; very deep pagination returns an error instead of over-consuming resources.
 
 `Index::open(opts)` opens an existing index; `Index::compact()` rewrites all segments into one. WAL-backed writers queue documents until `commit` is called; `rollback` drops uncommitted changes.
 

@@ -65,6 +65,7 @@ fn index_and_search() {
         max: 2024,
       }],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -75,6 +76,422 @@ fn index_and_search() {
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
+}
+
+#[test]
+fn cursor_paginates_ordered_hits() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 0..3 {
+      let repeats = 6 - i;
+      writer
+        .add_document(&Document {
+          fields: [(
+            "body".to_string(),
+            serde_json::json!("rust ".repeat(repeats)),
+          )]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 3..6 {
+      let repeats = 6 - i;
+      writer
+        .add_document(&Document {
+          fields: [(
+            "body".to_string(),
+            serde_json::json!("rust ".repeat(repeats)),
+          )]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 2,
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  let mut bodies = Vec::new();
+
+  let first = reader.search(&req).unwrap();
+  assert_eq!(first.hits.len(), 2);
+  assert!(first.next_cursor.is_some());
+  bodies.extend(extract_bodies(&first));
+
+  req.cursor = first.next_cursor.clone();
+  let second = reader.search(&req).unwrap();
+  assert_eq!(second.hits.len(), 2);
+  assert!(second.next_cursor.is_some());
+  bodies.extend(extract_bodies(&second));
+
+  req.cursor = second.next_cursor.clone();
+  let third = reader.search(&req).unwrap();
+  assert_eq!(third.hits.len(), 2);
+  assert!(third.next_cursor.is_none());
+  bodies.extend(extract_bodies(&third));
+
+  bodies.sort();
+  bodies.dedup();
+  assert_eq!(bodies.len(), 6);
+}
+
+#[test]
+fn cursor_rejects_invalid_hex() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("body".to_string(), serde_json::json!("rust"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 1,
+    cursor: Some("not-a-valid-cursor".to_string()),
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  assert!(reader.search(&req).is_err());
+}
+
+#[test]
+fn cursor_rejects_when_limit_zero() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("body".to_string(), serde_json::json!("rust"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let err = reader
+    .search(&SearchRequest {
+      query: "rust".to_string(),
+      fields: None,
+      filters: vec![],
+      limit: 0,
+      cursor: Some("00000000000000000000000000000000".to_string()),
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: false,
+      highlight_field: None,
+      aggs: BTreeMap::new(),
+    })
+    .unwrap_err();
+
+  assert!(err
+    .to_string()
+    .contains("cursor is not supported when limit is 0"));
+}
+
+#[test]
+fn cursor_rejects_excessive_advance() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("body".to_string(), serde_json::json!("rust"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let manifest_generation = idx
+    .manifest()
+    .segments
+    .iter()
+    .map(|s| s.generation)
+    .max()
+    .unwrap_or(0);
+  let req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 1,
+    cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  assert!(reader.search(&req).is_err());
+}
+
+#[test]
+fn cursor_rejects_mismatched_position() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for _ in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: [("body".to_string(), serde_json::json!("rust"))]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 2,
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  let first = reader.search(&req).unwrap();
+  assert!(first.next_cursor.is_some());
+
+  req.cursor = first.next_cursor.as_ref().map(|c| tamper_cursor(c));
+  assert!(reader.search(&req).is_err());
+}
+
+#[test]
+fn cursor_orders_stably_across_segments() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.keyword_fields.push(KeywordField {
+    name: "tag".to_string(),
+    stored: true,
+    indexed: true,
+    fast: false,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("body".to_string(), serde_json::json!("rust")),
+            ("tag".to_string(), serde_json::json!(format!("s0-{i}"))),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("body".to_string(), serde_json::json!("rust")),
+            ("tag".to_string(), serde_json::json!(format!("s1-{i}"))),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 2,
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: false,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  let mut doc_ids = Vec::new();
+  for _ in 0..4 {
+    let res = reader.search(&req).unwrap();
+    doc_ids.extend(res.hits.iter().map(|h| h.doc_id));
+    if res.next_cursor.is_none() {
+      break;
+    }
+    req.cursor = res.next_cursor.clone();
+  }
+
+  assert_eq!(doc_ids, vec![0, 1, 2, 0, 1, 2]);
+}
+
+fn extract_bodies(res: &searchlite_core::api::reader::SearchResult) -> Vec<String> {
+  res
+    .hits
+    .iter()
+    .filter_map(|hit| {
+      hit
+        .fields
+        .as_ref()
+        .and_then(|doc| doc.get("body"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+    })
+    .collect()
+}
+
+const TEST_CURSOR_VERSION: u8 = 1;
+const TEST_CURSOR_BYTES: usize = 21;
+
+fn encode_cursor_with_returned(returned: u32, generation: u32) -> String {
+  let mut buf = [0u8; TEST_CURSOR_BYTES];
+  buf[0] = TEST_CURSOR_VERSION;
+  buf[1..5].copy_from_slice(&generation.to_be_bytes());
+  buf[17..].copy_from_slice(&returned.to_be_bytes());
+  let mut encoded = String::with_capacity(TEST_CURSOR_BYTES * 2);
+  const HEX: &[u8; 16] = b"0123456789abcdef";
+  for byte in buf {
+    encoded.push(HEX[(byte >> 4) as usize] as char);
+    encoded.push(HEX[(byte & 0x0f) as usize] as char);
+  }
+  encoded
+}
+
+fn tamper_cursor(cursor: &str) -> String {
+  let mut chars: Vec<char> = cursor.chars().collect();
+  if let Some(first) = chars.first_mut() {
+    *first = if *first == 'a' { 'b' } else { 'a' };
+  }
+  chars.into_iter().collect()
 }
 
 #[test]
@@ -110,6 +527,7 @@ fn in_memory_storage_keeps_disk_clean() {
       fields: None,
       filters: vec![],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -232,6 +650,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       fields: None,
       filters,
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -387,6 +806,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       fields: None,
       filters,
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
