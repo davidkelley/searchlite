@@ -418,8 +418,11 @@ for hit in results.hits {
 }
 ```
 
-Search responses include a `next_cursor` when additional hits remain. Pass that value back via the `cursor` field (or the `--cursor`
-flag in the CLI / the `cursor` argument in the FFI) to request the next page without recomputing offsets.
+Search responses include a `next_cursor` when additional hits remain.
+- JSON/SDK: send that value in the `cursor` field to fetch the next page without computing offsets.
+- CLI: `cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 5 --cursor "$NEXT_CURSOR"`.
+- FFI: pass the cursor string to the `cursor` argument.
+- Cursors are opaque and bounded (up to ~50k returned hits) to avoid unbounded memory use; very deep pagination returns an error instead of over-consuming resources.
 
 `Index::open(opts)` opens an existing index; `Index::compact()` rewrites all segments into one. WAL-backed writers queue documents until `commit` is called; `rollback` drops uncommitted changes.
 
