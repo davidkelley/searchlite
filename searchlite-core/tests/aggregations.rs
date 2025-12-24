@@ -103,6 +103,7 @@ fn terms_and_stats_aggregations() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -175,6 +176,7 @@ fn aggregation_requires_fast_field() {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -251,6 +253,7 @@ fn histogram_bucket_generation() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -330,6 +333,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -423,6 +427,7 @@ fn range_aggregation_counts() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -518,6 +523,7 @@ fn date_range_missing_and_keyed() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -601,6 +607,7 @@ fn extended_stats_and_value_count_include_missing() {
       fields: None,
       filters: vec![],
       limit: 1, // ensure aggregations still see all docs
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -703,6 +710,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -803,6 +811,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -907,6 +916,7 @@ fn terms_size_applied_after_merge() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]

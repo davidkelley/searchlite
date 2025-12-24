@@ -382,6 +382,7 @@ let results = reader.search(&SearchRequest {
     fields: None,
     filters: vec![Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }],
     limit: 5,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     return_stored: true,
@@ -406,6 +407,9 @@ for hit in results.hits {
     println!("doc {} score {:.3} fields {:?}", hit.doc_id, hit.score, hit.fields);
 }
 ```
+
+Search responses include a `next_cursor` when additional hits remain. Pass that value back via the `cursor` field (or the `--cursor`
+flag in the CLI / the `cursor` argument in the FFI) to request the next page without recomputing offsets.
 
 `Index::open(opts)` opens an existing index; `Index::compact()` rewrites all segments into one. WAL-backed writers queue documents until `commit` is called; `rollback` drops uncommitted changes.
 

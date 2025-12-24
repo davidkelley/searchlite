@@ -2,7 +2,7 @@ use hashbrown::{HashMap, HashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::query::parse_query;
@@ -37,8 +37,108 @@ pub struct Hit {
 pub struct SearchResult {
   pub total_hits_estimate: u64,
   pub hits: Vec<Hit>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub next_cursor: Option<String>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggregations: BTreeMap<String, AggregationResponse>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortKey {
+  score_bits: u32,
+  segment_ord: u32,
+  doc_id: DocId,
+}
+
+impl SortKey {
+  fn new(score: f32, segment_ord: u32, doc_id: DocId) -> Self {
+    Self {
+      score_bits: score.to_bits(),
+      segment_ord,
+      doc_id,
+    }
+  }
+
+  fn ordering(&self, other: &Self) -> std::cmp::Ordering {
+    other
+      .score()
+      .total_cmp(&self.score())
+      .then_with(|| self.segment_ord.cmp(&other.segment_ord))
+      .then_with(|| self.doc_id.cmp(&other.doc_id))
+  }
+
+  fn score(&self) -> f32 {
+    f32::from_bits(self.score_bits)
+  }
+}
+
+impl Ord for SortKey {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    self.ordering(other)
+  }
+}
+
+impl PartialOrd for SortKey {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaginationCursor {
+  key: SortKey,
+  seen: u32,
+}
+
+impl PaginationCursor {
+  fn encode(&self) -> String {
+    let mut buf = [0u8; 16];
+    buf[..4].copy_from_slice(&self.key.score_bits.to_be_bytes());
+    buf[4..8].copy_from_slice(&self.key.segment_ord.to_be_bytes());
+    buf[8..12].copy_from_slice(&self.key.doc_id.to_be_bytes());
+    buf[12..].copy_from_slice(&self.seen.to_be_bytes());
+    let mut encoded = String::with_capacity(32);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in buf {
+      encoded.push(HEX[(byte >> 4) as usize] as char);
+      encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+  }
+
+  fn decode(raw: &str) -> Result<Self> {
+    if raw.len() != 32 {
+      bail!(
+        "invalid cursor length: expected 32 hex chars, got {}",
+        raw.len()
+      );
+    }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+      let hex = std::str::from_utf8(chunk).unwrap();
+      let value = u8::from_str_radix(hex, 16)
+        .with_context(|| format!("decoding cursor at byte index {i}"))?;
+      bytes[i] = value;
+    }
+    let score_bits = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let segment_ord = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+    let doc_id = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    let seen = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+    Ok(Self {
+      key: SortKey {
+        score_bits,
+        segment_ord,
+        doc_id,
+      },
+      seen,
+    })
+  }
+}
+
+#[derive(Clone, Debug)]
+struct RankedHit {
+  hit: Hit,
+  key: SortKey,
 }
 
 struct SegmentSearchParams<'a> {
@@ -49,6 +149,8 @@ struct SegmentSearchParams<'a> {
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
   req: &'a SearchRequest,
+  segment_ord: u32,
+  limit: usize,
 }
 
 pub struct IndexReader {
@@ -85,6 +187,17 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
+    let cursor = req
+      .cursor
+      .as_deref()
+      .map(PaginationCursor::decode)
+      .transpose()?;
+    let cursor_seen = cursor.map(|c| c.seen as usize).unwrap_or(0);
+    let top_k = if req.limit == 0 {
+      0
+    } else {
+      req.limit.saturating_add(cursor_seen).saturating_add(1)
+    };
     let parsed = parse_query(&req.query);
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
@@ -160,12 +273,12 @@ impl IndexReader {
       })
       .collect();
 
-    let mut hits: Vec<Hit> = Vec::new();
+    let mut hits: Vec<RankedHit> = Vec::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
     let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
-    for seg in self.segments.iter() {
+    for (segment_ord, seg) in self.segments.iter().enumerate() {
       let mut agg_collector = agg_pipeline
         .as_ref()
         .map(|p| p.for_segment(seg))
@@ -187,6 +300,8 @@ impl IndexReader {
           agg_collector: agg_ref,
           match_counter: counter,
           req,
+          segment_ord: segment_ord as u32,
+          limit: top_k,
         };
         self.search_segment(seg, params)?
       };
@@ -196,14 +311,33 @@ impl IndexReader {
       hits.append(&mut seg_hits);
     }
 
-    hits.sort_by(|a, b| {
-      b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
-    if hits.len() > req.limit {
+    hits.sort_by(|a, b| a.key.cmp(&b.key));
+    if let Some(cur) = cursor {
+      let skip = cur.seen.min(hits.len() as u32) as usize;
+      if skip > 0 {
+        hits.drain(0..skip);
+      }
+      while hits.first().map(|h| h.key <= cur.key).unwrap_or(false) {
+        hits.remove(0);
+      }
+    }
+    let mut next_cursor = None;
+    if req.limit > 0 && hits.len() > req.limit {
+      let last = &hits[req.limit - 1];
+      let seen = cursor_seen
+        .saturating_add(req.limit)
+        .try_into()
+        .unwrap_or(u32::MAX);
+      next_cursor = Some(
+        PaginationCursor {
+          key: last.key,
+          seen,
+        }
+        .encode(),
+      );
       hits.truncate(req.limit);
     }
+    let hits: Vec<Hit> = hits.into_iter().map(|h| h.hit).collect();
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
     } else {
@@ -216,6 +350,7 @@ impl IndexReader {
         hits.len() as u64
       },
       hits,
+      next_cursor,
       aggregations,
     })
   }
@@ -224,7 +359,7 @@ impl IndexReader {
     &self,
     seg: &SegmentReader,
     params: SegmentSearchParams<'_>,
-  ) -> Result<Vec<Hit>> {
+  ) -> Result<Vec<RankedHit>> {
     let SegmentSearchParams {
       qualified_terms,
       qualified_not_terms,
@@ -233,6 +368,8 @@ impl IndexReader {
       agg_collector,
       match_counter,
       req,
+      segment_ord,
+      limit,
     } = params;
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
@@ -320,7 +457,7 @@ impl IndexReader {
 
     let ranked = execute_top_k(
       terms,
-      req.limit,
+      limit,
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
@@ -350,11 +487,14 @@ impl IndexReader {
       } else {
         None
       };
-      hits.push(Hit {
-        doc_id: rd.doc_id,
-        score: rd.score,
-        fields: fields_val,
-        snippet,
+      hits.push(RankedHit {
+        hit: Hit {
+          doc_id: rd.doc_id,
+          score: rd.score,
+          fields: fields_val,
+          snippet,
+        },
+        key: SortKey::new(rd.score, segment_ord, rd.doc_id),
       });
     }
     Ok(hits)

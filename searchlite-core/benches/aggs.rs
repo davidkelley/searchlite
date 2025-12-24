@@ -93,6 +93,7 @@ fn bench_terms_aggregation(c: &mut Criterion) {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -136,6 +137,7 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]

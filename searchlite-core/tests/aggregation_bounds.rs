@@ -76,6 +76,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -136,6 +137,7 @@ fn histogram_requires_positive_interval() {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -218,6 +220,7 @@ fn nested_terms_stats_aggregation() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -290,6 +293,7 @@ fn date_histogram_rejects_invalid_config() {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -330,6 +334,7 @@ fn date_histogram_rejects_invalid_config() {
     fields: None,
     filters: vec![],
     limit: 0,
+    cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -393,6 +398,7 @@ fn top_hits_returns_requested_docs() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -481,6 +487,7 @@ fn date_histogram_calendar_month_interval() {
       fields: None,
       filters: vec![],
       limit: 0,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]

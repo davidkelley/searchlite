@@ -84,6 +84,7 @@ fn bench_search(c: &mut Criterion) {
         fields: None,
         filters: vec![],
         limit: 5,
+        cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         #[cfg(feature = "vectors")]
@@ -183,6 +184,7 @@ fn bench_nested_filters(c: &mut Criterion) {
           },
         ],
         limit: 5,
+        cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         #[cfg(feature = "vectors")]

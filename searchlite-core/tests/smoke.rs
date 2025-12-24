@@ -65,6 +65,7 @@ fn index_and_search() {
         max: 2024,
       }],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -75,6 +76,111 @@ fn index_and_search() {
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
+}
+
+#[test]
+fn cursor_paginates_ordered_hits() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 0..3 {
+      let repeats = 6 - i;
+      writer
+        .add_document(&Document {
+          fields: [(
+            "body".to_string(),
+            serde_json::json!("rust ".repeat(repeats)),
+          )]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().unwrap();
+    for i in 3..6 {
+      let repeats = 6 - i;
+      writer
+        .add_document(&Document {
+          fields: [(
+            "body".to_string(),
+            serde_json::json!("rust ".repeat(repeats)),
+          )]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut req = SearchRequest {
+    query: "rust".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 2,
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+
+  let mut bodies = Vec::new();
+
+  let first = reader.search(&req).unwrap();
+  assert_eq!(first.hits.len(), 2);
+  assert!(first.next_cursor.is_some());
+  bodies.extend(extract_bodies(&first));
+
+  req.cursor = first.next_cursor.clone();
+  let second = reader.search(&req).unwrap();
+  assert_eq!(second.hits.len(), 2);
+  assert!(second.next_cursor.is_some());
+  bodies.extend(extract_bodies(&second));
+
+  req.cursor = second.next_cursor.clone();
+  let third = reader.search(&req).unwrap();
+  assert_eq!(third.hits.len(), 2);
+  assert!(third.next_cursor.is_none());
+  bodies.extend(extract_bodies(&third));
+
+  bodies.sort();
+  bodies.dedup();
+  assert_eq!(bodies.len(), 6);
+}
+
+fn extract_bodies(res: &searchlite_core::api::reader::SearchResult) -> Vec<String> {
+  res
+    .hits
+    .iter()
+    .filter_map(|hit| {
+      hit
+        .fields
+        .as_ref()
+        .and_then(|doc| doc.get("body"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+    })
+    .collect()
 }
 
 #[test]
@@ -110,6 +216,7 @@ fn in_memory_storage_keeps_disk_clean() {
       fields: None,
       filters: vec![],
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -232,6 +339,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       fields: None,
       filters,
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]
@@ -387,6 +495,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       fields: None,
       filters,
       limit: 5,
+      cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       #[cfg(feature = "vectors")]

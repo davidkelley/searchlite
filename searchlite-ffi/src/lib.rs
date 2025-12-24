@@ -107,12 +107,15 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
 }
 
 /// # Safety
-/// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `aggs_json`, when provided, must point to `aggs_len` bytes of JSON; `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
+/// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `cursor`, when provided,
+/// must be a valid C string produced by a previous response; `aggs_json`, when provided, must point to `aggs_len` bytes of JSON;
+/// `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_search(
   handle: *mut IndexHandle,
   query: *const c_char,
   limit: usize,
+  cursor: *const c_char,
   aggs_json: *const c_char,
   aggs_len: usize,
   out_json_buf: *mut c_char,
@@ -126,6 +129,11 @@ pub unsafe extern "C" fn searchlite_search(
   let reader = match h.index.reader() {
     Ok(r) => r,
     Err(_) => return 0,
+  };
+  let cursor = if cursor.is_null() {
+    None
+  } else {
+    Some(CStr::from_ptr(cursor).to_string_lossy().to_string())
   };
   let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
     let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
@@ -149,6 +157,7 @@ pub unsafe extern "C" fn searchlite_search(
     bmw_block_size: None,
     return_stored: true,
     highlight_field: None,
+    cursor,
     aggs: aggs_map,
     #[cfg(feature = "vectors")]
     vector_query: None,
@@ -194,6 +203,7 @@ mod tests {
         query.as_ptr(),
         5,
         std::ptr::null(),
+        std::ptr::null(),
         0,
         buf.as_mut_ptr(),
         buf.len(),
@@ -223,6 +233,7 @@ mod tests {
         handle,
         query.as_ptr(),
         5,
+        std::ptr::null(),
         bad_aggs.as_ptr(),
         bad_aggs.as_bytes().len(),
         buf.as_mut_ptr(),

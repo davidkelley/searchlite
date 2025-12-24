@@ -394,9 +394,9 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         if let Some(collector) = collector.as_deref_mut() {
           collector.collect(doc_id, score);
         }
-      }
-      if score > threshold && accepted && rank_hits {
-        push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+        if rank_hits && (heap.len() < k || score > threshold) {
+          push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+        }
       }
       requeue_terms(&mut order, &terms, &mut mutated);
     } else {
