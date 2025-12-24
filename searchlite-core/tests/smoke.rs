@@ -215,6 +215,56 @@ fn cursor_rejects_invalid_hex() {
 }
 
 #[test]
+fn cursor_rejects_when_limit_zero() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("body".to_string(), serde_json::json!("rust"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let err = reader
+    .search(&SearchRequest {
+      query: "rust".to_string(),
+      fields: None,
+      filters: vec![],
+      limit: 0,
+      cursor: Some("00000000000000000000000000000000".to_string()),
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: false,
+      highlight_field: None,
+      aggs: BTreeMap::new(),
+    })
+    .unwrap_err();
+
+  assert!(err
+    .to_string()
+    .contains("cursor is not supported when limit is 0"));
+}
+
+#[test]
 fn cursor_rejects_excessive_advance() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
@@ -242,12 +292,19 @@ fn cursor_rejects_excessive_advance() {
   }
 
   let reader = idx.reader().unwrap();
+  let manifest_generation = idx
+    .manifest()
+    .segments
+    .iter()
+    .map(|s| s.generation)
+    .max()
+    .unwrap_or(0);
   let req = SearchRequest {
     query: "rust".to_string(),
     fields: None,
     filters: vec![],
     limit: 1,
-    cursor: Some(encode_cursor_with_returned(60_000)),
+    cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     #[cfg(feature = "vectors")]
@@ -412,10 +469,15 @@ fn extract_bodies(res: &searchlite_core::api::reader::SearchResult) -> Vec<Strin
     .collect()
 }
 
-fn encode_cursor_with_returned(returned: u32) -> String {
-  let mut buf = [0u8; 16];
-  buf[12..].copy_from_slice(&returned.to_be_bytes());
-  let mut encoded = String::with_capacity(32);
+const TEST_CURSOR_VERSION: u8 = 1;
+const TEST_CURSOR_BYTES: usize = 21;
+
+fn encode_cursor_with_returned(returned: u32, generation: u32) -> String {
+  let mut buf = [0u8; TEST_CURSOR_BYTES];
+  buf[0] = TEST_CURSOR_VERSION;
+  buf[1..5].copy_from_slice(&generation.to_be_bytes());
+  buf[17..].copy_from_slice(&returned.to_be_bytes());
+  let mut encoded = String::with_capacity(TEST_CURSOR_BYTES * 2);
   const HEX: &[u8; 16] = b"0123456789abcdef";
   for byte in buf {
     encoded.push(HEX[(byte >> 4) as usize] as char);

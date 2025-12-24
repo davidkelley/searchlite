@@ -86,20 +86,28 @@ impl PartialOrd for SortKey {
   }
 }
 
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_BYTES: usize = 21;
+const CURSOR_HEX_LEN: usize = CURSOR_BYTES * 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaginationCursor {
+  version: u8,
+  generation: u32,
   key: SortKey,
   returned: u32,
 }
 
 impl PaginationCursor {
   fn encode(&self) -> String {
-    let mut buf = [0u8; 16];
-    buf[..4].copy_from_slice(&self.key.score_bits.to_be_bytes());
-    buf[4..8].copy_from_slice(&self.key.segment_ord.to_be_bytes());
-    buf[8..12].copy_from_slice(&self.key.doc_id.to_be_bytes());
-    buf[12..].copy_from_slice(&self.returned.to_be_bytes());
-    let mut encoded = String::with_capacity(32);
+    let mut buf = [0u8; CURSOR_BYTES];
+    buf[0] = self.version;
+    buf[1..5].copy_from_slice(&self.generation.to_be_bytes());
+    buf[5..9].copy_from_slice(&self.key.score_bits.to_be_bytes());
+    buf[9..13].copy_from_slice(&self.key.segment_ord.to_be_bytes());
+    buf[13..17].copy_from_slice(&self.key.doc_id.to_be_bytes());
+    buf[17..].copy_from_slice(&self.returned.to_be_bytes());
+    let mut encoded = String::with_capacity(CURSOR_HEX_LEN);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in buf {
       encoded.push(HEX[(byte >> 4) as usize] as char);
@@ -109,23 +117,28 @@ impl PaginationCursor {
   }
 
   fn decode(raw: &str) -> Result<Self> {
-    if raw.len() != 32 {
+    if raw.len() != CURSOR_HEX_LEN {
       bail!(
-        "invalid cursor length: expected 32 hex chars, got {}",
+        "invalid cursor length: expected {CURSOR_HEX_LEN} hex chars, got {}",
         raw.len()
       );
     }
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; CURSOR_BYTES];
     for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
       let hex = std::str::from_utf8(chunk).unwrap();
       let value = u8::from_str_radix(hex, 16)
         .with_context(|| format!("decoding cursor at byte index {i}"))?;
       bytes[i] = value;
     }
-    let score_bits = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-    let segment_ord = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
-    let doc_id = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-    let returned = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+    let version = bytes[0];
+    if version != CURSOR_VERSION {
+      bail!("unsupported cursor version {version}");
+    }
+    let generation = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+    let score_bits = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+    let segment_ord = u32::from_be_bytes(bytes[9..13].try_into().unwrap());
+    let doc_id = u32::from_be_bytes(bytes[13..17].try_into().unwrap());
+    let returned = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
     if returned as usize > MAX_CURSOR_ADVANCE {
       bail!(
         "cursor requests {} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}",
@@ -133,6 +146,8 @@ impl PaginationCursor {
       );
     }
     Ok(Self {
+      version,
+      generation,
       key: SortKey {
         score_bits,
         segment_ord,
@@ -196,11 +211,30 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
+    if req.limit == 0 && req.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0; set a positive limit to page results");
+    }
+    let manifest_generation = self
+      .manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
     let cursor = req
       .cursor
       .as_deref()
       .map(PaginationCursor::decode)
       .transpose()?;
+    if let Some(cur) = &cursor {
+      if cur.generation != manifest_generation {
+        bail!(
+          "stale cursor for this index generation: expected {}, got {}",
+          manifest_generation,
+          cur.generation
+        );
+      }
+    }
     let cursor_key = cursor.as_ref().map(|c| c.key);
     let cursor_returned = cursor.as_ref().map(|c| c.returned as usize).unwrap_or(0);
     let top_k = if req.limit == 0 {
@@ -336,6 +370,8 @@ impl IndexReader {
         .unwrap_or(u32::MAX);
       next_cursor = Some(
         PaginationCursor {
+          version: CURSOR_VERSION,
+          generation: manifest_generation,
           key: last.key,
           returned,
         }
@@ -771,6 +807,8 @@ mod tests {
   #[test]
   fn pagination_cursor_roundtrips() {
     let cursor = PaginationCursor {
+      version: CURSOR_VERSION,
+      generation: 2,
       key: SortKey::new(1.5, 2, 3),
       returned: 42,
     };
@@ -786,15 +824,16 @@ mod tests {
 
   #[test]
   fn pagination_cursor_rejects_non_hex() {
-    let invalid = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"; // 32 chars, not hex
+    let invalid = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"; // 42 chars, not hex
     assert!(PaginationCursor::decode(invalid).is_err());
   }
 
   #[test]
   fn pagination_cursor_rejects_excessive_advance() {
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; CURSOR_BYTES];
+    buf[0] = CURSOR_VERSION;
     let returned = (MAX_CURSOR_ADVANCE as u32).saturating_add(1);
-    buf[12..].copy_from_slice(&returned.to_be_bytes());
+    buf[17..].copy_from_slice(&returned.to_be_bytes());
     let encoded = hex_encode(&buf);
     assert!(PaginationCursor::decode(&encoded).is_err());
   }
