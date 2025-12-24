@@ -60,6 +60,16 @@ Set an index location once:
 INDEX=/tmp/searchlite_idx
 ```
 
+## CLI commands
+Use `cargo run -p searchlite-cli -- <command> ...` to invoke the CLI. Each command maps to a lifecycle step:
+
+- `init <index> <schema>`: creates a new index directory and writes the schema manifest so the index is ready to accept documents.
+- `add <index> <doc.jsonl>`: ingests newline-delimited JSON documents into the writer buffer; changes are not visible to readers until you run `commit`.
+- `commit <index>`: flushes buffered documents, writes new segment files, and updates the manifest so searches can see the newly added data.
+- `search <index> [options]`: executes a query, returning JSON hits (and optional aggregations) using either CLI flags or a full request payload.
+- `inspect <index>`: prints the current manifest and segment metadata to help debug index contents and state.
+- `compact <index>`: merges segments to reduce fragmentation and improve search performance.
+
 - Create an index from a schema:
 ```bash
 cargo run -p searchlite-cli -- init "$INDEX" schema.json
