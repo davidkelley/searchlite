@@ -1,14 +1,15 @@
 use hashbrown::{HashMap, HashSet};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
 
 use crate::api::query::parse_query;
 use crate::api::types::{
   Aggregation, AggregationResponse, DateHistogramAggregation, HistogramAggregation, IndexOptions,
-  SearchRequest,
+  SearchRequest, SortOrder,
 };
 use crate::api::AggregationError;
 use crate::index::highlight::make_snippet;
@@ -22,7 +23,8 @@ use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
-use crate::query::wand::{execute_top_k, ScoredTerm};
+use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
+use crate::query::wand::{execute_top_k_with_mode, ScoreMode, ScoredTerm};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
@@ -45,52 +47,23 @@ pub struct SearchResult {
   pub aggregations: BTreeMap<String, AggregationResponse>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SortKey {
-  score_bits: u32,
-  segment_ord: u32,
-  doc_id: DocId,
-}
-
-impl SortKey {
-  fn new(score: f32, segment_ord: u32, doc_id: DocId) -> Self {
-    Self {
-      score_bits: score.to_bits(),
-      segment_ord,
-      doc_id,
-    }
-  }
-
-  fn ordering(&self, other: &Self) -> std::cmp::Ordering {
-    other
-      .score()
-      .total_cmp(&self.score())
-      .then_with(|| self.segment_ord.cmp(&other.segment_ord))
-      .then_with(|| self.doc_id.cmp(&other.doc_id))
-  }
-
-  fn score(&self) -> f32 {
-    f32::from_bits(self.score_bits)
-  }
-}
-
-impl Ord for SortKey {
-  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-    self.ordering(other)
-  }
-}
-
-impl PartialOrd for SortKey {
-  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-    Some(self.cmp(other))
+fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder) -> SortKey {
+  SortKey {
+    parts: smallvec![SortKeyPart {
+      order,
+      value: SortValue::Score(score),
+    }],
+    segment_ord,
+    doc_id,
   }
 }
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 21;
 const CURSOR_HEX_LEN: usize = CURSOR_BYTES * 2;
+const SORT_CURSOR_VERSION: u8 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PaginationCursor {
   version: u8,
   generation: u32,
@@ -100,10 +73,14 @@ struct PaginationCursor {
 
 impl PaginationCursor {
   fn encode(&self) -> String {
+    let score_bits = self
+      .key
+      .score_bits()
+      .expect("score cursor missing score value");
     let mut buf = [0u8; CURSOR_BYTES];
     buf[0] = self.version;
     buf[1..5].copy_from_slice(&self.generation.to_be_bytes());
-    buf[5..9].copy_from_slice(&self.key.score_bits.to_be_bytes());
+    buf[5..9].copy_from_slice(&score_bits.to_be_bytes());
     buf[9..13].copy_from_slice(&self.key.segment_ord.to_be_bytes());
     buf[13..17].copy_from_slice(&self.key.doc_id.to_be_bytes());
     buf[17..].copy_from_slice(&self.returned.to_be_bytes());
@@ -148,20 +125,220 @@ impl PaginationCursor {
     Ok(Self {
       version,
       generation,
-      key: SortKey {
-        score_bits,
+      key: score_sort_key(
+        f32::from_bits(score_bits),
         segment_ord,
         doc_id,
-      },
+        SortOrder::Desc,
+      ),
       returned,
     })
   }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SortCursorState {
+  version: u8,
+  generation: u32,
+  returned: u32,
+  plan_hash: u32,
+  segment_ord: u32,
+  doc_id: DocId,
+  values: Vec<CursorValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v", rename_all = "lowercase")]
+enum CursorValue {
+  Score(u32),
+  I64(i64),
+  F64(f64),
+  Str(String),
+  Missing,
+}
+
+impl From<SortValue> for CursorValue {
+  fn from(value: SortValue) -> Self {
+    match value {
+      SortValue::Score(score) => CursorValue::Score(score.to_bits()),
+      SortValue::I64(v) => CursorValue::I64(v),
+      SortValue::F64(v) => CursorValue::F64(v),
+      SortValue::Str(v) => CursorValue::Str(v),
+      SortValue::Missing => CursorValue::Missing,
+    }
+  }
+}
+
+impl From<CursorValue> for SortValue {
+  fn from(value: CursorValue) -> Self {
+    match value {
+      CursorValue::Score(bits) => SortValue::Score(f32::from_bits(bits)),
+      CursorValue::I64(v) => SortValue::I64(v),
+      CursorValue::F64(v) => SortValue::F64(v),
+      CursorValue::Str(v) => SortValue::Str(v),
+      CursorValue::Missing => SortValue::Missing,
+    }
+  }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+  const HEX: &[u8; 16] = b"0123456789abcdef";
+  let mut out = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
+  }
+  out
+}
+
+fn hex_decode(raw: &str) -> Result<Vec<u8>> {
+  if raw.len() & 1 != 0 {
+    bail!("invalid cursor: expected even-length hex string");
+  }
+  let mut bytes = Vec::with_capacity(raw.len() / 2);
+  for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+    let hex = std::str::from_utf8(chunk).unwrap();
+    let value =
+      u8::from_str_radix(hex, 16).with_context(|| format!("decoding cursor at byte index {i}"))?;
+    bytes.push(value);
+  }
+  Ok(bytes)
 }
 
 #[derive(Clone, Debug)]
 struct RankedHit {
   key: SortKey,
   score: f32,
+}
+
+impl PartialEq for RankedHit {
+  fn eq(&self, other: &Self) -> bool {
+    self.key == other.key && self.score.to_bits() == other.score.to_bits()
+  }
+}
+
+impl Eq for RankedHit {}
+
+impl PartialOrd for RankedHit {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for RankedHit {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    self.key.cmp(&other.key)
+  }
+}
+
+#[derive(Default)]
+struct NoopCollector;
+
+impl DocCollector for NoopCollector {
+  fn collect(&mut self, _doc_id: DocId, _score: f32) {}
+}
+
+fn push_ranked(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) {
+  if limit == 0 {
+    return;
+  }
+  if heap.len() < limit {
+    heap.push(hit);
+    return;
+  }
+  if let Some(worst) = heap.peek() {
+    if hit < *worst {
+      heap.pop();
+      heap.push(hit);
+    }
+  }
+}
+
+struct CursorState {
+  key: SortKey,
+  returned: u32,
+}
+
+fn decode_cursor(
+  raw: &str,
+  manifest_generation: u32,
+  sort_plan: &SortPlan,
+  score_fast_path: bool,
+) -> Result<CursorState> {
+  if score_fast_path {
+    let cur = PaginationCursor::decode(raw)?;
+    if cur.generation != manifest_generation {
+      bail!(
+        "stale cursor for this index generation: expected {}, got {}",
+        manifest_generation,
+        cur.generation
+      );
+    }
+    return Ok(CursorState {
+      key: cur.key,
+      returned: cur.returned,
+    });
+  }
+  let bytes = hex_decode(raw)?;
+  let state: SortCursorState =
+    serde_json::from_slice(&bytes).context("parsing sort cursor payload")?;
+  if state.version != SORT_CURSOR_VERSION {
+    bail!("unsupported sort cursor version {}", state.version);
+  }
+  if state.generation != manifest_generation {
+    bail!(
+      "stale cursor for this index generation: expected {}, got {}",
+      manifest_generation,
+      state.generation
+    );
+  }
+  if state.plan_hash != sort_plan.hash() {
+    bail!("cursor sort order does not match this request");
+  }
+  if state.returned as usize > MAX_CURSOR_ADVANCE {
+    bail!(
+      "cursor requests {} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}",
+      state.returned
+    );
+  }
+  let values: Vec<SortValue> = state.values.into_iter().map(SortValue::from).collect();
+  let key = sort_plan.key_from_values(&values, state.segment_ord, state.doc_id)?;
+  Ok(CursorState {
+    key,
+    returned: state.returned,
+  })
+}
+
+fn encode_cursor(
+  manifest_generation: u32,
+  returned: u32,
+  key: &SortKey,
+  sort_plan: &SortPlan,
+  score_fast_path: bool,
+) -> Result<String> {
+  if score_fast_path {
+    return Ok(
+      PaginationCursor {
+        version: CURSOR_VERSION,
+        generation: manifest_generation,
+        key: key.clone(),
+        returned,
+      }
+      .encode(),
+    );
+  }
+  let values = sort_plan.values_from_key(key)?;
+  let state = SortCursorState {
+    version: SORT_CURSOR_VERSION,
+    generation: manifest_generation,
+    returned,
+    plan_hash: sort_plan.hash(),
+    segment_ord: key.segment_ord,
+    doc_id: key.doc_id,
+    values: values.into_iter().map(CursorValue::from).collect(),
+  };
+  let data = serde_json::to_vec(&state)?;
+  Ok(hex_encode(&data))
 }
 
 struct SegmentSearchParams<'a> {
@@ -172,9 +349,11 @@ struct SegmentSearchParams<'a> {
   match_counter: Option<&'a mut u64>,
   req: &'a SearchRequest,
   segment_ord: u32,
-  limit: usize,
+  rank_limit: usize,
   cursor_key: Option<SortKey>,
   saw_cursor: &'a mut bool,
+  sort_plan: &'a SortPlan,
+  collect_hits: Option<&'a mut dyn FnMut(SortKey, f32)>,
 }
 
 pub struct IndexReader {
@@ -214,6 +393,9 @@ impl IndexReader {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0; set a positive limit to page results");
     }
+    let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
+    let score_fast_path =
+      sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
     let manifest_generation = self
       .manifest
       .segments
@@ -221,22 +403,23 @@ impl IndexReader {
       .map(|s| s.generation)
       .max()
       .unwrap_or(0);
-    let cursor = req
-      .cursor
-      .as_deref()
-      .map(PaginationCursor::decode)
-      .transpose()?;
-    if let Some(cur) = &cursor {
-      if cur.generation != manifest_generation {
-        bail!(
-          "stale cursor for this index generation: expected {}, got {}",
-          manifest_generation,
-          cur.generation
-        );
-      }
-    }
-    let cursor_key = cursor.as_ref().map(|c| c.key);
-    let cursor_returned = cursor.as_ref().map(|c| c.returned as usize).unwrap_or(0);
+    let cursor_state = if req.limit == 0 {
+      None
+    } else if let Some(raw) = req.cursor.as_deref() {
+      Some(decode_cursor(
+        raw,
+        manifest_generation,
+        &sort_plan,
+        score_fast_path,
+      )?)
+    } else {
+      None
+    };
+    let cursor_key = cursor_state.as_ref().map(|c| c.key.clone());
+    let cursor_returned = cursor_state
+      .as_ref()
+      .map(|c| c.returned as usize)
+      .unwrap_or(0);
     let top_k = if req.limit == 0 {
       0
     } else {
@@ -318,20 +501,34 @@ impl IndexReader {
       .collect();
 
     let mut hits: Vec<RankedHit> = Vec::new();
+    let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
-    let mut saw_cursor = cursor.is_none() || req.limit == 0;
+    let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
-    let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
+    let agg_pipeline =
+      AggregationPipeline::from_request(&req.aggs, &highlight_terms, &self.manifest.schema);
     for (segment_ord, seg) in self.segments.iter().enumerate() {
       let mut agg_collector = agg_pipeline
         .as_ref()
-        .map(|p| p.for_segment(seg))
+        .map(|p| p.for_segment(seg, segment_ord as u32))
         .transpose()?;
+      let mut noop_collector = NoopCollector;
+      let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
+      if !score_fast_path && req.limit > 0 {
+        let heap_limit = top_k;
+        let heap_ref = &mut heap;
+        collect_hits = Some(Box::new(move |key: SortKey, score: f32| {
+          push_ranked(heap_ref, RankedHit { key, score }, heap_limit);
+        }));
+      }
       let mut seg_hits = {
-        let agg_ref = agg_collector
+        let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
+        if !score_fast_path && agg_ref.is_none() && req.limit > 0 {
+          agg_ref = Some(&mut noop_collector);
+        }
         let counter = if req.limit == 0 && agg_ref.is_some() {
           Some(&mut total_matches)
         } else {
@@ -345,9 +542,13 @@ impl IndexReader {
           match_counter: counter,
           req,
           segment_ord: segment_ord as u32,
-          limit: top_k,
-          cursor_key,
+          rank_limit: if score_fast_path { top_k } else { 0 },
+          cursor_key: cursor_key.clone(),
           saw_cursor: &mut saw_cursor,
+          sort_plan: &sort_plan,
+          collect_hits: collect_hits
+            .as_mut()
+            .map(|f| f as &mut dyn FnMut(SortKey, f32)),
         };
         self.search_segment(seg, params)?
       };
@@ -360,6 +561,10 @@ impl IndexReader {
     if !saw_cursor {
       bail!("stale or invalid cursor for this result set");
     }
+
+    if !score_fast_path {
+      hits.extend(heap);
+    }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
     let mut next_cursor = None;
     if req.limit > 0 && hits.len() > req.limit {
@@ -368,15 +573,13 @@ impl IndexReader {
         .saturating_add(req.limit)
         .try_into()
         .unwrap_or(u32::MAX);
-      next_cursor = Some(
-        PaginationCursor {
-          version: CURSOR_VERSION,
-          generation: manifest_generation,
-          key: last.key,
-          returned,
-        }
-        .encode(),
-      );
+      next_cursor = Some(encode_cursor(
+        manifest_generation,
+        returned,
+        &last.key,
+        &sort_plan,
+        score_fast_path,
+      )?);
       hits.truncate(req.limit);
     }
     let hits: Vec<Hit> = hits
@@ -413,10 +616,17 @@ impl IndexReader {
       match_counter,
       req,
       segment_ord,
-      limit,
+      rank_limit,
       cursor_key,
       saw_cursor,
+      sort_plan,
+      collect_hits,
     } = params;
+    let score_mode = if sort_plan.uses_score() {
+      ScoreMode::Score
+    } else {
+      ScoreMode::MatchOnly
+    };
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
       let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
@@ -471,16 +681,8 @@ impl IndexReader {
       .collect();
 
     let mut match_counter = match_counter;
+    let mut collect_hits = collect_hits;
     let mut accept = |doc_id: DocId, score: f32| -> bool {
-      if let Some(cur) = cursor_key {
-        let key = SortKey::new(score, segment_ord, doc_id);
-        if key <= cur {
-          if key == cur {
-            *saw_cursor = true;
-          }
-          return false;
-        }
-      }
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
       }
@@ -504,26 +706,40 @@ impl IndexReader {
           return false;
         }
       }
+      let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
+      if let Some(cur) = &cursor_key {
+        let ord = key.cmp(cur);
+        if ord.is_lt() || ord.is_eq() {
+          if ord.is_eq() {
+            *saw_cursor = true;
+          }
+          return false;
+        }
+      }
       if let Some(counter) = match_counter.as_mut() {
         **counter += 1;
+      }
+      if let Some(collector) = collect_hits.as_mut() {
+        (*collector)(key, score);
       }
       true
     };
 
-    let ranked = execute_top_k(
+    let ranked = execute_top_k_with_mode(
       terms,
-      limit,
+      rank_limit,
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
       agg_collector,
+      score_mode,
     );
 
     Ok(
       ranked
         .into_iter()
         .map(|rd| RankedHit {
-          key: SortKey::new(rd.score, segment_ord, rd.doc_id),
+          key: sort_plan.build_key(seg, rd.doc_id, rd.score, segment_ord),
           score: rd.score,
         })
         .collect(),
@@ -596,7 +812,10 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
         ensure_numeric_fast(schema, &m.field, name)?
       }
-      Aggregation::TopHits(_) => {}
+      Aggregation::TopHits(t) => {
+        SortPlan::from_request(schema, &t.sort)
+          .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
+      }
     }
   }
   Ok(())
@@ -794,22 +1013,12 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
 mod tests {
   use super::*;
 
-  fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-      out.push(HEX[(byte >> 4) as usize] as char);
-      out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-  }
-
   #[test]
   fn pagination_cursor_roundtrips() {
     let cursor = PaginationCursor {
       version: CURSOR_VERSION,
       generation: 2,
-      key: SortKey::new(1.5, 2, 3),
+      key: score_sort_key(1.5, 2, 3, SortOrder::Desc),
       returned: 42,
     };
     let encoded = cursor.encode();

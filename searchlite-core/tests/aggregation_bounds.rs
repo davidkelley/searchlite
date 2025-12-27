@@ -5,7 +5,8 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, DateHistogramAggregation, DateHistogramBounds, Document, ExecutionStrategy,
   HistogramAggregation, HistogramBounds, IndexOptions, KeywordField, MetricAggregation,
-  NumericField, Schema, SearchRequest, StorageType, TermsAggregation, TopHitsAggregation,
+  NumericField, Schema, SearchRequest, SortOrder, SortSpec, StorageType, TermsAggregation,
+  TopHitsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -76,6 +77,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       fields: None,
       filters: vec![],
       limit: 0,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
@@ -137,6 +139,7 @@ fn histogram_requires_positive_interval() {
     fields: None,
     filters: vec![],
     limit: 0,
+    sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
@@ -220,6 +223,7 @@ fn nested_terms_stats_aggregation() {
       fields: None,
       filters: vec![],
       limit: 0,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
@@ -293,6 +297,7 @@ fn date_histogram_rejects_invalid_config() {
     fields: None,
     filters: vec![],
     limit: 0,
+    sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
@@ -334,6 +339,7 @@ fn date_histogram_rejects_invalid_config() {
     fields: None,
     filters: vec![],
     limit: 0,
+    sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
@@ -385,7 +391,7 @@ fn top_hits_returns_requested_docs() {
       size: 2,
       from: 0,
       fields: Some(vec!["tag".into()]),
-      sort: None,
+      sort: Vec::new(),
       highlight_field: Some("body".into()),
     }),
   );
@@ -398,6 +404,7 @@ fn top_hits_returns_requested_docs() {
       fields: None,
       filters: vec![],
       limit: 0,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
@@ -421,6 +428,103 @@ fn top_hits_returns_requested_docs() {
       .iter()
       .all(|h| h.fields.as_ref().unwrap().get("tag").is_some()));
     assert!(top_hits.hits.iter().all(|h| h.snippet.is_some()));
+  } else {
+    panic!("expected top hits response");
+  }
+}
+
+#[test]
+fn top_hits_applies_sort_spec() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "priority".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for priority in [2, 5] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("body".into(), json!("rust systems")),
+            ("priority".into(), json!(priority)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("body".into(), json!("rust systems")),
+          ("priority".into(), json!(1)),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hits".into(),
+    Aggregation::TopHits(TopHitsAggregation {
+      size: 3,
+      from: 0,
+      fields: Some(vec!["priority".into()]),
+      sort: vec![SortSpec {
+        field: "priority".into(),
+        order: Some(SortOrder::Asc),
+      }],
+      highlight_field: None,
+    }),
+  );
+
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filters: vec![],
+      limit: 0,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: false,
+      highlight_field: None,
+      aggs,
+    })
+    .unwrap();
+
+  let agg = resp.aggregations.get("hits").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::TopHits(top_hits) = agg {
+    assert_eq!(top_hits.total, 3);
+    let priorities: Vec<_> = top_hits
+      .hits
+      .iter()
+      .map(|h| {
+        h.fields
+          .as_ref()
+          .and_then(|f| f.get("priority"))
+          .and_then(|v| v.as_i64())
+          .unwrap()
+      })
+      .collect();
+    assert_eq!(priorities, vec![1, 2, 5]);
+    assert!(top_hits.hits.iter().all(|h| h.score.is_some()));
   } else {
     panic!("expected top hits response");
   }
@@ -487,6 +591,7 @@ fn date_histogram_calendar_month_interval() {
       fields: None,
       filters: vec![],
       limit: 0,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,

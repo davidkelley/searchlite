@@ -45,6 +45,18 @@ pub struct QueryStats {
   pub postings_advanced: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreMode {
+  Score,
+  MatchOnly,
+}
+
+impl ScoreMode {
+  fn needs_scores(self) -> bool {
+    matches!(self, ScoreMode::Score)
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScoredTerm {
   pub postings: PostingsReader,
@@ -257,7 +269,29 @@ pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   accept: &mut F,
   collector: Option<&mut C>,
 ) -> Vec<RankedDoc> {
-  execute_top_k_with_stats(terms, k, strategy, block_size, accept, collector, None)
+  execute_top_k_with_mode(
+    terms,
+    k,
+    strategy,
+    block_size,
+    accept,
+    collector,
+    ScoreMode::Score,
+  )
+}
+
+pub fn execute_top_k_with_mode<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
+  terms: Vec<ScoredTerm>,
+  k: usize,
+  strategy: ExecutionStrategy,
+  block_size: Option<usize>,
+  accept: &mut F,
+  collector: Option<&mut C>,
+  score_mode: ScoreMode,
+) -> Vec<RankedDoc> {
+  execute_top_k_with_stats_and_mode(
+    terms, k, strategy, block_size, accept, collector, None, score_mode,
+  )
 }
 
 pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
@@ -269,9 +303,41 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + 
   collector: Option<&mut C>,
   stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
+  execute_top_k_with_stats_and_mode(
+    terms,
+    k,
+    strategy,
+    block_size,
+    accept,
+    collector,
+    stats,
+    ScoreMode::Score,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_top_k_with_stats_and_mode<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
+  terms: Vec<ScoredTerm>,
+  k: usize,
+  strategy: ExecutionStrategy,
+  block_size: Option<usize>,
+  accept: &mut F,
+  collector: Option<&mut C>,
+  stats: Option<&mut QueryStats>,
+  score_mode: ScoreMode,
+) -> Vec<RankedDoc> {
   let should_rank = k > 0;
   if terms.is_empty() || (!should_rank && collector.is_none()) {
     return Vec::new();
+  }
+  if !score_mode.needs_scores() {
+    let bsize = block_size.unwrap_or(DEFAULT_BLOCK_SIZE).max(1);
+    let states: Vec<TermState> = terms
+      .into_iter()
+      .filter(|t| t.postings.len() > 0)
+      .map(|t| TermState::new(t, bsize))
+      .collect();
+    return match_only_loop(states, accept, collector, stats);
   }
   if matches!(strategy, ExecutionStrategy::Bm25) {
     return brute_force(&terms, k, should_rank, accept, collector, stats);
@@ -337,6 +403,42 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     }
   }
   finalize_heap(heap)
+}
+
+fn match_only_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
+  mut terms: Vec<TermState>,
+  accept: &mut F,
+  mut collector: Option<&mut C>,
+  mut stats: Option<&mut QueryStats>,
+) -> Vec<RankedDoc> {
+  let mut order: Vec<usize> = (0..terms.len()).collect();
+  order.sort_by_key(|&idx| terms[idx].doc_id());
+  while !order.is_empty() {
+    let doc = terms[order[0]].doc_id();
+    if doc == DOCID_END {
+      break;
+    }
+    let mut mutated: Vec<usize> = Vec::new();
+    let mut idx = 0usize;
+    while idx < order.len() && terms[order[idx]].doc_id() == doc {
+      let term_idx = order[idx];
+      let moved = terms[term_idx].advance();
+      with_stats(&mut stats, |s| s.postings_advanced += moved);
+      mutated.push(term_idx);
+      idx += 1;
+    }
+    with_stats(&mut stats, |s| {
+      s.candidates_examined += 1;
+      s.scored_docs += 1;
+    });
+    if accept(doc, 0.0) {
+      if let Some(col) = collector.as_deref_mut() {
+        col.collect(doc, 0.0);
+      }
+    }
+    requeue_terms(&mut order, &terms, &mut mutated);
+  }
+  Vec::new()
 }
 
 fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(

@@ -12,8 +12,10 @@ use crate::api::types::{
 };
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
+use crate::index::manifest::Schema;
 use crate::index::segment::SegmentReader;
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
+use crate::query::sort::{SortKey, SortPlan};
 use crate::DocId;
 
 #[derive(Clone)]
@@ -21,6 +23,8 @@ pub struct AggregationContext<'a> {
   pub fast_fields: &'a FastFieldsReader,
   pub segment: &'a SegmentReader,
   pub highlight_terms: &'a [String],
+  pub schema: &'a Schema,
+  pub segment_ord: u32,
 }
 
 #[derive(Clone)]
@@ -91,7 +95,33 @@ pub struct TopHitsState {
   pub size: usize,
   pub from: usize,
   pub total: u64,
-  pub hits: Vec<TopHit>,
+  pub(crate) hits: Vec<RankedTopHit>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RankedTopHit {
+  key: SortKey,
+  hit: TopHit,
+}
+
+impl PartialEq for RankedTopHit {
+  fn eq(&self, other: &Self) -> bool {
+    self.key == other.key
+  }
+}
+
+impl Eq for RankedTopHit {}
+
+impl PartialOrd for RankedTopHit {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for RankedTopHit {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self.key.cmp(&other.key)
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -815,32 +845,30 @@ impl<'a> ValueCountCollector<'a> {
   }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ScoredHit {
-  doc_id: DocId,
+#[derive(Clone, Debug)]
+struct RankedDoc {
+  key: SortKey,
   score: f32,
+  doc_id: DocId,
 }
 
-impl Eq for ScoredHit {}
-
-impl PartialEq for ScoredHit {
+impl PartialEq for RankedDoc {
   fn eq(&self, other: &Self) -> bool {
-    self.doc_id == other.doc_id && self.score.to_bits() == other.score.to_bits()
+    self.key == other.key
   }
 }
 
-impl Ord for ScoredHit {
-  fn cmp(&self, other: &Self) -> Ordering {
-    self
-      .score
-      .total_cmp(&other.score)
-      .then_with(|| self.doc_id.cmp(&other.doc_id))
-  }
-}
+impl Eq for RankedDoc {}
 
-impl PartialOrd for ScoredHit {
+impl PartialOrd for RankedDoc {
   fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
     Some(self.cmp(other))
+  }
+}
+
+impl Ord for RankedDoc {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self.key.cmp(&other.key)
   }
 }
 
@@ -848,16 +876,20 @@ pub(crate) struct TopHitsCollector<'a> {
   size: usize,
   from: usize,
   limit: usize,
-  heap: BinaryHeap<std::cmp::Reverse<ScoredHit>>,
+  heap: BinaryHeap<RankedDoc>,
   total: u64,
   fields: Option<Vec<String>>,
   highlight_field: Option<String>,
   highlight_terms: &'a [String],
+  plan: SortPlan,
+  segment_ord: u32,
   ctx: AggregationContext<'a>,
 }
 
 impl<'a> TopHitsCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &TopHitsAggregation) -> Self {
+    let plan = SortPlan::from_request(ctx.schema, &agg.sort)
+      .expect("top_hits sort validated during request planning");
     Self {
       size: agg.size,
       from: agg.from,
@@ -867,33 +899,39 @@ impl<'a> TopHitsCollector<'a> {
       fields: agg.fields.clone(),
       highlight_field: agg.highlight_field.clone(),
       highlight_terms: ctx.highlight_terms,
+      plan,
+      segment_ord: ctx.segment_ord,
       ctx,
     }
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
     self.total += 1;
-    self
-      .heap
-      .push(std::cmp::Reverse(ScoredHit { doc_id, score }));
-    if self.heap.len() > self.limit {
-      self.heap.pop();
+    let key = self
+      .plan
+      .build_key(self.ctx.segment, doc_id, score, self.segment_ord);
+    let ranked = RankedDoc { key, score, doc_id };
+    if self.heap.len() < self.limit {
+      self.heap.push(ranked);
+      return;
+    }
+    if let Some(worst) = self.heap.peek() {
+      if ranked < *worst {
+        self.heap.pop();
+        self.heap.push(ranked);
+      }
     }
   }
 
   fn finish(mut self) -> TopHitsState {
-    let mut scored: Vec<ScoredHit> = self.heap.drain().map(|r| r.0).collect();
-    scored.sort_by(|a, b| {
-      b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
-    let start = self.from.min(scored.len());
-    let end = (start + self.size).min(scored.len());
+    let mut ranked: Vec<RankedDoc> = self.heap.drain().collect();
+    ranked.sort_by(|a, b| a.key.cmp(&b.key));
+    let start = self.from.min(ranked.len());
+    let end = (start + self.size).min(ranked.len());
     let mut hits = Vec::with_capacity(end.saturating_sub(start));
-    for h in scored.into_iter().skip(start).take(self.size) {
-      let doc = self.ctx.segment.get_doc(h.doc_id).ok();
-      let fields_val = doc.as_ref().and_then(|d| {
+    for doc in ranked.into_iter().skip(start).take(self.size) {
+      let fetched = self.ctx.segment.get_doc(doc.doc_id).ok();
+      let fields_val = fetched.as_ref().and_then(|d| {
         if let Some(sel) = &self.fields {
           let obj = d.as_object()?;
           let mut out = serde_json::Map::new();
@@ -907,7 +945,8 @@ impl<'a> TopHitsCollector<'a> {
           Some(d.clone())
         }
       });
-      let snippet = if let (Some(field), Some(doc_val)) = (&self.highlight_field, doc.as_ref()) {
+      let snippet = if let (Some(field), Some(doc_val)) = (&self.highlight_field, fetched.as_ref())
+      {
         if let Some(text) = doc_val.get(field).and_then(|v| v.as_str()) {
           make_snippet(text, self.highlight_terms)
         } else {
@@ -916,11 +955,14 @@ impl<'a> TopHitsCollector<'a> {
       } else {
         None
       };
-      hits.push(TopHit {
-        doc_id: h.doc_id,
-        score: Some(h.score),
-        fields: fields_val,
-        snippet,
+      hits.push(RankedTopHit {
+        key: doc.key,
+        hit: TopHit {
+          doc_id: doc.doc_id,
+          score: Some(doc.score),
+          fields: fields_val,
+          snippet,
+        },
       });
     }
     TopHitsState {
@@ -1125,44 +1167,20 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
     .max(target.size)
     .max(1);
   target.total += incoming.total;
-  #[derive(Clone, Debug)]
-  struct Ranked {
-    score: f32,
-    hit: TopHit,
-    doc_id: crate::DocId,
-  }
-  impl PartialEq for Ranked {
-    fn eq(&self, other: &Self) -> bool {
-      self.score.to_bits() == other.score.to_bits() && self.doc_id == other.doc_id
-    }
-  }
-  impl Eq for Ranked {}
-  impl PartialOrd for Ranked {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-      Some(self.cmp(other))
-    }
-  }
-  impl Ord for Ranked {
-    fn cmp(&self, other: &Self) -> Ordering {
-      self
-        .score
-        .total_cmp(&other.score)
-        .then_with(|| other.doc_id.cmp(&self.doc_id))
-    }
-  }
   let total_hits = target.hits.len().saturating_add(incoming.hits.len());
   let min_capacity = target.size.max(1);
   let cap = limit.min(total_hits.max(min_capacity)).saturating_add(1);
-  let mut heap: BinaryHeap<std::cmp::Reverse<Ranked>> = BinaryHeap::with_capacity(cap);
-  let mut push_hit = |hit: TopHit| {
-    let ranked = Ranked {
-      score: hit.score.unwrap_or(0.0),
-      doc_id: hit.doc_id,
-      hit,
-    };
-    heap.push(std::cmp::Reverse(ranked));
-    if heap.len() > limit {
-      heap.pop();
+  let mut heap: BinaryHeap<RankedTopHit> = BinaryHeap::with_capacity(cap);
+  let mut push_hit = |hit: RankedTopHit| {
+    if heap.len() < limit {
+      heap.push(hit);
+      return;
+    }
+    if let Some(worst) = heap.peek() {
+      if hit < *worst {
+        heap.pop();
+        heap.push(hit);
+      }
     }
   };
   for hit in target.hits.drain(..) {
@@ -1171,19 +1189,10 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
   for hit in incoming.hits {
     push_hit(hit);
   }
-  let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
-  hits.sort_by(|a, b| {
-    b.score
-      .total_cmp(&a.score)
-      .then_with(|| a.doc_id.cmp(&b.doc_id))
-  });
+  let mut hits: Vec<_> = heap.into_iter().collect();
+  hits.sort_by(|a, b| a.key.cmp(&b.key));
   let start = target.from.min(hits.len());
-  target.hits = hits
-    .into_iter()
-    .skip(start)
-    .take(target.size)
-    .map(|r| r.hit)
-    .collect();
+  target.hits = hits.into_iter().skip(start).take(target.size).collect();
 }
 
 fn bucket_key_string(key: &serde_json::Value) -> String {
@@ -1271,7 +1280,7 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
     }
     AggregationIntermediate::TopHits(state) => AggregationResponse::TopHits(TopHitsResponse {
       total: state.total,
-      hits: state.hits,
+      hits: state.hits.into_iter().map(|h| h.hit).collect(),
     }),
   }
 }

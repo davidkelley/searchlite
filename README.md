@@ -128,6 +128,12 @@ cargo run -p searchlite-cli -- search \
 
 If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"}}'`.
 
+### Sorting
+- Provide a `sort` array in the search request (or via `--sort "field:order,other_field:asc"` in the CLI). Each entry looks like `{"field":"year","order":"desc"}`; `_score` is also allowed.
+- Sort targets must be fast keyword or numeric fields; the default order is ascending (descending for `_score`).
+- Multi-valued fields use the minimum value for ascending sorts and the maximum for descending sorts; documents missing the field are placed last.
+- Ordering is stable and tiebroken by segment/doc id so cursor pagination works reliably.
+
 ### Aggregations quick reference
 - Field requirements: `terms` needs a fast keyword field; `range`, `histogram`, `stats`, `date_histogram` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `top_hits` has no field requirement but returns stored fields/snippets when enabled.
 - Stats semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value).
@@ -149,6 +155,9 @@ cat > /tmp/search_request.json <<'EOF'
     { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
   ],
   "limit": 5,
+  "sort": [
+    { "field": "year", "order": "desc" }
+  ],
   "execution": "wand",
   "bmw_block_size": null,
   "return_stored": true,
@@ -342,7 +351,7 @@ use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
     types::{
         Aggregation, Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
-        SearchRequest, StorageType,
+        SearchRequest, SortOrder, SortSpec, StorageType,
     },
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -392,6 +401,7 @@ let results = reader.search(&SearchRequest {
     fields: None,
     filters: vec![Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }],
     limit: 5,
+    sort: vec![SortSpec { field: "year".into(), order: Some(SortOrder::Desc) }],
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
