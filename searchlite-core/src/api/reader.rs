@@ -191,7 +191,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(raw: &str) -> Result<Vec<u8>> {
-  if raw.len() % 2 != 0 {
+  if raw.len() & 1 != 0 {
     bail!("invalid cursor: expected even-length hex string");
   }
   let mut bytes = Vec::with_capacity(raw.len() / 2);
