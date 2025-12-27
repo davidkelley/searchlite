@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use crc32fast::Hasher;
+use smallvec::SmallVec;
 
 use crate::api::types::{SortOrder, SortSpec};
 use crate::index::manifest::{FieldKind, Schema};
@@ -53,7 +54,7 @@ pub struct SortKeyPart {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SortKey {
-  pub parts: Vec<SortKeyPart>,
+  pub parts: SmallVec<[SortKeyPart; 4]>,
   pub segment_ord: u32,
   pub doc_id: DocId,
 }
@@ -228,6 +229,13 @@ impl SortPlan {
     self.fields.first().map(|f| f.order)
   }
 
+  pub fn uses_score(&self) -> bool {
+    self
+      .fields
+      .iter()
+      .any(|f| matches!(f.field, SortField::Score))
+  }
+
   pub fn build_key(
     &self,
     segment: &SegmentReader,
@@ -235,7 +243,7 @@ impl SortPlan {
     score: f32,
     segment_ord: u32,
   ) -> SortKey {
-    let mut parts = Vec::with_capacity(self.fields.len());
+    let mut parts: SmallVec<[SortKeyPart; 4]> = SmallVec::with_capacity(self.fields.len());
     for field in self.fields.iter() {
       let value = field.value(segment, doc_id, score);
       parts.push(SortKeyPart {
@@ -274,7 +282,7 @@ impl SortPlan {
         self.fields.len()
       );
     }
-    let mut parts = Vec::with_capacity(values.len());
+    let mut parts: SmallVec<[SortKeyPart; 4]> = SmallVec::with_capacity(values.len());
     for (field, value) in self.fields.iter().zip(values.iter()) {
       parts.push(SortKeyPart {
         order: field.order,
@@ -395,11 +403,12 @@ fn default_order_for_field(field: &str) -> SortOrder {
 mod tests {
   use super::*;
   use crate::index::manifest::{KeywordField, NumericField, Schema, TextField};
+  use smallvec::smallvec;
 
   #[test]
   fn sort_key_orders_with_direction() {
     let key_asc = SortKey {
-      parts: vec![SortKeyPart {
+      parts: smallvec![SortKeyPart {
         order: SortOrder::Asc,
         value: SortValue::I64(1),
       }],
@@ -409,7 +418,7 @@ mod tests {
     let mut key_desc = key_asc.clone();
     key_desc.parts[0].order = SortOrder::Desc;
     let higher_asc = SortKey {
-      parts: vec![SortKeyPart {
+      parts: smallvec![SortKeyPart {
         order: SortOrder::Asc,
         value: SortValue::I64(2),
       }],
@@ -417,7 +426,7 @@ mod tests {
       doc_id: 1,
     };
     let higher_desc = SortKey {
-      parts: vec![SortKeyPart {
+      parts: smallvec![SortKeyPart {
         order: SortOrder::Desc,
         value: SortValue::I64(2),
       }],

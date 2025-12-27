@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
 
 use crate::api::query::parse_query;
 use crate::api::types::{
@@ -23,7 +24,7 @@ use crate::query::filters::passes_filters;
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{expand_not_terms, expand_terms};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
-use crate::query::wand::{execute_top_k, ScoredTerm};
+use crate::query::wand::{execute_top_k_with_mode, ScoreMode, ScoredTerm};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
@@ -48,7 +49,7 @@ pub struct SearchResult {
 
 fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder) -> SortKey {
   SortKey {
-    parts: vec![SortKeyPart {
+    parts: smallvec![SortKeyPart {
       order,
       value: SortValue::Score(score),
     }],
@@ -620,6 +621,11 @@ impl IndexReader {
       sort_plan,
       collect_hits,
     } = params;
+    let score_mode = if sort_plan.uses_score() {
+      ScoreMode::Score
+    } else {
+      ScoreMode::MatchOnly
+    };
     let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
     for (field, _, key) in qualified_terms.iter() {
       let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
@@ -676,16 +682,6 @@ impl IndexReader {
     let mut match_counter = match_counter;
     let mut collect_hits = collect_hits;
     let mut accept = |doc_id: DocId, score: f32| -> bool {
-      let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
-      if let Some(cur) = &cursor_key {
-        let ord = key.cmp(cur);
-        if ord.is_lt() || ord.is_eq() {
-          if ord.is_eq() {
-            *saw_cursor = true;
-          }
-          return false;
-        }
-      }
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
       }
@@ -709,6 +705,16 @@ impl IndexReader {
           return false;
         }
       }
+      let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
+      if let Some(cur) = &cursor_key {
+        let ord = key.cmp(cur);
+        if ord.is_lt() || ord.is_eq() {
+          if ord.is_eq() {
+            *saw_cursor = true;
+          }
+          return false;
+        }
+      }
       if let Some(counter) = match_counter.as_mut() {
         **counter += 1;
       }
@@ -718,13 +724,14 @@ impl IndexReader {
       true
     };
 
-    let ranked = execute_top_k(
+    let ranked = execute_top_k_with_mode(
       terms,
       rank_limit,
       req.execution.clone(),
       req.bmw_block_size,
       &mut accept,
       agg_collector,
+      score_mode,
     );
 
     Ok(
