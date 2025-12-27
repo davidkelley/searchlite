@@ -506,11 +506,12 @@ impl IndexReader {
     let mut total_matches: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
-    let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &highlight_terms);
+    let agg_pipeline =
+      AggregationPipeline::from_request(&req.aggs, &highlight_terms, &self.manifest.schema);
     for (segment_ord, seg) in self.segments.iter().enumerate() {
       let mut agg_collector = agg_pipeline
         .as_ref()
-        .map(|p| p.for_segment(seg))
+        .map(|p| p.for_segment(seg, segment_ord as u32))
         .transpose()?;
       let mut noop_collector = NoopCollector;
       let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
@@ -811,7 +812,10 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
         ensure_numeric_fast(schema, &m.field, name)?
       }
-      Aggregation::TopHits(_) => {}
+      Aggregation::TopHits(t) => {
+        SortPlan::from_request(schema, &t.sort)
+          .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
+      }
     }
   }
   Ok(())

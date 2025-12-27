@@ -303,15 +303,13 @@ impl ResolvedSortField {
       SortField::Score => SortValue::Score(score),
       SortField::Keyword(field) => {
         let values = segment.fast_fields().str_values(field, doc_id);
-        if values.is_empty() {
-          SortValue::Missing
-        } else {
-          let selected = match self.selector {
-            ValueSelector::Min => values.iter().min().copied().unwrap_or_default(),
-            ValueSelector::Max => values.iter().max().copied().unwrap_or_default(),
-          };
-          SortValue::Str(selected.to_string())
-        }
+        let selected = match self.selector {
+          ValueSelector::Min => values.iter().min().copied(),
+          ValueSelector::Max => values.iter().max().copied(),
+        };
+        selected
+          .map(|value| SortValue::Str(value.to_owned()))
+          .unwrap_or(SortValue::Missing)
       }
       SortField::I64(field) => {
         let values = segment.fast_fields().i64_values(field, doc_id);
