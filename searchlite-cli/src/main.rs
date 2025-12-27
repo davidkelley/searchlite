@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, SortOrder, SortSpec,
+  StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -46,6 +47,8 @@ enum Commands {
     highlight: Option<String>,
     #[arg(long)]
     cursor: Option<String>,
+    #[arg(long)]
+    sort: Option<String>,
     #[arg(long)]
     request: Option<PathBuf>,
     #[arg(long, conflicts_with = "request")]
@@ -89,6 +92,7 @@ fn main() -> Result<()> {
       return_stored,
       highlight,
       cursor,
+      sort,
       request,
       request_stdin,
       #[cfg(feature = "vectors")]
@@ -112,6 +116,7 @@ fn main() -> Result<()> {
           return_stored,
           highlight,
           cursor,
+          sort,
           #[cfg(feature = "vectors")]
           vector_field,
           #[cfg(feature = "vectors")]
@@ -151,6 +156,7 @@ struct SearchCliArgs {
   return_stored: bool,
   highlight: Option<String>,
   cursor: Option<String>,
+  sort: Option<String>,
   #[cfg(feature = "vectors")]
   vector_field: Option<String>,
   #[cfg(feature = "vectors")]
@@ -222,6 +228,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     return_stored,
     highlight,
     cursor,
+    sort,
     #[cfg(feature = "vectors")]
     vector_field,
     #[cfg(feature = "vectors")]
@@ -240,6 +247,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
     filters: Vec::new(),
     limit,
+    sort: parse_sort(sort)?,
     execution: parse_execution(&execution),
     bmw_block_size,
     #[cfg(feature = "vectors")]
@@ -298,6 +306,31 @@ fn parse_execution(value: &str) -> ExecutionStrategy {
     "bmw" => ExecutionStrategy::Bmw,
     _ => ExecutionStrategy::Wand,
   }
+}
+
+fn parse_sort(value: Option<String>) -> Result<Vec<SortSpec>> {
+  let mut out = Vec::new();
+  if let Some(raw) = value {
+    for clause in raw.split(',') {
+      let trimmed = clause.trim();
+      if trimmed.is_empty() {
+        continue;
+      }
+      let mut parts = trimmed.splitn(2, ':');
+      let field = parts.next().unwrap().to_string();
+      let order = if let Some(ord) = parts.next() {
+        match ord.to_ascii_lowercase().as_str() {
+          "asc" => Some(SortOrder::Asc),
+          "desc" => Some(SortOrder::Desc),
+          _ => bail!("invalid sort order `{ord}` (expected asc or desc)"),
+        }
+      } else {
+        None
+      };
+      out.push(SortSpec { field, order });
+    }
+  }
+  Ok(out)
 }
 
 #[cfg(feature = "vectors")]
@@ -370,6 +403,7 @@ mod tests {
       fields: None,
       return_stored: true,
       highlight: Some("body".to_string()),
+      sort: None,
       #[cfg(feature = "vectors")]
       vector_field: None,
       #[cfg(feature = "vectors")]
@@ -404,6 +438,7 @@ mod tests {
       fields: None,
       filters: vec![],
       limit: 5,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,

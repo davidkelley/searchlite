@@ -6,4 +6,5 @@ pub mod collector;
 pub mod filters;
 pub mod phrase;
 pub mod planner;
+pub mod sort;
 pub mod wand;

@@ -98,6 +98,7 @@ fn search_with_phrase_filters_and_compaction() {
         },
       ],
       limit: 10,
+      sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,

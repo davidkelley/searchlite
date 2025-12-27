@@ -153,6 +153,7 @@ pub unsafe extern "C" fn searchlite_search(
     fields: None,
     filters: vec![],
     limit,
+    sort: Vec::new(),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     return_stored: true,

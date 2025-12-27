@@ -58,6 +58,8 @@ pub struct SearchRequest {
   pub filters: Vec<Filter>,
   pub limit: usize,
   #[serde(default)]
+  pub sort: Vec<SortSpec>,
+  #[serde(default)]
   pub cursor: Option<String>,
   #[serde(default)]
   pub execution: ExecutionStrategy,
@@ -174,9 +176,23 @@ pub struct TopHitsAggregation {
   #[serde(default)]
   pub fields: Option<Vec<String>>,
   #[serde(default)]
-  pub sort: Option<String>,
+  pub sort: Vec<SortSpec>,
   #[serde(default)]
   pub highlight_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+  Asc,
+  Desc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SortSpec {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub order: Option<SortOrder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
