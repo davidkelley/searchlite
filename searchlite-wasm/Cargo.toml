@@ -1,0 +1,42 @@
+[package]
+name = "searchlite-wasm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Searchlite Authors"]
+license = "MIT"
+description = "WASM bindings for searchlite with IndexedDB-backed storage"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+searchlite-core = { path = "../searchlite-core", features = ["browser"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures = "0.3.30"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = { version = "0.2.92", features = ["serde-serialize"] }
+wasm-bindgen-futures = "0.4.42"
+wasm-bindgen-rayon = "1.2.0"
+js-sys = "0.3.69"
+web-sys = { version = "0.3.69", features = [
+  "Window",
+  "Navigator",
+  "IdbFactory",
+  "IdbOpenDbRequest",
+  "IdbDatabase",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbObjectStore",
+  "IdbRequest",
+  "DomException",
+  "Event",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.42"

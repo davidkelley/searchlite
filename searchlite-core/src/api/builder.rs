@@ -1,6 +1,8 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::Path;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 
 use crate::api::types::IndexOptions;
@@ -14,6 +16,7 @@ impl IndexBuilder {
     Index::create(path, schema, opts)
   }
 
+  #[cfg(not(target_arch = "wasm32"))]
   pub fn create_from_schema_file(
     path: &Path,
     schema_path: &Path,
@@ -24,6 +27,17 @@ impl IndexBuilder {
     let schema: Schema = serde_json::from_str(&data)
       .with_context(|| format!("parsing schema file {:?}", schema_path))?;
     Self::create(path, schema, opts)
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn create_from_schema_file(
+    _path: &Path,
+    _schema_path: &Path,
+    _opts: IndexOptions,
+  ) -> anyhow::Result<Index> {
+    Err(anyhow::anyhow!(
+      "create_from_schema_file is not supported on wasm targets"
+    ))
   }
 }
 

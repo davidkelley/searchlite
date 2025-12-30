@@ -6,6 +6,7 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - `searchlite-core`: indexing, storage, and retrieval (BM25 + block-level maxima, boolean/phrase matching, filters, optional vectors/GPU rerank stubs).
 - `searchlite-cli`: CLI for init/add/commit/search/inspect/compact.
 - `searchlite-ffi`: optional C ABI (enable with the `ffi` feature).
+- `searchlite-wasm`: experimental wasm bindings with an IndexedDB-backed `Storage` implementation (threaded wasm needs `wasm-bindgen-rayon`; you must configure COOP/COEP yourself).
 
 **Core capabilities**
 - Single-writer, multi-reader index backed by a WAL and atomic manifest updates.

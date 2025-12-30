@@ -37,9 +37,18 @@ pub(crate) struct InnerIndex {
 
 impl Index {
   pub fn create(path: &Path, schema: Schema, opts: IndexOptions) -> Result<Self> {
+    let storage = storage_from_options(&opts);
+    Self::create_with_storage(path, schema, opts, storage)
+  }
+
+  pub fn create_with_storage(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    storage: Arc<dyn Storage>,
+  ) -> Result<Self> {
     let mut opts = opts;
     opts.path = path.to_path_buf();
-    let storage = storage_from_options(&opts);
     ensure_root(storage.as_ref(), path)?;
     let manifest = Manifest::new(schema);
     manifest.store(storage.as_ref(), &Manifest::manifest_path(path))?;
@@ -55,6 +64,10 @@ impl Index {
 
   pub fn open(opts: IndexOptions) -> Result<Self> {
     let storage = storage_from_options(&opts);
+    Self::open_with_storage(opts, storage)
+  }
+
+  pub fn open_with_storage(opts: IndexOptions, storage: Arc<dyn Storage>) -> Result<Self> {
     ensure_root(storage.as_ref(), &opts.path)?;
     let manifest_path = Manifest::manifest_path(&opts.path);
     let manifest = if storage.exists(&manifest_path) {
