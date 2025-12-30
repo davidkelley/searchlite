@@ -125,7 +125,6 @@ impl IndexWriter {
         }
       }
     }
-    self.wal.append_commit()?;
     let mut manifest = self.inner.manifest.write();
     for seg in manifest.segments.iter_mut() {
       if let Some(deleted) = tombstones.remove(&seg.id) {
@@ -166,6 +165,7 @@ impl IndexWriter {
     }
     manifest.committed_at = Utc::now().to_rfc3339();
     manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
+    self.wal.append_commit()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
     self.live_docs = live_docs;
@@ -227,9 +227,17 @@ fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<Str
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::Arc;
+
+  use anyhow::anyhow;
+  use parking_lot::{Mutex, RwLock};
+
   use super::PendingOp;
   use crate::api::types::{Document, IndexOptions, Schema, StorageType};
-  use crate::index::Index;
+  use crate::index::{directory, manifest::Manifest, wal::Wal, Index, InnerIndex};
+  use crate::storage::{InMemoryStorage, Storage};
   use tempfile::tempdir;
 
   fn opts(path: &std::path::Path) -> IndexOptions {
@@ -243,6 +251,120 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
+  }
+
+  struct FailingManifestStorage {
+    inner: InMemoryStorage,
+    fail_manifest: AtomicBool,
+  }
+
+  impl FailingManifestStorage {
+    fn new(root: PathBuf) -> Self {
+      Self {
+        inner: InMemoryStorage::new(root),
+        fail_manifest: AtomicBool::new(false),
+      }
+    }
+
+    fn fail_next_manifest_store(&self) {
+      self.fail_manifest.store(true, Ordering::SeqCst);
+    }
+
+    fn should_fail(&self, path: &std::path::Path) -> bool {
+      path.ends_with("MANIFEST.json") && self.fail_manifest.swap(false, Ordering::SeqCst)
+    }
+  }
+
+  impl Storage for FailingManifestStorage {
+    fn root(&self) -> &std::path::Path {
+      self.inner.root()
+    }
+
+    fn ensure_dir(&self, path: &std::path::Path) -> anyhow::Result<()> {
+      self.inner.ensure_dir(path)
+    }
+
+    fn exists(&self, path: &std::path::Path) -> bool {
+      self.inner.exists(path)
+    }
+
+    fn open_read(&self, path: &std::path::Path) -> anyhow::Result<crate::storage::DynFile> {
+      self.inner.open_read(path)
+    }
+
+    fn open_write(&self, path: &std::path::Path) -> anyhow::Result<crate::storage::DynFile> {
+      self.inner.open_write(path)
+    }
+
+    fn open_append(&self, path: &std::path::Path) -> anyhow::Result<crate::storage::DynFile> {
+      self.inner.open_append(path)
+    }
+
+    fn read_to_end(&self, path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+      self.inner.read_to_end(path)
+    }
+
+    fn write_all(&self, path: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+      self.inner.write_all(path, data)
+    }
+
+    fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+      if self.should_fail(path) {
+        return Err(anyhow!("manifest write failed"));
+      }
+      self.inner.atomic_write(path, data)
+    }
+  }
+
+  #[test]
+  fn wal_retains_pending_when_manifest_store_fails() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let storage = Arc::new(FailingManifestStorage::new(dir.path().to_path_buf()));
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let manifest = Manifest::new(schema.clone());
+    manifest.store(storage.as_ref(), &manifest_path).unwrap();
+
+    let mut opts = opts(dir.path());
+    opts.storage = StorageType::InMemory;
+    let inner = Arc::new(InnerIndex {
+      path: dir.path().to_path_buf(),
+      options: opts,
+      manifest: RwLock::new(manifest),
+      writer_lock: Mutex::new(()),
+      storage: storage.clone(),
+    });
+
+    storage.fail_next_manifest_store();
+
+    let mut writer = super::IndexWriter::new(inner).unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("_id".into(), serde_json::json!("1")),
+          ("body".into(), serde_json::json!("commit wal safety")),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    let err = writer.commit();
+    assert!(err.is_err());
+    assert_eq!(
+      writer
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Add { .. }))
+        .count(),
+      1
+    );
+
+    let wal_path = directory::wal_path(dir.path());
+    let pending = Wal::last_pending_ops(storage.as_ref(), &wal_path).unwrap();
+    assert!(
+      !pending.is_empty(),
+      "wal should retain pending ops when manifest persistence fails"
+    );
   }
 
   #[test]
