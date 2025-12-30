@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,11 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use wasm_bindgen_rayon::init_thread_pool;
 
 const STORE_NAME: &str = "searchlite_files";
+
+thread_local! {
+  // Avoid reconnecting for each persist operation.
+  static DB_CACHE: RefCell<HashMap<String, web_sys::IdbDatabase>> = RefCell::new(HashMap::new());
+}
 
 fn path_key(path: &Path) -> String {
   path.to_string_lossy().to_string()
@@ -87,6 +93,9 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
 }
 
 async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
+  if let Some(db) = DB_CACHE.with(|cache| cache.borrow().get(name).cloned()) {
+    return Ok(db);
+  }
   let window = web_sys::window().ok_or_else(|| anyhow!("window missing"))?;
   let factory = window
     .indexed_db()
@@ -102,7 +111,11 @@ async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
         if let Ok(req) = target.dyn_into::<web_sys::IdbOpenDbRequest>() {
           if let Ok(result) = req.result() {
             if let Ok(db) = result.dyn_into::<web_sys::IdbDatabase>() {
-              let _ = db.create_object_store(&store);
+              if let Err(e) = db.create_object_store(&store) {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                  "Failed to create IndexedDB object store '{store}': {e:?}"
+                )));
+              }
             }
           }
         }
@@ -113,9 +126,13 @@ async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
   }
   let request: web_sys::IdbRequest = request.into();
   let db_value = request_future(&request).await?;
-  db_value
+  let db = db_value
     .dyn_into::<web_sys::IdbDatabase>()
-    .map_err(|_| anyhow!("failed to open IndexedDB database"))
+    .map_err(|_| anyhow!("failed to open IndexedDB database"))?;
+  DB_CACHE.with(|cache| {
+    cache.borrow_mut().insert(name.to_string(), db.clone());
+  });
+  Ok(db)
 }
 
 async fn load_snapshot(db_name: &str) -> Result<HashMap<PathBuf, Vec<u8>>> {
@@ -256,10 +273,19 @@ impl Storage for JsStorage {
   }
 
   fn open_read(&self, path: &Path) -> Result<DynFile> {
-    if !self.exists(path) {
-      return Err(anyhow!("file {:?} missing", path));
-    }
-    self.open_with_mode(path, false, false)
+    let data = self
+      .files
+      .read()
+      .get(path)
+      .cloned()
+      .ok_or_else(|| anyhow!("file {:?} missing", path))?;
+    Ok(Box::new(JsFile {
+      path: path.to_path_buf(),
+      data,
+      pos: 0,
+      pending: self.pending.clone(),
+      dirty: false,
+    }))
   }
 
   fn open_write(&self, path: &Path) -> Result<DynFile> {
@@ -294,8 +320,10 @@ impl Storage for JsStorage {
 impl JsStorage {
   fn open_with_mode(&self, path: &Path, truncate: bool, append: bool) -> Result<DynFile> {
     let data = self.entry(path);
+    let mut dirty = false;
     if truncate {
       data.write().clear();
+      dirty = true;
     }
     let pos = if append { data.read().len() as u64 } else { 0 };
     Ok(Box::new(JsFile {
@@ -303,6 +331,7 @@ impl JsStorage {
       data,
       pos,
       pending: self.pending.clone(),
+      dirty,
     }))
   }
 }
@@ -312,12 +341,15 @@ struct JsFile {
   data: Arc<RwLock<Vec<u8>>>,
   pos: u64,
   pending: PendingWrites,
+  dirty: bool,
 }
 
 impl Drop for JsFile {
   fn drop(&mut self) {
-    let data = self.data.read().clone();
-    self.pending.schedule(self.path.clone(), data);
+    if self.dirty {
+      let data = self.data.read().clone();
+      self.pending.schedule(self.path.clone(), data);
+    }
   }
 }
 
@@ -344,6 +376,7 @@ impl std::io::Write for JsFile {
     }
     data[self.pos as usize..end].copy_from_slice(buf);
     self.pos = end as u64;
+    self.dirty = true;
     Ok(buf.len())
   }
 
@@ -377,12 +410,14 @@ impl StorageFile for JsFile {
     if self.pos > len {
       self.pos = len;
     }
+    self.dirty = true;
     self.pending.schedule(self.path.clone(), data.clone());
     Ok(())
   }
 
   fn sync_all(&mut self) -> Result<()> {
     let data = self.data.read().clone();
+    self.dirty = true;
     self.pending.schedule(self.path.clone(), data);
     Ok(())
   }
@@ -411,6 +446,7 @@ impl Searchlite {
       enable_positions: true,
       bm25_k1: 0.9,
       bm25_b: 0.4,
+      // The IndexedDB-backed `JsStorage` determines persistence here.
       storage: StorageType::InMemory,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
@@ -422,6 +458,7 @@ impl Searchlite {
   }
 
   /// Preferred async constructor for wasm (avoids async ctor warnings in bindings).
+  /// `db_name` is used for both the IndexedDB database name and the virtual root path.
   #[wasm_bindgen(js_name = init)]
   pub async fn init(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
     Self::create(db_name, schema_json).await
@@ -460,18 +497,21 @@ impl Searchlite {
     Ok(())
   }
 
+  /// Add a document to the index. Call `commit` to make it searchable and persist it.
   pub async fn add_document(&self, doc: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
       serde_wasm_bindgen::from_value(doc).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(vec![value_to_document(value)?])
   }
 
+  /// Add multiple documents to the index. Call `commit` to persist changes.
   pub async fn add_documents(&self, docs: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
       serde_wasm_bindgen::from_value(docs).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(value_to_documents(value)?)
   }
 
+  /// Commit pending documents and flush IndexedDB-backed storage.
   pub async fn commit(&self) -> Result<(), JsValue> {
     let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
     writer.commit().map_err(to_js_error)?;
@@ -479,7 +519,7 @@ impl Searchlite {
     Ok(())
   }
 
-  pub async fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
+  pub fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
     let request = SearchRequest {
       query,
       fields: None,
@@ -498,7 +538,7 @@ impl Searchlite {
     self.run_search(request)
   }
 
-  pub async fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
+  pub fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
     let req: SearchRequest = serde_json::from_str(&request_json)
       .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
     self.run_search(req)
@@ -510,6 +550,7 @@ impl Searchlite {
     serde_wasm_bindgen::to_value(&result).map_err(|err| JsValue::from_str(&err.to_string()))
   }
 
+  /// Wait for pending IndexedDB writes; `commit` already calls this.
   pub async fn flush_storage(&self) -> Result<(), JsValue> {
     self.storage.flush().await;
     Ok(())
