@@ -34,8 +34,8 @@ pub struct IndexWriter {
 
 impl IndexWriter {
   pub(crate) fn new(inner: Arc<InnerIndex>) -> Result<Self> {
+    // Hold the writer lock during initialization to avoid racing with a commit.
     let _guard = inner.writer_lock.lock();
-    drop(_guard);
     let wal_path = crate::index::directory::wal_path(&inner.path);
     let pending_entries = Wal::last_pending_ops(inner.storage.as_ref(), &wal_path)?;
     let wal = inner.wal()?;
@@ -53,6 +53,7 @@ impl IndexWriter {
         WalEntry::Commit => {}
       }
     }
+    drop(_guard);
     Ok(Self {
       inner,
       wal,
