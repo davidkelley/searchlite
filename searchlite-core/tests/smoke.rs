@@ -7,6 +7,16 @@ use searchlite_core::api::types::{
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
+use serde_json::json;
+
+fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
+  let mut map = BTreeMap::new();
+  map.insert("_id".to_string(), json!(id));
+  for (k, v) in fields {
+    map.insert(k.to_string(), v);
+  }
+  Document { fields: map }
+}
 
 #[test]
 fn index_and_search() {
@@ -39,18 +49,14 @@ fn index_and_search() {
   };
   let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
   let mut writer = idx.writer().expect("writer");
-  let doc = Document {
-    fields: [
-      ("title".to_string(), serde_json::json!("Rust systems")),
-      (
-        "body".to_string(),
-        serde_json::json!("Rust is a systems programming language"),
-      ),
-      ("year".to_string(), serde_json::json!(2023)),
-    ]
-    .into_iter()
-    .collect(),
-  };
+  let doc = doc(
+    "1",
+    vec![
+      ("title", json!("Rust systems")),
+      ("body", json!("Rust is a systems programming language")),
+      ("year", json!(2023)),
+    ],
+  );
   writer.add_document(&doc).unwrap();
   writer.commit().unwrap();
 
@@ -80,6 +86,74 @@ fn index_and_search() {
 }
 
 #[test]
+fn upsert_and_delete_by_id() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("doc-1", vec![("body", json!("first version"))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("doc-1", vec![("body", json!("second version"))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: "second".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 5,
+    sort: Vec::new(),
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 1);
+  assert_eq!(resp.hits[0].doc_id, "doc-1".to_string());
+  assert_eq!(
+    resp.hits[0]
+      .fields
+      .as_ref()
+      .unwrap()
+      .get("body")
+      .and_then(|v| v.as_str())
+      .unwrap(),
+    "second version"
+  );
+
+  {
+    let mut writer = idx.writer().unwrap();
+    writer.delete_document("doc-1").unwrap();
+    writer.commit().unwrap();
+  }
+  let after_delete = idx.reader().unwrap().search(&req).unwrap();
+  assert!(after_delete.hits.is_empty());
+}
+
+#[test]
 fn cursor_paginates_ordered_hits() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
@@ -99,14 +173,10 @@ fn cursor_paginates_ordered_hits() {
     for i in 0..3 {
       let repeats = 6 - i;
       writer
-        .add_document(&Document {
-          fields: [(
-            "body".to_string(),
-            serde_json::json!("rust ".repeat(repeats)),
-          )]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("{}", i),
+          vec![("body", json!("rust ".repeat(repeats)))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -116,14 +186,10 @@ fn cursor_paginates_ordered_hits() {
     for i in 3..6 {
       let repeats = 6 - i;
       writer
-        .add_document(&Document {
-          fields: [(
-            "body".to_string(),
-            serde_json::json!("rust ".repeat(repeats)),
-          )]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("{}", i),
+          vec![("body", json!("rust ".repeat(repeats)))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -188,11 +254,7 @@ fn cursor_rejects_invalid_hex() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".to_string(), serde_json::json!("rust"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("cursor-1", vec![("body", json!("rust"))]))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -235,11 +297,7 @@ fn cursor_rejects_when_limit_zero() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".to_string(), serde_json::json!("rust"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("cursor-2", vec![("body", json!("rust"))]))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -286,11 +344,7 @@ fn cursor_rejects_excessive_advance() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".to_string(), serde_json::json!("rust"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("cursor-3", vec![("body", json!("rust"))]))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -339,13 +393,9 @@ fn cursor_rejects_mismatched_position() {
   let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
   {
     let mut writer = idx.writer().unwrap();
-    for _ in 0..3 {
+    for i in 0..3 {
       writer
-        .add_document(&Document {
-          fields: [("body".to_string(), serde_json::json!("rust"))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(&format!("stable-{i}"), vec![("body", json!("rust"))]))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -402,14 +452,10 @@ fn cursor_orders_stably_across_segments() {
     let mut writer = idx.writer().unwrap();
     for i in 0..3 {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".to_string(), serde_json::json!("rust")),
-            ("tag".to_string(), serde_json::json!(format!("s0-{i}"))),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("doc-s0-{i}"),
+          vec![("body", json!("rust")), ("tag", json!(format!("s0-{i}")))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -418,14 +464,10 @@ fn cursor_orders_stably_across_segments() {
     let mut writer = idx.writer().unwrap();
     for i in 0..3 {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".to_string(), serde_json::json!("rust")),
-            ("tag".to_string(), serde_json::json!(format!("s1-{i}"))),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("doc-s1-{i}"),
+          vec![("body", json!("rust")), ("tag", json!(format!("s1-{i}")))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -451,14 +493,24 @@ fn cursor_orders_stably_across_segments() {
   let mut doc_ids = Vec::new();
   for _ in 0..4 {
     let res = reader.search(&req).unwrap();
-    doc_ids.extend(res.hits.iter().map(|h| h.doc_id));
+    doc_ids.extend(res.hits.iter().map(|h| h.doc_id.clone()));
     if res.next_cursor.is_none() {
       break;
     }
     req.cursor = res.next_cursor.clone();
   }
 
-  assert_eq!(doc_ids, vec![0, 1, 2, 0, 1, 2]);
+  assert_eq!(
+    doc_ids,
+    vec![
+      "doc-s0-0".to_string(),
+      "doc-s0-1".to_string(),
+      "doc-s0-2".to_string(),
+      "doc-s1-0".to_string(),
+      "doc-s1-1".to_string(),
+      "doc-s1-2".to_string()
+    ]
+  );
 }
 
 fn extract_bodies(res: &searchlite_core::api::reader::SearchResult) -> Vec<String> {
@@ -519,11 +571,7 @@ fn in_memory_storage_keeps_disk_clean() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".into(), serde_json::json!("in memory wal"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("mem-1", vec![("body", json!("in memory wal"))]))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -602,33 +650,31 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust nested filters")),
+      .add_document(&doc(
+        "nested-1",
+        vec![
+          ("body", json!("rust nested filters")),
           (
-            "comment".into(),
-            serde_json::json!([
+            "comment",
+            json!([
               { "author": "alice", "tag": "x", "note": "keep" },
               { "author": "bob", "tag": "y" }
             ]),
           ),
-        ]
-        .into_iter()
-        .collect(),
-      })
+        ],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust nested filters")),
+      .add_document(&doc(
+        "nested-2",
+        vec![
+          ("body", json!("rust nested filters")),
           (
-            "comment".into(),
-            serde_json::json!([{ "author": "alice", "tag": "y", "note": "secret" }]),
+            "comment",
+            json!([{ "author": "alice", "tag": "y", "note": "secret" }]),
           ),
-        ]
-        .into_iter()
-        .collect(),
-      })
+        ],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -734,49 +780,46 @@ fn nested_numeric_filters_bind_to_object_values() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust nested numbers")),
+      .add_document(&doc(
+        "nested-num-1",
+        vec![
+          ("body", json!("rust nested numbers")),
           (
-            "review".into(),
-            serde_json::json!([
+            "review",
+            json!([
               { "user": "alice", "rating": 5, "score": 0.72 },
               { "user": "bob", "rating": 9, "score": 0.25 }
             ]),
           ),
-        ]
-        .into_iter()
-        .collect(),
-      })
+        ],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust nested numbers")),
+      .add_document(&doc(
+        "nested-num-2",
+        vec![
+          ("body", json!("rust nested numbers")),
           (
-            "review".into(),
-            serde_json::json!([{ "user": "alice", "rating": 2, "score": 0.95 }]),
+            "review",
+            json!([{ "user": "alice", "rating": 2, "score": 0.95 }]),
           ),
-        ]
-        .into_iter()
-        .collect(),
-      })
+        ],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust nested numbers")),
+      .add_document(&doc(
+        "nested-num-3",
+        vec![
+          ("body", json!("rust nested numbers")),
           (
-            "review".into(),
-            serde_json::json!([
+            "review",
+            json!([
               { "user": "alice", "rating": 2, "score": 0.9 },
               { "user": "bob", "rating": 6, "score": 0.72 }
             ]),
           ),
-        ]
-        .into_iter()
-        .collect(),
-      })
+        ],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }

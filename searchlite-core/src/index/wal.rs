@@ -12,6 +12,7 @@ use crate::util::varint::{read_u64, write_u64};
 #[derive(Debug, Clone)]
 pub enum WalEntry {
   AddDoc(Document),
+  DeleteDocId(String),
   Commit,
 }
 
@@ -40,6 +41,10 @@ impl Wal {
 
   pub fn append_commit(&mut self) -> Result<()> {
     self.append_entry(2, &[])
+  }
+
+  pub fn append_delete_doc_id(&mut self, doc_id: &str) -> Result<()> {
+    self.append_entry(3, doc_id.as_bytes())
   }
 
   fn append_entry(&mut self, entry_type: u8, payload: &[u8]) -> Result<()> {
@@ -102,13 +107,18 @@ impl Wal {
           }
         }
         2 => entries.push(WalEntry::Commit),
+        3 => {
+          if let Ok(id) = std::str::from_utf8(payload) {
+            entries.push(WalEntry::DeleteDocId(id.to_string()));
+          }
+        }
         _ => {}
       }
     }
     Ok(entries)
   }
 
-  pub fn last_pending_documents(storage: &dyn Storage, path: &Path) -> Result<Vec<Document>> {
+  pub fn last_pending_ops(storage: &dyn Storage, path: &Path) -> Result<Vec<WalEntry>> {
     let entries = if storage.exists(path) {
       Self::replay(storage, path)?
     } else {
@@ -117,7 +127,7 @@ impl Wal {
     let mut pending = Vec::new();
     for entry in entries {
       match entry {
-        WalEntry::AddDoc(doc) => pending.push(doc),
+        WalEntry::AddDoc(_) | WalEntry::DeleteDocId(_) => pending.push(entry),
         WalEntry::Commit => pending.clear(),
       }
     }
@@ -146,7 +156,7 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let entries = Wal::replay(&storage, &path).unwrap();
     assert!(matches!(entries.last(), Some(WalEntry::Commit)));
-    let pending = Wal::last_pending_documents(&storage, &path).unwrap();
+    let pending = Wal::last_pending_ops(&storage, &path).unwrap();
     assert!(pending.is_empty());
   }
 
@@ -158,5 +168,20 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let entries = Wal::replay(&storage, &path).unwrap();
     assert!(entries.is_empty());
+  }
+
+  #[test]
+  fn records_delete_entries() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut wal = Wal::open(Arc::new(storage), &path).unwrap();
+    wal.append_delete_doc_id("abc").unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let entries = Wal::replay(&storage, &path).unwrap();
+    assert!(matches!(
+      entries.first(),
+      Some(WalEntry::DeleteDocId(id)) if id == "abc"
+    ));
   }
 }

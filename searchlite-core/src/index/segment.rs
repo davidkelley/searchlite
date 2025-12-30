@@ -30,6 +30,8 @@ use crate::DocId;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentFileMeta {
   pub doc_offsets: Vec<u64>,
+  #[serde(default)]
+  pub doc_ids: Vec<String>,
   pub avg_field_lengths: HashMap<String, f32>,
   #[cfg(feature = "vectors")]
   pub vectors: HashMap<String, Vec<Vec<f32>>>,
@@ -38,6 +40,7 @@ pub struct SegmentFileMeta {
 
 #[derive(Default)]
 struct CollectedDocument {
+  doc_id: Option<String>,
   text: HashMap<String, Vec<String>>,
   keywords: HashMap<String, Vec<String>>,
   i64s: HashMap<String, Vec<i64>>,
@@ -441,7 +444,20 @@ fn collect_document(
   resolved: &FastHashMap<String, ResolvedField>,
 ) -> Result<CollectedDocument> {
   let mut collected = CollectedDocument::default();
+  let doc_id = doc
+    .fields
+    .get(schema.doc_id_field())
+    .and_then(|v| v.as_str())
+    .expect("doc ids validated upstream");
+  collected.doc_id = Some(doc_id.to_string());
+  collected.push_stored(
+    schema.doc_id_field(),
+    [serde_json::Value::String(doc_id.to_string())],
+  );
   for (field, value) in doc.fields.iter() {
+    if field == schema.doc_id_field() {
+      continue;
+    }
     if let Some(meta) = resolved.get(field) {
       handle_field(meta, value, &mut collected, true);
     } else if let Some(nested) = schema.nested_fields.iter().find(|n| n.name == *field) {
@@ -526,11 +542,22 @@ impl<'a> SegmentWriter<'a> {
 
     #[cfg(feature = "vectors")]
     let mut vector_fields: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    let mut doc_ids: Vec<String> = Vec::new();
 
     for (doc_id_u64, doc) in docs.iter().enumerate() {
-      let doc_id = doc_id_u64 as DocId;
+      let doc_ord = doc_id_u64 as DocId;
       self.schema.validate_document(doc)?;
       let collected = collect_document(self.schema, doc, &resolved)?;
+      let doc_key = collected
+        .doc_id
+        .clone()
+        .expect("collect_document should enforce doc id presence");
+      doc_ids.push(doc_key.clone());
+      fast_writer.set(
+        self.schema.doc_id_field(),
+        doc_ord,
+        FastValue::Str(doc_key.clone()),
+      );
 
       for (field, values) in collected.text.iter() {
         if let Some(meta) = resolved.get(field) {
@@ -552,7 +579,7 @@ impl<'a> SegmentWriter<'a> {
             term_key.push_str(tok);
             postings_builder.add_term(
               &term_key,
-              doc_id,
+              doc_ord,
               position_offset + pos as u32,
               self.enable_positions,
             );
@@ -573,15 +600,15 @@ impl<'a> SegmentWriter<'a> {
               term_key.push_str(field);
               term_key.push(':');
               term_key.push_str(&lower);
-              postings_builder.add_term(&term_key, doc_id, 0, false);
+              postings_builder.add_term(&term_key, doc_ord, 0, false);
             }
           }
         }
         if keyword_fast.contains(field.as_str()) && !is_nested_field {
           if values.len() == 1 {
-            fast_writer.set(field, doc_id, FastValue::Str(values[0].clone()));
+            fast_writer.set(field, doc_ord, FastValue::Str(values[0].clone()));
           } else if !values.is_empty() {
-            fast_writer.set(field, doc_id, FastValue::StrList(values.clone()));
+            fast_writer.set(field, doc_ord, FastValue::StrList(values.clone()));
           }
         }
       }
@@ -590,9 +617,9 @@ impl<'a> SegmentWriter<'a> {
         if let Some((_, fast)) = numeric_info.get(field.as_str()) {
           if *fast && !field.contains('.') {
             if values.len() == 1 {
-              fast_writer.set(field, doc_id, FastValue::I64(values[0]));
+              fast_writer.set(field, doc_ord, FastValue::I64(values[0]));
             } else {
-              fast_writer.set(field, doc_id, FastValue::I64List(values.clone()));
+              fast_writer.set(field, doc_ord, FastValue::I64List(values.clone()));
             }
           }
         }
@@ -602,9 +629,9 @@ impl<'a> SegmentWriter<'a> {
         if let Some((_, fast)) = numeric_info.get(field.as_str()) {
           if *fast && !field.contains('.') {
             if values.len() == 1 {
-              fast_writer.set(field, doc_id, FastValue::F64(values[0]));
+              fast_writer.set(field, doc_ord, FastValue::F64(values[0]));
             } else {
-              fast_writer.set(field, doc_id, FastValue::F64List(values.clone()));
+              fast_writer.set(field, doc_ord, FastValue::F64List(values.clone()));
             }
           }
         }
@@ -613,7 +640,7 @@ impl<'a> SegmentWriter<'a> {
       for (path, count) in collected.nested_counts.iter() {
         fast_writer.set(
           &nested_count_key(path),
-          doc_id,
+          doc_ord,
           FastValue::NestedCount { objects: *count },
         );
       }
@@ -622,7 +649,7 @@ impl<'a> SegmentWriter<'a> {
         for (object_idx, parent) in parents.iter().enumerate() {
           fast_writer.set(
             &nested_parent_key(path),
-            doc_id,
+            doc_ord,
             FastValue::NestedParent {
               object: object_idx,
               parent: *parent,
@@ -636,7 +663,7 @@ impl<'a> SegmentWriter<'a> {
           if !vals.is_empty() {
             fast_writer.set(
               field,
-              doc_id,
+              doc_ord,
               FastValue::StrNested {
                 object: object_idx,
                 values: vals.clone(),
@@ -651,7 +678,7 @@ impl<'a> SegmentWriter<'a> {
           if !vals.is_empty() {
             fast_writer.set(
               field,
-              doc_id,
+              doc_ord,
               FastValue::I64Nested {
                 object: object_idx,
                 values: vals.clone(),
@@ -666,7 +693,7 @@ impl<'a> SegmentWriter<'a> {
           if !vals.is_empty() {
             fast_writer.set(
               field,
-              doc_id,
+              doc_ord,
               FastValue::F64Nested {
                 object: object_idx,
                 values: vals.clone(),
@@ -727,6 +754,7 @@ impl<'a> SegmentWriter<'a> {
 
     let seg_file_meta = SegmentFileMeta {
       doc_offsets,
+      doc_ids,
       avg_field_lengths: avg_field_lengths.clone(),
       #[cfg(feature = "vectors")]
       vectors: vector_fields,
@@ -747,6 +775,7 @@ impl<'a> SegmentWriter<'a> {
       doc_count: docs.len() as u32,
       max_doc_id: docs.len() as u32 - 1,
       blockmax: true,
+      deleted_docs: Vec::new(),
       avg_field_lengths,
       checksums,
     };
@@ -797,6 +826,8 @@ pub struct SegmentReader {
   terms: TinyTerms,
   postings: RefCell<Box<dyn StorageFile>>,
   docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
+  doc_ids: Vec<String>,
+  deleted: FastHashSet<DocId>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
   seg_meta: SegmentFileMeta,
@@ -809,6 +840,12 @@ impl SegmentReader {
     let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
     let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
+      bail!(
+        "segment {} is missing document ids; reindex or re-commit documents with doc_id support",
+        meta.id
+      );
+    }
     #[cfg(not(feature = "zstd"))]
     if seg_meta.use_zstd {
       eprintln!(
@@ -817,11 +854,14 @@ impl SegmentReader {
     }
     let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
     let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
+    let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
     Ok(Self {
       meta,
       terms: TinyTerms(terms),
       postings: RefCell::new(postings),
       docstore: RefCell::new(docstore),
+      doc_ids: seg_meta.doc_ids.clone(),
+      deleted,
       fast_fields,
       keep_positions,
       seg_meta,
@@ -845,6 +885,21 @@ impl SegmentReader {
 
   pub fn get_doc(&self, doc_id: DocId) -> Result<serde_json::Value> {
     self.docstore.borrow_mut().get(doc_id)
+  }
+
+  pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {
+    self.doc_ids.get(doc_id as usize).map(|s| s.as_str())
+  }
+
+  pub fn is_deleted(&self, doc_id: DocId) -> bool {
+    self.deleted.contains(&doc_id)
+  }
+
+  pub fn live_docs(&self) -> u32 {
+    self
+      .meta
+      .doc_count
+      .saturating_sub(self.deleted.len() as u32)
   }
 
   pub fn fast_fields(&self) -> &FastFieldsReader {
@@ -875,6 +930,7 @@ mod tests {
 
   fn sample_schema() -> Schema {
     Schema {
+      doc_id_field: crate::index::manifest::default_doc_id_field(),
       text_fields: vec![crate::index::manifest::TextField {
         name: "body".into(),
         tokenizer: "default".into(),
@@ -905,6 +961,10 @@ mod tests {
   fn doc(body: &str, tag: &str, year: i64) -> Document {
     Document {
       fields: [
+        (
+          "_id".into(),
+          serde_json::json!(format!("{body}-{tag}-{year}")),
+        ),
         ("body".into(), serde_json::json!(body)),
         ("tag".into(), serde_json::json!(tag)),
         ("year".into(), serde_json::json!(year)),

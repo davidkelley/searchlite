@@ -23,6 +23,10 @@ fn opts(path: &std::path::Path) -> IndexOptions {
 fn doc(body: &str, category: &str, year: i64) -> Document {
   Document {
     fields: [
+      (
+        "_id".into(),
+        serde_json::json!(format!("{category}-{year}-{body}")),
+      ),
       ("body".into(), serde_json::json!(body)),
       ("category".into(), serde_json::json!(category)),
       ("year".into(), serde_json::json!(year)),

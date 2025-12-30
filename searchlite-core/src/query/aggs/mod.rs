@@ -930,7 +930,18 @@ impl<'a> TopHitsCollector<'a> {
     let end = (start + self.size).min(ranked.len());
     let mut hits = Vec::with_capacity(end.saturating_sub(start));
     for doc in ranked.into_iter().skip(start).take(self.size) {
-      let fetched = self.ctx.segment.get_doc(doc.doc_id).ok();
+      let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+      let fetched = if need_doc {
+        self.ctx.segment.get_doc(doc.doc_id).ok()
+      } else {
+        None
+      };
+      let doc_id_str = self
+        .ctx
+        .segment
+        .doc_id(doc.doc_id)
+        .unwrap_or("")
+        .to_string();
       let fields_val = fetched.as_ref().and_then(|d| {
         if let Some(sel) = &self.fields {
           let obj = d.as_object()?;
@@ -958,7 +969,7 @@ impl<'a> TopHitsCollector<'a> {
       hits.push(RankedTopHit {
         key: doc.key,
         hit: TopHit {
-          doc_id: doc.doc_id,
+          doc_id: doc_id_str,
           score: Some(doc.score),
           fields: fields_val,
           snippet,

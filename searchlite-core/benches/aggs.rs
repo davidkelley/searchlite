@@ -53,6 +53,7 @@ fn build_bench_index(doc_count: usize, cardinality: usize) -> BenchIndex {
     writer
       .add_document(&Document {
         fields: [
+          ("_id".into(), serde_json::json!(format!("bench-{i}"))),
           (
             "body".into(),
             serde_json::json!(format!("rust systems {i}")),

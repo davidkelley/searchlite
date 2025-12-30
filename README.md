@@ -30,6 +30,7 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
 
 ```json
 {
+  "doc_id_field": "_id",
   "text_fields": [
     { "name": "body", "tokenizer": "default", "stored": true, "indexed": true }
   ],
@@ -54,6 +55,8 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
 `stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
 Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
 
+Every document must include a string primary key under `doc_id_field` (defaults to `_id`). Skip listing that id in your `text_fields`/`keyword_fields`/`numeric_fields`; it is stored automatically, returned on hits, and used for upsert/delete semantics.
+
 ## CLI workflow examples
 Set an index location once:
 ```bash
@@ -64,11 +67,15 @@ INDEX=/tmp/searchlite_idx
 Use `cargo run -p searchlite-cli -- <command> ...` to invoke the CLI. Each command maps to a lifecycle step:
 
 - `init <index> <schema>`: creates a new index directory and writes the schema manifest so the index is ready to accept documents.
-- `add <index> <doc.jsonl>`: ingests newline-delimited JSON documents into the writer buffer; changes are not visible to readers until you run `commit`.
+- `add <index> <doc.jsonl>`: upserts newline-delimited JSON documents (keyed by `doc_id_field`) into the writer buffer; changes are not visible to readers until you run `commit`.
+- `update <index> <doc.jsonl>`: alias for `add` to emphasize upsert semantics.
+- `delete <index> <ids.txt>`: queues deletions by id (one id per line, matching `doc_id_field`), applied on `commit`.
 - `commit <index>`: flushes buffered documents, writes new segment files, and updates the manifest so searches can see the newly added data.
 - `search <index> [options]`: executes a query, returning JSON hits (and optional aggregations) using either CLI flags or a full request payload.
 - `inspect <index>`: prints the current manifest and segment metadata to help debug index contents and state.
 - `compact <index>`: merges segments to reduce fragmentation and improve search performance.
+
+Documents without the required id (`doc_id_field`) will be rejected. Upserts are effective on commit; deletes hide older documents immediately after commit and are dropped on the next compaction.
 
 - Create an index from a schema:
 ```bash
@@ -78,7 +85,7 @@ cargo run -p searchlite-cli -- init "$INDEX" schema.json
 - Add a single document (newline-delimited JSON):
 ```bash
 cat > /tmp/one.jsonl <<'EOF'
-{"body":"Rust is a systems programming language","lang":"en","year":2024}
+{"_id":"doc-1","body":"Rust is a systems programming language","lang":"en","year":2024}
 EOF
 cargo run -p searchlite-cli -- add "$INDEX" /tmp/one.jsonl
 cargo run -p searchlite-cli -- commit "$INDEX"
@@ -378,6 +385,7 @@ let idx = IndexBuilder::create(&path, schema, opts.clone())?;
 // Insert one document.
 let mut writer = idx.writer()?;
 let doc = Document { fields: [
+    ("_id".to_string(), serde_json::json!("doc-1")),
     ("body".to_string(), serde_json::json!("Rust is fast and reliable")),
     ("lang".to_string(), serde_json::json!("en")),
     ("year".to_string(), serde_json::json!(2024)),
@@ -386,8 +394,8 @@ writer.add_document(&doc)?;
 
 // Insert multiple documents in one batch.
 let more_docs = vec![
-    Document { fields: [("body".to_string(), serde_json::json!("SQLite vibes for search")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2023))].into_iter().collect() },
-    Document { fields: [("body".to_string(), serde_json::json!("Embedded search engine demo")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2022))].into_iter().collect() },
+    Document { fields: [("_id".to_string(), serde_json::json!("doc-2")), ("body".to_string(), serde_json::json!("SQLite vibes for search")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2023))].into_iter().collect() },
+    Document { fields: [("_id".to_string(), serde_json::json!("doc-3")), ("body".to_string(), serde_json::json!("Embedded search engine demo")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2022))].into_iter().collect() },
 ];
 for d in more_docs.iter() {
     writer.add_document(d)?;
