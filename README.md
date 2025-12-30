@@ -446,6 +446,15 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
 ### In-memory indexes
 For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `IndexOptions`. The API and search behavior stay the same, but no files are created on disk. (The CLI currently uses filesystem storage only.)
 
+### WASM
+- Install `wasm-pack` (e.g., `brew install wasm-pack` or `cargo install wasm-pack`) before building.
+- Threaded wasm needs atomics/bulk-memory and build-std; `searchlite-wasm/rust-toolchain.toml` pins a nightly with `rust-src` and the wasm target, and `searchlite-wasm/.cargo/config.toml` sets the required rustflags/build-std. Rustup will fetch the nightly toolchain automatically when you build this crate.
+- Build the wasm bundle (outputs to `searchlite-wasm/pkg/`): `wasm-pack build searchlite-wasm --target web --release`.
+- Enable rayon threads (requires COOP/COEP + atomics): `wasm-pack build searchlite-wasm --target web --release -- --features threads`.
+- Serve the crate directory over HTTP with COOP/COEP headers so SharedArrayBuffer works (e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080 -H "Cross-Origin-Opener-Policy: same-origin" -H "Cross-Origin-Embedder-Policy: require-corp"`).
+- Open `http://localhost:8080/index.html`. The bundled page imports `pkg/searchlite_wasm.js`, initializes the module, and provides a lightweight schema/upload/search demo in the browser.
+- Instantiate from JS with `await Searchlite.init("demo-db", JSON.stringify(schema))`. Prefer `add_documents([...])` for bulk ingest and call `commit()` to flush everything to the manifest.
+
 ## Building the C library
 Build the FFI crate to generate a shared library and header for C or other language bindings.
 ```bash

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -11,13 +11,13 @@ use searchlite_core::api::types::{
   Aggregation, ExecutionStrategy, Filter, IndexOptions, SearchRequest, SortSpec, StorageType,
 };
 use searchlite_core::api::{Document, IndexReader, IndexWriter};
-use searchlite_core::index::manifest::Schema;
-use searchlite_core::index::Index;
 use searchlite_core::storage::{DynFile, Storage, StorageFile};
+use searchlite_core::{Index, Schema};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
+#[cfg(feature = "threads")]
 use wasm_bindgen_rayon::init_thread_pool;
 
 const STORE_NAME: &str = "searchlite_files";
@@ -30,11 +30,32 @@ fn to_js_error(err: impl std::fmt::Display) -> JsValue {
   JsValue::from_str(&err.to_string())
 }
 
+fn value_to_document(value: serde_json::Value) -> Result<Document, JsValue> {
+  let obj = value
+    .as_object()
+    .ok_or_else(|| JsValue::from_str("document must be a JSON object"))?;
+  let mut fields = BTreeMap::new();
+  for (k, v) in obj.iter() {
+    fields.insert(k.clone(), v.clone());
+  }
+  Ok(Document { fields })
+}
+
+fn value_to_documents(value: serde_json::Value) -> Result<Vec<Document>, JsValue> {
+  match value {
+    serde_json::Value::Array(items) => items.into_iter().map(value_to_document).collect(),
+    obj @ serde_json::Value::Object(_) => Ok(vec![value_to_document(obj)?]),
+    _ => Err(JsValue::from_str(
+      "documents must be an object or array of objects",
+    )),
+  }
+}
+
 fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output = Result<JsValue>> {
   let success_req = req.clone();
   let error_req = req.clone();
   let promise = js_sys::Promise::new(&mut |resolve, reject| {
-    let success = Closure::once_into_js(move |event: web_sys::Event| {
+    let success = Closure::wrap(Box::new(move |event: web_sys::Event| {
       if let Some(target) = event.target() {
         if let Ok(req) = target.dyn_into::<web_sys::IdbRequest>() {
           if let Ok(result) = req.result() {
@@ -44,17 +65,18 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
         }
       }
       let _ = resolve.call0(&JsValue::UNDEFINED);
-    });
-    let error = Closure::once_into_js(move |_event: web_sys::Event| {
-      let err_val = error_req
-        .error()
-        .map(|e| e.into())
-        .unwrap_or_else(|| JsValue::from_str("indexeddb request error"));
+    }) as Box<dyn FnMut(_)>);
+    let err_req = error_req.clone();
+    let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+      let err_val = match err_req.error() {
+        Ok(e) => e.into(),
+        Err(_) => JsValue::from_str("indexeddb request error"),
+      };
       let _ = reject.call1(&JsValue::UNDEFINED, &err_val);
-    });
+    }) as Box<dyn FnMut(_)>);
     success_req.set_onsuccess(Some(success.as_ref().unchecked_ref()));
-    success.forget();
     error_req.set_onerror(Some(error.as_ref().unchecked_ref()));
+    success.forget();
     error.forget();
   });
   async move {
@@ -67,9 +89,12 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
 async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
   let window = web_sys::window().ok_or_else(|| anyhow!("window missing"))?;
   let factory = window
-    .indexed_db()?
+    .indexed_db()
+    .map_err(|e| anyhow!("indexed_db error: {:?}", e))?
     .ok_or_else(|| anyhow!("IndexedDB unavailable"))?;
-  let request = factory.open_with_u32(name, 1)?;
+  let request = factory
+    .open_with_u32(name, 1)
+    .map_err(|e| anyhow!("indexed_db open error: {:?}", e))?;
   {
     let store = STORE_NAME.to_string();
     let upgrade = Closure::wrap(Box::new(move |event: web_sys::Event| {
@@ -97,10 +122,10 @@ async fn load_snapshot(db_name: &str) -> Result<HashMap<PathBuf, Vec<u8>>> {
   let db = open_db(db_name).await?;
   let tx = db
     .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-    .with_context(|| format!("opening transaction for {STORE_NAME}"))?;
+    .map_err(|e| anyhow!("opening transaction for {STORE_NAME}: {:?}", e))?;
   let store = tx
     .object_store(STORE_NAME)
-    .with_context(|| format!("opening object store {STORE_NAME}"))?;
+    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
   let keys_req = store
     .get_all_keys()
     .map_err(|e| anyhow!("get_all_keys failed: {:?}", e))?;
@@ -127,10 +152,10 @@ async fn persist_file(db_name: &str, path: &Path, data: Vec<u8>) -> Result<()> {
   let db = open_db(db_name).await?;
   let tx = db
     .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .with_context(|| format!("opening rw transaction for {STORE_NAME}"))?;
+    .map_err(|e| anyhow!("opening rw transaction for {STORE_NAME}: {:?}", e))?;
   let store = tx
     .object_store(STORE_NAME)
-    .with_context(|| format!("opening object store {STORE_NAME}"))?;
+    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
   let key = JsValue::from_str(&path_key(path));
   let value: JsValue = js_sys::Uint8Array::from(data.as_slice()).into();
   let req = store
@@ -364,15 +389,14 @@ impl StorageFile for JsFile {
 }
 
 #[wasm_bindgen]
-pub struct WasmIndex {
+pub struct Searchlite {
   index: Index,
   storage: Arc<JsStorage>,
 }
 
 #[wasm_bindgen]
-impl WasmIndex {
-  #[wasm_bindgen(constructor)]
-  pub async fn new(db_name: String, schema_json: String) -> Result<WasmIndex, JsValue> {
+impl Searchlite {
+  async fn create(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
     let schema: Schema =
       serde_json::from_str(&schema_json).map_err(|err| JsValue::from_str(&err.to_string()))?;
     let root = PathBuf::from(db_name.clone());
@@ -394,38 +418,58 @@ impl WasmIndex {
     let index =
       Index::create_with_storage(&root, schema, opts, storage.clone()).map_err(to_js_error)?;
     storage.flush().await;
-    Ok(WasmIndex { index, storage })
+    Ok(Searchlite { index, storage })
+  }
+
+  /// Preferred async constructor for wasm (avoids async ctor warnings in bindings).
+  #[wasm_bindgen(js_name = init)]
+  pub async fn init(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
+    Self::create(db_name, schema_json).await
   }
 
   /// Initialize the rayon pool for threaded execution. COOP/COEP (cross-origin isolation) must
   /// be handled by the embedding app; this helper does not set headers for you.
+  #[cfg(feature = "threads")]
   pub async fn init_threads(&self, threads: Option<u32>) -> Result<(), JsValue> {
     let desired = threads.unwrap_or_else(|| {
       web_sys::window()
         .map(|w| w.navigator().hardware_concurrency())
+        .map(|n| n as u32)
         .filter(|&n| n > 0)
         .unwrap_or(1)
     });
-    init_thread_pool(desired as usize)
+    JsFuture::from(init_thread_pool(desired as usize))
       .await
+      .map(|_| ())
       .map_err(|err| JsValue::from_str(&format!("{err:?}")))
+  }
+
+  /// Threaded mode is disabled unless the `threads` feature is enabled.
+  #[cfg(not(feature = "threads"))]
+  pub async fn init_threads(&self, _threads: Option<u32>) -> Result<(), JsValue> {
+    Err(JsValue::from_str(
+      "threads feature is disabled; rebuild searchlite-wasm with --features threads and enable wasm atomics/COOP+COEP",
+    ))
+  }
+
+  fn add_documents_internal(&self, docs: Vec<Document>) -> Result<(), JsValue> {
+    let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
+    for doc in docs.iter() {
+      writer.add_document(doc).map_err(to_js_error)?;
+    }
+    Ok(())
   }
 
   pub async fn add_document(&self, doc: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
       serde_wasm_bindgen::from_value(doc).map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let obj = value
-      .as_object()
-      .ok_or_else(|| JsValue::from_str("document must be a JSON object"))?;
-    let mut fields = BTreeMap::new();
-    for (k, v) in obj.iter() {
-      fields.insert(k.clone(), v.clone());
-    }
-    let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
-    writer
-      .add_document(&Document { fields })
-      .map_err(to_js_error)?;
-    Ok(())
+    self.add_documents_internal(vec![value_to_document(value)?])
+  }
+
+  pub async fn add_documents(&self, docs: JsValue) -> Result<(), JsValue> {
+    let value: serde_json::Value =
+      serde_wasm_bindgen::from_value(docs).map_err(|err| JsValue::from_str(&err.to_string()))?;
+    self.add_documents_internal(value_to_documents(value)?)
   }
 
   pub async fn commit(&self) -> Result<(), JsValue> {
@@ -436,7 +480,6 @@ impl WasmIndex {
   }
 
   pub async fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
-    let reader: IndexReader = self.index.reader().map_err(to_js_error)?;
     let request = SearchRequest {
       query,
       fields: None,
@@ -452,7 +495,18 @@ impl WasmIndex {
       highlight_field: None,
       aggs: BTreeMap::<String, Aggregation>::new(),
     };
-    let result = reader.search(request).map_err(to_js_error)?;
+    self.run_search(request)
+  }
+
+  pub async fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
+    let req: SearchRequest = serde_json::from_str(&request_json)
+      .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    self.run_search(req)
+  }
+
+  fn run_search(&self, req: SearchRequest) -> Result<JsValue, JsValue> {
+    let reader: IndexReader = self.index.reader().map_err(to_js_error)?;
+    let result = reader.search(&req).map_err(to_js_error)?;
     serde_wasm_bindgen::to_value(&result).map_err(|err| JsValue::from_str(&err.to_string()))
   }
 

@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Searchlite WASM Demo</title>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+    />
+    <style>
+      :root {
+        --bg: #0c1220;
+        --panel: #111a2e;
+        --panel-alt: #0f1b2c;
+        --border: #1e2b44;
+        --accent: #5ae8c7;
+        --text: #e6edf7;
+        --muted: #94a3b8;
+        --error: #f87171;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(120% 120% at 20% 20%, #12223f, #0b111f 65%);
+        color: var(--text);
+        font-family: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+        min-height: 100vh;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 22px;
+        letter-spacing: 0.4px;
+      }
+      .lead {
+        margin: 0 0 16px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .app {
+        max-width: 1100px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .steps {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .step {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px 16px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .step-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .step-number {
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: #0b1220;
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+      }
+      .step-title {
+        font-weight: 700;
+      }
+      .step-desc {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .step-body {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .load-block {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .file-label {
+        padding: 10px 12px;
+        border: 1px dashed var(--border);
+        border-radius: 10px;
+        background: var(--panel-alt);
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .file-label input {
+        display: none;
+      }
+      button {
+        background: var(--accent);
+        color: #0b1220;
+        border: none;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 120ms ease, box-shadow 120ms ease;
+        font-family: inherit;
+      }
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 24px rgba(90, 232, 199, 0.25);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+      .index-info {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 14px;
+        color: var(--muted);
+        flex-wrap: wrap;
+      }
+      .pill {
+        background: var(--panel-alt);
+        padding: 8px 10px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      .hint {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .panes {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 12px;
+      }
+      .pane {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .pane label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+      textarea {
+        width: 100%;
+        min-height: 340px;
+        resize: vertical;
+        background: var(--panel-alt);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        padding: 10px;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      pre {
+        margin: 0;
+        width: 100%;
+        min-height: 340px;
+        background: var(--panel-alt);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px;
+        overflow: auto;
+      }
+      code {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 13px;
+        white-space: pre;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+      }
+      .status {
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .status.error {
+        color: var(--error);
+      }
+      @media (max-width: 700px) {
+        body {
+          padding: 16px;
+        }
+        textarea,
+        pre {
+          min-height: 260px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <h1>Searchlite WASM Demo</h1>
+      <p class="lead">
+        Follow the steps to load a schema, ingest data, and run search requests
+        in-browser.
+      </p>
+
+      <div class="steps">
+        <section class="step">
+          <div class="step-header">
+            <div class="step-number">1</div>
+            <div>
+              <div class="step-title">Upload schema</div>
+              <div class="step-desc">
+                Applying a new schema resets the index.
+              </div>
+            </div>
+            <div class="pill">Schema: <span id="schema-name">none</span></div>
+          </div>
+          <div class="step-body">
+            <label class="file-label">
+              <input
+                id="schema-input"
+                type="file"
+                accept=".json,application/json"
+              />
+              Choose schema
+            </label>
+            <button id="apply-schema-btn" type="button">Apply schema</button>
+            <span class="hint"
+              >Defaults to a single text field named "body".</span
+            >
+          </div>
+        </section>
+
+        <section class="step">
+          <div class="step-header">
+            <div class="step-number">2</div>
+            <div>
+              <div class="step-title">Load data</div>
+              <div class="step-desc">Add documents to the current index.</div>
+            </div>
+            <div class="pill">DB: <span id="index-name">pending…</span></div>
+            <div class="pill">Docs: <span id="doc-count">0</span></div>
+          </div>
+          <div class="step-body">
+            <label class="file-label">
+              <input
+                id="dataset-input"
+                type="file"
+                accept=".json,.jsonl,.txt,application/json"
+              />
+              Choose dataset
+            </label>
+            <button id="load-btn" type="button">Load into index</button>
+            <span class="hint"
+              >Accepts JSON array or JSON Lines of objects.</span
+            >
+          </div>
+        </section>
+
+        <section class="step">
+          <div class="step-header">
+            <div class="step-number">3</div>
+            <div>
+              <div class="step-title">Search</div>
+              <div class="step-desc">
+                Edit the request JSON and run a search.
+              </div>
+            </div>
+          </div>
+          <div class="panes">
+            <div class="pane">
+              <label for="request">Search request (JSON)</label>
+              <textarea id="request" spellcheck="false"></textarea>
+            </div>
+            <div class="pane">
+              <label for="response">Search response</label>
+              <pre><code id="response" class="language-json">Run a search to see results here.</code></pre>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="search-btn" type="button">Run search</button>
+            <div id="status" class="status">Initializing…</div>
+          </div>
+        </section>
+
+        <section class="step">
+          <div class="step-header">
+            <div class="step-number">4</div>
+            <div>
+              <div class="step-title">Reset</div>
+              <div class="step-desc">Restore defaults and start fresh.</div>
+            </div>
+          </div>
+          <div class="step-body">
+            <button id="page-reset-btn" type="button">Reset page</button>
+            <button id="reset-btn" type="button">Reset index only</button>
+            <span class="hint"
+              >Resets index; page reset also clears schema/data
+              selections.</span
+            >
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script
+      defer
+      src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"
+    ></script>
+    <script type="module">
+      import init, { Searchlite } from "./pkg/searchlite_wasm.js";
+
+      const defaultRequest = {
+        query: "orzo",
+        limit: 5,
+        filters: [],
+        sort: [],
+        return_stored: true,
+      };
+
+      const defaultResponse =
+        "Upload a schema, then load data and run a search.";
+
+      const requestInput = document.getElementById("request");
+      const responseOutput = document.getElementById("response");
+      const datasetInput = document.getElementById("dataset-input");
+      const schemaInput = document.getElementById("schema-input");
+      const loadBtn = document.getElementById("load-btn");
+      const resetBtn = document.getElementById("reset-btn");
+      const searchBtn = document.getElementById("search-btn");
+      const applySchemaBtn = document.getElementById("apply-schema-btn");
+      const pageResetBtn = document.getElementById("page-reset-btn");
+      const statusEl = document.getElementById("status");
+      const docCountEl = document.getElementById("doc-count");
+      const indexNameEl = document.getElementById("index-name");
+      const schemaNameEl = document.getElementById("schema-name");
+
+      let idx = null;
+      let docCount = 0;
+      let currentDb = "";
+      let currentSchema = null;
+      let busy = false;
+      schemaNameEl.dataset.label = "none";
+      requestInput.value = JSON.stringify(defaultRequest, null, 2);
+
+      function setStatus(msg, isError = false) {
+        statusEl.textContent = msg;
+        statusEl.classList.toggle("error", isError);
+      }
+
+      function updateIndexInfo() {
+        indexNameEl.textContent = currentDb || "pending";
+        docCountEl.textContent = docCount.toString();
+        schemaNameEl.textContent = schemaNameEl.dataset.label || "none";
+      }
+
+      function nextDbName() {
+        return `demo-db-${Date.now()}`;
+      }
+
+      function syncDisabled() {
+        loadBtn.disabled = busy || !currentSchema;
+        resetBtn.disabled = busy || !currentSchema;
+        searchBtn.disabled = busy || !currentSchema;
+        applySchemaBtn.disabled = busy;
+        pageResetBtn.disabled = busy;
+      }
+
+      function toggleBusy(state) {
+        busy = state;
+        syncDisabled();
+      }
+
+      function normalize(value) {
+        if (value instanceof Map) {
+          const obj = {};
+          for (const [k, v] of value.entries()) {
+            obj[k] = normalize(v);
+          }
+          return obj;
+        }
+        if (Array.isArray(value)) {
+          return value.map((v) => normalize(v));
+        }
+        if (value && typeof value === "object") {
+          const obj = {};
+          for (const [k, v] of Object.entries(value)) {
+            obj[k] = normalize(v);
+          }
+          return obj;
+        }
+        return value;
+      }
+
+      function renderResponse(data) {
+        const normalized = normalize(data);
+        const text =
+          typeof normalized === "string"
+            ? normalized
+            : JSON.stringify(normalized, null, 2);
+        responseOutput.textContent = text;
+        if (window.hljs) {
+          hljs.highlightElement(responseOutput);
+        }
+      }
+
+      function parseDocuments(raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            return parsed;
+          }
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return [parsed];
+          }
+        } catch (_err) {
+          // Fall through to JSONL parsing.
+        }
+
+        const docs = [];
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj = JSON.parse(trimmed);
+            if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+              docs.push(obj);
+            }
+          } catch (_err) {
+            // ignore malformed lines and report later
+          }
+        }
+        if (docs.length === 0) {
+          throw new Error(
+            "Dataset must be a JSON array or JSON Lines of JSON objects."
+          );
+        }
+        return docs;
+      }
+
+      async function ensureIndex(reset = false) {
+        if (!currentSchema) {
+          throw new Error("Upload a schema first.");
+        }
+        if (idx && !reset) return idx;
+        if (idx?.free) {
+          try {
+            idx.free();
+          } catch (err) {
+            console.warn("Failed to free existing index", err);
+          }
+        }
+        currentDb = nextDbName();
+        setStatus("Initializing index…");
+        idx = await Searchlite.init(currentDb, JSON.stringify(currentSchema));
+        docCount = 0;
+        updateIndexInfo();
+        setStatus("Index ready");
+        return idx;
+      }
+
+      async function loadDataset() {
+        const file = datasetInput.files?.[0];
+        if (!file) {
+          setStatus("Choose a dataset file first.", true);
+          return;
+        }
+        toggleBusy(true);
+        try {
+          await ensureIndex();
+          const raw = await file.text();
+          const docs = parseDocuments(raw);
+          if (!docs.length) {
+            throw new Error("No documents found in dataset.");
+          }
+          await idx.add_documents(docs);
+          await idx.commit();
+          docCount += docs.length;
+          updateIndexInfo();
+          setStatus(`Loaded ${docs.length} documents from ${file.name}.`);
+        } catch (err) {
+          console.error(err);
+          setStatus(`Load failed: ${err.message || err}`, true);
+        } finally {
+          toggleBusy(false);
+        }
+      }
+
+      async function applySchemaFromFile() {
+        const file = schemaInput.files?.[0];
+        if (!file) {
+          setStatus("Choose a schema file first.", true);
+          return;
+        }
+        toggleBusy(true);
+        try {
+          const raw = await file.text();
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object") {
+            throw new Error("Schema must be a JSON object.");
+          }
+          currentSchema = parsed;
+          schemaNameEl.dataset.label = file.name;
+          updateIndexInfo();
+          await ensureIndex(true);
+          renderResponse(`Schema "${file.name}" applied. Index reset.`);
+        } catch (err) {
+          console.error(err);
+          setStatus(`Schema load failed: ${err.message || err}`, true);
+        } finally {
+          toggleBusy(false);
+        }
+      }
+
+      async function resetPage() {
+        toggleBusy(true);
+        try {
+          if (idx?.free) {
+            try {
+              idx.free();
+            } catch (err) {
+              console.warn("Failed to free index on reset", err);
+            }
+          }
+          idx = null;
+          currentSchema = null;
+          currentDb = "";
+          docCount = 0;
+          schemaNameEl.dataset.label = "none";
+          requestInput.value = JSON.stringify(defaultRequest, null, 2);
+          datasetInput.value = "";
+          schemaInput.value = "";
+          renderResponse(defaultResponse);
+          setStatus("Page reset. Upload a schema to start.");
+          updateIndexInfo();
+        } catch (err) {
+          console.error(err);
+          setStatus(`Page reset failed: ${err.message || err}`, true);
+        } finally {
+          syncDisabled();
+          toggleBusy(false);
+        }
+      }
+
+      function parseRequest() {
+        let parsed;
+        try {
+          parsed = JSON.parse(requestInput.value);
+        } catch (err) {
+          throw new Error(`Request JSON is invalid: ${err.message}`);
+        }
+        if (!parsed || typeof parsed !== "object") {
+          throw new Error("Request JSON must be an object.");
+        }
+        if (!parsed.query || typeof parsed.query !== "string") {
+          throw new Error("Include a 'query' string field in the request.");
+        }
+        if (
+          typeof parsed.limit !== "number" ||
+          !Number.isFinite(parsed.limit)
+        ) {
+          throw new Error("Include a numeric 'limit' in the request.");
+        }
+        if (!Array.isArray(parsed.filters)) {
+          parsed.filters = [];
+        }
+        if (!Array.isArray(parsed.sort)) {
+          parsed.sort = [];
+        }
+        if (parsed.cursor === undefined) {
+          parsed.cursor = null;
+        }
+        if (parsed.bmw_block_size === undefined) {
+          parsed.bmw_block_size = null;
+        }
+        if (parsed.return_stored === undefined) {
+          parsed.return_stored = true;
+        }
+        if (!parsed.execution) {
+          parsed.execution = "wand";
+        }
+        if (!parsed.aggs || typeof parsed.aggs !== "object") {
+          parsed.aggs = {};
+        }
+        return parsed;
+      }
+
+      async function runSearch() {
+        toggleBusy(true);
+        try {
+          await ensureIndex();
+          const req = parseRequest();
+          setStatus("Searching…");
+          const result = await idx.search_request(JSON.stringify(req));
+          console.log(result);
+          renderResponse(result);
+          setStatus("Search complete.");
+        } catch (err) {
+          console.error(err);
+          setStatus(`Search failed: ${err.message || err}`, true);
+        } finally {
+          toggleBusy(false);
+        }
+      }
+
+      loadBtn.addEventListener("click", () => {
+        loadDataset();
+      });
+
+      applySchemaBtn.addEventListener("click", () => {
+        applySchemaFromFile();
+      });
+
+      resetBtn.addEventListener("click", async () => {
+        toggleBusy(true);
+        try {
+          await ensureIndex(true);
+          renderResponse(defaultResponse);
+          setStatus("Index reset. Load data to continue.");
+        } catch (err) {
+          console.error(err);
+          setStatus(`Reset failed: ${err.message || err}`, true);
+        } finally {
+          toggleBusy(false);
+        }
+      });
+
+      pageResetBtn.addEventListener("click", () => {
+        resetPage();
+      });
+
+      searchBtn.addEventListener("click", () => {
+        runSearch();
+      });
+
+      // Initialize the module and first index.
+      (async () => {
+        try {
+          await init();
+          setStatus("WASM module loaded. Upload a schema to start.");
+          renderResponse(defaultResponse);
+          syncDisabled();
+        } catch (err) {
+          console.error(err);
+          setStatus(`Init failed: ${err.message || err}`, true);
+        }
+      })();
+    </script>
+  </body>
+</html>
