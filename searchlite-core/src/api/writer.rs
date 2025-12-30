@@ -181,17 +181,23 @@ impl IndexWriter {
 }
 
 fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
-  doc
+  let doc_id = doc
     .fields
     .get(schema.doc_id_field())
     .and_then(|v| v.as_str())
-    .map(|s| s.to_string())
     .ok_or_else(|| {
       anyhow!(
-        "missing required document id field `{}`",
+        "missing or empty required document id field `{}`",
         schema.doc_id_field()
       )
-    })
+    })?;
+  if doc_id.trim().is_empty() {
+    bail!(
+      "missing or empty required document id field `{}`",
+      schema.doc_id_field()
+    );
+  }
+  Ok(doc_id.to_string())
 }
 
 fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<String, DocAddress>> {
@@ -398,6 +404,102 @@ mod tests {
   }
 
   #[test]
+  fn replay_pending_delete_from_wal() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("to delete")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      writer.delete_document("1").unwrap();
+      // Drop without commit so wal retains delete entry.
+    }
+    let mut restored = idx.writer().unwrap();
+    assert_eq!(
+      restored
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Delete { .. }))
+        .count(),
+      1
+    );
+    restored.commit().unwrap();
+    let manifest = idx.manifest();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].deleted_docs, vec![0]);
+  }
+
+  #[test]
+  fn replay_add_then_delete_same_id() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("original")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("updated")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.delete_document("1").unwrap();
+      // Drop without commit so wal retains ordered ops.
+    }
+    let mut restored = idx.writer().unwrap();
+    assert_eq!(
+      restored
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Add { .. }))
+        .count(),
+      1
+    );
+    assert_eq!(
+      restored
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Delete { .. }))
+        .count(),
+      1
+    );
+    restored.commit().unwrap();
+    let manifest = idx.manifest();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].deleted_docs, vec![0]);
+  }
+
+  #[test]
   fn rollback_clears_pending_and_wal() {
     let dir = tempdir().unwrap();
     let schema = Schema::default_text_body();
@@ -425,5 +527,42 @@ mod tests {
     assert!(writer.pending_ops.is_empty());
     let wal_path = crate::index::directory::wal_path(&writer.inner.path);
     assert_eq!(std::fs::metadata(wal_path).unwrap().len(), 0);
+  }
+
+  #[test]
+  fn rollback_discards_pending_delete_ops() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("to keep")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let mut writer = idx.writer().unwrap();
+    writer.delete_document("1").unwrap();
+    assert_eq!(
+      writer
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Delete { .. }))
+        .count(),
+      1
+    );
+    writer.rollback().unwrap();
+    assert!(writer.pending_ops.is_empty());
+    let wal_path = crate::index::directory::wal_path(&writer.inner.path);
+    assert_eq!(std::fs::metadata(wal_path).unwrap().len(), 0);
+    let manifest = idx.manifest();
+    assert!(manifest.segments[0].deleted_docs.is_empty());
   }
 }

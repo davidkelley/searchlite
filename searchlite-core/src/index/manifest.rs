@@ -208,10 +208,12 @@ impl Schema {
       .fields
       .get(self.doc_id_field())
       .and_then(|v| v.as_str())
+      .map(|s| s.trim())
+      .filter(|s| !s.is_empty())
       .is_none()
     {
       anyhow::bail!(
-        "missing required document id field `{}`",
+        "missing or empty required document id field `{}`",
         self.doc_id_field()
       );
     }
@@ -244,7 +246,23 @@ mod tests {
     let err = schema.validate_document(&doc).unwrap_err();
     assert!(err
       .to_string()
-      .contains("missing required document id field"));
+      .contains("missing or empty required document id field"));
+  }
+
+  #[test]
+  fn doc_id_field_rejects_empty() {
+    let schema = Schema::default_text_body();
+    for value in ["", "   "] {
+      let doc = crate::api::types::Document {
+        fields: [("_id".into(), serde_json::json!(value))]
+          .into_iter()
+          .collect(),
+      };
+      let err = schema.validate_document(&doc).unwrap_err();
+      assert!(err
+        .to_string()
+        .contains("missing or empty required document id field"));
+    }
   }
 
   #[test]
