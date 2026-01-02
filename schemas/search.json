@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/davidkelley/searchlite/search-schema.json",
+  "title": "Searchlite Search Request Schema",
+  "description": "Defines the JSON payload accepted by Searchlite search requests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query", "filters", "limit", "return_stored"],
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Query string supporting field:term, quoted phrases, and negation."
+    },
+    "fields": {
+      "description": "Optional list of text fields to search; null or omitted uses all text fields.",
+      "anyOf": [
+        { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        { "type": "null" }
+      ]
+    },
+    "filters": {
+      "type": "array",
+      "description": "Filter clauses applied to fast fields.",
+      "items": { "$ref": "#/$defs/filter" }
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Maximum number of hits to return. Use 0 for aggregation-only queries."
+    },
+    "sort": {
+      "type": "array",
+      "description": "Sort specifications; `_score` is allowed as a field name.",
+      "items": { "$ref": "#/$defs/sort_spec" },
+      "default": []
+    },
+    "cursor": {
+      "description": "Opaque pagination cursor from a previous response.",
+      "anyOf": [{ "type": "string" }, { "type": "null" }]
+    },
+    "execution": {
+      "$ref": "#/$defs/execution_strategy",
+      "description": "Ranking execution strategy.",
+      "default": "wand"
+    },
+    "bmw_block_size": {
+      "description": "Optional block size override for BMW execution.",
+      "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+    },
+    "vector_query": {
+      "description": "Optional vector query tuple: [field, vector, alpha]. Requires the `vectors` feature.",
+      "anyOf": [{ "$ref": "#/$defs/vector_query" }, { "type": "null" }]
+    },
+    "return_stored": {
+      "type": "boolean",
+      "description": "Whether to return stored fields in hits."
+    },
+    "highlight_field": {
+      "description": "Optional text field used to generate snippets.",
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "aggs": {
+      "type": "object",
+      "description": "Aggregation tree keyed by aggregation name.",
+      "additionalProperties": { "$ref": "#/$defs/aggregation" },
+      "default": {}
+    }
+  },
+  "$defs": {
+    "execution_strategy": {
+      "type": "string",
+      "enum": ["bm25", "wand", "bmw"]
+    },
+    "vector_query": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "string", "minLength": 1 },
+        { "type": "array", "items": { "type": "number" } },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "sort_order": {
+      "type": "string",
+      "enum": ["asc", "desc"]
+    },
+    "sort_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Field name or `_score`."
+        },
+        "order": {
+          "anyOf": [{ "$ref": "#/$defs/sort_order" }, { "type": "null" }]
+        }
+      }
+    },
+    "filter": {
+      "oneOf": [
+        { "$ref": "#/$defs/filter_keyword_eq" },
+        { "$ref": "#/$defs/filter_keyword_in" },
+        { "$ref": "#/$defs/filter_i64_range" },
+        { "$ref": "#/$defs/filter_f64_range" },
+        { "$ref": "#/$defs/filter_nested" }
+      ]
+    },
+    "filter_keyword_eq": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["KeywordEq"],
+      "properties": {
+        "KeywordEq": { "$ref": "#/$defs/filter_keyword_eq_body" }
+      }
+    },
+    "filter_keyword_eq_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "value"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "value": { "type": "string" }
+      }
+    },
+    "filter_keyword_in": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["KeywordIn"],
+      "properties": {
+        "KeywordIn": { "$ref": "#/$defs/filter_keyword_in_body" }
+      }
+    },
+    "filter_keyword_in_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "values"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "values": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "filter_i64_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["I64Range"],
+      "properties": {
+        "I64Range": { "$ref": "#/$defs/filter_i64_range_body" }
+      }
+    },
+    "filter_i64_range_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "min", "max"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "min": { "type": "integer" },
+        "max": { "type": "integer" }
+      }
+    },
+    "filter_f64_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["F64Range"],
+      "properties": {
+        "F64Range": { "$ref": "#/$defs/filter_f64_range_body" }
+      }
+    },
+    "filter_f64_range_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "min", "max"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      }
+    },
+    "filter_nested": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Nested"],
+      "properties": {
+        "Nested": { "$ref": "#/$defs/filter_nested_body" }
+      }
+    },
+    "filter_nested_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "filter"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "filter": { "$ref": "#/$defs/filter" }
+      }
+    },
+    "aggregation": {
+      "oneOf": [
+        { "$ref": "#/$defs/terms_agg" },
+        { "$ref": "#/$defs/range_agg" },
+        { "$ref": "#/$defs/date_range_agg" },
+        { "$ref": "#/$defs/histogram_agg" },
+        { "$ref": "#/$defs/date_histogram_agg" },
+        { "$ref": "#/$defs/stats_agg" },
+        { "$ref": "#/$defs/extended_stats_agg" },
+        { "$ref": "#/$defs/value_count_agg" },
+        { "$ref": "#/$defs/top_hits_agg" }
+      ]
+    },
+    "terms_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field"],
+      "properties": {
+        "type": { "const": "terms" },
+        "field": { "type": "string", "minLength": 1 },
+        "size": {
+          "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        },
+        "shard_size": {
+          "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        },
+        "min_doc_count": {
+          "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        },
+        "missing": {},
+        "aggs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/aggregation" },
+          "default": {}
+        }
+      }
+    },
+    "range_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field", "keyed", "ranges"],
+      "properties": {
+        "type": { "const": "range" },
+        "field": { "type": "string", "minLength": 1 },
+        "keyed": { "type": "boolean" },
+        "ranges": { "type": "array", "items": { "$ref": "#/$defs/range_bound" } },
+        "missing": {},
+        "aggs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/aggregation" },
+          "default": {}
+        }
+      }
+    },
+    "date_range_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field", "keyed", "ranges"],
+      "properties": {
+        "type": { "const": "date_range" },
+        "field": { "type": "string", "minLength": 1 },
+        "keyed": { "type": "boolean" },
+        "format": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "ranges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/date_range_bound" }
+        },
+        "missing": {},
+        "aggs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/aggregation" },
+          "default": {}
+        }
+      }
+    },
+    "histogram_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field", "interval"],
+      "properties": {
+        "type": { "const": "histogram" },
+        "field": { "type": "string", "minLength": 1 },
+        "interval": { "type": "number", "exclusiveMinimum": 0 },
+        "offset": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "min_doc_count": {
+          "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        },
+        "extended_bounds": {
+          "anyOf": [{ "$ref": "#/$defs/histogram_bounds" }, { "type": "null" }]
+        },
+        "hard_bounds": {
+          "anyOf": [{ "$ref": "#/$defs/histogram_bounds" }, { "type": "null" }]
+        },
+        "missing": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "aggs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/aggregation" },
+          "default": {}
+        }
+      }
+    },
+    "date_histogram_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field"],
+      "properties": {
+        "type": { "const": "date_histogram" },
+        "field": { "type": "string", "minLength": 1 },
+        "calendar_interval": { "type": "string" },
+        "fixed_interval": { "type": "string" },
+        "offset": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "format": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "min_doc_count": {
+          "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        },
+        "extended_bounds": {
+          "anyOf": [{ "$ref": "#/$defs/date_histogram_bounds" }, { "type": "null" }]
+        },
+        "hard_bounds": {
+          "anyOf": [{ "$ref": "#/$defs/date_histogram_bounds" }, { "type": "null" }]
+        },
+        "missing": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "aggs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/aggregation" },
+          "default": {}
+        }
+      },
+      "anyOf": [
+        { "required": ["calendar_interval"] },
+        { "required": ["fixed_interval"] }
+      ]
+    },
+    "stats_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field"],
+      "properties": {
+        "type": { "const": "stats" },
+        "field": { "type": "string", "minLength": 1 },
+        "missing": {}
+      }
+    },
+    "extended_stats_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field"],
+      "properties": {
+        "type": { "const": "extended_stats" },
+        "field": { "type": "string", "minLength": 1 },
+        "missing": {}
+      }
+    },
+    "value_count_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "field"],
+      "properties": {
+        "type": { "const": "value_count" },
+        "field": { "type": "string", "minLength": 1 },
+        "missing": {}
+      }
+    },
+    "top_hits_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "top_hits" },
+        "size": { "type": "integer", "minimum": 0 },
+        "from": { "type": "integer", "minimum": 0 },
+        "fields": {
+          "anyOf": [
+            { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            { "type": "null" }
+          ]
+        },
+        "sort": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sort_spec" },
+          "default": []
+        },
+        "highlight_field": {
+          "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+        }
+      }
+    },
+    "range_bound": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "from": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "to": { "anyOf": [{ "type": "number" }, { "type": "null" }] }
+      }
+    },
+    "date_range_bound": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "from": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "to": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+      }
+    },
+    "histogram_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      }
+    },
+    "date_histogram_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "string" },
+        "max": { "type": "string" }
+      }
+    }
+  }
+}
