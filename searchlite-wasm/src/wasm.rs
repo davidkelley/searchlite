@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -22,9 +23,13 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use wasm_bindgen_rayon::init_thread_pool;
 
 const STORE_NAME: &str = "searchlite_files";
+// BM25 defaults tuned for browser-based search; keep aligned with core defaults.
+const BM25_K1: f32 = 0.9;
+const BM25_B: f32 = 0.4;
 
 thread_local! {
-  // Avoid reconnecting for each persist operation.
+  // Per-thread (per WASM worker) cache of IndexedDB connections.
+  // This avoids reconnecting for each persist operation on the same thread.
   static DB_CACHE: RefCell<HashMap<String, web_sys::IdbDatabase>> = RefCell::new(HashMap::new());
 }
 
@@ -57,38 +62,84 @@ fn value_to_documents(value: serde_json::Value) -> Result<Vec<Document>, JsValue
   }
 }
 
+fn clear_request_handlers(
+  req: &web_sys::IdbRequest,
+  success: &Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>>,
+  error: &Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>>,
+) {
+  req.set_onsuccess(None);
+  req.set_onerror(None);
+  success.borrow_mut().take();
+  error.borrow_mut().take();
+}
+
 fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output = Result<JsValue>> {
+  let (tx, rx) = oneshot::channel::<Result<JsValue>>();
+  let sender = Rc::new(RefCell::new(Some(tx)));
+  let success_handler: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
+    Rc::new(RefCell::new(None));
+  let error_handler: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
+    Rc::new(RefCell::new(None));
   let success_req = req.clone();
   let error_req = req.clone();
-  let promise = js_sys::Promise::new(&mut |resolve, reject| {
-    let success = Closure::wrap(Box::new(move |event: web_sys::Event| {
+
+  let success_handler_clone = success_handler.clone();
+  let error_handler_clone = error_handler.clone();
+  let sender_clone = sender.clone();
+  let success = Closure::wrap(Box::new(move |event: web_sys::Event| {
+    let result = (|| {
       if let Some(target) = event.target() {
         if let Ok(req) = target.dyn_into::<web_sys::IdbRequest>() {
           if let Ok(result) = req.result() {
-            let _ = resolve.call1(&JsValue::UNDEFINED, &result);
-            return;
+            return Ok(result);
           }
         }
       }
-      let _ = resolve.call0(&JsValue::UNDEFINED);
-    }) as Box<dyn FnMut(_)>);
-    let err_req = error_req.clone();
-    let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-      let err_val = match err_req.error() {
-        Ok(e) => e.into(),
-        Err(_) => JsValue::from_str("indexeddb request error"),
-      };
-      let _ = reject.call1(&JsValue::UNDEFINED, &err_val);
-    }) as Box<dyn FnMut(_)>);
-    success_req.set_onsuccess(Some(success.as_ref().unchecked_ref()));
-    error_req.set_onerror(Some(error.as_ref().unchecked_ref()));
-    success.forget();
-    error.forget();
-  });
+      Err(anyhow!("indexeddb request missing result"))
+    })();
+    if let Some(tx) = sender_clone.borrow_mut().take() {
+      let _ = tx.send(result);
+    }
+    clear_request_handlers(&success_req, &success_handler_clone, &error_handler_clone);
+  }) as Box<dyn FnMut(_)>);
+  *success_handler.borrow_mut() = Some(success);
+  success_req.set_onsuccess(Some(
+    success_handler
+      .borrow()
+      .as_ref()
+      .expect("success handler set")
+      .as_ref()
+      .unchecked_ref(),
+  ));
+
+  let success_handler_clone = success_handler.clone();
+  let error_handler_clone = error_handler.clone();
+  let sender_clone = sender.clone();
+  let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+    let err_val = match error_req.error() {
+      Ok(e) => e.into(),
+      Err(_) => JsValue::from_str("indexeddb request error"),
+    };
+    if let Some(tx) = sender_clone.borrow_mut().take() {
+      let _ = tx.send(Err(anyhow!("indexeddb request error: {:?}", err_val)));
+    }
+    clear_request_handlers(&error_req, &success_handler_clone, &error_handler_clone);
+  }) as Box<dyn FnMut(_)>);
+  *error_handler.borrow_mut() = Some(error);
+  error_req.set_onerror(Some(
+    error_handler
+      .borrow()
+      .as_ref()
+      .expect("error handler set")
+      .as_ref()
+      .unchecked_ref(),
+  ));
+
   async move {
-    JsFuture::from(promise)
-      .await
-      .map_err(|err| anyhow!("indexeddb request failed: {:?}", err))
+    match rx.await {
+      Ok(result) => result,
+      Err(_) => Err(anyhow!("indexeddb request canceled")),
+    }
   }
 }
 
@@ -104,28 +155,27 @@ async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
   let request = factory
     .open_with_u32(name, 1)
     .map_err(|e| anyhow!("indexed_db open error: {:?}", e))?;
-  {
-    let store = STORE_NAME.to_string();
-    let upgrade = Closure::wrap(Box::new(move |event: web_sys::Event| {
-      if let Some(target) = event.target() {
-        if let Ok(req) = target.dyn_into::<web_sys::IdbOpenDbRequest>() {
-          if let Ok(result) = req.result() {
-            if let Ok(db) = result.dyn_into::<web_sys::IdbDatabase>() {
-              if let Err(e) = db.create_object_store(&store) {
-                web_sys::console::error_1(&JsValue::from_str(&format!(
-                  "Failed to create IndexedDB object store '{store}': {e:?}"
-                )));
-              }
+  let store = STORE_NAME.to_string();
+  let upgrade = Closure::wrap(Box::new(move |event: web_sys::Event| {
+    if let Some(target) = event.target() {
+      if let Ok(req) = target.dyn_into::<web_sys::IdbOpenDbRequest>() {
+        if let Ok(result) = req.result() {
+          if let Ok(db) = result.dyn_into::<web_sys::IdbDatabase>() {
+            if let Err(e) = db.create_object_store(&store) {
+              web_sys::console::error_1(&JsValue::from_str(&format!(
+                "Failed to create IndexedDB object store '{store}': {e:?}"
+              )));
             }
           }
         }
       }
-    }) as Box<dyn FnMut(_)>);
-    request.set_onupgradeneeded(Some(upgrade.as_ref().unchecked_ref()));
-    upgrade.forget();
-  }
-  let request: web_sys::IdbRequest = request.into();
-  let db_value = request_future(&request).await?;
+    }
+  }) as Box<dyn FnMut(_)>);
+  request.set_onupgradeneeded(Some(upgrade.as_ref().unchecked_ref()));
+  let request_handle: web_sys::IdbRequest = request.clone().into();
+  let db_value = request_future(&request_handle).await?;
+  request.set_onupgradeneeded(None);
+  drop(upgrade);
   let db = db_value
     .dyn_into::<web_sys::IdbDatabase>()
     .map_err(|_| anyhow!("failed to open IndexedDB database"))?;
@@ -169,7 +219,7 @@ async fn persist_file(db_name: &str, path: &Path, data: Vec<u8>) -> Result<()> {
   let db = open_db(db_name).await?;
   let tx = db
     .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .map_err(|e| anyhow!("opening rw transaction for {STORE_NAME}: {:?}", e))?;
+    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
   let store = tx
     .object_store(STORE_NAME)
     .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
@@ -185,7 +235,14 @@ async fn persist_file(db_name: &str, path: &Path, data: Vec<u8>) -> Result<()> {
 #[derive(Clone)]
 struct PendingWrites {
   db_name: String,
-  pending: Arc<Mutex<Vec<oneshot::Receiver<()>>>>,
+  pending: Arc<Mutex<Vec<oneshot::Receiver<Result<()>>>>>,
+  queue: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
+}
+
+struct PendingEntry {
+  pending: Option<Vec<u8>>,
+  waiters: Vec<oneshot::Sender<Result<()>>>,
+  inflight: bool,
 }
 
 impl PendingWrites {
@@ -193,31 +250,101 @@ impl PendingWrites {
     Self {
       db_name,
       pending: Arc::new(Mutex::new(Vec::new())),
+      queue: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
   fn schedule(&self, path: PathBuf, data: Vec<u8>) {
     let (tx, rx) = oneshot::channel();
-    let db = self.db_name.clone();
-    spawn_local(async move {
-      if let Err(err) = persist_file(&db, &path, data).await {
-        web_sys::console::error_1(&JsValue::from_str(&format!(
-          "persist error for {:?}: {err}",
-          path
-        )));
-      }
-      let _ = tx.send(());
-    });
     self.pending.lock().push(rx);
+    let mut guard = self.queue.lock();
+    let entry = guard.entry(path.clone()).or_insert(PendingEntry {
+      pending: None,
+      waiters: Vec::new(),
+      inflight: false,
+    });
+    entry.pending = Some(data);
+    entry.waiters.push(tx);
+    if entry.inflight {
+      return;
+    }
+    entry.inflight = true;
+    drop(guard);
+    let db = self.db_name.clone();
+    let queue = self.queue.clone();
+    spawn_local(async move {
+      persist_queue(db, path, queue).await;
+    });
   }
 
-  async fn flush(&self) {
+  async fn flush(&self) -> Result<()> {
     let receivers = {
       let mut guard = self.pending.lock();
       std::mem::take(&mut *guard)
     };
+    let mut first_error = None;
     for rx in receivers {
-      let _ = rx.await;
+      match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+          if first_error.is_none() {
+            first_error = Some(err);
+          }
+        }
+        Err(_) => {
+          if first_error.is_none() {
+            first_error = Some(anyhow!("pending persist dropped"));
+          }
+        }
+      }
+    }
+    if let Some(err) = first_error {
+      Err(err)
+    } else {
+      Ok(())
+    }
+  }
+}
+
+async fn persist_queue(
+  db_name: String,
+  path: PathBuf,
+  queue: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
+) {
+  loop {
+    let (data, waiters) = {
+      let mut guard = queue.lock();
+      let entry = match guard.get_mut(&path) {
+        Some(entry) => entry,
+        None => return,
+      };
+      let data = match entry.pending.take() {
+        Some(data) => data,
+        None => {
+          entry.inflight = false;
+          if entry.waiters.is_empty() {
+            guard.remove(&path);
+          }
+          return;
+        }
+      };
+      let waiters = std::mem::take(&mut entry.waiters);
+      (data, waiters)
+    };
+    let result = persist_file(&db_name, &path, data).await;
+    let err_msg = result.as_ref().err().map(|err| err.to_string());
+    if let Some(msg) = &err_msg {
+      web_sys::console::error_1(&JsValue::from_str(&format!(
+        "persist error for {:?}: {}",
+        path, msg
+      )));
+    }
+    for tx in waiters {
+      let send_result = match &err_msg {
+        Some(msg) => Err(anyhow!(msg.clone())),
+        None => Ok(()),
+      };
+      let _ = tx.send(send_result);
     }
   }
 }
@@ -254,8 +381,8 @@ impl JsStorage {
     self.pending.schedule(path, data);
   }
 
-  pub async fn flush(&self) {
-    self.pending.flush().await;
+  pub async fn flush(&self) -> Result<()> {
+    self.pending.flush().await
   }
 }
 
@@ -370,7 +497,15 @@ impl std::io::Read for JsFile {
 impl std::io::Write for JsFile {
   fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
     let mut data = self.data.write();
-    let end = (self.pos as usize).saturating_add(buf.len());
+    let buf_len = buf.len() as u64;
+    let max_usize = usize::MAX as u64;
+    if self.pos > max_usize || buf_len > max_usize - self.pos {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "write would overflow address space",
+      ));
+    }
+    let end = (self.pos as usize) + buf.len();
     if end > data.len() {
       data.resize(end, 0);
     }
@@ -381,6 +516,12 @@ impl std::io::Write for JsFile {
   }
 
   fn flush(&mut self) -> std::io::Result<()> {
+    // Flushing schedules an async persist; use `flush_storage` to await completion.
+    if self.dirty {
+      let data = self.data.read().clone();
+      self.pending.schedule(self.path.clone(), data);
+      self.dirty = false;
+    }
     Ok(())
   }
 }
@@ -412,13 +553,16 @@ impl StorageFile for JsFile {
     }
     self.dirty = true;
     self.pending.schedule(self.path.clone(), data.clone());
+    self.dirty = false;
     Ok(())
   }
 
   fn sync_all(&mut self) -> Result<()> {
-    let data = self.data.read().clone();
-    self.dirty = true;
-    self.pending.schedule(self.path.clone(), data);
+    if self.dirty {
+      let data = self.data.read().clone();
+      self.pending.schedule(self.path.clone(), data);
+      self.dirty = false;
+    }
     Ok(())
   }
 }
@@ -444,20 +588,21 @@ impl Searchlite {
       path: root.clone(),
       create_if_missing: true,
       enable_positions: true,
-      bm25_k1: 0.9,
-      bm25_b: 0.4,
-      // The IndexedDB-backed `JsStorage` determines persistence here.
+      bm25_k1: BM25_K1,
+      bm25_b: BM25_B,
+      // Use the core in-memory storage; the surrounding JsStorage wrapper handles
+      // actual persistence (IndexedDB in the browser).
       storage: StorageType::InMemory,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
     let index =
       Index::create_with_storage(&root, schema, opts, storage.clone()).map_err(to_js_error)?;
-    storage.flush().await;
+    storage.flush().await.map_err(to_js_error)?;
     Ok(Searchlite { index, storage })
   }
 
-  /// Preferred async constructor for wasm (avoids async ctor warnings in bindings).
+  /// Public WASM-exported async constructor; delegates to the internal `create` helper.
   /// `db_name` is used for both the IndexedDB database name and the virtual root path.
   #[wasm_bindgen(js_name = init)]
   pub async fn init(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
@@ -498,14 +643,14 @@ impl Searchlite {
   }
 
   /// Add a document to the index. Call `commit` to make it searchable and persist it.
-  pub async fn add_document(&self, doc: JsValue) -> Result<(), JsValue> {
+  pub fn add_document(&self, doc: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
       serde_wasm_bindgen::from_value(doc).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(vec![value_to_document(value)?])
   }
 
   /// Add multiple documents to the index. Call `commit` to persist changes.
-  pub async fn add_documents(&self, docs: JsValue) -> Result<(), JsValue> {
+  pub fn add_documents(&self, docs: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
       serde_wasm_bindgen::from_value(docs).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(value_to_documents(value)?)
@@ -515,7 +660,7 @@ impl Searchlite {
   pub async fn commit(&self) -> Result<(), JsValue> {
     let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
     writer.commit().map_err(to_js_error)?;
-    self.storage.flush().await;
+    self.storage.flush().await.map_err(to_js_error)?;
     Ok(())
   }
 
@@ -552,7 +697,7 @@ impl Searchlite {
 
   /// Wait for pending IndexedDB writes; `commit` already calls this.
   pub async fn flush_storage(&self) -> Result<(), JsValue> {
-    self.storage.flush().await;
+    self.storage.flush().await.map_err(to_js_error)?;
     Ok(())
   }
 }
@@ -561,6 +706,7 @@ impl Searchlite {
 mod tests {
   use super::*;
   use searchlite_core::api::types::ExecutionStrategy;
+  use std::io::{Read, Seek, SeekFrom, Write};
   use wasm_bindgen_test::*;
 
   wasm_bindgen_test_configure!(run_in_browser);
@@ -576,11 +722,74 @@ mod tests {
     let storage = JsStorage::new(db.clone(), root.clone()).await.unwrap();
     let path = root.join("test.bin");
     storage.write_all(&path, b"hello wasm").unwrap();
-    storage.flush().await;
+    storage.flush().await.unwrap();
     drop(storage);
     let restored = JsStorage::new(db, root.clone()).await.unwrap();
     let contents = restored.read_to_end(&path).unwrap();
     assert_eq!(contents, b"hello wasm");
+  }
+
+  #[wasm_bindgen_test]
+  async fn js_storage_methods_roundtrip() {
+    let db = unique_db("searchlite-storage-methods");
+    let root = PathBuf::from("idx-methods");
+    let storage = JsStorage::new(db, root.clone()).await.unwrap();
+    let path = root.join("notes.txt");
+
+    storage.ensure_dir(&root).unwrap();
+    assert!(!storage.exists(&path));
+
+    {
+      let mut file = storage.open_write(&path).unwrap();
+      file.write_all(b"hello").unwrap();
+      file.flush().unwrap();
+    }
+    storage.flush().await.unwrap();
+    assert!(storage.exists(&path));
+
+    {
+      let mut file = storage.open_append(&path).unwrap();
+      file.write_all(b" world").unwrap();
+      file.flush().unwrap();
+    }
+    storage.flush().await.unwrap();
+    let contents = storage.read_to_end(&path).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    {
+      let mut file = storage.open_read(&path).unwrap();
+      let mut buf = Vec::new();
+      file.read_to_end(&mut buf).unwrap();
+      assert_eq!(buf, b"hello world");
+    }
+
+    let atomic_path = root.join("atomic.txt");
+    storage.atomic_write(&atomic_path, b"atomic").unwrap();
+    storage.flush().await.unwrap();
+    let contents = storage.read_to_end(&atomic_path).unwrap();
+    assert_eq!(contents, b"atomic");
+  }
+
+  #[wasm_bindgen_test]
+  async fn js_file_seek_behaves() {
+    let db = unique_db("searchlite-seek");
+    let root = PathBuf::from("idx-seek");
+    let storage = JsStorage::new(db, root.clone()).await.unwrap();
+    let path = root.join("seek.txt");
+    let mut file = storage.open_write(&path).unwrap();
+
+    file.write_all(b"abcdef").unwrap();
+    file.flush().unwrap();
+    file.seek(SeekFrom::Start(2)).unwrap();
+    let mut buf = [0u8; 2];
+    file.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"cd");
+    file.seek(SeekFrom::End(-2)).unwrap();
+    let mut tail = [0u8; 2];
+    file.read_exact(&mut tail).unwrap();
+    assert_eq!(&tail, b"ef");
+    file.seek(SeekFrom::Start(0)).unwrap();
+    assert!(file.seek(SeekFrom::Current(-1)).is_err());
   }
 
   #[wasm_bindgen_test]
@@ -593,8 +802,8 @@ mod tests {
       path: root.clone(),
       create_if_missing: true,
       enable_positions: true,
-      bm25_k1: 0.9,
-      bm25_b: 0.4,
+      bm25_k1: BM25_K1,
+      bm25_b: BM25_B,
       storage: StorageType::InMemory,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
@@ -609,7 +818,7 @@ mod tests {
       })
       .unwrap();
     writer.commit().unwrap();
-    storage.flush().await;
+    storage.flush().await.unwrap();
     let reader: IndexReader = index.reader().unwrap();
     let request = SearchRequest {
       query: "hello".to_string(),
@@ -628,5 +837,38 @@ mod tests {
     };
     let result = reader.search(request).unwrap();
     assert_eq!(result.hits.len(), 1);
+  }
+
+  #[wasm_bindgen_test]
+  async fn search_request_roundtrip() {
+    let db = unique_db("searchlite-search-request");
+    let schema = Schema::default_text_body();
+    let schema_json = serde_json::to_string(&schema).unwrap();
+    let idx = Searchlite::init(db, schema_json).await.unwrap();
+    let docs = vec![serde_json::json!({ "body": "hello wasm" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let request = SearchRequest {
+      query: "hello".to_string(),
+      fields: None,
+      filters: vec![],
+      limit: 5,
+      sort: vec![],
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: true,
+      highlight_field: None,
+      aggs: BTreeMap::new(),
+    };
+    let request_json = serde_json::to_string(&request).unwrap();
+    let result = idx.search_request(request_json).unwrap();
+    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    let hits = result_json["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
   }
 }

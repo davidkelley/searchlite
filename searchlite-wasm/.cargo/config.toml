@@ -2,6 +2,8 @@
 rustflags = [
   "-C", "target-feature=+atomics,+bulk-memory",
   "-C", "link-arg=--shared-memory",
+  # Set max linear memory to 1 GiB (1073741824 bytes) to balance typical workloads
+  # and common runtime limits; adjust as needed (must be a 64 KiB page multiple).
   "-C", "link-arg=--max-memory=1073741824",
   "-C", "link-arg=--import-memory",
   "-C", "link-arg=--export=__wasm_init_tls",

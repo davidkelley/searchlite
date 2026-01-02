@@ -501,7 +501,7 @@
           if (!docs.length) {
             throw new Error("No documents found in dataset.");
           }
-          await idx.add_documents(docs);
+          idx.add_documents(docs);
           await idx.commit();
           docCount += docs.length;
           updateIndexInfo();
@@ -619,7 +619,7 @@
           await ensureIndex();
           const req = parseRequest();
           setStatus("Searching…");
-          const result = await idx.search_request(JSON.stringify(req));
+          const result = idx.search_request(JSON.stringify(req));
           console.log(result);
           renderResponse(result);
           setStatus("Search complete.");
