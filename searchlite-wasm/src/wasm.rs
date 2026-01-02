@@ -13,12 +13,14 @@ use searchlite_core::api::types::{
   Aggregation, ExecutionStrategy, Filter, IndexOptions, SearchRequest, SortSpec, StorageType,
 };
 use searchlite_core::api::{Document, IndexReader, IndexWriter};
-use searchlite_core::storage::{DynFile, Storage, StorageFile};
+use searchlite_core::storage::{DynFile, InMemoryStorage, Storage, StorageFile};
 use searchlite_core::{Index, Schema};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
+#[cfg(feature = "threads")]
+use wasm_bindgen_futures::JsFuture;
 #[cfg(feature = "threads")]
 use wasm_bindgen_rayon::init_thread_pool;
 
@@ -31,6 +33,61 @@ thread_local! {
   // Per-thread (per WASM worker) cache of IndexedDB connections.
   // This avoids reconnecting for each persist operation on the same thread.
   static DB_CACHE: RefCell<HashMap<String, web_sys::IdbDatabase>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy)]
+enum StorageMode {
+  IndexedDb,
+  Memory,
+}
+
+impl StorageMode {
+  fn parse(raw: Option<String>) -> Result<Self, JsValue> {
+    match raw.as_deref() {
+      None => Ok(Self::IndexedDb),
+      Some(value) if value.eq_ignore_ascii_case("indexeddb") => Ok(Self::IndexedDb),
+      Some(value) if value.eq_ignore_ascii_case("memory") => Ok(Self::Memory),
+      Some(_) => Err(JsValue::from_str("storage must be 'indexeddb' or 'memory'")),
+    }
+  }
+}
+
+enum StorageBackend {
+  IndexedDb(Arc<JsStorage>),
+  Memory,
+}
+
+impl StorageBackend {
+  async fn flush(&self) -> Result<()> {
+    match self {
+      Self::IndexedDb(storage) => storage.flush().await,
+      Self::Memory => Ok(()),
+    }
+  }
+}
+
+fn indexed_db_factory() -> Result<web_sys::IdbFactory> {
+  let global = js_sys::global();
+  let idb = js_sys::Reflect::get(&global, &JsValue::from_str("indexedDB"))
+    .map_err(|_| anyhow!("IndexedDB unavailable"))?;
+  if idb.is_null() || idb.is_undefined() {
+    return Err(anyhow!("IndexedDB unavailable"));
+  }
+  idb
+    .dyn_into::<web_sys::IdbFactory>()
+    .map_err(|_| anyhow!("IndexedDB unavailable"))
+}
+
+#[cfg(feature = "threads")]
+fn hardware_concurrency() -> u32 {
+  let global = js_sys::global();
+  let navigator = js_sys::Reflect::get(&global, &JsValue::from_str("navigator"))
+    .ok()
+    .and_then(|value| value.dyn_into::<web_sys::Navigator>().ok());
+  navigator
+    .map(|nav| nav.hardware_concurrency() as u32)
+    .filter(|&count| count > 0)
+    .unwrap_or(1)
 }
 
 fn path_key(path: &Path) -> String {
@@ -80,8 +137,10 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
     Rc::new(RefCell::new(None));
   let error_handler: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
     Rc::new(RefCell::new(None));
-  let success_req = req.clone();
-  let error_req = req.clone();
+  let success_req_for_closure = req.clone();
+  let success_req_for_handler = req.clone();
+  let error_req_for_closure = req.clone();
+  let error_req_for_handler = req.clone();
 
   let success_handler_clone = success_handler.clone();
   let error_handler_clone = error_handler.clone();
@@ -100,10 +159,14 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
     if let Some(tx) = sender_clone.borrow_mut().take() {
       let _ = tx.send(result);
     }
-    clear_request_handlers(&success_req, &success_handler_clone, &error_handler_clone);
+    clear_request_handlers(
+      &success_req_for_closure,
+      &success_handler_clone,
+      &error_handler_clone,
+    );
   }) as Box<dyn FnMut(_)>);
   *success_handler.borrow_mut() = Some(success);
-  success_req.set_onsuccess(Some(
+  success_req_for_handler.set_onsuccess(Some(
     success_handler
       .borrow()
       .as_ref()
@@ -116,17 +179,21 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
   let error_handler_clone = error_handler.clone();
   let sender_clone = sender.clone();
   let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-    let err_val = match error_req.error() {
+    let err_val = match error_req_for_closure.error() {
       Ok(e) => e.into(),
       Err(_) => JsValue::from_str("indexeddb request error"),
     };
     if let Some(tx) = sender_clone.borrow_mut().take() {
       let _ = tx.send(Err(anyhow!("indexeddb request error: {:?}", err_val)));
     }
-    clear_request_handlers(&error_req, &success_handler_clone, &error_handler_clone);
+    clear_request_handlers(
+      &error_req_for_closure,
+      &success_handler_clone,
+      &error_handler_clone,
+    );
   }) as Box<dyn FnMut(_)>);
   *error_handler.borrow_mut() = Some(error);
-  error_req.set_onerror(Some(
+  error_req_for_handler.set_onerror(Some(
     error_handler
       .borrow()
       .as_ref()
@@ -147,11 +214,7 @@ async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
   if let Some(db) = DB_CACHE.with(|cache| cache.borrow().get(name).cloned()) {
     return Ok(db);
   }
-  let window = web_sys::window().ok_or_else(|| anyhow!("window missing"))?;
-  let factory = window
-    .indexed_db()
-    .map_err(|e| anyhow!("indexed_db error: {:?}", e))?
-    .ok_or_else(|| anyhow!("IndexedDB unavailable"))?;
+  let factory = indexed_db_factory()?;
   let request = factory
     .open_with_u32(name, 1)
     .map_err(|e| anyhow!("indexed_db open error: {:?}", e))?;
@@ -570,56 +633,91 @@ impl StorageFile for JsFile {
 #[wasm_bindgen]
 pub struct Searchlite {
   index: Index,
-  storage: Arc<JsStorage>,
+  storage: StorageBackend,
 }
 
 #[wasm_bindgen]
 impl Searchlite {
-  async fn create(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
+  async fn create(
+    db_name: String,
+    schema_json: String,
+    storage_mode: StorageMode,
+  ) -> Result<Searchlite, JsValue> {
     let schema: Schema =
       serde_json::from_str(&schema_json).map_err(|err| JsValue::from_str(&err.to_string()))?;
     let root = PathBuf::from(db_name.clone());
-    let storage = Arc::new(
-      JsStorage::new(db_name.clone(), root.clone())
-        .await
-        .map_err(to_js_error)?,
-    );
+    let (storage, backend) = match storage_mode {
+      StorageMode::IndexedDb => {
+        let storage = Arc::new(
+          JsStorage::new(db_name.clone(), root.clone())
+            .await
+            .map_err(to_js_error)?,
+        );
+        (
+          storage.clone() as Arc<dyn Storage>,
+          StorageBackend::IndexedDb(storage),
+        )
+      }
+      StorageMode::Memory => (
+        Arc::new(InMemoryStorage::new(root.clone())) as Arc<dyn Storage>,
+        StorageBackend::Memory,
+      ),
+    };
     let opts = IndexOptions {
       path: root.clone(),
       create_if_missing: true,
       enable_positions: true,
       bm25_k1: BM25_K1,
       bm25_b: BM25_B,
-      // Use the core in-memory storage; the surrounding JsStorage wrapper handles
-      // actual persistence (IndexedDB in the browser).
+      // Use in-memory storage for wasm; IndexedDB persistence is provided by JsStorage.
       storage: StorageType::InMemory,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
-    let index =
-      Index::create_with_storage(&root, schema, opts, storage.clone()).map_err(to_js_error)?;
-    storage.flush().await.map_err(to_js_error)?;
-    Ok(Searchlite { index, storage })
+    let manifest_path = root.join("MANIFEST.json");
+    let index = if storage.exists(&manifest_path) {
+      let open_opts = IndexOptions {
+        create_if_missing: false,
+        ..opts.clone()
+      };
+      let index = Index::open_with_storage(open_opts, storage).map_err(to_js_error)?;
+      let existing_schema = index.manifest().schema;
+      let existing = serde_json::to_value(&existing_schema).map_err(to_js_error)?;
+      let requested = serde_json::to_value(&schema).map_err(to_js_error)?;
+      if existing != requested {
+        return Err(JsValue::from_str(
+          "schema mismatch for existing index; use a new db_name or delete the stored index",
+        ));
+      }
+      index
+    } else {
+      Index::create_with_storage(&root, schema, opts, storage).map_err(to_js_error)?
+    };
+    backend.flush().await.map_err(to_js_error)?;
+    Ok(Searchlite {
+      index,
+      storage: backend,
+    })
   }
 
   /// Public WASM-exported async constructor; delegates to the internal `create` helper.
   /// `db_name` is used for both the IndexedDB database name and the virtual root path.
+  /// Pass `"indexeddb"` (default) or `"memory"` to choose the storage backend.
   #[wasm_bindgen(js_name = init)]
-  pub async fn init(db_name: String, schema_json: String) -> Result<Searchlite, JsValue> {
-    Self::create(db_name, schema_json).await
+  pub async fn init(
+    db_name: String,
+    schema_json: String,
+    storage: Option<String>,
+  ) -> Result<Searchlite, JsValue> {
+    let storage_mode = StorageMode::parse(storage)?;
+    Self::create(db_name, schema_json, storage_mode).await
   }
 
   /// Initialize the rayon pool for threaded execution. COOP/COEP (cross-origin isolation) must
   /// be handled by the embedding app; this helper does not set headers for you.
   #[cfg(feature = "threads")]
   pub async fn init_threads(&self, threads: Option<u32>) -> Result<(), JsValue> {
-    let desired = threads.unwrap_or_else(|| {
-      web_sys::window()
-        .map(|w| w.navigator().hardware_concurrency())
-        .map(|n| n as u32)
-        .filter(|&n| n > 0)
-        .unwrap_or(1)
-    });
+    let desired = threads.unwrap_or_else(hardware_concurrency);
     JsFuture::from(init_thread_pool(desired as usize))
       .await
       .map(|_| ())
@@ -656,7 +754,7 @@ impl Searchlite {
     self.add_documents_internal(value_to_documents(value)?)
   }
 
-  /// Commit pending documents and flush IndexedDB-backed storage.
+  /// Commit pending documents and flush the configured storage backend.
   pub async fn commit(&self) -> Result<(), JsValue> {
     let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
     writer.commit().map_err(to_js_error)?;
@@ -695,7 +793,7 @@ impl Searchlite {
     serde_wasm_bindgen::to_value(&result).map_err(|err| JsValue::from_str(&err.to_string()))
   }
 
-  /// Wait for pending IndexedDB writes; `commit` already calls this.
+  /// Wait for pending storage writes; `commit` already calls this.
   pub async fn flush_storage(&self) -> Result<(), JsValue> {
     self.storage.flush().await.map_err(to_js_error)?;
     Ok(())
@@ -812,9 +910,12 @@ mod tests {
     let mut writer: IndexWriter = index.writer().unwrap();
     writer
       .add_document(&Document {
-        fields: [("body".into(), serde_json::json!("hello wasm"))]
-          .into_iter()
-          .collect(),
+        fields: [
+          ("_id".into(), serde_json::json!("doc-1")),
+          ("body".into(), serde_json::json!("hello wasm")),
+        ]
+        .into_iter()
+        .collect(),
       })
       .unwrap();
     writer.commit().unwrap();
@@ -835,7 +936,7 @@ mod tests {
       highlight_field: None,
       aggs: BTreeMap::new(),
     };
-    let result = reader.search(request).unwrap();
+    let result = reader.search(&request).unwrap();
     assert_eq!(result.hits.len(), 1);
   }
 
@@ -844,8 +945,8 @@ mod tests {
     let db = unique_db("searchlite-search-request");
     let schema = Schema::default_text_body();
     let schema_json = serde_json::to_string(&schema).unwrap();
-    let idx = Searchlite::init(db, schema_json).await.unwrap();
-    let docs = vec![serde_json::json!({ "body": "hello wasm" })];
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello wasm" })];
     let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
     idx.add_documents(docs_js).unwrap();
     idx.commit().await.unwrap();
@@ -867,6 +968,27 @@ mod tests {
     };
     let request_json = serde_json::to_string(&request).unwrap();
     let result = idx.search_request(request_json).unwrap();
+    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    let hits = result_json["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+  }
+
+  #[wasm_bindgen_test]
+  async fn init_reuses_existing_index() {
+    let db = unique_db("searchlite-reopen");
+    let schema = Schema::default_text_body();
+    let schema_json = serde_json::to_string(&schema).unwrap();
+    let idx = Searchlite::init(db.clone(), schema_json.clone(), None)
+      .await
+      .unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello reopen" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+    drop(idx);
+
+    let reopened = Searchlite::init(db, schema_json, None).await.unwrap();
+    let result = reopened.search("hello".to_string(), 5).unwrap();
     let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
     let hits = result_json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);

@@ -111,6 +111,22 @@
       .file-label input {
         display: none;
       }
+      .select-label {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .select {
+        background: var(--panel-alt);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        padding: 10px 12px;
+        font-family: inherit;
+        font-size: 14px;
+      }
       button {
         background: var(--accent);
         color: #0b1220;
@@ -253,6 +269,13 @@
               Choose schema
             </label>
             <button id="apply-schema-btn" type="button">Apply schema</button>
+            <label class="select-label" for="storage-mode">
+              Storage
+              <select id="storage-mode" class="select">
+                <option value="indexeddb" selected>IndexedDB (persistent)</option>
+                <option value="memory">Memory (session)</option>
+              </select>
+            </label>
             <span class="hint"
               >Defaults to a single text field named "body".</span
             >
@@ -362,6 +385,7 @@
       const docCountEl = document.getElementById("doc-count");
       const indexNameEl = document.getElementById("index-name");
       const schemaNameEl = document.getElementById("schema-name");
+      const storageModeEl = document.getElementById("storage-mode");
 
       let idx = null;
       let docCount = 0;
@@ -392,6 +416,7 @@
         searchBtn.disabled = busy || !currentSchema;
         applySchemaBtn.disabled = busy;
         pageResetBtn.disabled = busy;
+        storageModeEl.disabled = busy;
       }
 
       function toggleBusy(state) {
@@ -480,7 +505,12 @@
         }
         currentDb = nextDbName();
         setStatus("Initializing index…");
-        idx = await Searchlite.init(currentDb, JSON.stringify(currentSchema));
+        const storageMode = storageModeEl?.value || "indexeddb";
+        idx = await Searchlite.init(
+          currentDb,
+          JSON.stringify(currentSchema),
+          storageMode
+        );
         docCount = 0;
         updateIndexInfo();
         setStatus("Index ready");
@@ -558,6 +588,7 @@
           requestInput.value = JSON.stringify(defaultRequest, null, 2);
           datasetInput.value = "";
           schemaInput.value = "";
+          storageModeEl.value = "indexeddb";
           renderResponse(defaultResponse);
           setStatus("Page reset. Upload a schema to start.");
           updateIndexInfo();
