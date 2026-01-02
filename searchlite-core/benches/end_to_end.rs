@@ -31,6 +31,10 @@ fn bench_indexing(c: &mut Criterion) {
         let doc = Document {
           fields: [
             (
+              "_id".to_string(),
+              serde_json::json!(format!("bench-add-{i}")),
+            ),
+            (
               "body".to_string(),
               serde_json::json!(format!("rust language {}", i)),
             ),
@@ -67,6 +71,10 @@ fn bench_search(c: &mut Criterion) {
       for i in 0..20u32 {
         let doc = Document {
           fields: [
+            (
+              "_id".to_string(),
+              serde_json::json!(format!("bench-search-{i}")),
+            ),
             ("body".to_string(), serde_json::json!(format!("rust {}", i))),
             ("year".to_string(), serde_json::json!(2020 + (i % 3))),
           ]
@@ -152,6 +160,7 @@ fn bench_nested_filters(c: &mut Criterion) {
         writer
           .add_document(&Document {
             fields: [
+              ("_id".into(), json!(format!("nested-{i}"))),
               ("body".into(), json!(format!("rust nested {}", i))),
               ("review".into(), reviews),
             ]

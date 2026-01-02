@@ -1,4 +1,5 @@
 {
+  "doc_id_field": "doc_id",
   "text_fields": [
     {
       "name": "text",

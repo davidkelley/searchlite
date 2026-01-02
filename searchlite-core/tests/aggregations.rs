@@ -9,6 +9,15 @@ use searchlite_core::api::types::{
 use searchlite_core::api::Index;
 use serde_json::json;
 
+fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
+  let mut map = std::collections::BTreeMap::new();
+  map.insert("_id".to_string(), json!(id));
+  for (k, v) in fields {
+    map.insert(k.to_string(), v);
+  }
+  Document { fields: map }
+}
+
 #[test]
 fn terms_and_stats_aggregations() {
   let tmp = tempfile::tempdir().unwrap();
@@ -43,33 +52,30 @@ fn terms_and_stats_aggregations() {
   let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
   let mut writer = idx.writer().expect("writer");
   let docs = [
-    Document {
-      fields: [
-        ("body".into(), json!("rust systems")),
-        ("tag".into(), json!("tech")),
-        ("views".into(), json!(10)),
-      ]
-      .into_iter()
-      .collect(),
-    },
-    Document {
-      fields: [
-        ("body".into(), json!("rust programming")),
-        ("tag".into(), json!("tech")),
-        ("views".into(), json!(15)),
-      ]
-      .into_iter()
-      .collect(),
-    },
-    Document {
-      fields: [
-        ("body".into(), json!("gardening")),
-        ("tag".into(), json!("hobby")),
-        ("views".into(), json!(2)),
-      ]
-      .into_iter()
-      .collect(),
-    },
+    doc(
+      "agg-1",
+      vec![
+        ("body", json!("rust systems")),
+        ("tag", json!("tech")),
+        ("views", json!(10)),
+      ],
+    ),
+    doc(
+      "agg-2",
+      vec![
+        ("body", json!("rust programming")),
+        ("tag", json!("tech")),
+        ("views", json!(15)),
+      ],
+    ),
+    doc(
+      "agg-3",
+      vec![
+        ("body", json!("gardening")),
+        ("tag", json!("hobby")),
+        ("views", json!(2)),
+      ],
+    ),
   ];
   for doc in docs.iter() {
     writer.add_document(doc).unwrap();
@@ -223,11 +229,10 @@ fn histogram_bucket_generation() {
     let mut writer = idx.writer().unwrap();
     for val in [1, 2, 7, 11] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("views".into(), json!(val))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("hist-{val}"),
+          vec![("body", json!("rust")), ("views", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -304,11 +309,10 @@ fn histogram_uses_floor_for_bucket_boundaries() {
     let mut writer = idx.writer().unwrap();
     for val in [0, 4, 5] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("views".into(), json!(val))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("hist2-{val}"),
+          vec![("body", json!("rust")), ("views", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -390,11 +394,10 @@ fn range_aggregation_counts() {
     let mut writer = idx.writer().unwrap();
     for val in [1, 5, 10, 20] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("score".into(), json!(val))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("score-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -479,19 +482,14 @@ fn date_range_missing_and_keyed() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust")), ("ts".into(), json!(1_000))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc(
+        "date-1",
+        vec![("body", json!("rust")), ("ts", json!(1_000))],
+      ))
       .unwrap();
     // missing ts should be counted in missing bucket
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust missing"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("date-missing", vec![("body", json!("rust missing"))]))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -579,10 +577,11 @@ fn extended_stats_and_value_count_include_missing() {
   .unwrap();
   {
     let mut writer = idx.writer().unwrap();
-    for val in [Some(1), Some(2), None] {
+    for (idx, val) in [Some(1), Some(2), None].into_iter().enumerate() {
       let mut fields = [("body".into(), json!("rust"))]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+      fields.insert("_id".into(), json!(format!("stats-{idx}")));
       if let Some(v) = val {
         fields.insert("score".into(), json!(v));
       }
@@ -672,20 +671,18 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
     let mut writer = idx.writer().unwrap();
     for ts in [0, 1_000, 1_600] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("ts".into(), json!(ts))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("hist-ts-{ts}"),
+          vec![("body", json!("rust")), ("ts", json!(ts))],
+        ))
         .unwrap();
     }
     // one doc missing ts to exercise "missing"
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust missing ts"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc(
+        "hist-ts-missing",
+        vec![("body", json!("rust missing ts"))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -776,19 +773,17 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
     let mut writer = idx.writer().unwrap();
     // within bounds
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust")), ("ts".into(), json!(1_000))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc(
+        "hard-1",
+        vec![("body", json!("rust")), ("ts", json!(1_000))],
+      ))
       .unwrap();
     // below hard bounds
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust")), ("ts".into(), json!(0))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc(
+        "hard-0",
+        vec![("body", json!("rust")), ("ts", json!(0))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -872,34 +867,31 @@ fn terms_size_applied_after_merge() {
   .unwrap();
   {
     let mut writer = idx.writer().unwrap();
-    for _ in 0..2 {
+    for i in 0..2 {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("tag".into(), json!("a"))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("t-a-{i}"),
+          vec![("body", json!("rust")), ("tag", json!("a"))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
   }
   {
     let mut writer = idx.writer().unwrap();
-    for _ in 0..4 {
+    for i in 0..4 {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("tag".into(), json!("b"))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("t-b-{i}"),
+          vec![("body", json!("rust")), ("tag", json!("b"))],
+        ))
         .unwrap();
     }
     writer
-      .add_document(&Document {
-        fields: [("body".into(), json!("rust")), ("tag".into(), json!("a"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc(
+        "t-a-last",
+        vec![("body", json!("rust")), ("tag", json!("a"))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }

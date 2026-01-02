@@ -7,6 +7,12 @@
   "additionalProperties": false,
   "required": ["text_fields", "keyword_fields", "numeric_fields"],
   "properties": {
+    "doc_id_field": {
+      "type": "string",
+      "description": "Name of the string primary key field expected on every document.",
+      "default": "_id",
+      "minLength": 1
+    },
     "text_fields": {
       "type": "array",
       "description": "Top-level text fields to tokenize and index.",

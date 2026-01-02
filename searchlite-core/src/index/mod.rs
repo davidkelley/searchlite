@@ -49,6 +49,7 @@ impl Index {
   ) -> Result<Self> {
     let mut opts = opts;
     opts.path = path.to_path_buf();
+    schema.validate_config()?;
     ensure_root(storage.as_ref(), path)?;
     let manifest = Manifest::new(schema);
     manifest.store(storage.as_ref(), &Manifest::manifest_path(path))?;
@@ -107,6 +108,9 @@ impl Index {
     let mut all_docs = Vec::new();
     for seg in reader.segments.iter() {
       for doc_id in 0..seg.meta.doc_count {
+        if seg.is_deleted(doc_id) {
+          continue;
+        }
         let doc_json = seg.get_doc(doc_id)?;
         if let Some(map) = doc_json.as_object() {
           let fields = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

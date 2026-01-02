@@ -1,4 +1,5 @@
 {
+  "doc_id_field": "doc_id",
   "text_fields": [
     { "name": "text", "tokenizer": "default", "stored": true, "indexed": true },
     { "name": "title", "tokenizer": "default", "stored": true, "indexed": true },
@@ -6,7 +7,6 @@
     { "name": "instructions", "tokenizer": "default", "stored": true, "indexed": true }
   ],
   "keyword_fields": [
-    { "name": "doc_id", "stored": true, "indexed": true, "fast": true },
     { "name": "cuisine", "stored": true, "indexed": true, "fast": true },
     { "name": "region", "stored": true, "indexed": true, "fast": true },
     { "name": "meal_type", "stored": true, "indexed": true, "fast": true },
