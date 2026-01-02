@@ -293,7 +293,7 @@ pub struct TopHitsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopHit {
-  pub doc_id: crate::DocId,
+  pub doc_id: String,
   pub score: Option<f32>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,

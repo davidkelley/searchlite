@@ -31,7 +31,7 @@ const MAX_CURSOR_ADVANCE: usize = 50_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
-  pub doc_id: DocId,
+  pub doc_id: String,
   pub score: f32,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
@@ -633,7 +633,7 @@ impl IndexReader {
       entry.1 += 1;
     }
 
-    let docs = seg.meta.doc_count as f32;
+    let docs = seg.live_docs() as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight)) in term_counts.into_iter() {
       if let Some(postings) = seg.postings(&key) {
@@ -683,6 +683,9 @@ impl IndexReader {
     let mut match_counter = match_counter;
     let mut collect_hits = collect_hits;
     let mut accept = |doc_id: DocId, score: f32| -> bool {
+      if seg.is_deleted(doc_id) {
+        return false;
+      }
       if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
         return false;
       }
@@ -753,6 +756,7 @@ impl IndexReader {
     highlight_terms: &[String],
   ) -> Option<Hit> {
     let seg = self.segments.get(ranked.key.segment_ord as usize)?;
+    let doc_id_str = seg.doc_id(ranked.key.doc_id)?;
     let need_doc = req.return_stored || req.highlight_field.is_some();
     let mut doc_cache = None;
     if need_doc {
@@ -776,7 +780,7 @@ impl IndexReader {
     };
 
     Some(Hit {
-      doc_id: ranked.key.doc_id,
+      doc_id: doc_id_str.to_string(),
       score: ranked.score,
       fields: fields_val,
       snippet,

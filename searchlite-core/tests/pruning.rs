@@ -22,16 +22,19 @@ fn opts(path: &std::path::Path) -> IndexOptions {
 
 fn add_random_docs(idx: &Index, vocab: &[&str], doc_count: usize, rng: &mut StdRng) {
   let mut writer = idx.writer().unwrap();
-  for _ in 0..doc_count {
+  for i in 0..doc_count {
     let body_tokens: Vec<&str> = (0..6)
       .map(|_| vocab[rng.gen_range(0..vocab.len())])
       .collect();
     let body = body_tokens.join(" ");
     writer
       .add_document(&Document {
-        fields: [("body".into(), serde_json::json!(body))]
-          .into_iter()
-          .collect(),
+        fields: [
+          ("_id".into(), serde_json::json!(format!("doc-{i}"))),
+          ("body".into(), serde_json::json!(body)),
+        ]
+        .into_iter()
+        .collect(),
       })
       .unwrap();
   }

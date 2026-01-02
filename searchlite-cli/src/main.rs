@@ -26,6 +26,10 @@ enum Commands {
   Init { index: PathBuf, schema: PathBuf },
   /// Add documents from a JSONL file
   Add { index: PathBuf, doc: PathBuf },
+  /// Update (upsert) documents from a JSONL file
+  Update { index: PathBuf, doc: PathBuf },
+  /// Delete documents by id (newline-delimited list)
+  Delete { index: PathBuf, ids: PathBuf },
   /// Commit pending documents
   Commit { index: PathBuf },
   /// Execute a search query
@@ -81,6 +85,8 @@ fn main() -> Result<()> {
   match cli.command {
     Commands::Init { index, schema } => cmd_init(index.as_path(), schema.as_path()),
     Commands::Add { index, doc } => cmd_add(index.as_path(), doc.as_path()),
+    Commands::Update { index, doc } => cmd_add(index.as_path(), doc.as_path()),
+    Commands::Delete { index, ids } => cmd_delete(index.as_path(), ids.as_path()),
     Commands::Commit { index } => cmd_commit(index.as_path()),
     Commands::Search {
       index,
@@ -196,7 +202,32 @@ fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
     }
     writer.add_document(&Document { fields })?;
   }
-  println!("added documents, run commit to persist");
+  println!("queued documents (upsert), run commit to persist");
+  Ok(())
+}
+
+fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
+  let opts = default_options(index);
+  let idx = Index::open(opts)?;
+  let mut writer = idx.writer()?;
+  let content = fs::read_to_string(ids_path)
+    .with_context(|| format!("reading document ids from {:?}", ids_path))?;
+  let mut ids = Vec::new();
+  for (line_no, line) in content.lines().enumerate() {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+      bail!("invalid id on line {}", line_no + 1);
+    }
+    ids.push(trimmed.to_string());
+  }
+  if ids.is_empty() {
+    bail!("no document ids provided");
+  }
+  writer.delete_documents(&ids)?;
+  println!("queued {} deletes, run commit to persist", ids.len());
   Ok(())
 }
 
@@ -389,7 +420,7 @@ mod tests {
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
       &docs_path,
-      "{\"body\":\"Rust search\"}\n{\"body\":\"Another document\"}\n",
+      "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another document\"}\n",
     )
     .unwrap();
     cmd_add(index.as_path(), docs_path.as_path()).unwrap();
@@ -429,7 +460,7 @@ mod tests {
     cmd_init(index.as_path(), schema_path.as_path()).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
-    fs::write(&docs_path, "{\"body\":\"Rust search\"}\n").unwrap();
+    fs::write(&docs_path, "{\"_id\":\"1\",\"body\":\"Rust search\"}\n").unwrap();
     cmd_add(index.as_path(), docs_path.as_path()).unwrap();
     cmd_commit(index.as_path()).unwrap();
 

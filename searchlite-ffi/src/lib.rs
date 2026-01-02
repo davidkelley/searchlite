@@ -191,7 +191,7 @@ mod tests {
     let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
     assert!(!handle.is_null());
 
-    let doc = CString::new(r#"{"body":"hello from ffi"}"#).unwrap();
+    let doc = CString::new(r#"{"_id":"ffi-1","body":"hello from ffi"}"#).unwrap();
     let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
     assert!(added >= 0);
     assert_eq!(unsafe { searchlite_commit(handle) }, 0);
@@ -221,7 +221,7 @@ mod tests {
     let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
     assert!(!handle.is_null());
 
-    let doc = CString::new(r#"{"body":"hello from ffi"}"#).unwrap();
+    let doc = CString::new(r#"{"_id":"ffi-1","body":"hello from ffi"}"#).unwrap();
     let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
     assert!(added >= 0);
     assert_eq!(unsafe { searchlite_commit(handle) }, 0);

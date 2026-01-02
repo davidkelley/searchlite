@@ -438,6 +438,7 @@ mod tests {
   #[test]
   fn sort_plan_defaults_score_desc() {
     let schema = Schema {
+      doc_id_field: crate::index::manifest::default_doc_id_field(),
       text_fields: vec![TextField {
         name: "body".into(),
         tokenizer: "default".into(),

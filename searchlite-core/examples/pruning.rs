@@ -33,15 +33,18 @@ fn main() -> Result<()> {
   {
     let mut rng = rand::thread_rng();
     let mut writer = idx.writer()?;
-    for _ in 0..docs {
+    for i in 0..docs {
       let body_tokens: Vec<&str> = (0..12)
         .map(|_| vocab[rng.gen_range(0..vocab.len())])
         .collect();
       let body = body_tokens.join(" ");
       writer.add_document(&Document {
-        fields: [("body".into(), serde_json::json!(body))]
-          .into_iter()
-          .collect(),
+        fields: [
+          ("_id".into(), serde_json::json!(format!("doc-{i}"))),
+          ("body".into(), serde_json::json!(body)),
+        ]
+        .into_iter()
+        .collect(),
       })?;
     }
     writer.commit()?;

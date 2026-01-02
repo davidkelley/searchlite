@@ -11,9 +11,12 @@ fn wal_roundtrip() {
   let storage = Arc::new(FsStorage::new(dir.path().to_path_buf()));
   let mut wal = Wal::open(storage.clone(), &path).unwrap();
   let doc = Document {
-    fields: [("body".to_string(), serde_json::json!("hello wal"))]
-      .into_iter()
-      .collect(),
+    fields: [
+      ("_id".to_string(), serde_json::json!("1")),
+      ("body".to_string(), serde_json::json!("hello wal")),
+    ]
+    .into_iter()
+    .collect(),
   };
   wal.append_add_doc(&doc).unwrap();
   wal.append_commit().unwrap();

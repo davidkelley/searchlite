@@ -6,6 +6,16 @@ use searchlite_core::api::types::{
   SortOrder, SortSpec, StorageType,
 };
 use searchlite_core::api::Index;
+use serde_json::json;
+
+fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
+  let mut map = BTreeMap::new();
+  map.insert("_id".to_string(), json!(id));
+  for (k, v) in fields {
+    map.insert(k.to_string(), v);
+  }
+  Document { fields: map }
+}
 
 fn base_options(path: &std::path::Path) -> IndexOptions {
   IndexOptions {
@@ -36,41 +46,25 @@ fn sorts_numeric_and_missing_last() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust alpha")),
-          ("rating".into(), serde_json::json!(10)),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "a",
+        vec![("body", json!("rust alpha")), ("rating", json!(10))],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust beta")),
-          ("rating".into(), serde_json::json!(3)),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "b",
+        vec![("body", json!("rust beta")), ("rating", json!(3))],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [("body".into(), serde_json::json!("rust gamma"))]
-          .into_iter()
-          .collect(),
-      })
+      .add_document(&doc("c", vec![("body", json!("rust gamma"))]))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust delta")),
-          ("rating".into(), serde_json::json!(7)),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "d",
+        vec![("body", json!("rust delta")), ("rating", json!(7))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -127,34 +121,28 @@ fn sorts_keywords_descending_with_multivalue_mode() {
   {
     let mut writer = idx.writer().unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust tags zulu")),
-          ("tag".into(), serde_json::json!(["alpha", "omega"])),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "t1",
+        vec![
+          ("body", json!("rust tags zulu")),
+          ("tag", json!(["alpha", "omega"])),
+        ],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust tags kappa")),
-          ("tag".into(), serde_json::json!(["kappa"])),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "t2",
+        vec![
+          ("body", json!("rust tags kappa")),
+          ("tag", json!(["kappa"])),
+        ],
+      ))
       .unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), serde_json::json!("rust tags zeta")),
-          ("tag".into(), serde_json::json!(["zeta"])),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "t3",
+        vec![("body", json!("rust tags zeta")), ("tag", json!(["zeta"]))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -228,14 +216,10 @@ fn paginates_with_sorted_cursor_across_segments() {
     let mut writer = idx.writer().unwrap();
     for val in [30, 10, 20] {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".into(), serde_json::json!("rust paging")),
-            ("rank".into(), serde_json::json!(val)),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("r{val}"),
+          vec![("body", json!("rust paging")), ("rank", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -244,14 +228,10 @@ fn paginates_with_sorted_cursor_across_segments() {
     let mut writer = idx.writer().unwrap();
     for val in [15, 5] {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".into(), serde_json::json!("rust paging")),
-            ("rank".into(), serde_json::json!(val)),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("r{val}"),
+          vec![("body", json!("rust paging")), ("rank", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();

@@ -25,6 +25,8 @@ pub struct SegmentMeta {
   pub doc_count: u32,
   pub max_doc_id: u32,
   pub blockmax: bool,
+  #[serde(default)]
+  pub deleted_docs: Vec<u32>,
   pub avg_field_lengths: HashMap<String, f32>,
   pub checksums: HashMap<String, u32>,
 }
@@ -72,6 +74,8 @@ impl Manifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Schema {
+  #[serde(default = "default_doc_id_field")]
+  pub doc_id_field: String,
   pub text_fields: Vec<TextField>,
   pub keyword_fields: Vec<KeywordField>,
   pub numeric_fields: Vec<NumericField>,
@@ -81,9 +85,14 @@ pub struct Schema {
   pub vector_fields: Vec<VectorField>,
 }
 
+pub fn default_doc_id_field() -> String {
+  "_id".to_string()
+}
+
 impl Schema {
   pub fn default_text_body() -> Self {
     Self {
+      doc_id_field: default_doc_id_field(),
       text_fields: vec![TextField {
         name: "body".to_string(),
         tokenizer: "default".to_string(),
@@ -111,6 +120,23 @@ impl Schema {
       .resolved_fields()
       .iter()
       .any(|f| f.path == field && f.stored)
+  }
+
+  pub fn validate_config(&self) -> anyhow::Result<()> {
+    if self.doc_id_field.contains('.') {
+      anyhow::bail!("doc_id_field `{}` cannot be nested", self.doc_id_field);
+    }
+    if self
+      .resolved_fields()
+      .iter()
+      .any(|f| f.path == self.doc_id_field)
+    {
+      anyhow::bail!(
+        "doc_id_field `{}` must not overlap with other schema fields",
+        self.doc_id_field
+      );
+    }
+    Ok(())
   }
 
   pub fn fast_fields(&self) -> Vec<String> {
@@ -173,7 +199,24 @@ impl Schema {
     fields
   }
 
+  pub fn doc_id_field(&self) -> &str {
+    &self.doc_id_field
+  }
+
   pub fn validate_document(&self, doc: &crate::api::types::Document) -> anyhow::Result<()> {
+    if doc
+      .fields
+      .get(self.doc_id_field())
+      .and_then(|v| v.as_str())
+      .map(|s| s.trim())
+      .filter(|s| !s.is_empty())
+      .is_none()
+    {
+      anyhow::bail!(
+        "missing or empty required document id field `{}`",
+        self.doc_id_field()
+      );
+    }
     for (name, value) in doc.fields.iter() {
       if let Some(nested) = self.nested_fields.iter().find(|n| n.name == *name) {
         nested
@@ -196,10 +239,38 @@ mod tests {
   use tempfile::tempdir;
 
   #[test]
+  fn doc_id_field_defaults_and_validates_presence() {
+    let schema = Schema::default_text_body();
+    assert_eq!(schema.doc_id_field(), "_id");
+    let doc = crate::api::types::Document::default();
+    let err = schema.validate_document(&doc).unwrap_err();
+    assert!(err
+      .to_string()
+      .contains("missing or empty required document id field"));
+  }
+
+  #[test]
+  fn doc_id_field_rejects_empty() {
+    let schema = Schema::default_text_body();
+    for value in ["", "   "] {
+      let doc = crate::api::types::Document {
+        fields: [("_id".into(), serde_json::json!(value))]
+          .into_iter()
+          .collect(),
+      };
+      let err = schema.validate_document(&doc).unwrap_err();
+      assert!(err
+        .to_string()
+        .contains("missing or empty required document id field"));
+    }
+  }
+
+  #[test]
   fn persists_manifest_and_schema_helpers() {
     let dir = tempdir().unwrap();
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let schema = Schema {
+      doc_id_field: "pk".into(),
       text_fields: vec![TextField {
         name: "body".into(),
         tokenizer: "default".into(),
@@ -264,6 +335,7 @@ mod tests {
   #[test]
   fn nested_nullable_fields_are_explicit() {
     let base_schema = Schema {
+      doc_id_field: default_doc_id_field(),
       text_fields: Vec::new(),
       keyword_fields: Vec::new(),
       numeric_fields: Vec::new(),
@@ -292,20 +364,26 @@ mod tests {
     };
 
     let ok = crate::api::types::Document {
-      fields: [(
-        "game".into(),
-        serde_json::json!({ "name": "Skyline of Void", "franchise": null }),
-      )]
+      fields: [
+        ("_id".into(), serde_json::json!("game-1")),
+        (
+          "game".into(),
+          serde_json::json!({ "name": "Skyline of Void", "franchise": null }),
+        ),
+      ]
       .into_iter()
       .collect(),
     };
     base_schema.validate_document(&ok).expect("nullable ok");
 
     let bad_null = crate::api::types::Document {
-      fields: [(
-        "game".into(),
-        serde_json::json!({ "name": null, "franchise": "Series" }),
-      )]
+      fields: [
+        ("_id".into(), serde_json::json!("game-2")),
+        (
+          "game".into(),
+          serde_json::json!({ "name": null, "franchise": "Series" }),
+        ),
+      ]
       .into_iter()
       .collect(),
     };
@@ -320,9 +398,12 @@ mod tests {
       ..base_schema.clone()
     };
     let null_game = crate::api::types::Document {
-      fields: [("game".into(), serde_json::Value::Null)]
-        .into_iter()
-        .collect(),
+      fields: [
+        ("_id".into(), serde_json::json!("game-3")),
+        ("game".into(), serde_json::Value::Null),
+      ]
+      .into_iter()
+      .collect(),
     };
     nullable_game_schema
       .validate_document(&null_game)

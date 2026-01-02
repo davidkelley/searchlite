@@ -24,6 +24,15 @@ fn build_base_options(path: &std::path::Path) -> IndexOptions {
   }
 }
 
+fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
+  let mut map = BTreeMap::new();
+  map.insert("_id".to_string(), json!(id));
+  for (k, v) in fields {
+    map.insert(k.to_string(), v);
+  }
+  Document { fields: map }
+}
+
 #[test]
 fn histogram_respects_extended_bounds_and_empty_buckets() {
   let tmp = tempfile::tempdir().unwrap();
@@ -41,11 +50,10 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
     let mut writer = idx.writer().unwrap();
     for val in [5, 15] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("score".into(), json!(val))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("hist-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -177,17 +185,16 @@ fn nested_terms_stats_aggregation() {
   {
     let mut writer = idx.writer().unwrap();
     let docs = vec![("rust", 10), ("rust", 8), ("go", 7)];
-    for (lang, stars) in docs {
+    for (idx, (lang, stars)) in docs.into_iter().enumerate() {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".into(), json!("systems")),
-            ("lang".into(), json!(lang)),
-            ("stars".into(), json!(stars)),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("agg-l-{idx}"),
+          vec![
+            ("body", json!("systems")),
+            ("lang", json!(lang)),
+            ("stars", json!(stars)),
+          ],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -371,14 +378,10 @@ fn top_hits_returns_requested_docs() {
     let mut writer = idx.writer().unwrap();
     for i in 0..4 {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".into(), json!(format!("rust {i}"))),
-            ("tag".into(), json!("dev")),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("top-{i}"),
+          vec![("body", json!(format!("rust {i}"))), ("tag", json!("dev"))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
@@ -450,26 +453,21 @@ fn top_hits_applies_sort_spec() {
     let mut writer = idx.writer().unwrap();
     for priority in [2, 5] {
       writer
-        .add_document(&Document {
-          fields: [
-            ("body".into(), json!("rust systems")),
-            ("priority".into(), json!(priority)),
-          ]
-          .into_iter()
-          .collect(),
-        })
+        .add_document(&doc(
+          &format!("priority-{priority}"),
+          vec![
+            ("body", json!("rust systems")),
+            ("priority", json!(priority)),
+          ],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
     writer
-      .add_document(&Document {
-        fields: [
-          ("body".into(), json!("rust systems")),
-          ("priority".into(), json!(1)),
-        ]
-        .into_iter()
-        .collect(),
-      })
+      .add_document(&doc(
+        "priority-1",
+        vec![("body", json!("rust systems")), ("priority", json!(1))],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
@@ -553,11 +551,10 @@ fn date_histogram_calendar_month_interval() {
       "2024-02-05T00:00:00Z",
     ] {
       writer
-        .add_document(&Document {
-          fields: [("body".into(), json!("rust")), ("ts".into(), json!(ts(t)))]
-            .into_iter()
-            .collect(),
-        })
+        .add_document(&doc(
+          &format!("ts-{t}"),
+          vec![("body", json!("rust")), ("ts", json!(ts(t)))],
+        ))
         .unwrap();
     }
     writer.commit().unwrap();
