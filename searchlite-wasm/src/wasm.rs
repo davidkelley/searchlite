@@ -264,10 +264,24 @@ async fn load_snapshot(db_name: &str) -> Result<HashMap<PathBuf, Vec<u8>>> {
     .map_err(|e| anyhow!("get_all failed: {:?}", e))?;
   let keys_val = request_future(&keys_req).await?;
   let values_val = request_future(&values_req).await?;
-  let keys: js_sys::Array = keys_val.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
-  let values: js_sys::Array = values_val
-    .dyn_into()
-    .unwrap_or_else(|_| js_sys::Array::new());
+  let keys: js_sys::Array = match keys_val.dyn_into() {
+    Ok(array) => array,
+    Err(_) => {
+      web_sys::console::warn_1(&JsValue::from_str(&format!(
+        "IndexedDB snapshot load for '{db_name}' expected array keys; skipping stored files"
+      )));
+      js_sys::Array::new()
+    }
+  };
+  let values: js_sys::Array = match values_val.dyn_into() {
+    Ok(array) => array,
+    Err(_) => {
+      web_sys::console::warn_1(&JsValue::from_str(&format!(
+        "IndexedDB snapshot load for '{db_name}' expected array values; skipping stored files"
+      )));
+      js_sys::Array::new()
+    }
+  };
   let mut map = HashMap::new();
   for (key, value) in keys.iter().zip(values.iter()) {
     if let Some(name) = key.as_string() {
@@ -615,8 +629,6 @@ impl StorageFile for JsFile {
       self.pos = len;
     }
     self.dirty = true;
-    self.pending.schedule(self.path.clone(), data.clone());
-    self.dirty = false;
     Ok(())
   }
 
@@ -669,7 +681,8 @@ impl Searchlite {
       enable_positions: true,
       bm25_k1: BM25_K1,
       bm25_b: BM25_B,
-      // Use in-memory storage for wasm; IndexedDB persistence is provided by JsStorage.
+      // The wasm Index always uses in-memory storage; JsStorage persists to IndexedDB when enabled.
+      // Do not mix storage modes for the same db_name; use a fresh name or clear stored data.
       storage: StorageType::InMemory,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
@@ -703,6 +716,8 @@ impl Searchlite {
   /// Public WASM-exported async constructor; delegates to the internal `create` helper.
   /// `db_name` is used for both the IndexedDB database name and the virtual root path.
   /// Pass `"indexeddb"` (default) or `"memory"` to choose the storage backend.
+  /// When using `"indexeddb"`, the index itself stays in memory and JsStorage persists snapshots.
+  /// Avoid switching storage modes for the same `db_name`; use a new name or clear storage.
   #[wasm_bindgen(js_name = init)]
   pub async fn init(
     db_name: String,

@@ -134,14 +134,16 @@ fn run_strategy(
       })
       .collect();
     for seg in reader.segments.iter() {
-      let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
+      let mut term_weights: HashMap<String, (String, f32)> = HashMap::new();
       for (field, _, key) in qualified_terms.iter() {
-        let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
-        entry.1 += 1;
+        let entry = term_weights
+          .entry(key.clone())
+          .or_insert((field.clone(), 0.0));
+        entry.1 += 1.0;
       }
       let docs = seg.meta.doc_count as f32;
       let mut terms = Vec::new();
-      for (key, (field, weight)) in term_counts.into_iter() {
+      for (key, (field, weight)) in term_weights.into_iter() {
         if let Some(postings) = seg.postings(&key) {
           terms.push(ScoredTerm {
             postings,

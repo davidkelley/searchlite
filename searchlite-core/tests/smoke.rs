@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, KeywordField, NestedField, NestedProperty,
-  NumericField, Schema, SearchRequest, StorageType, TextField,
+  Document, ExecutionStrategy, FuzzyOptions, IndexOptions, KeywordField, NestedField,
+  NestedProperty, NumericField, Schema, SearchRequest, StorageType, TextField,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -16,6 +16,49 @@ fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
     map.insert(k.to_string(), v);
   }
   Document { fields: map }
+}
+
+fn base_search_request(query: &str) -> SearchRequest {
+  SearchRequest {
+    query: query.to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 10,
+    sort: Vec::new(),
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    fuzzy: None,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  }
+}
+
+fn build_index_with_docs(docs: Vec<Document>) -> (tempfile::TempDir, Index) {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for doc in docs {
+      writer.add_document(&doc).unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  (tmp, idx)
 }
 
 #[test]
@@ -75,6 +118,7 @@ fn index_and_search() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -83,6 +127,174 @@ fn index_and_search() {
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_matches_typos() {
+  let (_tmp, idx) =
+    build_index_with_docs(vec![doc("doc-1", vec![("body", json!("Rust is fast"))])]);
+  let reader = idx.reader().unwrap();
+  let fuzzy_req = SearchRequest {
+    fuzzy: Some(FuzzyOptions {
+      max_edits: 1,
+      prefix_length: 1,
+      max_expansions: 20,
+      min_length: 3,
+    }),
+    ..base_search_request("rusk")
+  };
+  let fuzzy_resp = reader.search(&fuzzy_req).unwrap();
+  assert_eq!(fuzzy_resp.hits.len(), 1);
+
+  let exact_req = SearchRequest {
+    fuzzy: None,
+    ..fuzzy_req
+  };
+  let exact_resp = reader.search(&exact_req).unwrap();
+  assert!(exact_resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_expands_multiple_terms() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("Rust"))]),
+    doc("doc-2", vec![("body", json!("Systems"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let fuzzy_req = SearchRequest {
+    fuzzy: Some(FuzzyOptions {
+      max_edits: 1,
+      prefix_length: 1,
+      max_expansions: 20,
+      min_length: 3,
+    }),
+    ..base_search_request("rusk systms")
+  };
+  let fuzzy_resp = reader.search(&fuzzy_req).unwrap();
+  let mut ids: Vec<_> = fuzzy_resp
+    .hits
+    .iter()
+    .map(|hit| hit.doc_id.clone())
+    .collect();
+  ids.sort();
+  assert_eq!(ids, vec!["doc-1".to_string(), "doc-2".to_string()]);
+
+  let exact_resp = reader.search(&base_search_request("rusk systms")).unwrap();
+  assert!(exact_resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_respects_min_length() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("Rust"))])]);
+  let reader = idx.reader().unwrap();
+  let resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 1,
+        max_expansions: 20,
+        min_length: 3,
+      }),
+      ..base_search_request("ru")
+    })
+    .unwrap();
+  assert!(resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_respects_max_expansions() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("Rush"))]),
+    doc("doc-2", vec![("body", json!("Rust"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let limited_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 1,
+        max_expansions: 1,
+        min_length: 3,
+      }),
+      ..base_search_request("rusk")
+    })
+    .unwrap();
+  assert_eq!(limited_resp.hits.len(), 1);
+
+  let expanded_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 1,
+        max_expansions: 2,
+        min_length: 3,
+      }),
+      ..base_search_request("rusk")
+    })
+    .unwrap();
+  assert_eq!(expanded_resp.hits.len(), 2);
+}
+
+#[test]
+fn fuzzy_respects_prefix_length() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("Dusk"))])]);
+  let reader = idx.reader().unwrap();
+  let loose_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 0,
+        max_expansions: 20,
+        min_length: 3,
+      }),
+      ..base_search_request("rusk")
+    })
+    .unwrap();
+  assert_eq!(loose_resp.hits.len(), 1);
+
+  let strict_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 1,
+        max_expansions: 20,
+        min_length: 3,
+      }),
+      ..base_search_request("rusk")
+    })
+    .unwrap();
+  assert!(strict_resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_allows_two_edits() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("Rust"))])]);
+  let reader = idx.reader().unwrap();
+  let one_edit_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 1,
+        prefix_length: 1,
+        max_expansions: 20,
+        min_length: 3,
+      }),
+      ..base_search_request("rsut")
+    })
+    .unwrap();
+  assert!(one_edit_resp.hits.is_empty());
+
+  let two_edit_resp = reader
+    .search(&SearchRequest {
+      fuzzy: Some(FuzzyOptions {
+        max_edits: 2,
+        prefix_length: 1,
+        max_expansions: 20,
+        min_length: 3,
+      }),
+      ..base_search_request("rsut")
+    })
+    .unwrap();
+  assert_eq!(two_edit_resp.hits.len(), 1);
 }
 
 #[test]
@@ -124,6 +336,7 @@ fn upsert_and_delete_by_id() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -205,6 +418,7 @@ fn cursor_paginates_ordered_hits() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -269,6 +483,7 @@ fn cursor_rejects_invalid_hex() {
     cursor: Some("not-a-valid-cursor".to_string()),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -313,6 +528,7 @@ fn cursor_rejects_when_limit_zero() {
       cursor: Some("00000000000000000000000000000000".to_string()),
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -366,6 +582,7 @@ fn cursor_rejects_excessive_advance() {
     cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -411,6 +628,7 @@ fn cursor_rejects_mismatched_position() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -483,6 +701,7 @@ fn cursor_orders_stably_across_segments() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: false,
@@ -586,6 +805,7 @@ fn in_memory_storage_keeps_disk_clean() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -708,6 +928,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -862,6 +1083,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,

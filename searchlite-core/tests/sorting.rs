@@ -83,6 +83,7 @@ fn sorts_numeric_and_missing_last() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -161,6 +162,7 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -250,6 +252,7 @@ fn paginates_with_sorted_cursor_across_segments() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,

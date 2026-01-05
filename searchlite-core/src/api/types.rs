@@ -65,12 +65,53 @@ pub struct SearchRequest {
   pub execution: ExecutionStrategy,
   #[serde(default)]
   pub bmw_block_size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub fuzzy: Option<FuzzyOptions>,
   #[cfg(feature = "vectors")]
   pub vector_query: Option<(String, Vec<f32>, f32)>,
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzyOptions {
+  #[serde(default = "default_fuzzy_max_edits")]
+  pub max_edits: u8,
+  #[serde(default = "default_fuzzy_prefix_length")]
+  pub prefix_length: usize,
+  #[serde(default = "default_fuzzy_max_expansions")]
+  pub max_expansions: usize,
+  #[serde(default = "default_fuzzy_min_length")]
+  pub min_length: usize,
+}
+
+impl Default for FuzzyOptions {
+  fn default() -> Self {
+    Self {
+      max_edits: default_fuzzy_max_edits(),
+      prefix_length: default_fuzzy_prefix_length(),
+      max_expansions: default_fuzzy_max_expansions(),
+      min_length: default_fuzzy_min_length(),
+    }
+  }
+}
+
+fn default_fuzzy_max_edits() -> u8 {
+  1
+}
+
+fn default_fuzzy_prefix_length() -> usize {
+  1
+}
+
+fn default_fuzzy_max_expansions() -> usize {
+  50
+}
+
+fn default_fuzzy_min_length() -> usize {
+  3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
