@@ -590,6 +590,9 @@ impl<'a> SegmentWriter<'a> {
           }
           if let Some(max_pos) = tokens.iter().map(|t| t.position).max() {
             position_offset += max_pos + 1;
+          } else {
+            // Preserve a position gap between successive values even when filters drop all tokens.
+            position_offset += 1;
           }
         }
       }
