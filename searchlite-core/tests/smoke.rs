@@ -76,7 +76,8 @@ fn index_and_search() {
   });
   schema.text_fields.push(TextField {
     name: "title".to_string(),
-    tokenizer: "default".to_string(),
+    analyzer: "default".to_string(),
+    search_analyzer: None,
     stored: true,
     indexed: true,
     nullable: false,

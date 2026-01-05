@@ -32,13 +32,32 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 
 ## Schema and documents
 
-Schema lives in `schema.json` (example below). Text fields control tokenization and storage, keyword/numeric fields support filters and fast-field access.
+Schema lives in `schema.json` (example below). Text fields control analysis pipelines and storage, keyword/numeric fields support filters and fast-field access.
 
 ```json
 {
   "doc_id_field": "_id",
+  "analyzers": [
+    {
+      "name": "english",
+      "tokenizer": "default",
+      "filters": [{ "stopwords": "en" }, { "stemmer": "english" }]
+    },
+    {
+      "name": "title_prefix",
+      "tokenizer": "default",
+      "filters": [{ "edge_ngram": { "min": 1, "max": 5 } }]
+    }
+  ],
   "text_fields": [
-    { "name": "body", "tokenizer": "default", "stored": true, "indexed": true }
+    { "name": "body", "analyzer": "english", "stored": true, "indexed": true },
+    {
+      "name": "title",
+      "analyzer": "title_prefix",
+      "search_analyzer": "english",
+      "stored": true,
+      "indexed": true
+    }
   ],
   "keyword_fields": [
     { "name": "lang", "stored": true, "indexed": true, "fast": true }
@@ -61,6 +80,8 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
   "vector_fields": []
 }
 ```
+
+If you omit `analyzers`, Searchlite injects the built-in `default` analyzer (ASCII lowercase + alphanumeric tokenization) and `tokenizer` stays a supported alias for `analyzer`. Available tokenizers: `default`, `unicode` (NFKC + case-folded words), and `whitespace`. Token filters include `lowercase`, `stopwords` (built-in `en` or an explicit list), `stemmer` (English), `synonyms` (`from`/`to` lists expanded at the same position), and `edge_ngram` (`min`/`max`).
 
 `stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges and keyword predicates are expressed via the JSON `filter` AST (see examples below). Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
 Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
