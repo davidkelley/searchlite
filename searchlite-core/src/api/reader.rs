@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::api::query::parse_query;
 use crate::api::types::{
@@ -372,6 +372,7 @@ fn build_term_key(field: &str, term: &str) -> String {
   key
 }
 
+/// Returns the prefix by Unicode scalar value count (not bytes).
 fn char_prefix(input: &str, len: usize) -> &str {
   if len == 0 {
     return "";
@@ -388,7 +389,8 @@ fn distance_weight(distance: usize) -> f32 {
 
 fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
   let a_len = a.chars().count();
-  let b_len = b.chars().count();
+  let b_chars: SmallVec<[char; 32]> = b.chars().collect();
+  let b_len = b_chars.len();
   if a_len.abs_diff(b_len) > max_edits {
     return None;
   }
@@ -398,9 +400,8 @@ fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
   if b_len == 0 {
     return (a_len <= max_edits).then_some(a_len);
   }
-  let b_chars: Vec<char> = b.chars().collect();
-  let mut prev: Vec<usize> = (0..=b_len).collect();
-  let mut curr: Vec<usize> = vec![0; b_len + 1];
+  let mut prev: SmallVec<[usize; 64]> = (0..=b_len).collect();
+  let mut curr: SmallVec<[usize; 64]> = smallvec![0; b_len + 1];
   for (i, ca) in a.chars().enumerate() {
     curr[0] = i + 1;
     let mut row_min = curr[0];
@@ -469,10 +470,10 @@ fn expand_terms_fuzzy(
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert(exact_key);
     let mut expansions = 0usize;
-    for seg in segments.iter() {
+    'segments: for seg in segments.iter() {
       for key in seg.terms_with_prefix(&prefix_key) {
         if expansions >= fuzzy.max_expansions {
-          break;
+          break 'segments;
         }
         if key.len() <= field_prefix_len {
           continue;
@@ -499,10 +500,10 @@ fn expand_terms_fuzzy(
             weight: distance_weight(distance),
           });
           expansions += 1;
+          if expansions >= fuzzy.max_expansions {
+            break 'segments;
+          }
         }
-      }
-      if expansions >= fuzzy.max_expansions {
-        break;
       }
     }
   }

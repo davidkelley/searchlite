@@ -565,7 +565,8 @@ For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `
 
 #### Running the demo
 
-- Serve the crate directory over HTTP with COOP/COEP headers so SharedArrayBuffer works (e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080 -H "Cross-Origin-Opener-Policy: same-origin" -H "Cross-Origin-Embedder-Policy: require-corp"`).
+- For the default (non-threaded) demo build, serve the `searchlite-wasm` crate directory over HTTP (any static file server without special headers is fine, e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080`).
+- For the threaded build (`--features threads`), serve with COOP/COEP headers so `SharedArrayBuffer` works (e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080 -H "Cross-Origin-Opener-Policy: same-origin" -H "Cross-Origin-Embedder-Policy: require-corp"`).
 - Open `http://localhost:8080/index.html`. The bundled page imports `pkg/searchlite_wasm.js`, initializes the module, and provides a lightweight schema/upload/search demo in the browser.
 
 #### API usage

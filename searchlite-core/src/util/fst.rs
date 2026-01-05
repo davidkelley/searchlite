@@ -24,13 +24,12 @@ impl TinyFst {
 
   pub fn iter_prefix<'a>(
     &'a self,
-    prefix: &str,
+    prefix: &'a str,
   ) -> impl Iterator<Item = (&'a String, &'a u64)> + 'a {
-    let prefix_owned = prefix.to_string();
     self
       .map
-      .range(prefix_owned.clone()..)
-      .take_while(move |(k, _)| k.starts_with(&prefix_owned))
+      .range(prefix.to_string()..)
+      .take_while(move |(k, _)| k.starts_with(prefix))
   }
 }
 

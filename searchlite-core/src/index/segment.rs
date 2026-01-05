@@ -874,7 +874,7 @@ impl SegmentReader {
     PostingsReader::read_at(&mut *file, offset, self.keep_positions).ok()
   }
 
-  pub fn terms_with_prefix<'a>(&'a self, prefix: &str) -> impl Iterator<Item = &'a String> + 'a {
+  pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> + 'a {
     self.terms.0.iter_prefix(prefix).map(|(term, _)| term)
   }
 
