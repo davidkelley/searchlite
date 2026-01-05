@@ -83,6 +83,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -146,6 +147,7 @@ fn histogram_requires_positive_interval() {
   let resp = idx.reader().unwrap().search(&SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),
@@ -230,6 +232,7 @@ fn nested_terms_stats_aggregation() {
     .search(&SearchRequest {
       query: "systems".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -305,6 +308,7 @@ fn date_histogram_rejects_invalid_config() {
   let resp = idx.reader().unwrap().search(&SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),
@@ -348,6 +352,7 @@ fn date_histogram_rejects_invalid_config() {
   let resp = idx.reader().unwrap().search(&SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),
@@ -410,6 +415,7 @@ fn top_hits_returns_requested_docs() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -499,6 +505,7 @@ fn top_hits_applies_sort_spec() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -593,6 +600,7 @@ fn date_histogram_calendar_month_interval() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),

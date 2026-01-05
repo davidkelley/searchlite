@@ -149,8 +149,9 @@ pub unsafe extern "C" fn searchlite_search(
     BTreeMap::new()
   };
   let req = SearchRequest {
-    query: query_str,
+    query: query_str.into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit,
     sort: Vec::new(),

@@ -92,6 +92,7 @@ fn bench_terms_aggregation(c: &mut Criterion) {
   let req = SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),
@@ -138,6 +139,7 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
   let req = SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),

@@ -20,8 +20,9 @@ fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
 
 fn base_search_request(query: &str) -> SearchRequest {
   SearchRequest {
-    query: query.to_string(),
+    query: query.into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 10,
     sort: Vec::new(),
@@ -106,8 +107,9 @@ fn index_and_search() {
   let reader = idx.reader().unwrap();
   let resp = reader
     .search(&SearchRequest {
-      query: "systems programming".to_string(),
+      query: "systems programming".into(),
       fields: Some(vec!["body".to_string(), "title".to_string()]),
+      filter: None,
       filters: vec![Filter::I64Range {
         field: "year".to_string(),
         min: 2010,
@@ -328,8 +330,9 @@ fn upsert_and_delete_by_id() {
   }
   let reader = idx.reader().unwrap();
   let req = SearchRequest {
-    query: "second".to_string(),
+    query: "second".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 5,
     sort: Vec::new(),
@@ -410,8 +413,9 @@ fn cursor_paginates_ordered_hits() {
 
   let reader = idx.reader().unwrap();
   let mut req = SearchRequest {
-    query: "rust".to_string(),
+    query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 2,
     sort: Vec::new(),
@@ -475,8 +479,9 @@ fn cursor_rejects_invalid_hex() {
 
   let reader = idx.reader().unwrap();
   let req = SearchRequest {
-    query: "rust".to_string(),
+    query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 1,
     sort: Vec::new(),
@@ -520,8 +525,9 @@ fn cursor_rejects_when_limit_zero() {
   let reader = idx.reader().unwrap();
   let err = reader
     .search(&SearchRequest {
-      query: "rust".to_string(),
+      query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -574,8 +580,9 @@ fn cursor_rejects_excessive_advance() {
     .max()
     .unwrap_or(0);
   let req = SearchRequest {
-    query: "rust".to_string(),
+    query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 1,
     sort: Vec::new(),
@@ -620,8 +627,9 @@ fn cursor_rejects_mismatched_position() {
 
   let reader = idx.reader().unwrap();
   let mut req = SearchRequest {
-    query: "rust".to_string(),
+    query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 2,
     sort: Vec::new(),
@@ -693,8 +701,9 @@ fn cursor_orders_stably_across_segments() {
 
   let reader = idx.reader().unwrap();
   let mut req = SearchRequest {
-    query: "rust".to_string(),
+    query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 2,
     sort: Vec::new(),
@@ -797,8 +806,9 @@ fn in_memory_storage_keeps_disk_clean() {
   let reader = idx.reader().unwrap();
   let resp = reader
     .search(&SearchRequest {
-      query: "memory".to_string(),
+      query: "memory".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: Vec::new(),
@@ -922,6 +932,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters,
       limit: 5,
       sort: Vec::new(),
@@ -1077,6 +1088,7 @@ fn nested_numeric_filters_bind_to_object_values() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters,
       limit: 5,
       sort: Vec::new(),

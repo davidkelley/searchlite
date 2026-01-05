@@ -74,6 +74,7 @@ fn sorts_numeric_and_missing_last() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 10,
       sort: vec![SortSpec {
@@ -153,6 +154,7 @@ fn sorts_keywords_descending_with_multivalue_mode() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: vec![SortSpec {
@@ -243,6 +245,7 @@ fn paginates_with_sorted_cursor_across_segments() {
   let mut req = SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 2,
     sort: vec![SortSpec {

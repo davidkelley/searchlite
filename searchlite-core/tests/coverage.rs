@@ -88,8 +88,9 @@ fn search_with_phrase_filters_and_compaction() {
   let reader = index.reader().unwrap();
   let result = reader
     .search(&SearchRequest {
-      query: "\"systems programming\" rust -boring".to_string(),
+      query: "\"systems programming\" rust -boring".into(),
       fields: None,
+      filter: None,
       filters: vec![
         Filter::KeywordEq {
           field: "category".into(),

@@ -274,8 +274,9 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     None => bail!("search query is required unless --request or --request-stdin is provided"),
   };
   Ok(SearchRequest {
-    query,
+    query: query.into(),
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
+    filter: None,
     filters: Vec::new(),
     limit,
     sort: parse_sort(sort)?,
@@ -427,7 +428,7 @@ mod tests {
     cmd_add(index.as_path(), docs_path.as_path()).unwrap();
     cmd_commit(index.as_path()).unwrap();
     let request = build_search_request_from_cli(SearchCliArgs {
-      query: Some("rust".to_string()),
+      query: Some("rust".into()),
       limit: 5,
       cursor: None,
       execution: "wand".to_string(),
@@ -466,8 +467,9 @@ mod tests {
     cmd_commit(index.as_path()).unwrap();
 
     let request = SearchRequest {
-      query: "rust".to_string(),
+      query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: Vec::new(),

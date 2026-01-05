@@ -88,8 +88,9 @@ fn bench_search(c: &mut Criterion) {
     b.iter(|| {
       let reader = idx.reader().unwrap();
       let req = SearchRequest {
-        query: "rust".to_string(),
+        query: "rust".into(),
         fields: None,
+        filter: None,
         filters: vec![],
         limit: 5,
         sort: Vec::new(),
@@ -177,6 +178,7 @@ fn bench_nested_filters(c: &mut Criterion) {
       let req = SearchRequest {
         query: "rust".into(),
         fields: None,
+        filter: None,
         filters: vec![
           Filter::Nested {
             path: "review".into(),
@@ -253,6 +255,7 @@ fn bench_cursor_pagination(c: &mut Criterion) {
         let req = SearchRequest {
           query: "rust".into(),
           fields: None,
+          filter: None,
           filters: vec![],
           limit: 20,
           sort: Vec::new(),
