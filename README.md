@@ -6,6 +6,7 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - `searchlite-core`: indexing, storage, and retrieval (BM25 + block-level maxima, boolean/phrase matching, filters, optional vectors/GPU rerank stubs).
 - `searchlite-cli`: CLI for init/add/commit/search/inspect/compact.
 - `searchlite-ffi`: optional C ABI (enable with the `ffi` feature).
+- `searchlite-wasm`: experimental wasm bindings with an IndexedDB-backed `Storage` implementation (threaded wasm needs `wasm-bindgen-rayon`; you must configure COOP/COEP yourself).
 
 **Core capabilities**
 - Single-writer, multi-reader index backed by a WAL and atomic manifest updates.
@@ -452,6 +453,27 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
 
 ### In-memory indexes
 For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `IndexOptions`. The API and search behavior stay the same, but no files are created on disk. (The CLI currently uses filesystem storage only.)
+
+### WASM
+#### Builds and targets
+- Install `wasm-pack` (e.g., `brew install wasm-pack` or `cargo install wasm-pack`) before building.
+- Threaded wasm needs atomics/bulk-memory and build-std; `searchlite-wasm/rust-toolchain.toml` pins a nightly with `rust-src` and the wasm target, and `searchlite-wasm/.cargo/config.toml` sets the required rustflags/build-std. Rustup will fetch the nightly toolchain automatically when you build this crate.
+- Default build for browsers and module workers (ESM): `wasm-pack build searchlite-wasm --target web --release`.
+- Classic workers / `importScripts` need a separate build: `wasm-pack build searchlite-wasm --target no-modules --release` (or `--target bundler` if you want a bundler to wrap it).
+- Threaded build (requires COOP/COEP + SharedArrayBuffer): `wasm-pack build searchlite-wasm --target web --release -- --features threads`.
+
+#### Choosing the right build
+- **Browser window + module workers**: use the `--target web` build; this is a single build that works in both environments.
+- **Classic web worker / service worker (no modules)**: use `--target no-modules` (or `--target bundler`) because `importScripts` cannot load ES modules.
+- **Threads**: build with `--features threads` and serve with COOP/COEP headers; this is a separate build and is not available in service workers.
+
+#### Running the demo
+- Serve the crate directory over HTTP with COOP/COEP headers so SharedArrayBuffer works (e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080 -H "Cross-Origin-Opener-Policy: same-origin" -H "Cross-Origin-Embedder-Policy: require-corp"`).
+- Open `http://localhost:8080/index.html`. The bundled page imports `pkg/searchlite_wasm.js`, initializes the module, and provides a lightweight schema/upload/search demo in the browser.
+
+#### API usage
+- Instantiate from JS with `await Searchlite.init("demo-db", JSON.stringify(schema), "indexeddb")` (default) or `"memory"` for ephemeral indexes. `init` reopens existing indexes with the same name and validates schemas; mismatches return an error.
+- Prefer `add_documents([...])` for bulk ingest and call `commit()` to flush everything to the manifest.
 
 ## Building the C library
 Build the FFI crate to generate a shared library and header for C or other language bindings.

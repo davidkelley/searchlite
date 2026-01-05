@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = []
+browser = []
 vectors = ["bytemuck"]
 gpu = []
 zstd = ["dep:zstd"]
@@ -19,7 +20,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-memmap2 = { workspace = true }
 crc32fast = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true, optional = false }
@@ -32,6 +32,12 @@ parking_lot = { workspace = true }
 smallvec = { workspace = true }
 
 zstd = { version = "0.13.1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 rand = { workspace = true }
