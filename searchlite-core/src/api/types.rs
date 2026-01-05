@@ -51,6 +51,13 @@ pub struct Document {
   pub fields: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FieldSpec {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub boost: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Query {
@@ -76,6 +83,29 @@ impl From<QueryNode> for Query {
   }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchOperator {
+  Or,
+  And,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiMatchType {
+  #[default]
+  BestFields,
+  MostFields,
+  CrossFields,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MinimumShouldMatch {
+  Value(usize),
+  Percentage(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryNode {
@@ -86,8 +116,34 @@ pub enum QueryNode {
   },
   QueryString {
     query: String,
+    #[serde(
+      default,
+      skip_serializing_if = "Option::is_none",
+      deserialize_with = "deserialize_field_specs_opt"
+    )]
+    fields: Option<Vec<FieldSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    fields: Option<Vec<String>>,
+    boost: Option<f32>,
+  },
+  MultiMatch {
+    query: String,
+    #[serde(deserialize_with = "deserialize_field_specs")]
+    fields: Vec<FieldSpec>,
+    #[serde(default)]
+    match_type: MultiMatchType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tie_breaker: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator: Option<MatchOperator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimum_should_match: Option<MinimumShouldMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  DisMax {
+    queries: Vec<QueryNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tie_breaker: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
@@ -102,6 +158,8 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     field: Option<String>,
     terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slop: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
@@ -119,6 +177,45 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FieldSpecList {
+  Names(Vec<String>),
+  Specs(Vec<FieldSpec>),
+}
+
+fn deserialize_field_specs<'de, D>(deserializer: D) -> Result<Vec<FieldSpec>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let list = FieldSpecList::deserialize(deserializer)?;
+  Ok(match list {
+    FieldSpecList::Names(fields) => fields
+      .into_iter()
+      .map(|field| FieldSpec { field, boost: None })
+      .collect(),
+    FieldSpecList::Specs(specs) => specs,
+  })
+}
+
+fn deserialize_field_specs_opt<'de, D>(deserializer: D) -> Result<Option<Vec<FieldSpec>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let opt = Option::<FieldSpecList>::deserialize(deserializer)?;
+  opt
+    .map(|list| {
+      Ok(match list {
+        FieldSpecList::Names(fields) => fields
+          .into_iter()
+          .map(|field| FieldSpec { field, boost: None })
+          .collect(),
+        FieldSpecList::Specs(specs) => specs,
+      })
+    })
+    .transpose()
 }
 
 #[derive(Debug, Clone, Serialize)]

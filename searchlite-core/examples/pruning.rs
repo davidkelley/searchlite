@@ -152,6 +152,7 @@ fn run_strategy(
             docs,
             k1: opts.bm25_k1,
             b: opts.bm25_b,
+            leaf: 0,
           });
         }
       }

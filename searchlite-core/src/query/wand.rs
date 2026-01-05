@@ -5,6 +5,7 @@ use crate::api::types::ExecutionStrategy;
 use crate::index::postings::{PostingsReader, DEFAULT_BLOCK_SIZE};
 use crate::query::bm25::bm25;
 use crate::query::collector::DocCollector;
+use crate::query::planner::ScorePlan;
 use crate::DocId;
 
 const DOCID_END: DocId = u32::MAX;
@@ -65,6 +66,7 @@ pub struct ScoredTerm {
   pub docs: f32,
   pub k1: f32,
   pub b: f32,
+  pub leaf: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +79,7 @@ struct TermState {
   docs: f32,
   k1: f32,
   b: f32,
+  leaf: usize,
   ub: f32,
   block_max_doc_ids: Vec<DocId>,
   block_max_tfs: Vec<f32>,
@@ -106,6 +109,7 @@ impl TermState {
       docs: term.docs,
       k1: term.k1,
       b: term.b,
+      leaf: term.leaf,
       ub,
       block_max_doc_ids,
       block_max_tfs,
@@ -269,13 +273,15 @@ pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   accept: &mut F,
   collector: Option<&mut C>,
 ) -> Vec<RankedDoc> {
-  execute_top_k_with_mode(
+  execute_top_k_with_stats_and_mode_internal(
     terms,
     k,
     strategy,
     block_size,
+    None,
     accept,
     collector,
+    None,
     ScoreMode::Score,
   )
 }
@@ -289,8 +295,8 @@ pub fn execute_top_k_with_mode<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?
   collector: Option<&mut C>,
   score_mode: ScoreMode,
 ) -> Vec<RankedDoc> {
-  execute_top_k_with_stats_and_mode(
-    terms, k, strategy, block_size, accept, collector, None, score_mode,
+  execute_top_k_with_stats_and_mode_internal(
+    terms, k, strategy, block_size, None, accept, collector, None, score_mode,
   )
 }
 
@@ -303,11 +309,12 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + 
   collector: Option<&mut C>,
   stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
-  execute_top_k_with_stats_and_mode(
+  execute_top_k_with_stats_and_mode_internal(
     terms,
     k,
     strategy,
     block_size,
+    None,
     accept,
     collector,
     stats,
@@ -316,11 +323,15 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_top_k_with_stats_and_mode<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
+pub(crate) fn execute_top_k_with_stats_and_mode_internal<
+  F: FnMut(DocId, f32) -> bool,
+  C: DocCollector + ?Sized,
+>(
   terms: Vec<ScoredTerm>,
   k: usize,
   strategy: ExecutionStrategy,
   block_size: Option<usize>,
+  score_plan: Option<&ScorePlan>,
   accept: &mut F,
   collector: Option<&mut C>,
   stats: Option<&mut QueryStats>,
@@ -340,7 +351,7 @@ pub fn execute_top_k_with_stats_and_mode<F: FnMut(DocId, f32) -> bool, C: DocCol
     return match_only_loop(states, accept, collector, stats);
   }
   if matches!(strategy, ExecutionStrategy::Bm25) {
-    return brute_force(&terms, k, should_rank, accept, collector, stats);
+    return brute_force(&terms, k, should_rank, score_plan, accept, collector, stats);
   }
   let bsize = block_size.unwrap_or(DEFAULT_BLOCK_SIZE).max(1);
   let states: Vec<TermState> = terms
@@ -354,6 +365,7 @@ pub fn execute_top_k_with_stats_and_mode<F: FnMut(DocId, f32) -> bool, C: DocCol
     k,
     should_rank,
     use_block_bounds,
+    score_plan,
     accept,
     collector,
     stats,
@@ -364,10 +376,54 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   terms: &[ScoredTerm],
   k: usize,
   rank_hits: bool,
+  score_plan: Option<&ScorePlan>,
   accept: &mut F,
   mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
+  if let Some(plan) = score_plan {
+    let mut scores: hashbrown::HashMap<DocId, Vec<f32>> = hashbrown::HashMap::new();
+    for term in terms.iter() {
+      let df = term.postings.len() as f32;
+      with_stats(&mut stats, |s| s.postings_advanced += term.postings.len());
+      for entry in term.postings.iter() {
+        let score = score_tf(
+          entry.term_freq as f32,
+          df,
+          term.avgdl,
+          term.docs,
+          term.k1,
+          term.b,
+          term.weight,
+        );
+        let buf = scores
+          .entry(entry.doc_id)
+          .or_insert_with(|| vec![0.0; plan.leaf_count]);
+        if term.leaf < buf.len() {
+          buf[term.leaf] += score;
+        }
+      }
+    }
+    let scored = scores.len();
+    with_stats(&mut stats, |s| {
+      s.scored_docs += scored;
+      s.candidates_examined += scored;
+    });
+    let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
+    for (doc_id, leaves) in scores.into_iter() {
+      let score = plan.evaluate(&leaves);
+      if !accept(doc_id, score) {
+        continue;
+      }
+      if let Some(collector) = collector.as_deref_mut() {
+        collector.collect(doc_id, score);
+      }
+      if rank_hits {
+        push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+      }
+    }
+    return finalize_heap(heap);
+  }
   let mut scores: hashbrown::HashMap<DocId, f32> = hashbrown::HashMap::new();
   for term in terms.iter() {
     let df = term.postings.len() as f32;
@@ -441,11 +497,13 @@ fn match_only_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   Vec::new()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   mut terms: Vec<TermState>,
   k: usize,
   rank_hits: bool,
   use_block_bounds: bool,
+  score_plan: Option<&ScorePlan>,
   accept: &mut F,
   mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
@@ -453,12 +511,18 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
   let mut order: Vec<usize> = (0..terms.len()).collect();
   order.sort_by_key(|&idx| terms[idx].doc_id());
+  let mut leaf_scores = score_plan.map(|plan| vec![0.0_f32; plan.leaf_count]);
+  let mut touched: Vec<usize> = Vec::new();
   loop {
     order.retain(|idx| !terms[*idx].is_done());
     if order.is_empty() {
       break;
     }
-    let threshold = heap.peek().map(|d| d.0.score).unwrap_or(0.0);
+    let threshold = if rank_hits && heap.len() >= k {
+      heap.peek().map(|d| d.0.score).unwrap_or(0.0)
+    } else {
+      0.0
+    };
     let pivot_idx = match choose_pivot(
       &order,
       &terms,
@@ -476,12 +540,22 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     let smallest_doc = terms[order[0]].doc_id();
     if pivot_doc == smallest_doc {
       let doc_id = pivot_doc;
-      let mut score = 0.0;
+      let mut score_sum = 0.0;
       let mut mutated: Vec<usize> = Vec::new();
       let mut idx = 0usize;
       while idx < order.len() && terms[order[idx]].doc_id() == doc_id {
         let term_idx = order[idx];
-        score += terms[term_idx].score_current();
+        let contribution = terms[term_idx].score_current();
+        score_sum += contribution;
+        if let Some(buf) = leaf_scores.as_mut() {
+          let leaf = terms[term_idx].leaf;
+          if leaf < buf.len() {
+            if buf[leaf] == 0.0 {
+              touched.push(leaf);
+            }
+            buf[leaf] += contribution;
+          }
+        }
         let moved = terms[term_idx].advance();
         mutated.push(term_idx);
         with_stats(&mut stats, |s| s.postings_advanced += moved);
@@ -491,6 +565,17 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         s.candidates_examined += 1;
         s.scored_docs += 1;
       });
+      let mut score = score_sum;
+      if let Some(plan) = score_plan {
+        if let Some(buf) = leaf_scores.as_ref() {
+          score = plan.evaluate(buf);
+        }
+      }
+      if let Some(buf) = leaf_scores.as_mut() {
+        for idx in touched.drain(..) {
+          buf[idx] = 0.0;
+        }
+      }
       let accepted = accept(doc_id, score);
       if accepted {
         if let Some(collector) = collector.as_deref_mut() {
@@ -600,6 +685,7 @@ mod tests {
       docs: 10.0,
       k1: 1.2,
       b: 0.75,
+      leaf: 0,
     }
   }
 
@@ -644,6 +730,7 @@ mod tests {
       &[term1.clone(), term2.clone()],
       2,
       true,
+      None,
       &mut accept,
       None,
       None,

@@ -22,9 +22,9 @@ use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_sec
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::{passes_filter, passes_filters};
 use crate::query::phrase::matches_phrase;
-use crate::query::planner::{build_query_plan, PhraseSpec, QueryMatcher, TermGroupSpec};
+use crate::query::planner::{build_query_plan, PhraseSpec, QueryMatcher, ScorePlan, TermGroupSpec};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
-use crate::query::wand::{execute_top_k_with_mode, ScoreMode, ScoredTerm};
+use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
@@ -347,6 +347,7 @@ struct QualifiedTerm {
   term: String,
   key: String,
   weight: f32,
+  leaf: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +355,17 @@ struct TermMatchGroup {
   keys: Vec<String>,
 }
 
-type PhraseFieldConfig = Vec<(String, Vec<Vec<String>>)>;
+#[derive(Clone, Debug)]
+struct PhraseFieldConfig {
+  slop: u32,
+  fields: Vec<(String, Vec<Vec<String>>)>,
+}
+
+#[derive(Clone, Debug)]
+struct PhraseRuntime {
+  slop: u32,
+  variants: Vec<Vec<Vec<PostingEntry>>>,
+}
 
 #[derive(Clone, Copy)]
 enum RootFilter<'a> {
@@ -368,6 +379,7 @@ struct SegmentSearchParams<'a> {
   matcher: &'a QueryMatcher,
   term_groups: &'a [TermMatchGroup],
   phrase_fields: &'a [PhraseFieldConfig],
+  scorer: Option<&'a ScorePlan>,
   root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
@@ -455,9 +467,11 @@ fn expand_term_groups(
     let mut keys = Vec::new();
     let mut seen_keys = HashSet::new();
     for field in group.fields.iter() {
-      match schema.field_kind(field) {
+      let target_leaf = field.leaf.or(group.leaf);
+      let weight = group.boost * field.boost;
+      match schema.field_kind(&field.field) {
         FieldKind::Text => {
-          if let Some(analyzer) = analysis.search_analyzer(field) {
+          if let Some(analyzer) = analysis.search_analyzer(&field.field) {
             let mut seen_tokens = HashSet::new();
             for token in analyzer.analyze(&group.term).into_iter() {
               if !seen_tokens.insert(token.text.clone()) {
@@ -465,10 +479,11 @@ fn expand_term_groups(
               }
               let (scored, mut expanded_keys) = expand_term_for_group(
                 segments,
-                field,
+                &field.field,
                 &token.text,
-                group.boost,
+                weight,
                 group.score,
+                target_leaf,
                 fuzzy,
               );
               if group.score {
@@ -484,8 +499,15 @@ fn expand_term_groups(
         }
         FieldKind::Keyword => {
           let term = group.term.to_ascii_lowercase();
-          let (scored, mut expanded_keys) =
-            expand_term_for_group(segments, field, &term, group.boost, group.score, fuzzy);
+          let (scored, mut expanded_keys) = expand_term_for_group(
+            segments,
+            &field.field,
+            &term,
+            weight,
+            group.score,
+            target_leaf,
+            fuzzy,
+          );
           if group.score {
             qualified_terms.extend(scored);
           }
@@ -509,22 +531,31 @@ fn expand_term_for_group(
   term: &str,
   boost: f32,
   score: bool,
+  leaf: Option<usize>,
   fuzzy: Option<&FuzzyOptions>,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
   if !score {
     return (Vec::new(), vec![build_term_key(field, term)]);
   }
+  let Some(leaf) = leaf else {
+    return (Vec::new(), vec![build_term_key(field, term)]);
+  };
   let Some(fuzzy) = fuzzy else {
-    return expand_term_exact(field, term, boost);
+    return expand_term_exact(field, term, boost, leaf);
   };
   let max_edits = fuzzy.max_edits.min(2) as usize;
   if max_edits == 0 {
-    return expand_term_exact(field, term, boost);
+    return expand_term_exact(field, term, boost, leaf);
   }
-  expand_term_fuzzy(segments, field, term, boost, fuzzy)
+  expand_term_fuzzy(segments, field, term, boost, leaf, fuzzy)
 }
 
-fn expand_term_exact(field: &str, term: &str, boost: f32) -> (Vec<QualifiedTerm>, Vec<String>) {
+fn expand_term_exact(
+  field: &str,
+  term: &str,
+  boost: f32,
+  leaf: usize,
+) -> (Vec<QualifiedTerm>, Vec<String>) {
   let key = build_term_key(field, term);
   (
     vec![QualifiedTerm {
@@ -532,6 +563,7 @@ fn expand_term_exact(field: &str, term: &str, boost: f32) -> (Vec<QualifiedTerm>
       term: term.to_string(),
       key: key.clone(),
       weight: boost,
+      leaf,
     }],
     vec![key],
   )
@@ -542,6 +574,7 @@ fn expand_term_fuzzy(
   field: &str,
   term: &str,
   boost: f32,
+  leaf: usize,
   fuzzy: &FuzzyOptions,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
   let term_len = term.chars().count();
@@ -551,6 +584,7 @@ fn expand_term_fuzzy(
     term: term.to_string(),
     key: exact_key.clone(),
     weight: boost * distance_weight(0),
+    leaf,
   }];
   let mut keys = vec![exact_key.clone()];
   if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
@@ -595,6 +629,7 @@ fn expand_term_fuzzy(
           term: candidate.to_string(),
           key: key.clone(),
           weight: boost * distance_weight(distance),
+          leaf,
         });
         keys.push(key.clone());
         expansions += 1;
@@ -607,8 +642,6 @@ fn expand_term_fuzzy(
   (qualified, keys)
 }
 
-type PhrasePostings = Vec<Vec<Vec<PostingEntry>>>;
-
 struct TermDocLists {
   lists: Vec<Vec<DocId>>,
   group_lists: Vec<Vec<usize>>,
@@ -618,7 +651,7 @@ struct QueryEvaluator<'a> {
   matcher: &'a QueryMatcher,
   term_docs: &'a [Vec<DocId>],
   term_group_lists: &'a [Vec<usize>],
-  phrase_postings: &'a [PhrasePostings],
+  phrase_postings: &'a [PhraseRuntime],
   fast_fields: &'a FastFieldsReader,
 }
 
@@ -633,12 +666,6 @@ impl<'a> QueryEvaluator<'a> {
       QueryMatcher::Term(idx) => self.term_group_matches(*idx, doc_id),
       QueryMatcher::Phrase(idx) => self.phrase_matches(*idx, doc_id),
       QueryMatcher::QueryString(matcher) => {
-        let has_terms = !matcher.term_groups.is_empty();
-        let has_phrases = !matcher.phrase_groups.is_empty();
-        let has_negated = !matcher.not_term_groups.is_empty();
-        if !has_terms && !has_phrases && !has_negated {
-          return false;
-        }
         for idx in matcher.not_term_groups.iter().copied() {
           if self.term_group_matches(idx, doc_id) {
             return false;
@@ -649,14 +676,27 @@ impl<'a> QueryEvaluator<'a> {
             return false;
           }
         }
-        if has_terms {
-          return matcher
-            .term_groups
-            .iter()
-            .copied()
-            .any(|idx| self.term_group_matches(idx, doc_id));
+        if matcher.term_groups.is_empty() {
+          return !matcher.phrase_groups.is_empty() || !matcher.not_term_groups.is_empty();
         }
-        true
+        let matched_terms = matcher
+          .term_groups
+          .iter()
+          .copied()
+          .filter(|idx| self.term_group_matches(*idx, doc_id))
+          .count();
+        let required = matcher
+          .minimum_should_match
+          .unwrap_or(if matcher.term_groups.is_empty() { 0 } else { 1 });
+        matched_terms >= required
+      }
+      QueryMatcher::DisMax(children) => {
+        if children.is_empty() {
+          return false;
+        }
+        children
+          .iter()
+          .any(|child| self.matches_node(child, doc_id))
       }
       QueryMatcher::Bool {
         must,
@@ -712,14 +752,14 @@ impl<'a> QueryEvaluator<'a> {
   }
 
   fn phrase_matches(&self, phrase_idx: usize, doc_id: DocId) -> bool {
-    let Some(variants) = self.phrase_postings.get(phrase_idx) else {
+    let Some(runtime) = self.phrase_postings.get(phrase_idx) else {
       return false;
     };
-    if variants.is_empty() {
+    if runtime.variants.is_empty() {
       return false;
     }
-    for per_term in variants.iter() {
-      if matches_phrase(per_term.as_slice(), doc_id) {
+    for per_term in runtime.variants.iter() {
+      if matches_phrase(per_term.as_slice(), doc_id, runtime.slop) {
         return true;
       }
     }
@@ -735,7 +775,7 @@ fn expand_phrase_fields(
   phrase_specs
     .iter()
     .map(|phrase| {
-      phrase
+      let fields = phrase
         .fields
         .iter()
         .filter_map(|field| match schema.field_kind(field) {
@@ -767,7 +807,11 @@ fn expand_phrase_fields(
           }
           FieldKind::Numeric | FieldKind::Unknown => None,
         })
-        .collect()
+        .collect();
+      PhraseFieldConfig {
+        slop: phrase.slop,
+        fields,
+      }
     })
     .collect()
 }
@@ -987,6 +1031,7 @@ impl IndexReader {
           matcher: &query_plan.matcher,
           term_groups: &term_groups,
           phrase_fields: &phrase_fields,
+          scorer: query_plan.scorer.as_ref(),
           root_filter,
           agg_collector: agg_ref,
           match_counter: counter,
@@ -1063,6 +1108,7 @@ impl IndexReader {
       matcher,
       term_groups,
       phrase_fields,
+      scorer,
       root_filter,
       agg_collector,
       match_counter,
@@ -1080,10 +1126,11 @@ impl IndexReader {
       ScoreMode::MatchOnly
     };
     let term_doc_lists = build_term_doc_lists(seg, term_groups);
-    let phrase_postings: Vec<PhrasePostings> = phrase_fields
+    let phrase_postings: Vec<PhraseRuntime> = phrase_fields
       .iter()
-      .map(|fields| {
-        fields
+      .map(|config| {
+        let variants = config
+          .fields
           .iter()
           .filter_map(|(field, positions)| {
             let mut per_position: Vec<Vec<PostingEntry>> = Vec::new();
@@ -1102,7 +1149,11 @@ impl IndexReader {
             }
             Some(per_position)
           })
-          .collect::<Vec<Vec<Vec<PostingEntry>>>>()
+          .collect::<Vec<Vec<Vec<PostingEntry>>>>();
+        PhraseRuntime {
+          slop: config.slop,
+          variants,
+        }
       })
       .collect();
     let query_eval = QueryEvaluator {
@@ -1127,17 +1178,19 @@ impl IndexReader {
         collect_hits,
       );
     }
-    let mut term_weights: HashMap<String, (String, f32)> = HashMap::new();
+    let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
     for term in qualified_terms.iter() {
-      let entry = term_weights
-        .entry(term.key.clone())
-        .or_insert((term.field.clone(), 0.0));
+      let entry =
+        term_weights
+          .entry(term.key.clone())
+          .or_insert((term.field.clone(), 0.0, term.leaf));
       entry.1 += term.weight;
+      entry.2 = term.leaf;
     }
 
     let docs = seg.live_docs() as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
-    for (key, (field, weight)) in term_weights.into_iter() {
+    for (key, (field, weight, leaf)) in term_weights.into_iter() {
       if let Some(postings) = seg.postings(&key) {
         terms.push(ScoredTerm {
           postings,
@@ -1146,6 +1199,7 @@ impl IndexReader {
           docs,
           k1: self.options.bm25_k1,
           b: self.options.bm25_b,
+          leaf,
         });
       }
     }
@@ -1184,13 +1238,15 @@ impl IndexReader {
       true
     };
 
-    let ranked = execute_top_k_with_mode(
+    let ranked = execute_top_k_with_stats_and_mode_internal(
       terms,
       rank_limit,
       req.execution.clone(),
       req.bmw_block_size,
+      scorer,
       &mut accept,
       agg_collector,
+      None,
       score_mode,
     );
 
@@ -1526,6 +1582,12 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::api::types::{
+    ExecutionStrategy, FieldSpec, MatchOperator, MultiMatchType, QueryNode, Schema, SearchRequest,
+    TextField,
+  };
+  use crate::api::{Document, Index, Query, StorageType};
+  use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
 
   #[test]
   fn pagination_cursor_roundtrips() {
@@ -1559,5 +1621,247 @@ mod tests {
     buf[17..].copy_from_slice(&returned.to_be_bytes());
     let encoded = hex_encode(&buf);
     assert!(PaginationCursor::decode(&encoded).is_err());
+  }
+
+  #[test]
+  fn multi_match_term_groups_cover_all_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let mut schema = Schema::default_text_body();
+    schema.text_fields.push(TextField {
+      name: "title".into(),
+      analyzer: "default".into(),
+      search_analyzer: None,
+      stored: true,
+      indexed: true,
+      nullable: false,
+    });
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    let docs = vec![
+      Document {
+        fields: [
+          ("_id".to_string(), serde_json::json!("doc-1")),
+          ("title".to_string(), serde_json::json!("rust search")),
+          ("body".to_string(), serde_json::json!("fast")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".to_string(), serde_json::json!("doc-2")),
+          ("title".to_string(), serde_json::json!("rust")),
+          ("body".to_string(), serde_json::json!("search")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".to_string(), serde_json::json!("doc-3")),
+          ("title".to_string(), serde_json::json!("rust")),
+          ("body".to_string(), serde_json::json!("rust search")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".to_string(), serde_json::json!("doc-4")),
+          ("title".to_string(), serde_json::json!("boring")),
+          ("body".to_string(), serde_json::json!("rust")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".to_string(), serde_json::json!("doc-5")),
+          ("title".to_string(), serde_json::json!("none")),
+          ("body".to_string(), serde_json::json!("rust fast search")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ];
+    for doc in docs {
+      writer.add_document(&doc).unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::MultiMatch {
+        query: "rust search".into(),
+        fields: vec![
+          FieldSpec {
+            field: "title".into(),
+            boost: None,
+          },
+          FieldSpec {
+            field: "body".into(),
+            boost: None,
+          },
+        ],
+        match_type: MultiMatchType::BestFields,
+        tie_breaker: None,
+        operator: Some(MatchOperator::Or),
+        minimum_should_match: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (qualified_terms, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    );
+    assert_eq!(term_groups.len(), 2);
+    assert!(term_groups[0].keys.iter().any(|k| k == "title:rust"));
+    assert!(term_groups[0].keys.iter().any(|k| k == "body:rust"));
+    assert!(term_groups[1].keys.iter().any(|k| k == "title:search"));
+    assert!(term_groups[1].keys.iter().any(|k| k == "body:search"));
+    assert!(qualified_terms.iter().any(|t| t.key == "body:rust"));
+    let seg = &reader.segments[0];
+    let term_docs = build_term_doc_lists(seg, &term_groups);
+    let doc2 = (0..seg.meta.doc_count)
+      .map(|raw| raw as DocId)
+      .find(|id| seg.doc_id(*id) == Some("doc-2"))
+      .unwrap();
+    let doc4 = (0..seg.meta.doc_count)
+      .map(|raw| raw as DocId)
+      .find(|id| seg.doc_id(*id) == Some("doc-4"))
+      .unwrap();
+    let evaluator = QueryEvaluator {
+      matcher: &plan.matcher,
+      term_docs: &term_docs.lists,
+      term_group_lists: &term_docs.group_lists,
+      phrase_postings: &[],
+      fast_fields: seg.fast_fields(),
+    };
+    assert!(evaluator.matches(doc2));
+    assert!(evaluator.matches(doc4));
+    let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
+    for term in qualified_terms.iter() {
+      let entry =
+        term_weights
+          .entry(term.key.clone())
+          .or_insert((term.field.clone(), 0.0, term.leaf));
+      entry.1 += term.weight;
+      entry.2 = term.leaf;
+    }
+    let docs = seg.live_docs() as f32;
+    let mut scored_terms = Vec::new();
+    for (key, (field, weight, leaf)) in term_weights.into_iter() {
+      if let Some(postings) = seg.postings(&key) {
+        scored_terms.push(ScoredTerm {
+          postings,
+          weight,
+          avgdl: seg.avg_field_length(&field),
+          docs,
+          k1: reader.options.bm25_k1,
+          b: reader.options.bm25_b,
+          leaf,
+        });
+      }
+    }
+    let mut seen_matches: Vec<String> = Vec::new();
+    let mut accept = |doc_id: DocId, _score: f32| -> bool {
+      if seg.is_deleted(doc_id) {
+        return false;
+      }
+      if !evaluator.matches(doc_id) {
+        return false;
+      }
+      if let Some(ext) = seg.doc_id(doc_id) {
+        seen_matches.push(ext.to_string());
+      }
+      true
+    };
+    let ranked = execute_top_k_with_stats_and_mode_internal(
+      scored_terms,
+      6,
+      ExecutionStrategy::Wand,
+      None,
+      plan.scorer.as_ref(),
+      &mut accept,
+      None::<&mut crate::query::collector::MatchCountingCollector>,
+      None,
+      ScoreMode::Score,
+    );
+    let ranked_ids: Vec<_> = ranked
+      .iter()
+      .filter_map(|rd| seg.doc_id(rd.doc_id))
+      .map(str::to_string)
+      .collect();
+    assert_eq!(
+      seen_matches.len(),
+      5,
+      "accepted: {:?}, ranked: {:?}",
+      seen_matches,
+      ranked_ids
+    );
+    let res = reader
+      .search(&SearchRequest {
+        query: Query::Node(QueryNode::MultiMatch {
+          query: "rust search".into(),
+          fields: vec![
+            FieldSpec {
+              field: "title".into(),
+              boost: None,
+            },
+            FieldSpec {
+              field: "body".into(),
+              boost: None,
+            },
+          ],
+          match_type: MultiMatchType::BestFields,
+          tie_breaker: None,
+          operator: Some(MatchOperator::Or),
+          minimum_should_match: None,
+          boost: None,
+        }),
+        fields: None,
+        filter: None,
+        filters: vec![],
+        limit: 5,
+        sort: Vec::new(),
+        cursor: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        return_stored: false,
+        highlight_field: None,
+        aggs: BTreeMap::new(),
+      })
+      .unwrap();
+    let ids: Vec<_> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert_eq!(ids.len(), 5, "hits: {:?}", ids);
   }
 }
