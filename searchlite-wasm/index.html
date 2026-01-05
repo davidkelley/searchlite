@@ -362,8 +362,12 @@
       import init, { Searchlite } from "./pkg/searchlite_wasm.js";
 
       const defaultRequest = {
-        query: "orzo",
+        query: {
+          type: "query_string",
+          query: "orzo",
+        },
         limit: 5,
+        filter: null,
         filters: [],
         sort: [],
         return_stored: true,
@@ -601,62 +605,21 @@
         }
       }
 
-      function parseRequest() {
-        let parsed;
-        try {
-          parsed = JSON.parse(requestInput.value);
-        } catch (err) {
-          throw new Error(`Request JSON is invalid: ${err.message}`);
-        }
-        if (!parsed || typeof parsed !== "object") {
-          throw new Error("Request JSON must be an object.");
-        }
-        if (!parsed.query || typeof parsed.query !== "string") {
-          throw new Error("Include a 'query' string field in the request.");
-        }
-        if (
-          typeof parsed.limit !== "number" ||
-          !Number.isFinite(parsed.limit)
-        ) {
-          throw new Error("Include a numeric 'limit' in the request.");
-        }
-        if (!Array.isArray(parsed.filters)) {
-          parsed.filters = [];
-        }
-        if (!Array.isArray(parsed.sort)) {
-          parsed.sort = [];
-        }
-        if (parsed.cursor === undefined) {
-          parsed.cursor = null;
-        }
-        if (parsed.bmw_block_size === undefined) {
-          parsed.bmw_block_size = null;
-        }
-        if (parsed.return_stored === undefined) {
-          parsed.return_stored = true;
-        }
-        if (!parsed.execution) {
-          parsed.execution = "wand";
-        }
-        if (!parsed.aggs || typeof parsed.aggs !== "object") {
-          parsed.aggs = {};
-        }
-        return parsed;
-      }
-
       async function runSearch() {
         toggleBusy(true);
         try {
           await ensureIndex();
-          const req = parseRequest();
+          const requestJson = requestInput.value;
           setStatus("Searching…");
-          const result = idx.search_request(JSON.stringify(req));
+          const result = idx.search_request(requestJson);
           console.log(result);
           renderResponse(result);
           setStatus("Search complete.");
         } catch (err) {
           console.error(err);
-          setStatus(`Search failed: ${err.message || err}`, true);
+          const message = err?.message ?? String(err);
+          renderResponse(message);
+          setStatus(`Search failed: ${message}`, true);
         } finally {
           toggleBusy(false);
         }

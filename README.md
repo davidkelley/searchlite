@@ -62,7 +62,7 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
 }
 ```
 
-`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
+`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges and keyword predicates are expressed via the JSON `filter` AST (see examples below). Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
 Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
 
 Every document must include a string primary key under `doc_id_field` (defaults to `_id`). Skip listing that id in your `text_fields`/`keyword_fields`/`numeric_fields`; it is stored automatically, returned on hits, and used for upsert/delete semantics.
@@ -142,7 +142,10 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```bash
 cat > /tmp/request.json <<'EOF'
 {
-  "query": "body:rusk",
+  "query": {
+    "type": "query_string",
+    "query": "body:rusk"
+  },
   "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 3 },
   "limit": 5,
   "return_stored": true
@@ -186,7 +189,7 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
 
-Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
+The `query_string` node (and legacy string queries) supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
 - You can also pass the full search payload as JSON (same shape used by the upcoming HTTP service):
 
