@@ -21,6 +21,17 @@ impl TinyFst {
   pub fn iter(&self) -> impl Iterator<Item = (&String, &u64)> {
     self.map.iter()
   }
+
+  pub fn iter_prefix<'a>(
+    &'a self,
+    prefix: &str,
+  ) -> impl Iterator<Item = (&'a String, &'a u64)> + 'a {
+    let prefix_owned = prefix.to_string();
+    self
+      .map
+      .range(prefix_owned.clone()..)
+      .take_while(move |(k, _)| k.starts_with(&prefix_owned))
+  }
 }
 
 #[cfg(test)]

@@ -281,6 +281,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     sort: parse_sort(sort)?,
     execution: parse_execution(&execution),
     bmw_block_size,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: build_vector_query(vector_field, vector, alpha)?,
     return_stored,
@@ -473,6 +474,7 @@ mod tests {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,

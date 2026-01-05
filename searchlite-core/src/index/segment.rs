@@ -874,6 +874,10 @@ impl SegmentReader {
     PostingsReader::read_at(&mut *file, offset, self.keep_positions).ok()
   }
 
+  pub fn terms_with_prefix<'a>(&'a self, prefix: &str) -> impl Iterator<Item = &'a String> + 'a {
+    self.terms.0.iter_prefix(prefix).map(|(term, _)| term)
+  }
+
   pub fn avg_field_length(&self, field: &str) -> f32 {
     self
       .seg_meta

@@ -116,6 +116,19 @@ EOF
 cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```
 
+- Typo-tolerant search (fuzzy matching):
+```bash
+cat > /tmp/request.json <<'EOF'
+{
+  "query": "body:rusk",
+  "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 3 },
+  "limit": 5,
+  "return_stored": true
+}
+EOF
+cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
+```
+
 Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Provide inline JSON o
 r a file path; results are emitted as a single JSON blob containing `hits` and `aggregations`.
 
@@ -414,6 +427,7 @@ let results = reader.search(&SearchRequest {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     return_stored: true,
     highlight_field: Some("body".into()),
     aggs: [(

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, KeywordField, NestedField, NestedProperty,
-  NumericField, Schema, SearchRequest, StorageType, TextField,
+  Document, ExecutionStrategy, FuzzyOptions, IndexOptions, KeywordField, NestedField,
+  NestedProperty, NumericField, Schema, SearchRequest, StorageType, TextField,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -75,6 +75,7 @@ fn index_and_search() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -83,6 +84,62 @@ fn index_and_search() {
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
+}
+
+#[test]
+fn fuzzy_matches_typos() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("doc-1", vec![("body", json!("Rust is fast"))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let fuzzy_req = SearchRequest {
+    query: "rusk".to_string(),
+    fields: None,
+    filters: vec![],
+    limit: 5,
+    sort: Vec::new(),
+    cursor: None,
+    execution: ExecutionStrategy::Wand,
+    bmw_block_size: None,
+    fuzzy: Some(FuzzyOptions {
+      max_edits: 1,
+      prefix_length: 1,
+      max_expansions: 20,
+      min_length: 3,
+    }),
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    return_stored: true,
+    highlight_field: None,
+    aggs: BTreeMap::new(),
+  };
+  let fuzzy_resp = reader.search(&fuzzy_req).unwrap();
+  assert_eq!(fuzzy_resp.hits.len(), 1);
+
+  let exact_req = SearchRequest {
+    fuzzy: None,
+    ..fuzzy_req
+  };
+  let exact_resp = reader.search(&exact_req).unwrap();
+  assert!(exact_resp.hits.is_empty());
 }
 
 #[test]
@@ -124,6 +181,7 @@ fn upsert_and_delete_by_id() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -205,6 +263,7 @@ fn cursor_paginates_ordered_hits() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -269,6 +328,7 @@ fn cursor_rejects_invalid_hex() {
     cursor: Some("not-a-valid-cursor".to_string()),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -313,6 +373,7 @@ fn cursor_rejects_when_limit_zero() {
       cursor: Some("00000000000000000000000000000000".to_string()),
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -366,6 +427,7 @@ fn cursor_rejects_excessive_advance() {
     cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -411,6 +473,7 @@ fn cursor_rejects_mismatched_position() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: true,
@@ -483,6 +546,7 @@ fn cursor_orders_stably_across_segments() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: false,
@@ -586,6 +650,7 @@ fn in_memory_storage_keeps_disk_clean() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -708,6 +773,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -862,6 +928,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,

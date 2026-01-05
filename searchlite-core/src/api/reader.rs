@@ -8,8 +8,8 @@ use smallvec::smallvec;
 
 use crate::api::query::parse_query;
 use crate::api::types::{
-  Aggregation, AggregationResponse, DateHistogramAggregation, HistogramAggregation, IndexOptions,
-  SearchRequest, SortOrder,
+  Aggregation, AggregationResponse, DateHistogramAggregation, FuzzyOptions, HistogramAggregation,
+  IndexOptions, SearchRequest, SortOrder,
 };
 use crate::api::AggregationError;
 use crate::index::highlight::make_snippet;
@@ -341,8 +341,16 @@ fn encode_cursor(
   Ok(hex_encode(&data))
 }
 
+#[derive(Clone, Debug)]
+struct QualifiedTerm {
+  field: String,
+  term: String,
+  key: String,
+  weight: f32,
+}
+
 struct SegmentSearchParams<'a> {
-  qualified_terms: &'a [(String, String, String)],
+  qualified_terms: &'a [QualifiedTerm],
   qualified_not_terms: &'a [String],
   phrase_fields: &'a [Vec<(String, Vec<String>)>],
   agg_collector: Option<&'a mut dyn DocCollector>,
@@ -354,6 +362,151 @@ struct SegmentSearchParams<'a> {
   saw_cursor: &'a mut bool,
   sort_plan: &'a SortPlan,
   collect_hits: Option<&'a mut dyn FnMut(SortKey, f32)>,
+}
+
+fn build_term_key(field: &str, term: &str) -> String {
+  let mut key = String::with_capacity(field.len() + term.len() + 1);
+  key.push_str(field);
+  key.push(':');
+  key.push_str(term);
+  key
+}
+
+fn char_prefix(input: &str, len: usize) -> &str {
+  if len == 0 {
+    return "";
+  }
+  match input.char_indices().nth(len) {
+    Some((idx, _)) => &input[..idx],
+    None => input,
+  }
+}
+
+fn distance_weight(distance: usize) -> f32 {
+  1.0 / (distance as f32 + 1.0)
+}
+
+fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
+  let a_len = a.chars().count();
+  let b_len = b.chars().count();
+  if a_len.abs_diff(b_len) > max_edits {
+    return None;
+  }
+  if a_len == 0 {
+    return (b_len <= max_edits).then_some(b_len);
+  }
+  if b_len == 0 {
+    return (a_len <= max_edits).then_some(a_len);
+  }
+  let b_chars: Vec<char> = b.chars().collect();
+  let mut prev: Vec<usize> = (0..=b_len).collect();
+  let mut curr: Vec<usize> = vec![0; b_len + 1];
+  for (i, ca) in a.chars().enumerate() {
+    curr[0] = i + 1;
+    let mut row_min = curr[0];
+    for (j, cb) in b_chars.iter().enumerate() {
+      let cost = if ca == *cb { 0 } else { 1 };
+      let del = prev[j + 1] + 1;
+      let ins = curr[j] + 1;
+      let sub = prev[j] + cost;
+      let val = del.min(ins).min(sub);
+      curr[j + 1] = val;
+      row_min = row_min.min(val);
+    }
+    if row_min > max_edits {
+      return None;
+    }
+    std::mem::swap(&mut prev, &mut curr);
+  }
+  if prev[b_len] <= max_edits {
+    Some(prev[b_len])
+  } else {
+    None
+  }
+}
+
+fn expand_terms_exact(term_keys: &[(String, String)]) -> Vec<QualifiedTerm> {
+  term_keys
+    .iter()
+    .map(|(field, term)| QualifiedTerm {
+      field: field.clone(),
+      term: term.clone(),
+      key: build_term_key(field, term),
+      weight: 1.0,
+    })
+    .collect()
+}
+
+fn expand_terms_fuzzy(
+  segments: &[SegmentReader],
+  term_keys: &[(String, String)],
+  fuzzy: &FuzzyOptions,
+) -> Vec<QualifiedTerm> {
+  let max_edits = fuzzy.max_edits.min(2) as usize;
+  let mut out = Vec::new();
+  if max_edits == 0 {
+    return expand_terms_exact(term_keys);
+  }
+  for (field, term) in term_keys.iter() {
+    let term_len = term.chars().count();
+    let exact_key = build_term_key(field, term);
+    out.push(QualifiedTerm {
+      field: field.clone(),
+      term: term.clone(),
+      key: exact_key.clone(),
+      weight: distance_weight(0),
+    });
+    if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
+      continue;
+    }
+    let prefix_len = fuzzy.prefix_length.min(term_len);
+    let prefix = char_prefix(term, prefix_len);
+    let mut prefix_key = String::with_capacity(field.len() + prefix.len() + 1);
+    prefix_key.push_str(field);
+    prefix_key.push(':');
+    prefix_key.push_str(prefix);
+    let field_prefix_len = field.len() + 1;
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(exact_key);
+    let mut expansions = 0usize;
+    for seg in segments.iter() {
+      for key in seg.terms_with_prefix(&prefix_key) {
+        if expansions >= fuzzy.max_expansions {
+          break;
+        }
+        if key.len() <= field_prefix_len {
+          continue;
+        }
+        let candidate = &key[field_prefix_len..];
+        if candidate == term {
+          continue;
+        }
+        let candidate_len = candidate.chars().count();
+        if candidate_len.abs_diff(term_len) > max_edits {
+          continue;
+        }
+        let Some(distance) = bounded_levenshtein(term, candidate, max_edits) else {
+          continue;
+        };
+        if distance == 0 {
+          continue;
+        }
+        if seen.insert(key.clone()) {
+          out.push(QualifiedTerm {
+            field: field.clone(),
+            term: candidate.to_string(),
+            key: key.clone(),
+            weight: distance_weight(distance),
+          });
+          expansions += 1;
+        }
+      }
+      if expansions >= fuzzy.max_expansions {
+        break;
+      }
+    }
+  }
+  out
 }
 
 pub struct IndexReader {
@@ -440,32 +593,21 @@ impl IndexReader {
     let term_keys = expand_terms(&parsed, &default_fields);
     let not_terms = expand_not_terms(&parsed, &default_fields);
 
-    let qualified_terms: Vec<(String, String, String)> = term_keys
-      .iter()
-      .map(|(field, term)| {
-        let mut key = String::with_capacity(field.len() + term.len() + 1);
-        key.push_str(field);
-        key.push(':');
-        key.push_str(term);
-        (field.clone(), term.clone(), key)
-      })
-      .collect();
+    let qualified_terms = if let Some(fuzzy) = req.fuzzy.as_ref() {
+      expand_terms_fuzzy(&self.segments, &term_keys, fuzzy)
+    } else {
+      expand_terms_exact(&term_keys)
+    };
     let qualified_not_terms: Vec<String> = not_terms
       .iter()
-      .map(|(field, term)| {
-        let mut key = String::with_capacity(field.len() + term.len() + 1);
-        key.push_str(field);
-        key.push(':');
-        key.push_str(term);
-        key
-      })
+      .map(|(field, term)| build_term_key(field, term))
       .collect();
     let highlight_terms: Vec<String> = {
       let mut dedup = HashSet::new();
       let mut terms = Vec::new();
-      for (_, term, _) in qualified_terms.iter() {
-        if dedup.insert(term) {
-          terms.push(term.clone());
+      for term in qualified_terms.iter() {
+        if dedup.insert(term.term.clone()) {
+          terms.push(term.term.clone());
         }
       }
       terms
@@ -627,15 +769,17 @@ impl IndexReader {
     } else {
       ScoreMode::MatchOnly
     };
-    let mut term_counts: HashMap<String, (String, u32)> = HashMap::new();
-    for (field, _, key) in qualified_terms.iter() {
-      let entry = term_counts.entry(key.clone()).or_insert((field.clone(), 0));
-      entry.1 += 1;
+    let mut term_weights: HashMap<String, (String, f32)> = HashMap::new();
+    for term in qualified_terms.iter() {
+      let entry = term_weights
+        .entry(term.key.clone())
+        .or_insert((term.field.clone(), 0.0));
+      entry.1 += term.weight;
     }
 
     let docs = seg.live_docs() as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
-    for (key, (field, weight)) in term_counts.into_iter() {
+    for (key, (field, weight)) in term_weights.into_iter() {
       if let Some(postings) = seg.postings(&key) {
         terms.push(ScoredTerm {
           postings,

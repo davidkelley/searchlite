@@ -113,6 +113,7 @@ fn terms_and_stats_aggregations() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -187,6 +188,7 @@ fn aggregation_requires_fast_field() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: false,
@@ -264,6 +266,7 @@ fn histogram_bucket_generation() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -344,6 +347,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -438,6 +442,7 @@ fn range_aggregation_counts() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -530,6 +535,7 @@ fn date_range_missing_and_keyed() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -616,6 +622,7 @@ fn extended_stats_and_value_count_include_missing() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -718,6 +725,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -818,6 +826,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -921,6 +930,7 @@ fn terms_size_applied_after_merge() {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,

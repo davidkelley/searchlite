@@ -60,7 +60,7 @@ impl ScoreMode {
 #[derive(Debug, Clone)]
 pub struct ScoredTerm {
   pub postings: PostingsReader,
-  pub weight: u32,
+  pub weight: f32,
   pub avgdl: f32,
   pub docs: f32,
   pub k1: f32,
@@ -95,12 +95,12 @@ impl TermState {
       term.docs,
       term.k1,
       term.b,
-      term.weight as f32,
+      term.weight,
     );
     Self {
       postings: term.postings,
       idx: 0,
-      weight: term.weight as f32,
+      weight: term.weight,
       df,
       avgdl: term.avgdl,
       docs: term.docs,
@@ -380,7 +380,7 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         term.docs,
         term.k1,
         term.b,
-        term.weight as f32,
+        term.weight,
       );
       *scores.entry(entry.doc_id).or_insert(0.0) += score;
     }
@@ -595,7 +595,7 @@ mod tests {
     let reader = PostingsReader::from_entries_for_test(entries.to_vec(), DEFAULT_BLOCK_SIZE);
     ScoredTerm {
       postings: reader,
-      weight: 1,
+      weight: 1.0,
       avgdl: 10.0,
       docs: 10.0,
       k1: 1.2,

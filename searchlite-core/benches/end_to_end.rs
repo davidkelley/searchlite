@@ -96,6 +96,7 @@ fn bench_search(c: &mut Criterion) {
         cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
+        fuzzy: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         return_stored: true,
@@ -198,6 +199,7 @@ fn bench_nested_filters(c: &mut Criterion) {
         cursor: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
+        fuzzy: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         return_stored: true,
@@ -257,6 +259,7 @@ fn bench_cursor_pagination(c: &mut Criterion) {
           cursor,
           execution: ExecutionStrategy::Wand,
           bmw_block_size: None,
+          fuzzy: None,
           #[cfg(feature = "vectors")]
           vector_query: None,
           return_stored: false,

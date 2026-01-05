@@ -65,6 +65,7 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       cursor: None,
       execution: ExecutionStrategy::Bm25,
       bmw_block_size: Some(4),
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: false,
@@ -108,6 +109,7 @@ fn empty_query_returns_no_hits() {
     cursor: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
+    fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     return_stored: false,
