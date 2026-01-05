@@ -111,8 +111,8 @@ impl<'a> QueryPlanBuilder<'a> {
   fn build_node(&mut self, node: &QueryNode, score: bool, boost: f32) -> Result<QueryMatcher> {
     match node {
       QueryNode::MatchAll { boost: node_boost } => {
-        let _ = validate_boost(node_boost)?;
-        let _ = boost;
+        // MatchAll is filter-only; boost is validated for API consistency.
+        validate_boost(node_boost)?;
         Ok(QueryMatcher::MatchAll)
       }
       QueryNode::QueryString {
@@ -171,7 +171,8 @@ impl<'a> QueryPlanBuilder<'a> {
         terms,
         boost: node_boost,
       } => {
-        let _ = validate_boost(node_boost)?;
+        // Phrase matching is filter-only; boost is validated but not scored.
+        validate_boost(node_boost)?;
         let fields = match field {
           Some(field) => vec![field.clone()],
           None => self.default_fields.to_vec(),
@@ -237,10 +238,15 @@ impl<'a> QueryPlanBuilder<'a> {
   }
 }
 
+/// Validates and normalizes an optional boost value.
+///
+/// - `None` defaults to a boost of `1.0`.
+/// - Any non-negative value is accepted.
+/// - A boost of `0.0` disables scoring contribution while still matching.
 fn validate_boost(boost: &Option<f32>) -> Result<f32> {
   let value = boost.unwrap_or(1.0);
   if value.is_sign_negative() {
-    bail!("query boost must be >= 0");
+    bail!("query boost must be non-negative (>= 0)");
   }
   Ok(value)
 }

@@ -211,3 +211,34 @@ fn mixed_query_and_filter_matches() {
   let expected: HashSet<String> = ["doc-1"].into_iter().map(String::from).collect();
   assert_eq!(got, expected);
 }
+
+#[test]
+fn query_string_phrase_only_matches() {
+  let (_tmp, reader) = setup_reader();
+  let query = QueryNode::QueryString {
+    query: "\"rust engine\"".into(),
+    fields: None,
+    boost: None,
+  };
+  let resp = reader.search(&request(query)).unwrap();
+  let got = ids(&resp);
+  let expected: HashSet<String> = ["doc-1"].into_iter().map(String::from).collect();
+  assert_eq!(got, expected);
+}
+
+#[test]
+fn query_string_negated_only_matches() {
+  let (_tmp, reader) = setup_reader();
+  let query = QueryNode::QueryString {
+    query: "-boring".into(),
+    fields: None,
+    boost: None,
+  };
+  let resp = reader.search(&request(query)).unwrap();
+  let got = ids(&resp);
+  let expected: HashSet<String> = ["doc-1", "doc-2", "doc-3", "doc-5"]
+    .into_iter()
+    .map(String::from)
+    .collect();
+  assert_eq!(got, expected);
+}

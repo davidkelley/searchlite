@@ -79,6 +79,7 @@ impl From<QueryNode> for Query {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryNode {
+  /// Match every document. `boost` is validated but does not affect scoring.
   MatchAll {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
@@ -96,6 +97,7 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+  /// Match documents containing the exact phrase. `boost` is validated but does not affect scoring.
   Phrase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     field: Option<String>,

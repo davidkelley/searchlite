@@ -598,7 +598,10 @@ impl<'a> QueryEvaluator<'a> {
       QueryMatcher::Term(idx) => self.term_group_matches(*idx, doc_id),
       QueryMatcher::Phrase(idx) => self.phrase_matches(*idx, doc_id),
       QueryMatcher::QueryString(matcher) => {
-        if matcher.term_groups.is_empty() {
+        let has_terms = !matcher.term_groups.is_empty();
+        let has_phrases = !matcher.phrase_groups.is_empty();
+        let has_negated = !matcher.not_term_groups.is_empty();
+        if !has_terms && !has_phrases && !has_negated {
           return false;
         }
         for idx in matcher.not_term_groups.iter().copied() {
@@ -611,11 +614,14 @@ impl<'a> QueryEvaluator<'a> {
             return false;
           }
         }
-        matcher
-          .term_groups
-          .iter()
-          .copied()
-          .any(|idx| self.term_group_matches(idx, doc_id))
+        if has_terms {
+          return matcher
+            .term_groups
+            .iter()
+            .copied()
+            .any(|idx| self.term_group_matches(idx, doc_id));
+        }
+        true
       }
       QueryMatcher::Bool {
         must,

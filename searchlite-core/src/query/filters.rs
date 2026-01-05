@@ -556,4 +556,195 @@ mod tests {
     ];
     assert!(!passes_filters(&reader, 0, &failing));
   }
+
+  #[test]
+  fn nested_and_filters_require_shared_object_in_and() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::And(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(!passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_and_filters_match_shared_object_in_and() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::And(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_or_filters_match_any_object() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::Or(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_not_filters_negate_nested() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let rejecting = Filter::Not(Box::new(Filter::Nested {
+      path: "comment".into(),
+      filter: Box::new(Filter::KeywordEq {
+        field: "author".into(),
+        value: "alice".into(),
+      }),
+    }));
+    assert!(!passes_filter(&reader, 0, &rejecting));
+
+    let accepting = Filter::Not(Box::new(Filter::Nested {
+      path: "comment".into(),
+      filter: Box::new(Filter::KeywordEq {
+        field: "author".into(),
+        value: "bob".into(),
+      }),
+    }));
+    assert!(passes_filter(&reader, 0, &accepting));
+  }
 }
