@@ -146,7 +146,7 @@ EOF
 cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```
 
-Aggregations use Elasticsearch-style JSON and require Cob containing `hits` and `aggregations`.
+Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Results are emitted as a single JSON blob containing `hits` and `aggregations`.
 
 ```bash
 cat > /tmp/aggs.json <<'EOF'
