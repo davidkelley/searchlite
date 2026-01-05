@@ -6,6 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::analysis::analyzer::{Analyzer, AnalyzerDef, AnalyzerRegistry};
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +77,8 @@ impl Manifest {
 pub struct Schema {
   #[serde(default = "default_doc_id_field")]
   pub doc_id_field: String,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub analyzers: Vec<AnalyzerDef>,
   pub text_fields: Vec<TextField>,
   pub keyword_fields: Vec<KeywordField>,
   pub numeric_fields: Vec<NumericField>,
@@ -93,9 +96,11 @@ impl Schema {
   pub fn default_text_body() -> Self {
     Self {
       doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
       text_fields: vec![TextField {
         name: "body".to_string(),
-        tokenizer: "default".to_string(),
+        analyzer: "default".to_string(),
+        search_analyzer: None,
         stored: true,
         indexed: true,
         nullable: false,
@@ -126,6 +131,7 @@ impl Schema {
     if self.doc_id_field.contains('.') {
       anyhow::bail!("doc_id_field `{}` cannot be nested", self.doc_id_field);
     }
+    self.build_analyzers()?;
     if self
       .resolved_fields()
       .iter()
@@ -137,6 +143,53 @@ impl Schema {
       );
     }
     Ok(())
+  }
+
+  pub fn build_analyzers(&self) -> anyhow::Result<SchemaAnalyzers> {
+    let registry = AnalyzerRegistry::from_defs(&self.analyzers)?;
+    let mut field_map = HashMap::new();
+    for (path, field) in self.text_field_map().into_iter() {
+      if registry.get(&field.analyzer).is_none() {
+        anyhow::bail!(
+          "field `{path}` references unknown analyzer `{}`",
+          field.analyzer
+        );
+      }
+      let search_name = field
+        .search_analyzer
+        .clone()
+        .unwrap_or_else(|| field.analyzer.clone());
+      if registry.get(&search_name).is_none() {
+        anyhow::bail!("field `{path}` references unknown search analyzer `{search_name}`");
+      }
+      if field_map
+        .insert(
+          path.clone(),
+          FieldAnalyzerRefs {
+            analyzer: field.analyzer.clone(),
+            search_analyzer: search_name,
+          },
+        )
+        .is_some()
+      {
+        anyhow::bail!("duplicate field `{path}` in analyzer map");
+      }
+    }
+    Ok(SchemaAnalyzers {
+      registry,
+      field_map,
+    })
+  }
+
+  fn text_field_map(&self) -> Vec<(String, &TextField)> {
+    let mut out = Vec::new();
+    for field in self.text_fields.iter() {
+      out.push((field.name.clone(), field));
+    }
+    for nested in self.nested_fields.iter() {
+      collect_nested_text_fields(nested, None, &mut out);
+    }
+    out
   }
 
   pub fn fast_fields(&self) -> Vec<String> {
@@ -271,9 +324,11 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let schema = Schema {
       doc_id_field: "pk".into(),
+      analyzers: Vec::new(),
       text_fields: vec![TextField {
         name: "body".into(),
-        tokenizer: "default".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
         stored: true,
         indexed: true,
         nullable: false,
@@ -336,6 +391,7 @@ mod tests {
   fn nested_nullable_fields_are_explicit() {
     let base_schema = Schema {
       doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
       text_fields: Vec::new(),
       keyword_fields: Vec::new(),
       numeric_fields: Vec::new(),
@@ -429,14 +485,142 @@ pub struct ResolvedField {
   pub numeric_i64: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+pub struct FieldAnalyzerRefs {
+  pub analyzer: String,
+  pub search_analyzer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaAnalyzers {
+  pub(crate) registry: AnalyzerRegistry,
+  pub(crate) field_map: HashMap<String, FieldAnalyzerRefs>,
+}
+
+impl SchemaAnalyzers {
+  pub fn index_analyzer(&self, field: &str) -> Option<&Analyzer> {
+    self
+      .field_map
+      .get(field)
+      .and_then(|f| self.registry.get(&f.analyzer))
+  }
+
+  pub fn search_analyzer(&self, field: &str) -> Option<&Analyzer> {
+    self
+      .field_map
+      .get(field)
+      .and_then(|f| self.registry.get(&f.search_analyzer))
+  }
+}
+
+#[derive(Debug, Clone)]
 pub struct TextField {
   pub name: String,
-  pub tokenizer: String,
+  pub analyzer: String,
+  pub search_analyzer: Option<String>,
+  pub stored: bool,
+  pub indexed: bool,
+  pub nullable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TextFieldSerde {
+  pub name: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub tokenizer: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub analyzer: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub search_analyzer: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub search_tokenizer: Option<String>,
   pub stored: bool,
   pub indexed: bool,
   #[serde(default)]
   pub nullable: bool,
+}
+
+impl From<TextField> for TextFieldSerde {
+  fn from(value: TextField) -> Self {
+    Self {
+      name: value.name,
+      tokenizer: Some(value.analyzer),
+      analyzer: None,
+      search_analyzer: value.search_analyzer,
+      search_tokenizer: None,
+      stored: value.stored,
+      indexed: value.indexed,
+      nullable: value.nullable,
+    }
+  }
+}
+
+impl TryFrom<TextFieldSerde> for TextField {
+  type Error = serde::de::value::Error;
+
+  fn try_from(value: TextFieldSerde) -> Result<Self, Self::Error> {
+    let primary = match (value.analyzer, value.tokenizer) {
+      (Some(a), None) => a,
+      (None, Some(t)) => t,
+      (Some(_), Some(_)) => {
+        return Err(serde::de::Error::custom(
+          "text field cannot set both `tokenizer` and `analyzer`",
+        ));
+      }
+      (None, None) => {
+        return Err(serde::de::Error::custom(
+          "text field must set `analyzer` (or `tokenizer` as an alias)",
+        ));
+      }
+    };
+    let search_analyzer = match (value.search_analyzer, value.search_tokenizer) {
+      (Some(a), None) => Some(a),
+      (None, Some(t)) => Some(t),
+      (Some(_), Some(_)) => {
+        return Err(serde::de::Error::custom(
+          "text field cannot set both `search_analyzer` and `search_tokenizer`",
+        ));
+      }
+      (None, None) => None,
+    };
+    Ok(TextField {
+      name: value.name,
+      analyzer: primary,
+      search_analyzer,
+      stored: value.stored,
+      indexed: value.indexed,
+      nullable: value.nullable,
+    })
+  }
+}
+
+impl Serialize for TextField {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let helper = TextFieldSerde {
+      name: self.name.clone(),
+      tokenizer: Some(self.analyzer.clone()),
+      analyzer: None,
+      search_analyzer: self.search_analyzer.clone(),
+      search_tokenizer: None,
+      stored: self.stored,
+      indexed: self.indexed,
+      nullable: self.nullable,
+    };
+    helper.serialize(serializer)
+  }
+}
+
+impl<'de> Deserialize<'de> for TextField {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let helper = TextFieldSerde::deserialize(deserializer)?;
+    TextField::try_from(helper).map_err(serde::de::Error::custom)
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,6 +793,28 @@ impl NestedProperty {
         numeric_i64: Some(f.i64),
       }),
       NestedProperty::Object(obj) => obj.collect_fields(Some(prefix), out),
+    }
+  }
+}
+
+fn collect_nested_text_fields<'a>(
+  nested: &'a NestedField,
+  prefix: Option<&str>,
+  out: &mut Vec<(String, &'a TextField)>,
+) {
+  let mut full_prefix = String::new();
+  if let Some(p) = prefix {
+    full_prefix.push_str(p);
+    full_prefix.push('.');
+  }
+  full_prefix.push_str(&nested.name);
+  for f in nested.fields.iter() {
+    match f {
+      NestedProperty::Text(field) => {
+        out.push((format!("{full_prefix}.{}", field.name), field));
+      }
+      NestedProperty::Object(obj) => collect_nested_text_fields(obj, Some(&full_prefix), out),
+      _ => {}
     }
   }
 }

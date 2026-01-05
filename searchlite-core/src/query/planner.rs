@@ -162,8 +162,12 @@ impl<'a> QueryPlanBuilder<'a> {
         boost: node_boost,
       } => {
         let node_boost = validate_boost(node_boost)?;
-        let term = value.to_ascii_lowercase();
-        let idx = self.push_term_group(vec![field.clone()], term, boost * node_boost, score);
+        let idx = self.push_term_group(
+          vec![field.clone()],
+          value.clone(),
+          boost * node_boost,
+          score,
+        );
         Ok(QueryMatcher::Term(idx))
       }
       QueryNode::Phrase {
@@ -177,8 +181,7 @@ impl<'a> QueryPlanBuilder<'a> {
           Some(field) => vec![field.clone()],
           None => self.default_fields.to_vec(),
         };
-        let lowered = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
-        let idx = self.push_phrase(fields, lowered);
+        let idx = self.push_phrase(fields, terms.clone());
         Ok(QueryMatcher::Phrase(idx))
       }
       QueryNode::Bool {

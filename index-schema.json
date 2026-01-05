@@ -13,6 +13,12 @@
       "default": "_id",
       "minLength": 1
     },
+    "analyzers": {
+      "type": "array",
+      "description": "Optional custom analyzers composed of a tokenizer and token filters.",
+      "items": { "$ref": "#/$defs/analyzer" },
+      "default": []
+    },
     "text_fields": {
       "type": "array",
       "description": "Top-level text fields to tokenize and index.",
@@ -45,21 +51,139 @@
     }
   },
   "$defs": {
+    "analyzer": {
+      "type": "object",
+      "description": "Named analyzer consisting of a tokenizer and optional filters.",
+      "additionalProperties": false,
+      "required": ["name", "tokenizer"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique analyzer identifier referenced by text fields."
+        },
+        "tokenizer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Built-in tokenizer name (`default`, `unicode`, or `whitespace`)."
+        },
+        "filters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/token_filter" },
+          "default": [],
+          "description": "Ordered token filters applied after tokenization."
+        }
+      }
+    },
+    "token_filter": {
+      "description": "Token filters applied after tokenization.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["lowercase"],
+          "additionalProperties": false,
+          "properties": {
+            "lowercase": { "type": "boolean", "description": "Lowercase tokens using Unicode rules." }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["stopwords"],
+          "additionalProperties": false,
+          "properties": {
+            "stopwords": {
+              "$ref": "#/$defs/stopwords_config",
+              "description": "Built-in list name (e.g., `en`) or explicit array."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["stemmer"],
+          "additionalProperties": false,
+          "properties": {
+            "stemmer": {
+              "type": "string",
+              "description": "Stemmer language (e.g., `english`)."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["synonyms"],
+          "additionalProperties": false,
+          "properties": {
+            "synonyms": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/synonym_rule" },
+              "description": "Synonym expansion rules applied at the same token position."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["edge_ngram"],
+          "additionalProperties": false,
+          "properties": {
+            "edge_ngram": { "$ref": "#/$defs/edge_ngram" }
+          }
+        }
+      ]
+    },
+    "stopwords_config": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "synonym_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to"],
+      "properties": {
+        "from": { "type": "array", "items": { "type": "string" } },
+        "to": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "edge_ngram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "integer", "minimum": 1 },
+        "max": { "type": "integer", "minimum": 1 }
+      }
+    },
     "text_field": {
       "type": "object",
       "description": "Tokenized text column stored in postings and optionally in the doc store.",
       "additionalProperties": false,
-      "required": ["name", "tokenizer", "stored", "indexed"],
+      "required": ["name", "stored", "indexed"],
       "properties": {
         "name": {
           "type": "string",
           "minLength": 1,
           "description": "Field name used in documents and queries."
         },
+        "analyzer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Analyzer identifier applied at index time."
+        },
         "tokenizer": {
           "type": "string",
           "minLength": 1,
-          "description": "Tokenizer identifier (e.g., `default`)."
+          "description": "Deprecated alias for `analyzer`."
+        },
+        "search_analyzer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional analyzer to use at search time."
+        },
+        "search_tokenizer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Deprecated alias for `search_analyzer`."
         },
         "stored": {
           "type": "boolean",
@@ -74,7 +198,17 @@
           "description": "Permit null values in documents for this field.",
           "default": false
         }
-      }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["analyzer"] },
+            { "required": ["tokenizer"] }
+          ]
+        },
+        { "not": { "required": ["analyzer", "tokenizer"] } },
+        { "not": { "required": ["search_analyzer", "search_tokenizer"] } }
+      ]
     },
     "keyword_field": {
       "type": "object",
@@ -174,7 +308,7 @@
       "type": "object",
       "description": "Text field within a nested object.",
       "additionalProperties": false,
-      "required": ["type", "name", "tokenizer", "stored", "indexed"],
+      "required": ["type", "name", "stored", "indexed"],
       "properties": {
         "type": {
           "const": "text",
@@ -185,10 +319,25 @@
           "minLength": 1,
           "description": "Field name relative to its parent object."
         },
+        "analyzer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Analyzer identifier applied at index time."
+        },
         "tokenizer": {
           "type": "string",
           "minLength": 1,
-          "description": "Tokenizer identifier (e.g., `default`)."
+          "description": "Deprecated alias for `analyzer`."
+        },
+        "search_analyzer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional analyzer to use at search time."
+        },
+        "search_tokenizer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Deprecated alias for `search_analyzer`."
         },
         "stored": {
           "type": "boolean",
@@ -203,7 +352,17 @@
           "description": "Permit null values in documents for this field.",
           "default": false
         }
-      }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["analyzer"] },
+            { "required": ["tokenizer"] }
+          ]
+        },
+        { "not": { "required": ["analyzer", "tokenizer"] } },
+        { "not": { "required": ["search_analyzer", "search_tokenizer"] } }
+      ]
     },
     "nested_keyword_property": {
       "type": "object",

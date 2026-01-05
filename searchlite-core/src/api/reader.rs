@@ -13,7 +13,7 @@ use crate::api::types::{
 use crate::api::AggregationError;
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
-use crate::index::manifest::{Manifest, Schema};
+use crate::index::manifest::{FieldKind, Manifest, Schema, SchemaAnalyzers};
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
@@ -354,6 +354,8 @@ struct TermMatchGroup {
   keys: Vec<String>,
 }
 
+type PhraseFieldConfig = Vec<(String, Vec<Vec<String>>)>;
+
 #[derive(Clone, Copy)]
 enum RootFilter<'a> {
   None,
@@ -365,7 +367,7 @@ struct SegmentSearchParams<'a> {
   qualified_terms: &'a [QualifiedTerm],
   matcher: &'a QueryMatcher,
   term_groups: &'a [TermMatchGroup],
-  phrase_fields: &'a [Vec<(String, Vec<String>)>],
+  phrase_fields: &'a [PhraseFieldConfig],
   root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
@@ -444,24 +446,57 @@ fn expand_term_groups(
   segments: &[SegmentReader],
   groups: &[TermGroupSpec],
   fuzzy: Option<&FuzzyOptions>,
+  analysis: &SchemaAnalyzers,
+  schema: &Schema,
 ) -> (Vec<QualifiedTerm>, Vec<TermMatchGroup>) {
   let mut qualified_terms = Vec::new();
   let mut term_groups = Vec::with_capacity(groups.len());
   for group in groups.iter() {
     let mut keys = Vec::new();
+    let mut seen_keys = HashSet::new();
     for field in group.fields.iter() {
-      let (scored, mut expanded_keys) = expand_term_for_group(
-        segments,
-        field,
-        &group.term,
-        group.boost,
-        group.score,
-        fuzzy,
-      );
-      if group.score {
-        qualified_terms.extend(scored);
+      match schema.field_kind(field) {
+        FieldKind::Text => {
+          if let Some(analyzer) = analysis.search_analyzer(field) {
+            let mut seen_tokens = HashSet::new();
+            for token in analyzer.analyze(&group.term).into_iter() {
+              if !seen_tokens.insert(token.text.clone()) {
+                continue;
+              }
+              let (scored, mut expanded_keys) = expand_term_for_group(
+                segments,
+                field,
+                &token.text,
+                group.boost,
+                group.score,
+                fuzzy,
+              );
+              if group.score {
+                qualified_terms.extend(scored);
+              }
+              for key in expanded_keys.drain(..) {
+                if seen_keys.insert(key.clone()) {
+                  keys.push(key);
+                }
+              }
+            }
+          }
+        }
+        FieldKind::Keyword => {
+          let term = group.term.to_ascii_lowercase();
+          let (scored, mut expanded_keys) =
+            expand_term_for_group(segments, field, &term, group.boost, group.score, fuzzy);
+          if group.score {
+            qualified_terms.extend(scored);
+          }
+          for key in expanded_keys.drain(..) {
+            if seen_keys.insert(key.clone()) {
+              keys.push(key);
+            }
+          }
+        }
+        FieldKind::Numeric | FieldKind::Unknown => {}
       }
-      keys.append(&mut expanded_keys);
     }
     term_groups.push(TermMatchGroup { keys });
   }
@@ -692,20 +727,45 @@ impl<'a> QueryEvaluator<'a> {
   }
 }
 
-fn build_phrase_fields(phrase_specs: &[PhraseSpec]) -> Vec<Vec<(String, Vec<String>)>> {
+fn expand_phrase_fields(
+  phrase_specs: &[PhraseSpec],
+  analysis: &SchemaAnalyzers,
+  schema: &Schema,
+) -> Vec<PhraseFieldConfig> {
   phrase_specs
     .iter()
     .map(|phrase| {
       phrase
         .fields
         .iter()
-        .map(|field| {
-          let term_keys = phrase
-            .terms
-            .iter()
-            .map(|term| build_term_key(field, term))
-            .collect();
-          (field.clone(), term_keys)
+        .filter_map(|field| match schema.field_kind(field) {
+          FieldKind::Text => analysis.search_analyzer(field).and_then(|analyzer| {
+            let phrase_body = phrase.terms.join(" ");
+            let tokens = analyzer.analyze(&phrase_body);
+            if tokens.is_empty() {
+              return None;
+            }
+            let mut positions: Vec<Vec<String>> = Vec::new();
+            for token in tokens {
+              let pos = token.position as usize;
+              if positions.len() <= pos {
+                positions.resize(pos + 1, Vec::new());
+              }
+              if !positions[pos].contains(&token.text) {
+                positions[pos].push(token.text);
+              }
+            }
+            Some((field.clone(), positions))
+          }),
+          FieldKind::Keyword => {
+            let joined = phrase.terms.join(" ").to_ascii_lowercase();
+            if joined.is_empty() {
+              None
+            } else {
+              Some((field.clone(), vec![vec![joined]]))
+            }
+          }
+          FieldKind::Numeric | FieldKind::Unknown => None,
         })
         .collect()
     })
@@ -738,6 +798,30 @@ fn build_term_doc_lists(seg: &SegmentReader, term_groups: &[TermMatchGroup]) -> 
   TermDocLists { lists, group_lists }
 }
 
+fn merge_postings_lists(lists: Vec<Vec<PostingEntry>>) -> Vec<PostingEntry> {
+  let mut merged: HashMap<DocId, PostingEntry> = HashMap::new();
+  for list in lists.into_iter() {
+    for entry in list.into_iter() {
+      let positions = entry.positions;
+      let doc_id = entry.doc_id;
+      let target = merged.entry(doc_id).or_insert_with(|| PostingEntry {
+        doc_id,
+        term_freq: 0,
+        positions: SmallVec::new(),
+      });
+      target.positions.extend(positions.into_iter());
+    }
+  }
+  let mut values: Vec<_> = merged.into_values().collect();
+  for entry in values.iter_mut() {
+    entry.positions.sort_unstable();
+    entry.positions.dedup();
+    entry.term_freq = entry.positions.len() as u32;
+  }
+  values.sort_by_key(|e| e.doc_id);
+  values
+}
+
 fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter<'_>) -> bool {
   match root {
     RootFilter::None => true,
@@ -749,12 +833,14 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
+  analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
 
 impl IndexReader {
   pub(crate) fn open(inner: Arc<InnerIndex>) -> Result<Self> {
     let manifest = inner.manifest.read().clone();
+    let analysis = manifest.schema.build_analyzers()?;
     let mut segments = Vec::new();
     for seg in manifest.segments.iter() {
       segments.push(SegmentReader::open(
@@ -776,6 +862,7 @@ impl IndexReader {
         #[cfg(feature = "vectors")]
         vector_defaults: inner.options.vector_defaults.clone(),
       },
+      analysis,
     })
   }
 
@@ -830,8 +917,13 @@ impl IndexReader {
         .collect()
     };
     let query_plan = build_query_plan(&req.query, &default_fields)?;
-    let (qualified_terms, term_groups) =
-      expand_term_groups(&self.segments, &query_plan.term_groups, req.fuzzy.as_ref());
+    let (qualified_terms, term_groups) = expand_term_groups(
+      &self.segments,
+      &query_plan.term_groups,
+      req.fuzzy.as_ref(),
+      &self.analysis,
+      &self.manifest.schema,
+    );
     let highlight_terms: Vec<String> = {
       let mut dedup = HashSet::new();
       let mut terms = Vec::new();
@@ -843,7 +935,11 @@ impl IndexReader {
       terms
     };
 
-    let phrase_fields = build_phrase_fields(&query_plan.phrase_specs);
+    let phrase_fields = expand_phrase_fields(
+      &query_plan.phrase_specs,
+      &self.analysis,
+      &self.manifest.schema,
+    );
     let root_filter = if let Some(filter) = req.filter.as_ref() {
       RootFilter::Node(filter)
     } else if !req.filters.is_empty() {
@@ -989,16 +1085,22 @@ impl IndexReader {
       .map(|fields| {
         fields
           .iter()
-          .filter_map(|(_field, term_keys)| {
-            let per_term: Vec<Vec<PostingEntry>> = term_keys
-              .iter()
-              .filter_map(|key| seg.postings(key).map(|p| p.iter().cloned().collect()))
-              .collect();
-            if per_term.len() == term_keys.len() {
-              Some(per_term)
-            } else {
-              None
+          .filter_map(|(field, positions)| {
+            let mut per_position: Vec<Vec<PostingEntry>> = Vec::new();
+            for alternatives in positions.iter() {
+              let mut lists = Vec::new();
+              for term in alternatives.iter() {
+                let key = build_term_key(field, term);
+                if let Some(posts) = seg.postings(&key) {
+                  lists.push(posts.iter().cloned().collect());
+                }
+              }
+              if lists.is_empty() {
+                return None;
+              }
+              per_position.push(merge_postings_lists(lists));
             }
+            Some(per_position)
           })
           .collect::<Vec<Vec<Vec<PostingEntry>>>>()
       })

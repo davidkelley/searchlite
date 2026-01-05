@@ -11,7 +11,6 @@ use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::analysis::tokenizer::tokenize;
 use crate::api::types::Document;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
@@ -516,6 +515,7 @@ impl<'a> SegmentWriter<'a> {
   pub fn write_segment(&self, docs: &[Document], generation: u32) -> Result<SegmentMeta> {
     let id = Uuid::new_v4().simple().to_string();
     let paths = directory::segment_paths(self.root, &id);
+    let analyzers = self.schema.build_analyzers()?;
 
     let mut postings_builder = InvertedIndexBuilder::new();
     let mut doc_lengths: HashMap<String, u64> = HashMap::new();
@@ -565,26 +565,35 @@ impl<'a> SegmentWriter<'a> {
             continue;
           }
         }
+        let Some(analyzer) = analyzers.index_analyzer(field) else {
+          bail!("no analyzer configured for field `{field}`");
+        };
         let mut position_offset: u32 = 0;
         for text in values.iter() {
-          let tokens = tokenize(text);
+          let tokens = analyzer.analyze(text);
+          let token_count = tokens.len() as u64;
           doc_lengths
             .entry(field.clone())
-            .and_modify(|v| *v += tokens.len() as u64)
-            .or_insert(tokens.len() as u64);
-          for (pos, tok) in tokens.iter().enumerate() {
-            let mut term_key = String::with_capacity(field.len() + tok.len() + 1);
+            .and_modify(|v| *v += token_count)
+            .or_insert(token_count);
+          for tok in tokens.iter() {
+            let mut term_key = String::with_capacity(field.len() + tok.text.len() + 1);
             term_key.push_str(field);
             term_key.push(':');
-            term_key.push_str(tok);
+            term_key.push_str(&tok.text);
             postings_builder.add_term(
               &term_key,
               doc_ord,
-              position_offset + pos as u32,
+              position_offset + tok.position,
               self.enable_positions,
             );
           }
-          position_offset += tokens.len() as u32;
+          if let Some(max_pos) = tokens.iter().map(|t| t.position).max() {
+            position_offset += max_pos + 1;
+          } else {
+            // Preserve a position gap between successive values even when filters drop all tokens.
+            position_offset += 1;
+          }
         }
       }
 
@@ -935,9 +944,11 @@ mod tests {
   fn sample_schema() -> Schema {
     Schema {
       doc_id_field: crate::index::manifest::default_doc_id_field(),
+      analyzers: Vec::new(),
       text_fields: vec![crate::index::manifest::TextField {
         name: "body".into(),
-        tokenizer: "default".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
         stored: true,
         indexed: true,
         nullable: false,

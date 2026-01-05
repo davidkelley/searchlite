@@ -46,7 +46,7 @@ pub fn parse_query(input: &str) -> ParsedQuery {
       }
       let terms_vec = body
         .split_whitespace()
-        .map(|t| t.to_ascii_lowercase())
+        .map(|t| t.to_string())
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>();
       if !terms_vec.is_empty() {
@@ -87,10 +87,7 @@ fn parse_terms(segment: &str) -> (Vec<QueryTerm>, Vec<QueryTerm>) {
     } else {
       (None, token.to_string())
     };
-    let qt = QueryTerm {
-      field,
-      term: term.to_ascii_lowercase(),
-    };
+    let qt = QueryTerm { field, term };
     if is_not {
       not_out.push(qt);
     } else {
@@ -111,7 +108,7 @@ mod tests {
     assert_eq!(parsed.not_terms.len(), 1);
     let title = &parsed.terms[0];
     assert_eq!(title.field.as_deref(), Some("title"));
-    assert_eq!(title.term, "rust");
+    assert_eq!(title.term, "Rust");
     let body = &parsed.terms[1];
     assert_eq!(body.field.as_deref(), Some("body"));
     assert_eq!(body.term, "safety");
