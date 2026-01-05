@@ -6,6 +6,10 @@ pub fn passes_filters(reader: &FastFieldsReader, doc_id: DocId, filters: &[Filte
   passes_filters_at(reader, doc_id, filters, "", None)
 }
 
+pub fn passes_filter(reader: &FastFieldsReader, doc_id: DocId, filter: &Filter) -> bool {
+  filter_matches(reader, doc_id, filter, "", None)
+}
+
 fn passes_filters_at<'a>(
   reader: &FastFieldsReader,
   doc_id: DocId,
@@ -24,7 +28,7 @@ fn passes_filters_at<'a>(
           .push(filter.as_ref());
       }
       _ => {
-        if !filter_passes_flat(reader, doc_id, filter, base_path, object_idx) {
+        if !filter_matches(reader, doc_id, filter, base_path, object_idx) {
           return false;
         }
       }
@@ -77,7 +81,7 @@ fn nested_group_passes(
   false
 }
 
-fn filter_passes_flat(
+fn filter_matches(
   reader: &FastFieldsReader,
   doc_id: DocId,
   filter: &Filter,
@@ -129,8 +133,46 @@ fn filter_passes_flat(
         None => reader.matches_f64_range(&full, doc_id, *min, *max),
       }
     }
-    Filter::Nested { .. } => false,
+    Filter::Nested { path, filter } => {
+      nested_filter_passes(reader, doc_id, base_path, path, object_idx, filter.as_ref())
+    }
+    Filter::And(filters) => passes_filters_at(reader, doc_id, filters, base_path, object_idx),
+    Filter::Or(filters) => filters
+      .iter()
+      .any(|child| filter_matches(reader, doc_id, child, base_path, object_idx)),
+    Filter::Not(filter) => !filter_matches(reader, doc_id, filter.as_ref(), base_path, object_idx),
   }
+}
+
+fn nested_filter_passes(
+  reader: &FastFieldsReader,
+  doc_id: DocId,
+  base_path: &str,
+  path: &str,
+  parent_idx: Option<usize>,
+  filter: &Filter,
+) -> bool {
+  let full_path = if base_path.is_empty() {
+    path.to_string()
+  } else {
+    format!("{base_path}.{path}")
+  };
+  let object_count = reader.nested_object_count(&full_path, doc_id);
+  if object_count == 0 {
+    return false;
+  }
+  let parents = reader.nested_parents(&full_path, doc_id);
+  for idx in 0..object_count {
+    if let Some(p) = parent_idx {
+      if parents.get(idx).and_then(|v| *v) != Some(p) {
+        continue;
+      }
+    }
+    if filter_matches(reader, doc_id, filter, &full_path, Some(idx)) {
+      return true;
+    }
+  }
+  false
 }
 
 fn qualified_field(base: &str, field: &str) -> String {
@@ -513,5 +555,196 @@ mod tests {
       },
     ];
     assert!(!passes_filters(&reader, 0, &failing));
+  }
+
+  #[test]
+  fn nested_and_filters_require_shared_object_in_and() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::And(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(!passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_and_filters_match_shared_object_in_and() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::And(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_or_filters_match_any_object() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.set(
+      "comment.tag",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["rust".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filter = Filter::Or(vec![
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        }),
+      },
+    ]);
+
+    assert!(passes_filter(&reader, 0, &filter));
+  }
+
+  #[test]
+  fn nested_not_filters_negate_nested() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["alice".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let rejecting = Filter::Not(Box::new(Filter::Nested {
+      path: "comment".into(),
+      filter: Box::new(Filter::KeywordEq {
+        field: "author".into(),
+        value: "alice".into(),
+      }),
+    }));
+    assert!(!passes_filter(&reader, 0, &rejecting));
+
+    let accepting = Filter::Not(Box::new(Filter::Nested {
+      path: "comment".into(),
+      filter: Box::new(Filter::KeywordEq {
+        field: "author".into(),
+        value: "bob".into(),
+      }),
+    }));
+    assert!(passes_filter(&reader, 0, &accepting));
   }
 }

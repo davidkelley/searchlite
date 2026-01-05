@@ -57,8 +57,9 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
     let query_terms: Vec<&str> = terms.iter().take(3).copied().collect();
     let query = query_terms.join(" ");
     let mut req = SearchRequest {
-      query: query.clone(),
+      query: query.clone().into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: Vec::new(),
@@ -101,8 +102,9 @@ fn empty_query_returns_no_hits() {
   add_random_docs(&idx, &["rust"], 3, &mut rng);
   let reader = idx.reader().unwrap();
   let req = SearchRequest {
-    query: "".to_string(),
+    query: "".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 5,
     sort: Vec::new(),

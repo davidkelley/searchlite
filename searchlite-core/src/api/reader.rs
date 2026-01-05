@@ -6,12 +6,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
-use crate::api::query::parse_query;
 use crate::api::types::{
-  Aggregation, AggregationResponse, DateHistogramAggregation, FuzzyOptions, HistogramAggregation,
-  IndexOptions, SearchRequest, SortOrder,
+  Aggregation, AggregationResponse, DateHistogramAggregation, Filter, FuzzyOptions,
+  HistogramAggregation, IndexOptions, SearchRequest, SortOrder,
 };
 use crate::api::AggregationError;
+use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
 use crate::index::manifest::{Manifest, Schema};
 use crate::index::postings::PostingEntry;
@@ -20,9 +20,9 @@ use crate::index::InnerIndex;
 use crate::query::aggregation::AggregationPipeline;
 use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_seconds};
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
-use crate::query::filters::passes_filters;
+use crate::query::filters::{passes_filter, passes_filters};
 use crate::query::phrase::matches_phrase;
-use crate::query::planner::{expand_not_terms, expand_terms};
+use crate::query::planner::{build_query_plan, PhraseSpec, QueryMatcher, TermGroupSpec};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
 use crate::query::wand::{execute_top_k_with_mode, ScoreMode, ScoredTerm};
 use crate::DocId;
@@ -349,10 +349,24 @@ struct QualifiedTerm {
   weight: f32,
 }
 
+#[derive(Clone, Debug)]
+struct TermMatchGroup {
+  keys: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RootFilter<'a> {
+  None,
+  Node(&'a Filter),
+  AndSlice(&'a [Filter]),
+}
+
 struct SegmentSearchParams<'a> {
   qualified_terms: &'a [QualifiedTerm],
-  qualified_not_terms: &'a [String],
+  matcher: &'a QueryMatcher,
+  term_groups: &'a [TermMatchGroup],
   phrase_fields: &'a [Vec<(String, Vec<String>)>],
+  root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
   req: &'a SearchRequest,
@@ -426,88 +440,310 @@ fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
   }
 }
 
-fn expand_terms_exact(term_keys: &[(String, String)]) -> Vec<QualifiedTerm> {
-  term_keys
-    .iter()
-    .map(|(field, term)| QualifiedTerm {
-      field: field.clone(),
-      term: term.clone(),
-      key: build_term_key(field, term),
-      weight: 1.0,
-    })
-    .collect()
+fn expand_term_groups(
+  segments: &[SegmentReader],
+  groups: &[TermGroupSpec],
+  fuzzy: Option<&FuzzyOptions>,
+) -> (Vec<QualifiedTerm>, Vec<TermMatchGroup>) {
+  let mut qualified_terms = Vec::new();
+  let mut term_groups = Vec::with_capacity(groups.len());
+  for group in groups.iter() {
+    let mut keys = Vec::new();
+    for field in group.fields.iter() {
+      let (scored, mut expanded_keys) = expand_term_for_group(
+        segments,
+        field,
+        &group.term,
+        group.boost,
+        group.score,
+        fuzzy,
+      );
+      if group.score {
+        qualified_terms.extend(scored);
+      }
+      keys.append(&mut expanded_keys);
+    }
+    term_groups.push(TermMatchGroup { keys });
+  }
+  (qualified_terms, term_groups)
 }
 
-fn expand_terms_fuzzy(
+fn expand_term_for_group(
   segments: &[SegmentReader],
-  term_keys: &[(String, String)],
-  fuzzy: &FuzzyOptions,
-) -> Vec<QualifiedTerm> {
-  let max_edits = fuzzy.max_edits.min(2) as usize;
-  let mut out = Vec::new();
-  if max_edits == 0 {
-    return expand_terms_exact(term_keys);
+  field: &str,
+  term: &str,
+  boost: f32,
+  score: bool,
+  fuzzy: Option<&FuzzyOptions>,
+) -> (Vec<QualifiedTerm>, Vec<String>) {
+  if !score {
+    return (Vec::new(), vec![build_term_key(field, term)]);
   }
-  for (field, term) in term_keys.iter() {
-    let term_len = term.chars().count();
-    let exact_key = build_term_key(field, term);
-    out.push(QualifiedTerm {
-      field: field.clone(),
-      term: term.clone(),
-      key: exact_key.clone(),
-      weight: distance_weight(0),
-    });
-    if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
-      continue;
-    }
-    let prefix_len = fuzzy.prefix_length.min(term_len);
-    let prefix = char_prefix(term, prefix_len);
-    let mut prefix_key = String::with_capacity(field.len() + prefix.len() + 1);
-    prefix_key.push_str(field);
-    prefix_key.push(':');
-    prefix_key.push_str(prefix);
-    let field_prefix_len = field.len() + 1;
-    let mut seen: HashSet<String> = HashSet::new();
-    seen.insert(exact_key);
-    let mut expansions = 0usize;
-    'segments: for seg in segments.iter() {
-      for key in seg.terms_with_prefix(&prefix_key) {
+  let Some(fuzzy) = fuzzy else {
+    return expand_term_exact(field, term, boost);
+  };
+  let max_edits = fuzzy.max_edits.min(2) as usize;
+  if max_edits == 0 {
+    return expand_term_exact(field, term, boost);
+  }
+  expand_term_fuzzy(segments, field, term, boost, fuzzy)
+}
+
+fn expand_term_exact(field: &str, term: &str, boost: f32) -> (Vec<QualifiedTerm>, Vec<String>) {
+  let key = build_term_key(field, term);
+  (
+    vec![QualifiedTerm {
+      field: field.to_string(),
+      term: term.to_string(),
+      key: key.clone(),
+      weight: boost,
+    }],
+    vec![key],
+  )
+}
+
+fn expand_term_fuzzy(
+  segments: &[SegmentReader],
+  field: &str,
+  term: &str,
+  boost: f32,
+  fuzzy: &FuzzyOptions,
+) -> (Vec<QualifiedTerm>, Vec<String>) {
+  let term_len = term.chars().count();
+  let exact_key = build_term_key(field, term);
+  let mut qualified = vec![QualifiedTerm {
+    field: field.to_string(),
+    term: term.to_string(),
+    key: exact_key.clone(),
+    weight: boost * distance_weight(0),
+  }];
+  let mut keys = vec![exact_key.clone()];
+  if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
+    return (qualified, keys);
+  }
+  let max_edits = fuzzy.max_edits.min(2) as usize;
+  let prefix_len = fuzzy.prefix_length.min(term_len);
+  let prefix = char_prefix(term, prefix_len);
+  let mut prefix_key = String::with_capacity(field.len() + prefix.len() + 1);
+  prefix_key.push_str(field);
+  prefix_key.push(':');
+  prefix_key.push_str(prefix);
+  let field_prefix_len = field.len() + 1;
+  let mut seen: HashSet<String> = HashSet::new();
+  seen.insert(exact_key);
+  let mut expansions = 0usize;
+  'segments: for seg in segments.iter() {
+    for key in seg.terms_with_prefix(&prefix_key) {
+      if expansions >= fuzzy.max_expansions {
+        break 'segments;
+      }
+      if key.len() <= field_prefix_len {
+        continue;
+      }
+      let candidate = &key[field_prefix_len..];
+      if candidate == term {
+        continue;
+      }
+      let candidate_len = candidate.chars().count();
+      if candidate_len.abs_diff(term_len) > max_edits {
+        continue;
+      }
+      let Some(distance) = bounded_levenshtein(term, candidate, max_edits) else {
+        continue;
+      };
+      if distance == 0 {
+        continue;
+      }
+      if seen.insert(key.clone()) {
+        qualified.push(QualifiedTerm {
+          field: field.to_string(),
+          term: candidate.to_string(),
+          key: key.clone(),
+          weight: boost * distance_weight(distance),
+        });
+        keys.push(key.clone());
+        expansions += 1;
         if expansions >= fuzzy.max_expansions {
           break 'segments;
-        }
-        if key.len() <= field_prefix_len {
-          continue;
-        }
-        let candidate = &key[field_prefix_len..];
-        if candidate == term {
-          continue;
-        }
-        let candidate_len = candidate.chars().count();
-        if candidate_len.abs_diff(term_len) > max_edits {
-          continue;
-        }
-        let Some(distance) = bounded_levenshtein(term, candidate, max_edits) else {
-          continue;
-        };
-        if distance == 0 {
-          continue;
-        }
-        if seen.insert(key.clone()) {
-          out.push(QualifiedTerm {
-            field: field.clone(),
-            term: candidate.to_string(),
-            key: key.clone(),
-            weight: distance_weight(distance),
-          });
-          expansions += 1;
-          if expansions >= fuzzy.max_expansions {
-            break 'segments;
-          }
         }
       }
     }
   }
-  out
+  (qualified, keys)
+}
+
+type PhrasePostings = Vec<Vec<Vec<PostingEntry>>>;
+
+struct TermDocLists {
+  lists: Vec<Vec<DocId>>,
+  group_lists: Vec<Vec<usize>>,
+}
+
+struct QueryEvaluator<'a> {
+  matcher: &'a QueryMatcher,
+  term_docs: &'a [Vec<DocId>],
+  term_group_lists: &'a [Vec<usize>],
+  phrase_postings: &'a [PhrasePostings],
+  fast_fields: &'a FastFieldsReader,
+}
+
+impl<'a> QueryEvaluator<'a> {
+  fn matches(&self, doc_id: DocId) -> bool {
+    self.matches_node(self.matcher, doc_id)
+  }
+
+  fn matches_node(&self, node: &QueryMatcher, doc_id: DocId) -> bool {
+    match node {
+      QueryMatcher::MatchAll => true,
+      QueryMatcher::Term(idx) => self.term_group_matches(*idx, doc_id),
+      QueryMatcher::Phrase(idx) => self.phrase_matches(*idx, doc_id),
+      QueryMatcher::QueryString(matcher) => {
+        let has_terms = !matcher.term_groups.is_empty();
+        let has_phrases = !matcher.phrase_groups.is_empty();
+        let has_negated = !matcher.not_term_groups.is_empty();
+        if !has_terms && !has_phrases && !has_negated {
+          return false;
+        }
+        for idx in matcher.not_term_groups.iter().copied() {
+          if self.term_group_matches(idx, doc_id) {
+            return false;
+          }
+        }
+        for idx in matcher.phrase_groups.iter().copied() {
+          if !self.phrase_matches(idx, doc_id) {
+            return false;
+          }
+        }
+        if has_terms {
+          return matcher
+            .term_groups
+            .iter()
+            .copied()
+            .any(|idx| self.term_group_matches(idx, doc_id));
+        }
+        true
+      }
+      QueryMatcher::Bool {
+        must,
+        should,
+        must_not,
+        filter,
+        minimum_should_match,
+      } => {
+        for child in must.iter() {
+          if !self.matches_node(child, doc_id) {
+            return false;
+          }
+        }
+        for child in must_not.iter() {
+          if self.matches_node(child, doc_id) {
+            return false;
+          }
+        }
+        if !passes_filters(self.fast_fields, doc_id, filter) {
+          return false;
+        }
+        let mut should_matches = 0usize;
+        for child in should.iter() {
+          if self.matches_node(child, doc_id) {
+            should_matches += 1;
+          }
+        }
+        let min_should = minimum_should_match.unwrap_or_else(|| {
+          if should.is_empty() {
+            0
+          } else if must.is_empty() && filter.is_empty() {
+            1
+          } else {
+            0
+          }
+        });
+        should_matches >= min_should
+      }
+    }
+  }
+
+  fn term_group_matches(&self, group_idx: usize, doc_id: DocId) -> bool {
+    let Some(group) = self.term_group_lists.get(group_idx) else {
+      return false;
+    };
+    group.iter().copied().any(|list_idx| {
+      self
+        .term_docs
+        .get(list_idx)
+        .map(|docs| docs.binary_search(&doc_id).is_ok())
+        .unwrap_or(false)
+    })
+  }
+
+  fn phrase_matches(&self, phrase_idx: usize, doc_id: DocId) -> bool {
+    let Some(variants) = self.phrase_postings.get(phrase_idx) else {
+      return false;
+    };
+    if variants.is_empty() {
+      return false;
+    }
+    for per_term in variants.iter() {
+      if matches_phrase(per_term.as_slice(), doc_id) {
+        return true;
+      }
+    }
+    false
+  }
+}
+
+fn build_phrase_fields(phrase_specs: &[PhraseSpec]) -> Vec<Vec<(String, Vec<String>)>> {
+  phrase_specs
+    .iter()
+    .map(|phrase| {
+      phrase
+        .fields
+        .iter()
+        .map(|field| {
+          let term_keys = phrase
+            .terms
+            .iter()
+            .map(|term| build_term_key(field, term))
+            .collect();
+          (field.clone(), term_keys)
+        })
+        .collect()
+    })
+    .collect()
+}
+
+fn build_term_doc_lists(seg: &SegmentReader, term_groups: &[TermMatchGroup]) -> TermDocLists {
+  let mut lists = Vec::new();
+  let mut indices: HashMap<String, usize> = HashMap::new();
+  let mut group_lists = Vec::with_capacity(term_groups.len());
+  for group in term_groups.iter() {
+    let mut group_indices = Vec::new();
+    for key in group.keys.iter() {
+      let idx = if let Some(idx) = indices.get(key) {
+        *idx
+      } else {
+        let docs = seg
+          .postings(key)
+          .map(|p| p.iter().map(|e| e.doc_id).collect())
+          .unwrap_or_default();
+        let idx = lists.len();
+        lists.push(docs);
+        indices.insert(key.clone(), idx);
+        idx
+      };
+      group_indices.push(idx);
+    }
+    group_lists.push(group_indices);
+  }
+  TermDocLists { lists, group_lists }
+}
+
+fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter<'_>) -> bool {
+  match root {
+    RootFilter::None => true,
+    RootFilter::Node(filter) => passes_filter(reader, doc_id, filter),
+    RootFilter::AndSlice(filters) => passes_filters(reader, doc_id, filters),
+  }
 }
 
 pub struct IndexReader {
@@ -547,6 +783,9 @@ impl IndexReader {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0; set a positive limit to page results");
     }
+    if req.filter.is_some() && !req.filters.is_empty() {
+      bail!("search request cannot set both `filter` and `filters`");
+    }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
     let score_fast_path =
       sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
@@ -579,7 +818,6 @@ impl IndexReader {
     } else {
       req.limit.saturating_add(1)
     };
-    let parsed = parse_query(&req.query);
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
     } else {
@@ -591,18 +829,9 @@ impl IndexReader {
         .map(|f| f.name.clone())
         .collect()
     };
-    let term_keys = expand_terms(&parsed, &default_fields);
-    let not_terms = expand_not_terms(&parsed, &default_fields);
-
-    let qualified_terms = if let Some(fuzzy) = req.fuzzy.as_ref() {
-      expand_terms_fuzzy(&self.segments, &term_keys, fuzzy)
-    } else {
-      expand_terms_exact(&term_keys)
-    };
-    let qualified_not_terms: Vec<String> = not_terms
-      .iter()
-      .map(|(field, term)| build_term_key(field, term))
-      .collect();
+    let query_plan = build_query_plan(&req.query, &default_fields)?;
+    let (qualified_terms, term_groups) =
+      expand_term_groups(&self.segments, &query_plan.term_groups, req.fuzzy.as_ref());
     let highlight_terms: Vec<String> = {
       let mut dedup = HashSet::new();
       let mut terms = Vec::new();
@@ -614,34 +843,14 @@ impl IndexReader {
       terms
     };
 
-    let phrase_fields: Vec<Vec<(String, Vec<String>)>> = parsed
-      .phrases
-      .iter()
-      .map(|phrase| {
-        let fields = if let Some(f) = &phrase.field {
-          vec![f.clone()]
-        } else {
-          default_fields.clone()
-        };
-        fields
-          .into_iter()
-          .map(|field| {
-            let term_keys = phrase
-              .terms
-              .iter()
-              .map(|term| {
-                let mut key = String::with_capacity(field.len() + term.len() + 1);
-                key.push_str(&field);
-                key.push(':');
-                key.push_str(term);
-                key
-              })
-              .collect();
-            (field, term_keys)
-          })
-          .collect()
-      })
-      .collect();
+    let phrase_fields = build_phrase_fields(&query_plan.phrase_specs);
+    let root_filter = if let Some(filter) = req.filter.as_ref() {
+      RootFilter::Node(filter)
+    } else if !req.filters.is_empty() {
+      RootFilter::AndSlice(req.filters.as_slice())
+    } else {
+      RootFilter::None
+    };
 
     let mut hits: Vec<RankedHit> = Vec::new();
     let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
@@ -679,8 +888,10 @@ impl IndexReader {
         };
         let params = SegmentSearchParams {
           qualified_terms: &qualified_terms,
-          qualified_not_terms: &qualified_not_terms,
+          matcher: &query_plan.matcher,
+          term_groups: &term_groups,
           phrase_fields: &phrase_fields,
+          root_filter,
           agg_collector: agg_ref,
           match_counter: counter,
           req,
@@ -753,8 +964,10 @@ impl IndexReader {
   ) -> Result<Vec<RankedHit>> {
     let SegmentSearchParams {
       qualified_terms,
-      qualified_not_terms,
+      matcher,
+      term_groups,
       phrase_fields,
+      root_filter,
       agg_collector,
       match_counter,
       req,
@@ -770,6 +983,48 @@ impl IndexReader {
     } else {
       ScoreMode::MatchOnly
     };
+    let term_doc_lists = build_term_doc_lists(seg, term_groups);
+    let phrase_postings: Vec<PhrasePostings> = phrase_fields
+      .iter()
+      .map(|fields| {
+        fields
+          .iter()
+          .filter_map(|(_field, term_keys)| {
+            let per_term: Vec<Vec<PostingEntry>> = term_keys
+              .iter()
+              .filter_map(|key| seg.postings(key).map(|p| p.iter().cloned().collect()))
+              .collect();
+            if per_term.len() == term_keys.len() {
+              Some(per_term)
+            } else {
+              None
+            }
+          })
+          .collect::<Vec<Vec<Vec<PostingEntry>>>>()
+      })
+      .collect();
+    let query_eval = QueryEvaluator {
+      matcher,
+      term_docs: &term_doc_lists.lists,
+      term_group_lists: &term_doc_lists.group_lists,
+      phrase_postings: &phrase_postings,
+      fast_fields: seg.fast_fields(),
+    };
+    if qualified_terms.is_empty() {
+      return self.scan_segment(
+        seg,
+        &query_eval,
+        root_filter,
+        agg_collector,
+        match_counter,
+        segment_ord,
+        rank_limit,
+        cursor_key,
+        saw_cursor,
+        sort_plan,
+        collect_hits,
+      );
+    }
     let mut term_weights: HashMap<String, (String, f32)> = HashMap::new();
     for term in qualified_terms.iter() {
       let entry = term_weights
@@ -796,63 +1051,17 @@ impl IndexReader {
       return Ok(Vec::new());
     }
 
-    let not_doc_lists: Vec<Vec<DocId>> = qualified_not_terms
-      .iter()
-      .filter_map(|key| {
-        seg
-          .postings(key)
-          .map(|p| p.iter().map(|e| e.doc_id).collect())
-      })
-      .collect();
-
-    let phrase_postings: Vec<Vec<Vec<Vec<PostingEntry>>>> = phrase_fields
-      .iter()
-      .map(|fields| {
-        fields
-          .iter()
-          .filter_map(|(_field, term_keys)| {
-            let per_term: Vec<Vec<PostingEntry>> = term_keys
-              .iter()
-              .filter_map(|key| seg.postings(key).map(|p| p.iter().cloned().collect()))
-              .collect();
-            if per_term.len() == term_keys.len() {
-              Some(per_term)
-            } else {
-              None
-            }
-          })
-          .collect::<Vec<Vec<Vec<PostingEntry>>>>()
-      })
-      .collect();
-
     let mut match_counter = match_counter;
     let mut collect_hits = collect_hits;
     let mut accept = |doc_id: DocId, score: f32| -> bool {
       if seg.is_deleted(doc_id) {
         return false;
       }
-      if !passes_filters(seg.fast_fields(), doc_id, &req.filters) {
+      if !query_eval.matches(doc_id) {
         return false;
       }
-      for list in not_doc_lists.iter() {
-        if list.binary_search(&doc_id).is_ok() {
-          return false;
-        }
-      }
-      for variants in phrase_postings.iter() {
-        if variants.is_empty() {
-          return false;
-        }
-        let mut ok_any_field = false;
-        for per_term in variants.iter() {
-          if matches_phrase(per_term.as_slice(), doc_id) {
-            ok_any_field = true;
-            break;
-          }
-        }
-        if !ok_any_field {
-          return false;
-        }
+      if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
+        return false;
       }
       let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
       if let Some(cur) = &cursor_key {
@@ -892,6 +1101,60 @@ impl IndexReader {
         })
         .collect(),
     )
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  fn scan_segment(
+    &self,
+    seg: &SegmentReader,
+    query_eval: &QueryEvaluator<'_>,
+    root_filter: RootFilter<'_>,
+    mut agg_collector: Option<&mut dyn DocCollector>,
+    match_counter: Option<&mut u64>,
+    segment_ord: u32,
+    rank_limit: usize,
+    cursor_key: Option<SortKey>,
+    saw_cursor: &mut bool,
+    sort_plan: &SortPlan,
+    mut collect_hits: Option<&mut dyn FnMut(SortKey, f32)>,
+  ) -> Result<Vec<RankedHit>> {
+    let mut local_heap = std::collections::BinaryHeap::<RankedHit>::new();
+    let score = if sort_plan.uses_score() { 1.0 } else { 0.0 };
+    let mut match_counter = match_counter;
+    for raw in 0..seg.meta.doc_count {
+      let doc_id = raw as DocId;
+      if seg.is_deleted(doc_id) {
+        continue;
+      }
+      if !query_eval.matches(doc_id) {
+        continue;
+      }
+      if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
+        continue;
+      }
+      let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
+      if let Some(cur) = &cursor_key {
+        let ord = key.cmp(cur);
+        if ord.is_lt() || ord.is_eq() {
+          if ord.is_eq() {
+            *saw_cursor = true;
+          }
+          continue;
+        }
+      }
+      if let Some(counter) = match_counter.as_mut() {
+        **counter += 1;
+      }
+      if let Some(collector) = agg_collector.as_deref_mut() {
+        collector.collect(doc_id, score);
+      }
+      if let Some(collector) = collect_hits.as_mut() {
+        (*collector)(key, score);
+      } else if rank_limit > 0 {
+        push_ranked(&mut local_heap, RankedHit { key, score }, rank_limit);
+      }
+    }
+    Ok(local_heap.into_iter().collect())
   }
 
   fn materialize_hit(

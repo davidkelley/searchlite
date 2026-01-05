@@ -779,8 +779,9 @@ impl Searchlite {
 
   pub fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
     let request = SearchRequest {
-      query,
+      query: query.into(),
       fields: None,
+      filter: None,
       filters: Vec::<Filter>::new(),
       limit,
       sort: Vec::<SortSpec>::new(),
@@ -938,8 +939,9 @@ mod tests {
     storage.flush().await.unwrap();
     let reader: IndexReader = index.reader().unwrap();
     let request = SearchRequest {
-      query: "hello".to_string(),
+      query: "hello".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: vec![],
@@ -969,8 +971,9 @@ mod tests {
     idx.commit().await.unwrap();
 
     let request = SearchRequest {
-      query: "hello".to_string(),
+      query: "hello".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 5,
       sort: vec![],

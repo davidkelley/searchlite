@@ -62,7 +62,7 @@ Schema lives in `schema.json` (example below). Text fields control tokenization 
 }
 ```
 
-`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges use `field:[min TO max]`, keyword filters accept `field:value` or `field:v1,v2`. Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
+`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges and keyword predicates are expressed via the JSON `filter` AST (see examples below). Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
 Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
 
 Every document must include a string primary key under `doc_id_field` (defaults to `_id`). Skip listing that id in your `text_fields`/`keyword_fields`/`numeric_fields`; it is stored automatically, returned on hits, and used for upsert/delete semantics.
@@ -113,17 +113,22 @@ cargo run -p searchlite-cli -- add "$INDEX" docs.jsonl
 cargo run -p searchlite-cli -- commit "$INDEX"
 ```
 
-- Query the index (field scoping, filters, stored fields, snippets):
+- Query the index (structured query + filters, stored fields, snippets):
 
 ```bash
 cat > /tmp/request.json <<'EOF'
 {
-  "query": "body:rust language",
-  "fields": ["body","title"],
-  "filters": [
-    { "KeywordEq": { "field": "lang", "value": "en" } },
-    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
-  ],
+  "query": {
+    "type": "query_string",
+    "query": "rust language",
+    "fields": ["body","title"]
+  },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "lang", "value": "en" } },
+      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
+    ]
+  },
   "limit": 5,
   "return_stored": true,
   "highlight_field": "body"
@@ -137,7 +142,10 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 ```bash
 cat > /tmp/request.json <<'EOF'
 {
-  "query": "body:rusk",
+  "query": {
+    "type": "query_string",
+    "query": "body:rusk"
+  },
   "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 3 },
   "limit": 5,
   "return_stored": true
@@ -181,19 +189,24 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
 
-Query syntax supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
+The `query_string` node (and legacy string queries) supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
 - You can also pass the full search payload as JSON (same shape used by the upcoming HTTP service):
 
 ```bash
 cat > /tmp/search_request.json <<'EOF'
 {
-  "query": "body:rust language",
-  "fields": null,
-  "filters": [
-    { "KeywordEq": { "field": "lang", "value": "en" } },
-    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
-  ],
+  "query": {
+    "type": "query_string",
+    "query": "rust language",
+    "fields": null
+  },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "lang", "value": "en" } },
+      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
+    ]
+  },
   "limit": 5,
   "sort": [
     { "field": "year", "order": "desc" }
@@ -209,6 +222,8 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.jso
 
 Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
 
+Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
+
 ## Filters: examples
 
 Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
@@ -217,7 +232,7 @@ Filters operate on fast fields (`fast: true` in the schema). Keyword filters are
 
 ```json
 {
-  "filters": [{ "KeywordEq": { "field": "lang", "value": "en" } }]
+  "filter": { "KeywordEq": { "field": "lang", "value": "en" } }
 }
 ```
 
@@ -225,7 +240,7 @@ Filters operate on fast fields (`fast: true` in the schema). Keyword filters are
 
 ```json
 {
-  "filters": [{ "KeywordIn": { "field": "lang", "values": ["en", "fr"] } }]
+  "filter": { "KeywordIn": { "field": "lang", "values": ["en", "fr"] } }
 }
 ```
 
@@ -233,10 +248,12 @@ Filters operate on fast fields (`fast: true` in the schema). Keyword filters are
 
 ```json
 {
-  "filters": [
-    { "I64Range": { "field": "year", "min": 2018, "max": 2024 } },
-    { "F64Range": { "field": "score", "min": 0.25, "max": 0.9 } }
-  ]
+  "filter": {
+    "And": [
+      { "I64Range": { "field": "year", "min": 2018, "max": 2024 } },
+      { "F64Range": { "field": "score", "min": 0.25, "max": 0.9 } }
+    ]
+  }
 }
 ```
 
@@ -246,7 +263,7 @@ If your document has `tags: ["rust", "search"]` and `tags` is a fast keyword fie
 
 ```json
 {
-  "filters": [{ "KeywordEq": { "field": "tags", "value": "rust" } }]
+  "filter": { "KeywordEq": { "field": "tags", "value": "rust" } }
 }
 ```
 
@@ -286,24 +303,26 @@ Filter: match documents with any comment whose author is `alice` and tag is `rus
 
 ```json
 {
-  "filters": [
-    {
-      "Nested": {
-        "path": "comment",
-        "filter": {
-          "KeywordEq": { "field": "author", "value": "alice" }
+  "filter": {
+    "And": [
+      {
+        "Nested": {
+          "path": "comment",
+          "filter": {
+            "KeywordEq": { "field": "author", "value": "alice" }
+          }
+        }
+      },
+      {
+        "Nested": {
+          "path": "comment",
+          "filter": {
+            "KeywordEq": { "field": "tag", "value": "rust" }
+          }
         }
       }
-    },
-    {
-      "Nested": {
-        "path": "comment",
-        "filter": {
-          "KeywordEq": { "field": "tag", "value": "rust" }
-        }
-      }
-    }
-  ]
+    ]
+  }
 }
 ```
 
@@ -349,29 +368,31 @@ Filter: require a comment with `author=bob` that has a reply tagged `y` (parent-
 
 ```json
 {
-  "filters": [
-    {
-      "Nested": {
-        "path": "comment",
-        "filter": {
-          "KeywordEq": { "field": "author", "value": "bob" }
+  "filter": {
+    "And": [
+      {
+        "Nested": {
+          "path": "comment",
+          "filter": {
+            "KeywordEq": { "field": "author", "value": "bob" }
+          }
         }
-      }
-    },
-    {
-      "Nested": {
-        "path": "comment",
-        "filter": {
-          "Nested": {
-            "path": "reply",
-            "filter": {
-              "KeywordEq": { "field": "tag", "value": "y" }
+      },
+      {
+        "Nested": {
+          "path": "comment",
+          "filter": {
+            "Nested": {
+              "path": "reply",
+              "filter": {
+                "KeywordEq": { "field": "tag", "value": "y" }
+              }
             }
           }
         }
       }
-    }
-  ]
+    ]
+  }
 }
 ```
 
@@ -383,26 +404,28 @@ Filter on nested numeric properties alongside keywords:
 
 ```json
 {
-  "filters": [
-    {
-      "Nested": {
-        "path": "review",
-        "filter": { "KeywordEq": { "field": "user", "value": "alice" } }
+  "filter": {
+    "And": [
+      {
+        "Nested": {
+          "path": "review",
+          "filter": { "KeywordEq": { "field": "user", "value": "alice" } }
+        }
+      },
+      {
+        "Nested": {
+          "path": "review",
+          "filter": { "I64Range": { "field": "rating", "min": 5, "max": 8 } }
+        }
+      },
+      {
+        "Nested": {
+          "path": "review",
+          "filter": { "F64Range": { "field": "score", "min": 0.7, "max": 0.8 } }
+        }
       }
-    },
-    {
-      "Nested": {
-        "path": "review",
-        "filter": { "I64Range": { "field": "rating", "min": 5, "max": 8 } }
-      }
-    },
-    {
-      "Nested": {
-        "path": "review",
-        "filter": { "F64Range": { "field": "score", "min": 0.7, "max": 0.8 } }
-      }
-    }
-  ]
+    ]
+  }
 }
 ```
 
@@ -414,17 +437,19 @@ Combine a top-level numeric range with nested filters:
 
 ```json
 {
-  "filters": [
-    { "I64Range": { "field": "year", "min": 2020, "max": 2025 } },
-    {
-      "Nested": {
-        "path": "comment",
-        "filter": {
-          "KeywordEq": { "field": "author", "value": "alice" }
+  "filter": {
+    "And": [
+      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } },
+      {
+        "Nested": {
+          "path": "comment",
+          "filter": {
+            "KeywordEq": { "field": "author", "value": "alice" }
+          }
         }
       }
-    }
-  ]
+    ]
+  }
 }
 ```
 
@@ -448,7 +473,7 @@ use searchlite_core::api::{
     builder::IndexBuilder, Index, Filter,
     types::{
         Aggregation, Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
-        SearchRequest, SortOrder, SortSpec, StorageType,
+        QueryNode, SearchRequest, SortOrder, SortSpec, StorageType,
     },
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -495,9 +520,15 @@ writer.commit()?; // Flush WAL into a segment
 // Search the index.
 let reader = idx.reader()?;
 let results = reader.search(&SearchRequest {
-    query: "rust engine".into(),
+    query: QueryNode::QueryString {
+        query: "rust engine".into(),
+        fields: None,
+        boost: None,
+    }
+    .into(),
     fields: None,
-    filters: vec![Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }],
+    filter: Some(Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }),
+    filters: vec![],
     limit: 5,
     sort: vec![SortSpec { field: "year".into(), order: Some(SortOrder::Desc) }],
     cursor: None,

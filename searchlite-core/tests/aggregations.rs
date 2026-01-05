@@ -105,8 +105,9 @@ fn terms_and_stats_aggregations() {
 
   let resp = reader
     .search(&SearchRequest {
-      query: "rust".to_string(),
+      query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -182,6 +183,7 @@ fn aggregation_requires_fast_field() {
   let resp = reader.search(&SearchRequest {
     query: "rust".into(),
     fields: None,
+    filter: None,
     filters: vec![],
     limit: 0,
     sort: Vec::new(),
@@ -260,6 +262,7 @@ fn histogram_bucket_generation() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -341,6 +344,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -436,6 +440,7 @@ fn range_aggregation_counts() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -529,6 +534,7 @@ fn date_range_missing_and_keyed() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -616,6 +622,7 @@ fn extended_stats_and_value_count_include_missing() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 1, // ensure aggregations still see all docs
       sort: Vec::new(),
@@ -719,6 +726,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -820,6 +828,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),
@@ -924,6 +933,7 @@ fn terms_size_applied_after_merge() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
+      filter: None,
       filters: vec![],
       limit: 0,
       sort: Vec::new(),

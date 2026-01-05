@@ -52,9 +52,83 @@ pub struct Document {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Query {
+  String(String),
+  Node(QueryNode),
+}
+
+impl From<String> for Query {
+  fn from(value: String) -> Self {
+    Self::String(value)
+  }
+}
+
+impl From<&str> for Query {
+  fn from(value: &str) -> Self {
+    Self::String(value.to_string())
+  }
+}
+
+impl From<QueryNode> for Query {
+  fn from(value: QueryNode) -> Self {
+    Self::Node(value)
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueryNode {
+  /// Match every document. `boost` is validated but does not affect scoring.
+  MatchAll {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  QueryString {
+    query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fields: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  Term {
+    field: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  /// Match documents containing the exact phrase. `boost` is validated but does not affect scoring.
+  Phrase {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+    terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  Bool {
+    #[serde(default)]
+    must: Vec<QueryNode>,
+    #[serde(default)]
+    should: Vec<QueryNode>,
+    #[serde(default)]
+    must_not: Vec<QueryNode>,
+    #[serde(default)]
+    filter: Vec<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimum_should_match: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchRequest {
-  pub query: String,
+  pub query: Query,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fields: Option<Vec<String>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub filter: Option<Filter>,
+  #[serde(default)]
   pub filters: Vec<Filter>,
   pub limit: usize,
   #[serde(default)]
@@ -73,6 +147,66 @@ pub struct SearchRequest {
   pub highlight_field: Option<String>,
   #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchRequestHelper {
+  pub query: Query,
+  #[serde(default)]
+  pub fields: Option<Vec<String>>,
+  #[serde(default)]
+  pub filter: Option<Filter>,
+  #[serde(default)]
+  pub filters: Vec<Filter>,
+  pub limit: usize,
+  #[serde(default)]
+  pub sort: Vec<SortSpec>,
+  #[serde(default)]
+  pub cursor: Option<String>,
+  #[serde(default)]
+  pub execution: ExecutionStrategy,
+  #[serde(default)]
+  pub bmw_block_size: Option<usize>,
+  #[serde(default)]
+  pub fuzzy: Option<FuzzyOptions>,
+  #[cfg(feature = "vectors")]
+  #[serde(default)]
+  pub vector_query: Option<(String, Vec<f32>, f32)>,
+  pub return_stored: bool,
+  pub highlight_field: Option<String>,
+  #[serde(default)]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+impl<'de> Deserialize<'de> for SearchRequest {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let helper = SearchRequestHelper::deserialize(deserializer)?;
+    if helper.filter.is_some() && !helper.filters.is_empty() {
+      return Err(serde::de::Error::custom(
+        "SearchRequest cannot set both `filter` and `filters`",
+      ));
+    }
+    Ok(Self {
+      query: helper.query,
+      fields: helper.fields,
+      filter: helper.filter,
+      filters: helper.filters,
+      limit: helper.limit,
+      sort: helper.sort,
+      cursor: helper.cursor,
+      execution: helper.execution,
+      bmw_block_size: helper.bmw_block_size,
+      fuzzy: helper.fuzzy,
+      #[cfg(feature = "vectors")]
+      vector_query: helper.vector_query,
+      return_stored: helper.return_stored,
+      highlight_field: helper.highlight_field,
+      aggs: helper.aggs,
+    })
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +255,9 @@ pub enum Filter {
   I64Range { field: String, min: i64, max: i64 },
   F64Range { field: String, min: f64, max: f64 },
   Nested { path: String, filter: Box<Filter> },
+  And(Vec<Filter>),
+  Or(Vec<Filter>),
+  Not(Box<Filter>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
