@@ -772,6 +772,7 @@ impl Searchlite {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -930,6 +931,7 @@ mod tests {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
@@ -960,6 +962,7 @@ mod tests {
       cursor: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
+      fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       return_stored: true,
