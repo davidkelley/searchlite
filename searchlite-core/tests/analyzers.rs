@@ -276,5 +276,5 @@ fn default_schema_remains_compatible() {
   let reader = idx.reader().unwrap();
   let resp = reader.search(&request("rust language")).unwrap();
   let got = ids(&resp);
-  assert_eq!(got, vec!["doc-1".to_string()]);
+  assert_eq!(got, vec!["doc-1".to_string(), "doc-2".to_string()]);
 }

@@ -245,6 +245,47 @@ Use `--request-stdin` to read the payload from standard input. When a JSON reque
 
 Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
 
+## Multi-field Relevance Queries
+
+- `multi_match` supports `best_fields` (max score with optional `tie_breaker`), `most_fields` (sum across fields), and `cross_fields` (treat fields as one blended field). `fields` accepts `FieldSpec` entries so you can boost fields without string parsing (e.g., `{"field":"title","boost":2.0}`), and `minimum_should_match` accepts counts or percentages.
+- `dis_max` picks the best-scoring child query and blends the rest via `tie_breaker`.
+- `phrase` now accepts `slop` (positions of wiggle room) for near-match phrases.
+
+Example multi-field query with boosts:
+
+```json
+{
+  "query": {
+    "type": "multi_match",
+    "query": "rust search",
+    "match_type": "best_fields",
+    "fields": [
+      { "field": "title", "boost": 2.0 },
+      { "field": "body" }
+    ],
+    "operator": "or",
+    "tie_breaker": 0.2,
+    "minimum_should_match": "75%"
+  },
+  "limit": 5
+}
+```
+
+Blend multiple queries with `dis_max`:
+
+```json
+{ "query": { "type": "dis_max", "tie_breaker": 0.4, "queries": [
+  { "type": "term", "field": "title", "value": "rust" },
+  { "type": "term", "field": "body", "value": "rust" }
+]}}
+```
+
+Phrase slop example (allows one gap between terms):
+
+```json
+{ "query": { "type": "phrase", "field": "body", "terms": ["rust","search"], "slop": 1 } }
+```
+
 ## Filters: examples
 
 Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
