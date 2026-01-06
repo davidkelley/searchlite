@@ -396,12 +396,17 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           term.b,
           term.weight,
         );
+        // Leaf ids are assigned densely by the planner; dense buffers keep accumulation cache-friendly.
         let buf = scores
           .entry(entry.doc_id)
           .or_insert_with(|| vec![0.0; plan.leaf_count]);
-        if term.leaf < buf.len() {
-          buf[term.leaf] += score;
-        }
+        assert!(
+          term.leaf < buf.len(),
+          "ScorePlan leaf_count ({}) is less than term leaf index ({})",
+          buf.len(),
+          term.leaf
+        );
+        buf[term.leaf] += score;
       }
     }
     let scored = scores.len();
@@ -549,12 +554,16 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         score_sum += contribution;
         if let Some(buf) = leaf_scores.as_mut() {
           let leaf = terms[term_idx].leaf;
-          if leaf < buf.len() {
-            if buf[leaf] == 0.0 {
-              touched.push(leaf);
-            }
-            buf[leaf] += contribution;
+          assert!(
+            leaf < buf.len(),
+            "leaf index {} out of bounds for leaf_scores buffer of length {}",
+            leaf,
+            buf.len()
+          );
+          if buf[leaf] == 0.0 {
+            touched.push(leaf);
           }
+          buf[leaf] += contribution;
         }
         let moved = terms[term_idx].advance();
         mutated.push(term_idx);

@@ -53,6 +53,7 @@ pub(crate) struct TermGroupSpec {
   pub term: String,
   pub boost: f32,
   pub score: bool,
+  // TODO: Use `mode` to switch term grouping strategy (PerField vs CrossFields) when scoring.
   #[allow(dead_code)]
   pub mode: TermGroupMode,
   pub leaf: Option<usize>,
@@ -555,7 +556,7 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
 
 fn validate_tie_breaker(tie: &Option<f32>) -> Result<f32> {
   let value = tie.unwrap_or(0.0);
-  if value.is_sign_negative() {
+  if value < 0.0 {
     bail!("tie_breaker must be non-negative");
   }
   if value > 1.0 {
@@ -611,8 +612,11 @@ fn resolve_minimum_should_match(
   let required = match spec {
     MinimumShouldMatch::Value(v) => (*v).min(term_count),
     MinimumShouldMatch::Percentage(pct) => {
-      let trimmed = pct.trim_end_matches('%');
-      let percent: f32 = trimmed.parse().map_err(|_| {
+      if !pct.ends_with('%') {
+        bail!("minimum_should_match percentage must be a number with % suffix");
+      }
+      let without_percent_suffix = &pct[..pct.len() - 1];
+      let percent: f32 = without_percent_suffix.parse().map_err(|_| {
         anyhow::anyhow!("minimum_should_match percentage must be a number with % suffix")
       })?;
       if !(0.0..=100.0).contains(&percent) {

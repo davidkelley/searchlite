@@ -685,9 +685,7 @@ impl<'a> QueryEvaluator<'a> {
           .copied()
           .filter(|idx| self.term_group_matches(*idx, doc_id))
           .count();
-        let required = matcher
-          .minimum_should_match
-          .unwrap_or(if matcher.term_groups.is_empty() { 0 } else { 1 });
+        let required = matcher.minimum_should_match.unwrap_or(1);
         matched_terms >= required
       }
       QueryMatcher::DisMax(children) => {
@@ -1184,8 +1182,12 @@ impl IndexReader {
         term_weights
           .entry(term.key.clone())
           .or_insert((term.field.clone(), 0.0, term.leaf));
+      debug_assert_eq!(
+        entry.2, term.leaf,
+        "Inconsistent leaf for term key {} (expected {}, got {})",
+        term.key, entry.2, term.leaf
+      );
       entry.1 += term.weight;
-      entry.2 = term.leaf;
     }
 
     let docs = seg.live_docs() as f32;
@@ -1771,8 +1773,12 @@ mod tests {
         term_weights
           .entry(term.key.clone())
           .or_insert((term.field.clone(), 0.0, term.leaf));
+      debug_assert_eq!(
+        entry.2, term.leaf,
+        "Inconsistent leaf for term key {} (expected {}, got {})",
+        term.key, entry.2, term.leaf
+      );
       entry.1 += term.weight;
-      entry.2 = term.leaf;
     }
     let docs = seg.live_docs() as f32;
     let mut scored_terms = Vec::new();
@@ -1790,7 +1796,7 @@ mod tests {
       }
     }
     let mut seen_matches: Vec<String> = Vec::new();
-    let mut accept = |doc_id: DocId, _score: f32| -> bool {
+    let mut filter_doc = |doc_id: DocId, _score: f32| -> bool {
       if seg.is_deleted(doc_id) {
         return false;
       }
@@ -1808,7 +1814,7 @@ mod tests {
       ExecutionStrategy::Wand,
       None,
       plan.scorer.as_ref(),
-      &mut accept,
+      &mut filter_doc,
       None::<&mut crate::query::collector::MatchCountingCollector>,
       None,
       ScoreMode::Score,
