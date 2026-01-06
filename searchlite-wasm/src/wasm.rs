@@ -795,6 +795,9 @@ impl Searchlite {
       highlight_field: None,
       aggs: BTreeMap::<String, Aggregation>::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     };
     self.run_search(request)
   }
@@ -956,6 +959,9 @@ mod tests {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     };
     let result = reader.search(&request).unwrap();
     assert_eq!(result.hits.len(), 1);
@@ -989,6 +995,9 @@ mod tests {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     };
     let request_json = serde_json::to_string(&request).unwrap();
     let result = idx.search_request(request_json).unwrap();

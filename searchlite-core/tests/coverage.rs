@@ -114,6 +114,9 @@ fn search_with_phrase_filters_and_compaction() {
       highlight_field: Some("body".into()),
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   assert_eq!(result.hits.len(), 2);

@@ -290,6 +290,9 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     cursor,
     aggs: load_aggs(aggs, aggs_file)?,
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   })
 }
 
@@ -484,6 +487,9 @@ mod tests {
       highlight_field: Some("body".to_string()),
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     };
     let request_path = dir.path().join("request.json");
     fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();

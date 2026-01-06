@@ -348,6 +348,61 @@ Phrase slop example (allows one gap between terms):
 { "query": { "type": "phrase", "field": "body", "terms": ["rust","search"], "slop": 1 } }
 ```
 
+## Custom scoring and reranking
+
+- `constant_score` wraps a filter-only query and returns a fixed score (default 1.0) when the filter matches.
+- `function_score` lets you blend deterministic functions with the base BM25 score. Functions can be filtered, combined with `score_mode`, and merged with the base score via `boost_mode`.
+
+```json
+{
+  "query": {
+    "type": "function_score",
+    "query": { "type": "match_all" },
+    "functions": [
+      { "type": "weight", "weight": 2.0, "filter": { "KeywordEq": { "field": "lang", "value": "en" } } },
+      {
+        "type": "field_value_factor",
+        "field": "popularity",
+        "factor": 0.25,
+        "modifier": "log1p",
+        "missing": 0.0
+      }
+    ],
+    "score_mode": "sum",
+    "boost_mode": "sum",
+    "max_boost": 5.0,
+    "min_score": 0.5
+  },
+  "limit": 5
+}
+```
+
+Constant score example:
+
+```json
+{ "query": { "type": "constant_score", "filter": { "KeywordEq": { "field": "lang", "value": "en" } }, "boost": 2.5 } }
+```
+
+Rescore the top window after the initial rank (ordering outside the window is unchanged):
+
+```json
+{
+  "query": { "type": "query_string", "query": "rust search" },
+  "limit": 10,
+  "rescore": {
+    "window_size": 50,
+    "query": { "type": "phrase", "field": "body", "terms": ["rust", "search"], "slop": 1 },
+    "score_mode": "total"
+  }
+}
+```
+
+Debugging aids:
+
+- `explain: true` returns per-hit score breakdowns, including function contributions and any rescore adjustments.
+- `profile: true` attaches execution stats (`candidates_examined`, `scored_docs`, postings advances) and timing buckets (`search_ms`, `rescore_ms`).
+- Both flags are off by default to avoid overhead.
+
 ## Filters: examples
 
 Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
