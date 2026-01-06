@@ -6,7 +6,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::analysis::analyzer::{Analyzer, AnalyzerDef, AnalyzerRegistry};
+use crate::analysis::analyzer::{
+  Analyzer, AnalyzerDef, AnalyzerRegistry, EdgeNgramConfig, TokenFilterDef,
+};
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,7 @@ impl Schema {
         stored: true,
         indexed: true,
         nullable: false,
+        search_as_you_type: None,
       }],
       keyword_fields: Vec::new(),
       numeric_fields: Vec::new(),
@@ -146,32 +149,69 @@ impl Schema {
   }
 
   pub fn build_analyzers(&self) -> anyhow::Result<SchemaAnalyzers> {
-    let registry = AnalyzerRegistry::from_defs(&self.analyzers)?;
-    let mut field_map = HashMap::new();
-    for (path, field) in self.text_field_map().into_iter() {
-      if registry.get(&field.analyzer).is_none() {
-        anyhow::bail!(
-          "field `{path}` references unknown analyzer `{}`",
-          field.analyzer
-        );
+    let mut defs = self.analyzers.clone();
+    let mut field_refs = Vec::new();
+    let find_def = |name: &str, defs: &[AnalyzerDef]| -> Option<AnalyzerDef> {
+      if name == "default" {
+        return Some(AnalyzerDef {
+          name: "default".to_string(),
+          tokenizer: "default".to_string(),
+          filters: Vec::new(),
+        });
       }
+      defs.iter().find(|d| d.name == name).cloned()
+    };
+    for (path, field) in self.text_field_map().into_iter() {
+      let base_analyzer = field.analyzer.clone();
       let search_name = field
         .search_analyzer
         .clone()
         .unwrap_or_else(|| field.analyzer.clone());
-      if registry.get(&search_name).is_none() {
-        anyhow::bail!("field `{path}` references unknown search analyzer `{search_name}`");
+      let index_analyzer = if let Some(cfg) = &field.search_as_you_type {
+        let generated = format!("{}__saty_{}", base_analyzer, path.replace('.', "_"));
+        if defs.iter().all(|d| d.name != generated) {
+          let base_def = find_def(&base_analyzer, &defs).ok_or_else(|| {
+            anyhow::anyhow!("field `{path}` references unknown analyzer `{base_analyzer}`")
+          })?;
+          let mut filters = base_def.filters.clone();
+          filters.push(TokenFilterDef::EdgeNgram(EdgeNgramConfig {
+            min: cfg.min_gram,
+            max: cfg.max_gram,
+          }));
+          defs.push(AnalyzerDef {
+            name: generated.clone(),
+            tokenizer: base_def.tokenizer,
+            filters,
+          });
+        }
+        generated
+      } else {
+        base_analyzer.clone()
+      };
+      field_refs.push((
+        path.clone(),
+        FieldAnalyzerRefs {
+          analyzer: index_analyzer,
+          search_analyzer: search_name,
+        },
+      ));
+    }
+    let registry = AnalyzerRegistry::from_defs(&defs)?;
+    let mut field_map = HashMap::new();
+    for (path, refs) in field_refs.into_iter() {
+      if registry.get(&refs.analyzer).is_none() {
+        anyhow::bail!(
+          "field `{path}` references unknown analyzer `{}`",
+          refs.analyzer
+        );
       }
-      if field_map
-        .insert(
-          path.clone(),
-          FieldAnalyzerRefs {
-            analyzer: field.analyzer.clone(),
-            search_analyzer: search_name,
-          },
-        )
-        .is_some()
-      {
+      if registry.get(&refs.search_analyzer).is_none() {
+        anyhow::bail!(
+          "field `{path}` references unknown search analyzer `{}`",
+          refs.search_analyzer
+        );
+      }
+      if field_map.insert(path.clone(), refs).is_some() {
         anyhow::bail!("duplicate field `{path}` in analyzer map");
       }
     }
@@ -332,6 +372,7 @@ mod tests {
         stored: true,
         indexed: true,
         nullable: false,
+        search_as_you_type: None,
       }],
       keyword_fields: vec![KeywordField {
         name: "tag".into(),
@@ -513,6 +554,61 @@ impl SchemaAnalyzers {
   }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "SearchAsYouTypeDef", try_from = "SearchAsYouTypeDef")]
+pub struct SearchAsYouType {
+  pub min_gram: usize,
+  pub max_gram: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchAsYouTypeDef {
+  #[serde(default = "default_search_as_you_type_min")]
+  min_gram: usize,
+  #[serde(default = "default_search_as_you_type_max")]
+  max_gram: usize,
+}
+
+impl From<SearchAsYouType> for SearchAsYouTypeDef {
+  fn from(value: SearchAsYouType) -> Self {
+    Self {
+      min_gram: value.min_gram,
+      max_gram: value.max_gram,
+    }
+  }
+}
+
+impl TryFrom<SearchAsYouTypeDef> for SearchAsYouType {
+  type Error = anyhow::Error;
+
+  fn try_from(value: SearchAsYouTypeDef) -> Result<Self, Self::Error> {
+    let min = value.min_gram;
+    let max = value.max_gram;
+    if min == 0 || max == 0 {
+      anyhow::bail!(
+        "invalid search_as_you_type configuration: min_gram and max_gram must both be greater than zero (got min_gram={min}, max_gram={max})"
+      );
+    }
+    if min > max {
+      anyhow::bail!(
+        "invalid search_as_you_type configuration: min_gram ({min}) must be less than or equal to max_gram ({max})"
+      );
+    }
+    Ok(Self {
+      min_gram: min,
+      max_gram: max,
+    })
+  }
+}
+
+fn default_search_as_you_type_min() -> usize {
+  1
+}
+
+fn default_search_as_you_type_max() -> usize {
+  15
+}
+
 #[derive(Debug, Clone)]
 pub struct TextField {
   pub name: String,
@@ -521,6 +617,7 @@ pub struct TextField {
   pub stored: bool,
   pub indexed: bool,
   pub nullable: bool,
+  pub search_as_you_type: Option<SearchAsYouType>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -538,6 +635,8 @@ struct TextFieldSerde {
   pub indexed: bool,
   #[serde(default)]
   pub nullable: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub search_as_you_type: Option<SearchAsYouType>,
 }
 
 impl From<TextField> for TextFieldSerde {
@@ -551,6 +650,7 @@ impl From<TextField> for TextFieldSerde {
       stored: value.stored,
       indexed: value.indexed,
       nullable: value.nullable,
+      search_as_you_type: value.search_as_you_type,
     }
   }
 }
@@ -568,9 +668,13 @@ impl TryFrom<TextFieldSerde> for TextField {
         ));
       }
       (None, None) => {
-        return Err(serde::de::Error::custom(
-          "text field must set `analyzer` (or `tokenizer` as an alias)",
-        ));
+        if value.search_as_you_type.is_some() {
+          "default".to_string()
+        } else {
+          return Err(serde::de::Error::custom(
+            "text field must set `analyzer` (or `tokenizer` as an alias)",
+          ));
+        }
       }
     };
     let search_analyzer = match (value.search_analyzer, value.search_tokenizer) {
@@ -590,6 +694,7 @@ impl TryFrom<TextFieldSerde> for TextField {
       stored: value.stored,
       indexed: value.indexed,
       nullable: value.nullable,
+      search_as_you_type: value.search_as_you_type,
     })
   }
 }
@@ -608,6 +713,7 @@ impl Serialize for TextField {
       stored: self.stored,
       indexed: self.indexed,
       nullable: self.nullable,
+      search_as_you_type: self.search_as_you_type.clone(),
     };
     helper.serialize(serializer)
   }

@@ -111,6 +111,7 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   }
 }
 

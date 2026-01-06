@@ -27,6 +27,23 @@ impl Analyzer {
     resequence_positions(&mut tokens);
     tokens
   }
+
+  /// Applies inexpensive, structure-preserving normalization suitable for patterns
+  /// (e.g., wildcard/regex) without re-tokenizing or stripping delimiters.
+  pub fn normalize_pattern(&self, pattern: &str) -> String {
+    let lowercases = matches!(
+      self.tokenizer,
+      TokenizerKind::Default | TokenizerKind::Unicode
+    ) || self
+      .filters
+      .iter()
+      .any(|f| matches!(f, TokenFilter::Lowercase));
+    if lowercases {
+      pattern.to_lowercase()
+    } else {
+      pattern.to_string()
+    }
+  }
 }
 
 #[derive(Debug, Clone)]

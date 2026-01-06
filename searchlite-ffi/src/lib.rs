@@ -162,6 +162,7 @@ pub unsafe extern "C" fn searchlite_search(
     highlight_field: None,
     cursor,
     aggs: aggs_map,
+    suggest: BTreeMap::new(),
     #[cfg(feature = "vectors")]
     vector_query: None,
   };

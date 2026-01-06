@@ -1163,6 +1163,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rayon",
+ "regex",
  "rust-stemmers",
  "serde",
  "serde_json",

@@ -1,9 +1,14 @@
+use crate::util::regex::anchored_regex;
 use anyhow::{bail, Result};
 
 use crate::api::query::{parse_query, ParsedQuery};
 use crate::api::types::{
   FieldSpec, Filter, MatchOperator, MinimumShouldMatch, MultiMatchType, Query, QueryNode,
 };
+
+const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
+const DEFAULT_WILDCARD_MAX_EXPANSIONS: usize = 100;
+const DEFAULT_REGEX_MAX_EXPANSIONS: usize = 100;
 
 /// Expands query terms into field-qualified terms using default fields when no explicit field is given.
 pub fn expand_terms(query: &ParsedQuery, default_fields: &[String]) -> Vec<(String, String)> {
@@ -48,9 +53,18 @@ pub(crate) struct FieldSpecInternal {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum TermExpansion {
+  Exact,
+  Prefix { max_expansions: usize },
+  Wildcard { max_expansions: usize },
+  Regex { max_expansions: usize },
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct TermGroupSpec {
   pub fields: Vec<FieldSpecInternal>,
   pub term: String,
+  pub expansion: TermExpansion,
   pub boost: f32,
   pub score: bool,
   // NOTE: `mode` is set during planning to distinguish PerField vs CrossFields grouping,
@@ -246,6 +260,7 @@ impl<'a> QueryPlanBuilder<'a> {
           let idx = self.push_term_group(
             fields,
             term.term.clone(),
+            TermExpansion::Exact,
             boost * node_boost,
             score,
             TermGroupMode::PerField,
@@ -269,6 +284,7 @@ impl<'a> QueryPlanBuilder<'a> {
           let idx = self.push_term_group(
             fields,
             term.term.clone(),
+            TermExpansion::Exact,
             boost * node_boost,
             false,
             TermGroupMode::PerField,
@@ -355,6 +371,7 @@ impl<'a> QueryPlanBuilder<'a> {
           let idx = self.push_term_group(
             field_specs.clone(),
             term.term.clone(),
+            TermExpansion::Exact,
             boost * node_boost,
             score,
             mode.clone(),
@@ -367,6 +384,7 @@ impl<'a> QueryPlanBuilder<'a> {
           let idx = self.push_term_group(
             field_specs.clone(),
             term.term.clone(),
+            TermExpansion::Exact,
             boost * node_boost,
             false,
             mode.clone(),
@@ -431,6 +449,86 @@ impl<'a> QueryPlanBuilder<'a> {
             leaf: None,
           }],
           value.clone(),
+          TermExpansion::Exact,
+          boost * node_boost,
+          score,
+          TermGroupMode::PerField,
+          leaf,
+        );
+        let scorer = leaf.map(ScoreExpr::Leaf);
+        Ok((QueryMatcher::Term(idx), scorer))
+      }
+      QueryNode::Prefix {
+        field,
+        value,
+        max_expansions,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let leaf = score.then(|| self.alloc_leaf());
+        let idx = self.push_term_group(
+          vec![FieldSpecInternal {
+            field: field.clone(),
+            boost: 1.0,
+            leaf: None,
+          }],
+          value.clone(),
+          TermExpansion::Prefix {
+            max_expansions: max_expansions.unwrap_or(DEFAULT_PREFIX_MAX_EXPANSIONS),
+          },
+          boost * node_boost,
+          score,
+          TermGroupMode::PerField,
+          leaf,
+        );
+        let scorer = leaf.map(ScoreExpr::Leaf);
+        Ok((QueryMatcher::Term(idx), scorer))
+      }
+      QueryNode::Wildcard {
+        field,
+        value,
+        max_expansions,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let leaf = score.then(|| self.alloc_leaf());
+        let idx = self.push_term_group(
+          vec![FieldSpecInternal {
+            field: field.clone(),
+            boost: 1.0,
+            leaf: None,
+          }],
+          value.clone(),
+          TermExpansion::Wildcard {
+            max_expansions: max_expansions.unwrap_or(DEFAULT_WILDCARD_MAX_EXPANSIONS),
+          },
+          boost * node_boost,
+          score,
+          TermGroupMode::PerField,
+          leaf,
+        );
+        let scorer = leaf.map(ScoreExpr::Leaf);
+        Ok((QueryMatcher::Term(idx), scorer))
+      }
+      QueryNode::Regex {
+        field,
+        value,
+        max_expansions,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let leaf = score.then(|| self.alloc_leaf());
+        anchored_regex(value)?;
+        let idx = self.push_term_group(
+          vec![FieldSpecInternal {
+            field: field.clone(),
+            boost: 1.0,
+            leaf: None,
+          }],
+          value.clone(),
+          TermExpansion::Regex {
+            max_expansions: max_expansions.unwrap_or(DEFAULT_REGEX_MAX_EXPANSIONS),
+          },
           boost * node_boost,
           score,
           TermGroupMode::PerField,
@@ -510,10 +608,12 @@ impl<'a> QueryPlanBuilder<'a> {
     }
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn push_term_group(
     &mut self,
     fields: Vec<FieldSpecInternal>,
     term: String,
+    expansion: TermExpansion,
     boost: f32,
     score: bool,
     mode: TermGroupMode,
@@ -523,6 +623,7 @@ impl<'a> QueryPlanBuilder<'a> {
     self.term_groups.push(TermGroupSpec {
       fields,
       term,
+      expansion,
       boost,
       score,
       mode,

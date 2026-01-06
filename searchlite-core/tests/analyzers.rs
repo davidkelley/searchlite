@@ -40,6 +40,7 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   }
 }
 
@@ -68,6 +69,7 @@ fn search_analyzer_expands_synonyms() {
       stored: true,
       indexed: true,
       nullable: false,
+      search_as_you_type: None,
     }],
     keyword_fields: Vec::new(),
     numeric_fields: Vec::new(),
@@ -126,6 +128,7 @@ fn edge_ngram_index_analyzer_supports_prefix_queries() {
       stored: true,
       indexed: true,
       nullable: false,
+      search_as_you_type: None,
     }],
     keyword_fields: Vec::new(),
     numeric_fields: Vec::new(),
@@ -190,6 +193,7 @@ fn stopwords_and_stemming_apply_to_phrases_and_terms() {
       stored: true,
       indexed: true,
       nullable: false,
+      search_as_you_type: None,
     }],
     keyword_fields: Vec::new(),
     numeric_fields: Vec::new(),

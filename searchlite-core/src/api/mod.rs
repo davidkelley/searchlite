@@ -11,6 +11,7 @@ pub use errors::AggregationError;
 pub use reader::{Hit, IndexReader, SearchResult};
 pub use types::{
   Aggregation, AggregationResponse, Aggregations, Document, Filter, FuzzyOptions, IndexOptions,
-  Query, QueryNode, SearchRequest, SortOrder, SortSpec, StorageType,
+  Query, QueryNode, SearchRequest, SortOrder, SortSpec, StorageType, SuggestOption, SuggestRequest,
+  SuggestResult,
 };
 pub use writer::IndexWriter;

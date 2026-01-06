@@ -96,6 +96,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -160,6 +161,7 @@ fn histogram_requires_positive_interval() {
     return_stored: false,
     highlight_field: None,
     aggs,
+    suggest: BTreeMap::new(),
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
@@ -245,6 +247,7 @@ fn nested_terms_stats_aggregation() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -321,6 +324,7 @@ fn date_histogram_rejects_invalid_config() {
     return_stored: false,
     highlight_field: None,
     aggs,
+    suggest: BTreeMap::new(),
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
@@ -365,6 +369,7 @@ fn date_histogram_rejects_invalid_config() {
     return_stored: false,
     highlight_field: None,
     aggs,
+    suggest: BTreeMap::new(),
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
@@ -428,6 +433,7 @@ fn top_hits_returns_requested_docs() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -518,6 +524,7 @@ fn top_hits_applies_sort_spec() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -613,6 +620,7 @@ fn date_histogram_calendar_month_interval() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 

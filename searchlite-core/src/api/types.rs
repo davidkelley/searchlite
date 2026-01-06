@@ -153,6 +153,30 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+  Prefix {
+    field: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_expansions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  Wildcard {
+    field: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_expansions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  Regex {
+    field: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_expansions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
   /// Match documents containing the exact phrase. `boost` is validated but does not affect scoring.
   Phrase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +268,8 @@ pub struct SearchRequest {
   pub highlight_field: Option<String>,
   #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub suggest: BTreeMap<String, SuggestRequest>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +299,8 @@ struct SearchRequestHelper {
   pub highlight_field: Option<String>,
   #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
+  #[serde(default)]
+  pub suggest: BTreeMap<String, SuggestRequest>,
 }
 
 impl<'de> Deserialize<'de> for SearchRequest {
@@ -302,6 +330,7 @@ impl<'de> Deserialize<'de> for SearchRequest {
       return_stored: helper.return_stored,
       highlight_field: helper.highlight_field,
       aggs: helper.aggs,
+      suggest: helper.suggest,
     })
   }
 }
@@ -343,6 +372,35 @@ fn default_fuzzy_max_expansions() -> usize {
 
 fn default_fuzzy_min_length() -> usize {
   3
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SuggestRequest {
+  Completion {
+    field: String,
+    prefix: String,
+    #[serde(default = "default_suggest_size")]
+    size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fuzzy: Option<FuzzyOptions>,
+  },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SuggestResult {
+  pub options: Vec<SuggestOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SuggestOption {
+  pub text: String,
+  pub score: f32,
+  pub doc_freq: u64,
+}
+
+fn default_suggest_size() -> usize {
+  5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,5 +633,5 @@ pub struct TopHit {
 }
 
 pub use crate::index::manifest::{
-  KeywordField, NestedField, NestedProperty, NumericField, Schema, TextField,
+  KeywordField, NestedField, NestedProperty, NumericField, Schema, SearchAsYouType, TextField,
 };

@@ -35,6 +35,7 @@ fn base_search_request(query: &str) -> SearchRequest {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   }
 }
 
@@ -81,6 +82,7 @@ fn index_and_search() {
     stored: true,
     indexed: true,
     nullable: false,
+    search_as_you_type: None,
   });
   let opts = IndexOptions {
     path: path.clone(),
@@ -127,6 +129,7 @@ fn index_and_search() {
       return_stored: true,
       highlight_field: Some("body".to_string()),
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
@@ -346,6 +349,7 @@ fn upsert_and_delete_by_id() {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
   let resp = reader.search(&req).unwrap();
   assert_eq!(resp.hits.len(), 1);
@@ -429,6 +433,7 @@ fn cursor_paginates_ordered_hits() {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
 
   let mut bodies = Vec::new();
@@ -495,6 +500,7 @@ fn cursor_rejects_invalid_hex() {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
 
   assert!(reader.search(&req).is_err());
@@ -541,6 +547,7 @@ fn cursor_rejects_when_limit_zero() {
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap_err();
 
@@ -596,6 +603,7 @@ fn cursor_rejects_excessive_advance() {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
 
   assert!(reader.search(&req).is_err());
@@ -643,6 +651,7 @@ fn cursor_rejects_mismatched_position() {
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
 
   let first = reader.search(&req).unwrap();
@@ -717,6 +726,7 @@ fn cursor_orders_stably_across_segments() {
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
 
   let mut doc_ids = Vec::new();
@@ -822,6 +832,7 @@ fn in_memory_storage_keeps_disk_clean() {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   assert_eq!(resp.hits.len(), 1);
@@ -946,6 +957,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -1102,6 +1114,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 

@@ -31,6 +31,7 @@ fn setup_reader() -> (TempDir, searchlite_core::api::IndexReader) {
     stored: true,
     indexed: true,
     nullable: false,
+    search_as_you_type: None,
   });
   let opts = IndexOptions {
     path: path.clone(),
@@ -76,6 +77,7 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   }
 }
 
