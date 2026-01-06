@@ -518,6 +518,7 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   order.sort_by_key(|&idx| terms[idx].doc_id());
   let mut leaf_scores = score_plan.map(|plan| vec![0.0_f32; plan.leaf_count]);
   let mut touched: Vec<usize> = Vec::new();
+  let mut touched_flags = leaf_scores.as_ref().map(|buf| vec![false; buf.len()]);
   loop {
     order.retain(|idx| !terms[*idx].is_done());
     if order.is_empty() {
@@ -552,7 +553,7 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         let term_idx = order[idx];
         let contribution = terms[term_idx].score_current();
         score_sum += contribution;
-        if let Some(buf) = leaf_scores.as_mut() {
+        if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
           let leaf = terms[term_idx].leaf;
           assert!(
             leaf < buf.len(),
@@ -560,7 +561,8 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
             leaf,
             buf.len()
           );
-          if buf[leaf] == 0.0 {
+          if !flags[leaf] {
+            flags[leaf] = true;
             touched.push(leaf);
           }
           buf[leaf] += contribution;
@@ -580,10 +582,13 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           score = plan.evaluate(buf);
         }
       }
-      if let Some(buf) = leaf_scores.as_mut() {
+      if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
         for idx in touched.drain(..) {
           buf[idx] = 0.0;
+          flags[idx] = false;
         }
+      } else {
+        touched.clear();
       }
       let accepted = accept(doc_id, score);
       if accepted {

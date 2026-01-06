@@ -666,6 +666,12 @@ impl<'a> QueryEvaluator<'a> {
       QueryMatcher::Term(idx) => self.term_group_matches(*idx, doc_id),
       QueryMatcher::Phrase(idx) => self.phrase_matches(*idx, doc_id),
       QueryMatcher::QueryString(matcher) => {
+        if matcher.term_groups.is_empty()
+          && matcher.phrase_groups.is_empty()
+          && matcher.not_term_groups.is_empty()
+        {
+          return false;
+        }
         for idx in matcher.not_term_groups.iter().copied() {
           if self.term_group_matches(idx, doc_id) {
             return false;

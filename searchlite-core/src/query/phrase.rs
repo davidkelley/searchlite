@@ -27,7 +27,7 @@ pub fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId, slop: u32) 
       if pos <= prev {
         continue;
       }
-      let gap = pos.saturating_sub(prev + 1) as i32;
+      let gap = pos.saturating_sub(prev.saturating_add(1)) as i32;
       if gap > remaining {
         // positions are sorted; no later entry will shrink the gap
         break;

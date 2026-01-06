@@ -117,18 +117,17 @@ impl ScoreExpr {
         children,
         tie_breaker,
       } => {
-        let mut max = 0.0_f32;
+        if children.is_empty() {
+          return 0.0;
+        }
+        let mut max = f32::NEG_INFINITY;
         let mut sum = 0.0_f32;
         for child in children.iter() {
           let score = child.evaluate(leaves);
           max = max.max(score);
           sum += score;
         }
-        if sum == 0.0 {
-          0.0
-        } else {
-          max + *tie_breaker * (sum - max)
-        }
+        max + *tie_breaker * (sum - max)
       }
     }
   }
@@ -623,6 +622,7 @@ fn resolve_minimum_should_match(
         bail!("minimum_should_match percentage must be between 0 and 100");
       }
       let raw = (percent / 100.0) * term_count as f32;
+      // 0% explicitly allows zero required matches; callers opt into this.
       raw.ceil() as usize
     }
   };
