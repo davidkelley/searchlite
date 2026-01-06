@@ -717,6 +717,16 @@ impl<'a> QueryPlanBuilder<'a> {
         boost: node_boost,
       } => {
         let node_boost = validate_boost(node_boost)?;
+        if let Some(val) = max_boost {
+          if !val.is_finite() {
+            bail!("function_score `max_boost` must be finite");
+          }
+        }
+        if let Some(val) = min_score {
+          if !val.is_finite() {
+            bail!("function_score `min_score` must be finite");
+          }
+        }
         let (matcher, scorer, base_score_node) = self.build_node(query, score, boost)?;
         let score_node = ScoreNode::FunctionScore {
           matcher: matcher.clone(),

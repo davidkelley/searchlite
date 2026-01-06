@@ -40,10 +40,15 @@ pub(crate) fn compile_functions(
   let mut compiled = Vec::with_capacity(functions.len());
   for func in functions.iter() {
     match func {
-      FunctionSpec::Weight { weight, filter } => compiled.push(CompiledFunction::Weight {
-        weight: *weight,
-        filter: filter.clone(),
-      }),
+      FunctionSpec::Weight { weight, filter } => {
+        if !weight.is_finite() {
+          bail!("weight must be finite");
+        }
+        compiled.push(CompiledFunction::Weight {
+          weight: *weight,
+          filter: filter.clone(),
+        });
+      }
       FunctionSpec::FieldValueFactor {
         field,
         factor,
@@ -51,6 +56,9 @@ pub(crate) fn compile_functions(
         missing,
         filter,
       } => {
+        if !factor.is_finite() {
+          bail!("field_value_factor `factor` must be finite");
+        }
         ensure_numeric_fast(schema, field)?;
         compiled.push(CompiledFunction::FieldValueFactor {
           field: field.clone(),
@@ -69,6 +77,9 @@ pub(crate) fn compile_functions(
         function,
         filter,
       } => {
+        if !scale.is_finite() {
+          bail!("decay scale must be finite");
+        }
         ensure_numeric_fast(schema, field)?;
         if *scale <= 0.0 {
           bail!("decay scale must be > 0");
@@ -99,16 +110,8 @@ pub(crate) fn combine_function_scores(values: &[f32], mode: FunctionScoreMode) -
   match mode {
     FunctionScoreMode::Sum => Some(values.iter().copied().sum()),
     FunctionScoreMode::Multiply => Some(values.iter().copied().product()),
-    FunctionScoreMode::Max => values
-      .iter()
-      .copied()
-      .reduce(|a, b| a.max(b))
-      .or_else(|| values.first().copied()),
-    FunctionScoreMode::Min => values
-      .iter()
-      .copied()
-      .reduce(|a, b| a.min(b))
-      .or_else(|| values.first().copied()),
+    FunctionScoreMode::Max => Some(values.iter().copied().reduce(|a, b| a.max(b)).unwrap()),
+    FunctionScoreMode::Min => Some(values.iter().copied().reduce(|a, b| a.min(b)).unwrap()),
     FunctionScoreMode::Avg => Some(values.iter().copied().sum::<f32>() / values.len() as f32),
   }
 }
@@ -144,7 +147,13 @@ impl CompiledFunction {
         }
         let raw = numeric_value(fast_fields, field, doc_id).unwrap_or(*missing);
         let scaled = raw * *factor as f64;
+        if !scaled.is_finite() {
+          return None;
+        }
         let modified = apply_modifier(scaled, modifier);
+        if !modified.is_finite() {
+          return None;
+        }
         Some(modified as f32)
       }
       CompiledFunction::Decay {

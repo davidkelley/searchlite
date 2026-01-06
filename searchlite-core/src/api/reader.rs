@@ -329,7 +329,7 @@ fn evaluate_compiled_score(
         }
       }
       let mut effective_base = base_score;
-      if effective_base == 0.0 && !function_values.is_empty() {
+      if effective_base.abs() <= f32::EPSILON && !function_values.is_empty() {
         // Preserve function contributions even when the base query scored 0.0,
         // so multiplicative boost modes do not erase function-only scoring.
         effective_base = 1.0;
