@@ -31,6 +31,7 @@ use crate::query::planner::{
 };
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
 use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
+use crate::util::regex::anchored_regex;
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
@@ -662,11 +663,14 @@ fn wildcard_literal_prefix(pattern: &str) -> &str {
 
 fn build_wildcard_regex(pattern: &str) -> Result<Regex> {
   let mut buf = String::from("^");
-  for ch in pattern.chars() {
+  for (i, ch) in pattern.char_indices() {
     match ch {
       '*' => buf.push_str(".*"),
       '?' => buf.push('.'),
-      _ => buf.push_str(&regex::escape(&ch.to_string())),
+      _ => {
+        let end = i + ch.len_utf8();
+        buf.push_str(&regex::escape(&pattern[i..end]));
+      }
     }
   }
   buf.push('$');
@@ -729,17 +733,27 @@ fn expand_wildcard(
 fn regex_literal_prefix(pattern: &str) -> String {
   let mut prefix = String::new();
   let mut escaped = false;
-  for ch in pattern.chars() {
+  for (i, ch) in pattern.char_indices() {
     if escaped {
-      prefix.push(ch);
-      escaped = false;
-      continue;
+      match ch {
+        'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' => break,
+        'p' | 'P' => break,
+        _ => {
+          let end = i + ch.len_utf8();
+          prefix.push_str(&pattern[i..end]);
+          escaped = false;
+          continue;
+        }
+      }
     }
     match ch {
       '\\' => escaped = true,
       '^' if prefix.is_empty() => continue,
       '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '$' => break,
-      _ => prefix.push(ch),
+      _ => {
+        let end = i + ch.len_utf8();
+        prefix.push_str(&pattern[i..end]);
+      }
     }
   }
   prefix
@@ -757,9 +771,7 @@ fn expand_regex(
   if max_expansions == 0 {
     return Ok((Vec::new(), Vec::new()));
   }
-  let anchored = format!("^(?:{pattern})$");
-  let regex =
-    Regex::new(&anchored).map_err(|e| anyhow::anyhow!("invalid regex `{pattern}`: {e}"))?;
+  let regex = anchored_regex(pattern)?;
   let literal_prefix = regex_literal_prefix(pattern);
   let prefix_key = build_term_key(field, &literal_prefix);
   let field_prefix_len = field.len() + 1;

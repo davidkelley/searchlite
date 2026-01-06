@@ -555,11 +555,50 @@ impl SchemaAnalyzers {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "SearchAsYouTypeDef", try_from = "SearchAsYouTypeDef")]
 pub struct SearchAsYouType {
-  #[serde(default = "default_search_as_you_type_min")]
   pub min_gram: usize,
-  #[serde(default = "default_search_as_you_type_max")]
   pub max_gram: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchAsYouTypeDef {
+  #[serde(default = "default_search_as_you_type_min")]
+  min_gram: usize,
+  #[serde(default = "default_search_as_you_type_max")]
+  max_gram: usize,
+}
+
+impl From<SearchAsYouType> for SearchAsYouTypeDef {
+  fn from(value: SearchAsYouType) -> Self {
+    Self {
+      min_gram: value.min_gram,
+      max_gram: value.max_gram,
+    }
+  }
+}
+
+impl TryFrom<SearchAsYouTypeDef> for SearchAsYouType {
+  type Error = anyhow::Error;
+
+  fn try_from(value: SearchAsYouTypeDef) -> Result<Self, Self::Error> {
+    let min = value.min_gram;
+    let max = value.max_gram;
+    if min == 0 || max == 0 {
+      anyhow::bail!(
+        "invalid SearchAsYouType configuration: min_gram ({min}) and max_gram ({max}) must be greater than zero"
+      );
+    }
+    if min > max {
+      anyhow::bail!(
+        "invalid SearchAsYouType configuration: min_gram ({min}) must be less than or equal to max_gram ({max})"
+      );
+    }
+    Ok(Self {
+      min_gram: min,
+      max_gram: max,
+    })
+  }
 }
 
 fn default_search_as_you_type_min() -> usize {

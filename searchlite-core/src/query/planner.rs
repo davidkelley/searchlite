@@ -1,5 +1,5 @@
+use crate::util::regex::anchored_regex;
 use anyhow::{bail, Result};
-use regex::Regex;
 
 use crate::api::query::{parse_query, ParsedQuery};
 use crate::api::types::{
@@ -55,15 +55,9 @@ pub(crate) struct FieldSpecInternal {
 #[derive(Debug, Clone)]
 pub(crate) enum TermExpansion {
   Exact,
-  Prefix {
-    max_expansions: usize,
-  },
-  Wildcard {
-    max_expansions: usize,
-  },
-  Regex {
-    max_expansions: usize,
-  },
+  Prefix { max_expansions: usize },
+  Wildcard { max_expansions: usize },
+  Regex { max_expansions: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -524,8 +518,7 @@ impl<'a> QueryPlanBuilder<'a> {
       } => {
         let node_boost = validate_boost(node_boost)?;
         let leaf = score.then(|| self.alloc_leaf());
-        Regex::new(&format!("^(?:{value})$"))
-          .map_err(|e| anyhow::anyhow!("invalid regex `{value}`: {e}"))?;
+        anchored_regex(value)?;
         let idx = self.push_term_group(
           vec![FieldSpecInternal {
             field: field.clone(),
