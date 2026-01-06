@@ -270,3 +270,68 @@ fn decay_function_orders_by_distance() {
   assert!(resp.hits[0].score > resp.hits[1].score);
   assert!(resp.hits[1].score > resp.hits[2].score);
 }
+
+#[test]
+fn min_score_branch_does_not_drop_other_clauses() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Term {
+        field: "body".into(),
+        value: "fast".into(),
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: 1.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Multiply),
+        max_boost: None,
+        min_score: Some(10.0),
+        boost: None,
+      },
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: Some(1),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(ids(&resp), vec!["doc-1"]);
+  assert!(resp.hits[0].score > 0.0);
+}
+
+#[test]
+fn rescore_min_score_filters_hits() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::MatchAll { boost: None });
+  req.rescore = Some(RescoreRequest {
+    window_size: 3,
+    query: QueryNode::FunctionScore {
+      query: Box::new(QueryNode::MatchAll { boost: None }),
+      functions: vec![FunctionSpec::Weight {
+        weight: 2.0,
+        filter: Some(Filter::KeywordEq {
+          field: "lang".into(),
+          value: "en".into(),
+        }),
+      }],
+      score_mode: Some(FunctionScoreMode::Sum),
+      boost_mode: Some(FunctionBoostMode::Multiply),
+      max_boost: None,
+      min_score: Some(2.0),
+      boost: None,
+    },
+    score_mode: RescoreMode::Total,
+  });
+  let resp = reader.search(&req).unwrap();
+  let ids = ids(&resp);
+  assert_eq!(ids.len(), 2);
+  assert!(ids.contains(&"doc-1".to_string()));
+  assert!(ids.contains(&"doc-2".to_string()));
+  assert!(!ids.contains(&"doc-3".to_string()));
+}

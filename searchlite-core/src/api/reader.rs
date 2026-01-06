@@ -251,8 +251,9 @@ fn evaluate_compiled_score(
     CompiledScoreNode::Expr(expr) => Some(expr.evaluate(leaf_scores)),
     CompiledScoreNode::Sum(children) => {
       let mut sum = 0.0_f32;
+      let mut has_score = false;
       for child in children.iter() {
-        let score = evaluate_compiled_score(
+        if let Some(score) = evaluate_compiled_score(
           child,
           evaluator,
           fast_fields,
@@ -260,10 +261,16 @@ fn evaluate_compiled_score(
           leaf_scores,
           collect_functions,
           out_functions,
-        )?;
-        sum += score;
+        ) {
+          has_score = true;
+          sum += score;
+        }
       }
-      Some(sum)
+      if has_score || children.is_empty() {
+        Some(sum)
+      } else {
+        None
+      }
     }
     CompiledScoreNode::DisMax {
       children,
@@ -274,8 +281,9 @@ fn evaluate_compiled_score(
       }
       let mut sum = 0.0_f32;
       let mut max = f32::NEG_INFINITY;
+      let mut has_score = false;
       for child in children.iter() {
-        let score = evaluate_compiled_score(
+        if let Some(score) = evaluate_compiled_score(
           child,
           evaluator,
           fast_fields,
@@ -283,11 +291,17 @@ fn evaluate_compiled_score(
           leaf_scores,
           collect_functions,
           out_functions,
-        )?;
-        max = max.max(score);
-        sum += score;
+        ) {
+          has_score = true;
+          max = max.max(score);
+          sum += score;
+        }
       }
-      Some(max + *tie_breaker * (sum - max))
+      if has_score {
+        Some(max + *tie_breaker * (sum - max))
+      } else {
+        None
+      }
     }
     CompiledScoreNode::Constant { score, matcher } => {
       if evaluator.matches_subquery(matcher, doc_id) {
@@ -1882,7 +1896,7 @@ impl IndexReader {
     if let Some(rescore_req) = req.rescore.as_ref() {
       let rescore_start = Instant::now();
       self.rescore_hits(
-        hits.as_mut_slice(),
+        &mut hits,
         rescore_req,
         &default_fields,
         &sort_plan,
@@ -2300,7 +2314,7 @@ impl IndexReader {
 
   fn rescore_hits(
     &self,
-    hits: &mut [RankedHit],
+    hits: &mut Vec<RankedHit>,
     rescore: &RescoreRequest,
     default_fields: &[String],
     sort_plan: &SortPlan,
@@ -2335,6 +2349,7 @@ impl IndexReader {
         .or_default()
         .push((hit.key.doc_id, idx));
     }
+    let mut to_remove: Vec<usize> = Vec::new();
     for (segment_ord, docs) in per_segment.into_iter() {
       let Some(seg) = self.segments.get(segment_ord as usize) else {
         continue;
@@ -2394,13 +2409,8 @@ impl IndexReader {
             }
           }
         }
-        let base_score = rescore_plan
-          .scorer
-          .as_ref()
-          .map(|plan| plan.evaluate(&leaf_scores))
-          .unwrap_or_else(|| leaf_scores.iter().copied().sum());
         let mut fn_details = Vec::new();
-        let rescore_score = evaluate_compiled_score(
+        let rescore_score = match evaluate_compiled_score(
           &compiled_score,
           &query_eval,
           seg.fast_fields(),
@@ -2408,8 +2418,13 @@ impl IndexReader {
           &leaf_scores,
           req.explain,
           &mut fn_details,
-        )
-        .unwrap_or(base_score);
+        ) {
+          Some(score) => score,
+          None => {
+            to_remove.push(hit_idx);
+            continue;
+          }
+        };
         stats.scored_docs += 1;
         stats.postings_advanced += terms.len();
         let hit = hits.get_mut(hit_idx).unwrap();
@@ -2434,7 +2449,17 @@ impl IndexReader {
         }
       }
     }
-    hits[..window].sort_by(|a, b| a.key.cmp(&b.key));
+    if !to_remove.is_empty() {
+      to_remove.sort_unstable();
+      to_remove.dedup();
+      for idx in to_remove.into_iter().rev() {
+        hits.remove(idx);
+      }
+    }
+    let sort_window = rescore.window_size.min(hits.len());
+    if sort_window > 0 {
+      hits[..sort_window].sort_by(|a, b| a.key.cmp(&b.key));
+    }
     Ok(())
   }
 
