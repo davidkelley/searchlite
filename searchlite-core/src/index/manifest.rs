@@ -586,12 +586,12 @@ impl TryFrom<SearchAsYouTypeDef> for SearchAsYouType {
     let max = value.max_gram;
     if min == 0 || max == 0 {
       anyhow::bail!(
-        "invalid SearchAsYouType configuration: min_gram and max_gram must both be greater than zero (got min_gram={min}, max_gram={max})"
+        "invalid search_as_you_type configuration: min_gram and max_gram must both be greater than zero (got min_gram={min}, max_gram={max})"
       );
     }
     if min > max {
       anyhow::bail!(
-        "invalid SearchAsYouType configuration: min_gram ({min}) must be less than or equal to max_gram ({max})"
+        "invalid search_as_you_type configuration: min_gram ({min}) must be less than or equal to max_gram ({max})"
       );
     }
     Ok(Self {

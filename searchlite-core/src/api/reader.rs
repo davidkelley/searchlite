@@ -736,6 +736,13 @@ fn regex_literal_prefix(pattern: &str) -> String {
   for (i, ch) in pattern.char_indices() {
     if escaped {
       match ch {
+        '\\' => {
+          // Escaped backslash is a literal backslash in the prefix.
+          let end = i + ch.len_utf8();
+          prefix.push_str(&pattern[i..end]);
+          escaped = false;
+          continue;
+        }
         // Escape classes/boundaries mean we cannot keep extending the literal prefix.
         'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' => break,
         'p' | 'P' => break,
