@@ -1989,7 +1989,8 @@ impl IndexReader {
       collect_hits,
       stats,
     } = params;
-    let score_mode = if sort_plan.uses_score() {
+    let use_score_hook = needs_score_hook || explain;
+    let score_mode = if sort_plan.uses_score() || use_score_hook {
       ScoreMode::Score
     } else {
       ScoreMode::MatchOnly
@@ -2023,7 +2024,6 @@ impl IndexReader {
         stats,
       );
     }
-    let use_score_hook = needs_score_hook || explain;
     let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
     let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
     for term in qualified_terms.iter() {
@@ -2364,6 +2364,10 @@ impl IndexReader {
         if seg.is_deleted(doc_id) {
           continue;
         }
+        stats.candidates_examined += 1;
+        if !query_eval.matches(doc_id) {
+          continue;
+        }
         let mut leaf_scores = rescore_plan
           .scorer
           .as_ref()
@@ -2396,7 +2400,6 @@ impl IndexReader {
         )
         .unwrap_or(base_score);
         stats.scored_docs += 1;
-        stats.candidates_examined += 1;
         stats.postings_advanced += terms.len();
         let hit = hits.get_mut(hit_idx).unwrap();
         let orig_score = hit.score;
