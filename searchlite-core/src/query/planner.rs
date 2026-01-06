@@ -53,7 +53,9 @@ pub(crate) struct TermGroupSpec {
   pub term: String,
   pub boost: f32,
   pub score: bool,
-  // TODO: Use `mode` to switch term grouping strategy (PerField vs CrossFields) when scoring.
+  // NOTE: `mode` is set during planning to distinguish PerField vs CrossFields grouping,
+  // but scoring currently assumes PerField. CrossFields-aware scoring will consume this
+  // in a future iteration; until then we keep it and silence unused warnings.
   #[allow(dead_code)]
   pub mode: TermGroupMode,
   pub leaf: Option<usize>,

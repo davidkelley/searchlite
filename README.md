@@ -245,10 +245,11 @@ Use `--request-stdin` to read the payload from standard input. When a JSON reque
 
 Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
 
-- Structured query options for multi-field relevance:
-  - `multi_match` supports `best_fields` (max score with optional `tie_breaker`), `most_fields` (sum across fields), and `cross_fields` (treat fields as one blended field). `fields` accepts `FieldSpec` entries so you can boost fields without string parsing (e.g., `{"field":"title","boost":2.0}`), and `minimum_should_match` accepts counts or percentages.
-  - `dis_max` picks the best-scoring child query and blends the rest via `tie_breaker`.
-  - `phrase` now accepts `slop` (positions of wiggle room) for near-match phrases.
+## Multi-field Relevance Queries
+
+- `multi_match` supports `best_fields` (max score with optional `tie_breaker`), `most_fields` (sum across fields), and `cross_fields` (treat fields as one blended field). `fields` accepts `FieldSpec` entries so you can boost fields without string parsing (e.g., `{"field":"title","boost":2.0}`), and `minimum_should_match` accepts counts or percentages.
+- `dis_max` picks the best-scoring child query and blends the rest via `tie_breaker`.
+- `phrase` now accepts `slop` (positions of wiggle room) for near-match phrases.
 
 Example multi-field query with boosts:
 
