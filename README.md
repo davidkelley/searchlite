@@ -251,7 +251,7 @@ The structured query AST now supports dictionary-driven expansion without changi
 
 ```json
 { "query": { "type": "prefix", "field": "title", "value": "rus", "max_expansions": 50 } }
-{ "query": { "type": "wildcard", "field": "title", "value": "r*st?", "max_expansions": 100 } }
+{ "query": { "type": "wildcard", "field": "title", "value": "r*st", "max_expansions": 100 } }
 { "query": { "type": "regex", "field": "title", "value": "r(ust|uby)", "max_expansions": 100 } }
 ```
 
