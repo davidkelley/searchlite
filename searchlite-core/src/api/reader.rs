@@ -1,14 +1,18 @@
 use hashbrown::{HashMap, HashSet};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
+use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
   Aggregation, AggregationResponse, DateHistogramAggregation, Filter, FuzzyOptions,
-  HistogramAggregation, IndexOptions, SearchRequest, SortOrder,
+  HistogramAggregation, IndexOptions, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
+  SuggestResult,
 };
 use crate::api::AggregationError;
 use crate::index::fastfields::FastFieldsReader;
@@ -22,7 +26,9 @@ use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_sec
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::{passes_filter, passes_filters};
 use crate::query::phrase::matches_phrase;
-use crate::query::planner::{build_query_plan, PhraseSpec, QueryMatcher, ScorePlan, TermGroupSpec};
+use crate::query::planner::{
+  build_query_plan, PhraseSpec, QueryMatcher, ScorePlan, TermExpansion, TermGroupSpec,
+};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
 use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
 use crate::DocId;
@@ -45,6 +51,8 @@ pub struct SearchResult {
   pub next_cursor: Option<String>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggregations: BTreeMap<String, AggregationResponse>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub suggest: BTreeMap<String, SuggestResult>,
 }
 
 fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder) -> SortKey {
@@ -62,6 +70,8 @@ const CURSOR_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 21;
 const CURSOR_HEX_LEN: usize = CURSOR_BYTES * 2;
 const SORT_CURSOR_VERSION: u8 = 2;
+const DEFAULT_SUGGEST_SCAN: usize = 64;
+const MAX_SUGGEST_CANDIDATES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PaginationCursor {
@@ -460,7 +470,7 @@ fn expand_term_groups(
   fuzzy: Option<&FuzzyOptions>,
   analysis: &SchemaAnalyzers,
   schema: &Schema,
-) -> (Vec<QualifiedTerm>, Vec<TermMatchGroup>) {
+) -> Result<(Vec<QualifiedTerm>, Vec<TermMatchGroup>)> {
   let mut qualified_terms = Vec::new();
   let mut term_groups = Vec::with_capacity(groups.len());
   for group in groups.iter() {
@@ -473,19 +483,28 @@ fn expand_term_groups(
         FieldKind::Text => {
           if let Some(analyzer) = analysis.search_analyzer(&field.field) {
             let mut seen_tokens = HashSet::new();
-            for token in analyzer.analyze(&group.term).into_iter() {
-              if !seen_tokens.insert(token.text.clone()) {
+            let tokens: Vec<String> = match group.expansion {
+              TermExpansion::Exact => analyzer
+                .analyze(&group.term)
+                .into_iter()
+                .map(|t| t.text)
+                .collect(),
+              _ => analyze_pattern_tokens(analyzer, &group.term),
+            };
+            for token in tokens.into_iter() {
+              if !seen_tokens.insert(token.clone()) {
                 continue;
               }
               let (scored, mut expanded_keys) = expand_term_for_group(
                 segments,
                 &field.field,
-                &token.text,
+                &token,
                 weight,
                 group.score,
                 target_leaf,
                 fuzzy,
-              );
+                &group.expansion,
+              )?;
               if group.score {
                 qualified_terms.extend(scored);
               }
@@ -507,7 +526,8 @@ fn expand_term_groups(
             group.score,
             target_leaf,
             fuzzy,
-          );
+            &group.expansion,
+          )?;
           if group.score {
             qualified_terms.extend(scored);
           }
@@ -522,9 +542,27 @@ fn expand_term_groups(
     }
     term_groups.push(TermMatchGroup { keys });
   }
-  (qualified_terms, term_groups)
+  Ok((qualified_terms, term_groups))
 }
 
+fn analyze_pattern_tokens(analyzer: &Analyzer, value: &str) -> Vec<String> {
+  let tokens: Vec<String> = analyzer
+    .analyze(value)
+    .into_iter()
+    .map(|t| t.text)
+    .collect();
+  if tokens.is_empty() {
+    return vec![value.to_string()];
+  }
+  if tokens.len() == 1 {
+    return tokens;
+  }
+  // Wildcard/regex patterns often get split by analyzers; fall back to the raw pattern so we
+  // preserve the literal structure.
+  vec![value.to_string()]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn expand_term_for_group(
   segments: &[SegmentReader],
   field: &str,
@@ -533,21 +571,233 @@ fn expand_term_for_group(
   score: bool,
   leaf: Option<usize>,
   fuzzy: Option<&FuzzyOptions>,
+  expansion: &TermExpansion,
+) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
+  match expansion {
+    TermExpansion::Exact => {
+      if !score {
+        return Ok((Vec::new(), vec![build_term_key(field, term)]));
+      }
+      let Some(leaf) = leaf else {
+        return Ok((Vec::new(), vec![build_term_key(field, term)]));
+      };
+      let Some(fuzzy) = fuzzy else {
+        return Ok(expand_term_exact(field, term, boost, leaf));
+      };
+      let max_edits = fuzzy.max_edits.min(2) as usize;
+      if max_edits == 0 {
+        return Ok(expand_term_exact(field, term, boost, leaf));
+      }
+      Ok(expand_term_fuzzy(segments, field, term, boost, leaf, fuzzy))
+    }
+    TermExpansion::Prefix { max_expansions } => Ok(expand_prefix(
+      segments,
+      field,
+      term,
+      boost,
+      score,
+      leaf,
+      *max_expansions,
+    )),
+    TermExpansion::Wildcard { max_expansions } => {
+      expand_wildcard(segments, field, term, boost, score, leaf, *max_expansions)
+    }
+    TermExpansion::Regex { max_expansions } => {
+      expand_regex(segments, field, term, boost, score, leaf, *max_expansions)
+    }
+  }
+}
+
+fn expand_prefix(
+  segments: &[SegmentReader],
+  field: &str,
+  prefix: &str,
+  boost: f32,
+  score: bool,
+  leaf: Option<usize>,
+  max_expansions: usize,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
-  if !score {
-    return (Vec::new(), vec![build_term_key(field, term)]);
+  if max_expansions == 0 {
+    return (Vec::new(), Vec::new());
   }
-  let Some(leaf) = leaf else {
-    return (Vec::new(), vec![build_term_key(field, term)]);
-  };
-  let Some(fuzzy) = fuzzy else {
-    return expand_term_exact(field, term, boost, leaf);
-  };
-  let max_edits = fuzzy.max_edits.min(2) as usize;
-  if max_edits == 0 {
-    return expand_term_exact(field, term, boost, leaf);
+  let prefix_key = build_term_key(field, prefix);
+  let field_prefix_len = field.len() + 1;
+  let mut qualified = Vec::new();
+  let mut keys = Vec::new();
+  let mut seen = HashSet::new();
+  for seg in segments.iter() {
+    let mut expanded = 0usize;
+    for key in seg.terms_with_prefix(&prefix_key) {
+      if expanded >= max_expansions {
+        break;
+      }
+      if key.len() <= field_prefix_len {
+        continue;
+      }
+      if !seen.insert(key.clone()) {
+        continue;
+      }
+      let term = key[field_prefix_len..].to_string();
+      if score {
+        if let Some(idx) = leaf {
+          qualified.push(QualifiedTerm {
+            field: field.to_string(),
+            term: term.clone(),
+            key: key.clone(),
+            weight: boost,
+            leaf: idx,
+          });
+        }
+      }
+      keys.push(key.clone());
+      expanded += 1;
+    }
   }
-  expand_term_fuzzy(segments, field, term, boost, leaf, fuzzy)
+  (qualified, keys)
+}
+
+fn wildcard_literal_prefix(pattern: &str) -> &str {
+  pattern.split(['*', '?']).next().unwrap_or("")
+}
+
+fn build_wildcard_regex(pattern: &str) -> Result<Regex> {
+  let mut buf = String::from("^");
+  for ch in pattern.chars() {
+    match ch {
+      '*' => buf.push_str(".*"),
+      '?' => buf.push('.'),
+      _ => buf.push_str(&regex::escape(&ch.to_string())),
+    }
+  }
+  buf.push('$');
+  Regex::new(&buf).map_err(|e| anyhow::anyhow!("invalid wildcard `{pattern}`: {e}"))
+}
+
+fn expand_wildcard(
+  segments: &[SegmentReader],
+  field: &str,
+  pattern: &str,
+  boost: f32,
+  score: bool,
+  leaf: Option<usize>,
+  max_expansions: usize,
+) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
+  if max_expansions == 0 {
+    return Ok((Vec::new(), Vec::new()));
+  }
+  let regex = build_wildcard_regex(pattern)?;
+  let literal_prefix = wildcard_literal_prefix(pattern);
+  let prefix_key = build_term_key(field, literal_prefix);
+  let field_prefix_len = field.len() + 1;
+  let mut qualified = Vec::new();
+  let mut keys = Vec::new();
+  let mut seen = HashSet::new();
+  for seg in segments.iter() {
+    let mut expanded = 0usize;
+    for key in seg.terms_with_prefix(&prefix_key) {
+      if expanded >= max_expansions {
+        break;
+      }
+      if key.len() <= field_prefix_len {
+        continue;
+      }
+      let term = &key[field_prefix_len..];
+      if !regex.is_match(term) {
+        continue;
+      }
+      if !seen.insert(key.clone()) {
+        continue;
+      }
+      if score {
+        if let Some(idx) = leaf {
+          qualified.push(QualifiedTerm {
+            field: field.to_string(),
+            term: term.to_string(),
+            key: key.clone(),
+            weight: boost,
+            leaf: idx,
+          });
+        }
+      }
+      keys.push(key.clone());
+      expanded += 1;
+    }
+  }
+  Ok((qualified, keys))
+}
+
+fn regex_literal_prefix(pattern: &str) -> String {
+  let mut prefix = String::new();
+  let mut escaped = false;
+  for ch in pattern.chars() {
+    if escaped {
+      prefix.push(ch);
+      escaped = false;
+      continue;
+    }
+    match ch {
+      '\\' => escaped = true,
+      '^' if prefix.is_empty() => continue,
+      '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '$' => break,
+      _ => prefix.push(ch),
+    }
+  }
+  prefix
+}
+
+fn expand_regex(
+  segments: &[SegmentReader],
+  field: &str,
+  pattern: &str,
+  boost: f32,
+  score: bool,
+  leaf: Option<usize>,
+  max_expansions: usize,
+) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
+  if max_expansions == 0 {
+    return Ok((Vec::new(), Vec::new()));
+  }
+  let anchored = format!("^(?:{pattern})$");
+  let regex =
+    Regex::new(&anchored).map_err(|e| anyhow::anyhow!("invalid regex `{pattern}`: {e}"))?;
+  let literal_prefix = regex_literal_prefix(pattern);
+  let prefix_key = build_term_key(field, &literal_prefix);
+  let field_prefix_len = field.len() + 1;
+  let mut qualified = Vec::new();
+  let mut keys = Vec::new();
+  let mut seen = HashSet::new();
+  for seg in segments.iter() {
+    let mut expanded = 0usize;
+    for key in seg.terms_with_prefix(&prefix_key) {
+      if expanded >= max_expansions {
+        break;
+      }
+      if key.len() <= field_prefix_len {
+        continue;
+      }
+      let term = &key[field_prefix_len..];
+      if !regex.is_match(term) {
+        continue;
+      }
+      if !seen.insert(key.clone()) {
+        continue;
+      }
+      if score {
+        if let Some(idx) = leaf {
+          qualified.push(QualifiedTerm {
+            field: field.to_string(),
+            term: term.to_string(),
+            key: key.clone(),
+            weight: boost,
+            leaf: idx,
+          });
+        }
+      }
+      keys.push(key.clone());
+      expanded += 1;
+    }
+  }
+  Ok((qualified, keys))
 }
 
 fn expand_term_exact(
@@ -878,6 +1128,95 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
   }
 }
 
+#[derive(Default)]
+struct SuggestCandidate {
+  doc_freq: u64,
+  score: f32,
+}
+
+fn collect_completion_candidates(
+  segments: &[SegmentReader],
+  field: &str,
+  term: &str,
+  size: usize,
+  fuzzy: Option<&FuzzyOptions>,
+) -> HashMap<String, SuggestCandidate> {
+  let mut out: HashMap<String, SuggestCandidate> = HashMap::new();
+  let max_candidates = size
+    .saturating_mul(5)
+    .clamp(DEFAULT_SUGGEST_SCAN, MAX_SUGGEST_CANDIDATES);
+  match fuzzy {
+    None => {
+      let prefix_key = build_term_key(field, term);
+      let field_prefix_len = field.len() + 1;
+      for seg in segments.iter() {
+        let mut expanded = 0usize;
+        for key in seg.terms_with_prefix(&prefix_key) {
+          if expanded >= max_candidates {
+            break;
+          }
+          if key.len() <= field_prefix_len {
+            continue;
+          }
+          let term_text = key[field_prefix_len..].to_string();
+          let df = seg.postings(key).map(|p| p.len() as u64).unwrap_or(0);
+          if df == 0 {
+            continue;
+          }
+          let entry = out.entry(term_text).or_default();
+          entry.doc_freq = entry.doc_freq.saturating_add(df);
+          entry.score += df as f32;
+          expanded += 1;
+        }
+      }
+    }
+    Some(fuzzy) => {
+      let term_len = term.chars().count();
+      if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
+        return out;
+      }
+      let max_edits = fuzzy.max_edits.min(2) as usize;
+      if max_edits == 0 {
+        return out;
+      }
+      let prefix_len = fuzzy.prefix_length.min(term_len);
+      let prefix = char_prefix(term, prefix_len);
+      let prefix_key = build_term_key(field, prefix);
+      let field_prefix_len = field.len() + 1;
+      let mut per_segment_cap = fuzzy.max_expansions.min(MAX_SUGGEST_CANDIDATES);
+      per_segment_cap = per_segment_cap.max(size);
+      for seg in segments.iter() {
+        let mut expanded = 0usize;
+        for key in seg.terms_with_prefix(&prefix_key) {
+          if expanded >= per_segment_cap {
+            break;
+          }
+          if key.len() <= field_prefix_len {
+            continue;
+          }
+          let candidate = &key[field_prefix_len..];
+          let candidate_len = candidate.chars().count();
+          if candidate_len.abs_diff(term_len) > max_edits {
+            continue;
+          }
+          let Some(distance) = bounded_levenshtein(term, candidate, max_edits) else {
+            continue;
+          };
+          let df = seg.postings(key).map(|p| p.len() as u64).unwrap_or(0);
+          if df == 0 {
+            continue;
+          }
+          let entry = out.entry(candidate.to_string()).or_default();
+          entry.doc_freq = entry.doc_freq.saturating_add(df);
+          entry.score += distance_weight(distance) * df as f32;
+          expanded += 1;
+        }
+      }
+    }
+  }
+  out
+}
+
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
@@ -912,6 +1251,91 @@ impl IndexReader {
       },
       analysis,
     })
+  }
+
+  fn completion_inputs(&self, field: &str, prefix: &str) -> Result<Vec<String>> {
+    match self.manifest.schema.field_kind(field) {
+      FieldKind::Text => {
+        let analyzer = self
+          .analysis
+          .search_analyzer(field)
+          .ok_or_else(|| anyhow::anyhow!("field `{field}` has no search analyzer"))?;
+        let mut inputs = Vec::new();
+        let tokens = analyzer.analyze(prefix);
+        if let Some(last) = tokens.last() {
+          inputs.push(last.text.clone());
+        }
+        if inputs.is_empty() {
+          inputs.push(prefix.to_string());
+        }
+        inputs.sort();
+        inputs.dedup();
+        Ok(inputs)
+      }
+      FieldKind::Keyword => Ok(vec![prefix.to_ascii_lowercase()]),
+      FieldKind::Numeric | FieldKind::Unknown => {
+        bail!("completion suggest is only supported on text/keyword fields")
+      }
+    }
+  }
+
+  fn completion_suggest(
+    &self,
+    field: &str,
+    prefix: &str,
+    size: usize,
+    fuzzy: Option<&FuzzyOptions>,
+  ) -> Result<Vec<SuggestOption>> {
+    if size == 0 {
+      return Ok(Vec::new());
+    }
+    let inputs = self.completion_inputs(field, prefix)?;
+    let mut merged: HashMap<String, SuggestCandidate> = HashMap::new();
+    for term in inputs.into_iter() {
+      let candidates = collect_completion_candidates(&self.segments, field, &term, size, fuzzy);
+      for (text, cand) in candidates.into_iter() {
+        let entry = merged.entry(text).or_default();
+        entry.doc_freq = entry.doc_freq.saturating_add(cand.doc_freq);
+        entry.score += cand.score;
+      }
+    }
+    let mut options: Vec<SuggestOption> = merged
+      .into_iter()
+      .map(|(text, cand)| SuggestOption {
+        text,
+        score: cand.score,
+        doc_freq: cand.doc_freq,
+      })
+      .collect();
+    options.sort_by(|a, b| {
+      b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.text.cmp(&b.text))
+    });
+    options.truncate(size);
+    Ok(options)
+  }
+
+  fn execute_suggest(
+    &self,
+    requests: &BTreeMap<String, SuggestRequest>,
+  ) -> Result<BTreeMap<String, SuggestResult>> {
+    let mut responses = BTreeMap::new();
+    for (name, req) in requests.iter() {
+      match req {
+        SuggestRequest::Completion {
+          field,
+          prefix,
+          size,
+          fuzzy,
+        } => {
+          let options = self.completion_suggest(field, prefix, *size, fuzzy.as_ref())?;
+          responses.insert(name.clone(), SuggestResult { options });
+        }
+      }
+    }
+    Ok(responses)
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
@@ -971,7 +1395,7 @@ impl IndexReader {
       req.fuzzy.as_ref(),
       &self.analysis,
       &self.manifest.schema,
-    );
+    )?;
     let highlight_terms: Vec<String> = {
       let mut dedup = HashSet::new();
       let mut terms = Vec::new();
@@ -1090,6 +1514,11 @@ impl IndexReader {
     } else {
       BTreeMap::new()
     };
+    let suggest = if req.suggest.is_empty() {
+      BTreeMap::new()
+    } else {
+      self.execute_suggest(&req.suggest)?
+    };
     Ok(SearchResult {
       total_hits_estimate: if req.limit == 0 {
         total_matches
@@ -1099,6 +1528,7 @@ impl IndexReader {
       hits,
       next_cursor,
       aggregations,
+      suggest,
     })
   }
 
@@ -1591,11 +2021,12 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
 mod tests {
   use super::*;
   use crate::api::types::{
-    ExecutionStrategy, FieldSpec, MatchOperator, MultiMatchType, QueryNode, Schema, SearchRequest,
-    TextField,
+    ExecutionStrategy, FieldSpec, IndexOptions, MatchOperator, MultiMatchType, QueryNode, Schema,
+    SearchRequest, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
+  use std::collections::HashSet;
 
   #[test]
   fn pagination_cursor_roundtrips() {
@@ -1643,6 +2074,7 @@ mod tests {
       stored: true,
       indexed: true,
       nullable: false,
+      search_as_you_type: None,
     });
     let idx = Index::create(
       &path,
@@ -1747,7 +2179,8 @@ mod tests {
       None,
       &reader.analysis,
       &reader.manifest.schema,
-    );
+    )
+    .unwrap();
     assert_eq!(term_groups.len(), 2);
     assert!(term_groups[0].keys.iter().any(|k| k == "title:rust"));
     assert!(term_groups[0].keys.iter().any(|k| k == "body:rust"));
@@ -1871,9 +2304,271 @@ mod tests {
         return_stored: false,
         highlight_field: None,
         aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
       })
       .unwrap();
     let ids: Vec<_> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
     assert_eq!(ids.len(), 5, "hits: {:?}", ids);
+  }
+
+  #[test]
+  fn prefix_expansion_respects_max_expansions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "ruby"), ("2", "rumor"), ("3", "rust")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Prefix {
+        field: "body".into(),
+        value: "ru".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains("body:rumor"));
+    assert!(keys.contains("body:ruby"));
+    assert!(!keys.contains("body:rust"));
+  }
+
+  #[test]
+  fn wildcard_expansion_handles_star_and_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-wildcard");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "rest"), ("3", "roast"), ("4", "roost")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let star_plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "r*st".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, star_groups) = expand_term_groups(
+      &reader.segments,
+      &star_plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let star_keys: HashSet<_> = star_groups[0].keys.iter().cloned().collect();
+    assert!(star_keys.contains("body:rust"));
+    assert!(star_keys.contains("body:rest"));
+    assert!(star_keys.contains("body:roast"));
+    assert!(star_keys.contains("body:roost"));
+
+    let question_plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "ro?st".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, question_groups) = expand_term_groups(
+      &reader.segments,
+      &question_plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let question_keys: HashSet<_> = question_groups[0].keys.iter().cloned().collect();
+    assert!(question_keys.contains("body:roast"));
+    assert!(question_keys.contains("body:roost"));
+    assert_eq!(question_keys.len(), 2);
+  }
+
+  #[test]
+  fn regex_expansion_applies_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "ruby"), ("3", "rope")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "r(ust|uby)".into(),
+        max_expansions: Some(1),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys = groups[0].keys.to_vec();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0], "body:ruby");
+  }
+
+  #[test]
+  fn completion_suggest_prefers_higher_doc_freq() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-suggest");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "rust"), ("3", "ruby")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let options = reader
+      .completion_suggest("body", "ru", 1, None)
+      .expect("completion suggest");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].text, "rust");
+    assert_eq!(options[0].doc_freq, 2);
   }
 }

@@ -447,6 +447,7 @@ mod tests {
         stored: true,
         indexed: true,
         nullable: false,
+        search_as_you_type: None,
       }],
       keyword_fields: vec![KeywordField {
         name: "tag".into(),

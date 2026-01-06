@@ -154,6 +154,15 @@
         "max": { "type": "integer", "minimum": 1 }
       }
     },
+    "search_as_you_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_gram": { "type": "integer", "minimum": 1, "default": 1 },
+        "max_gram": { "type": "integer", "minimum": 1, "default": 15 }
+      },
+      "description": "Convenience flag that adds an edge_ngram filter to the index analyzer while keeping the search analyzer unchanged."
+    },
     "text_field": {
       "type": "object",
       "description": "Tokenized text column stored in postings and optionally in the doc store.",
@@ -197,6 +206,10 @@
           "type": "boolean",
           "description": "Permit null values in documents for this field.",
           "default": false
+        },
+        "search_as_you_type": {
+          "$ref": "#/$defs/search_as_you_type",
+          "description": "Enable edge n-gram indexing for search-as-you-type queries."
         }
       },
       "allOf": [
@@ -351,6 +364,10 @@
           "type": "boolean",
           "description": "Permit null values in documents for this field.",
           "default": false
+        },
+        "search_as_you_type": {
+          "$ref": "#/$defs/search_as_you_type",
+          "description": "Enable edge n-gram indexing for search-as-you-type queries."
         }
       },
       "allOf": [

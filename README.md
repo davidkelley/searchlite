@@ -245,6 +245,68 @@ Use `--request-stdin` to read the payload from standard input. When a JSON reque
 
 Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
 
+### Prefix, wildcard, and regex queries
+
+The structured query AST now supports dictionary-driven expansion without changing analyzer behavior:
+
+```json
+{ "query": { "type": "prefix", "field": "title", "value": "rus", "max_expansions": 50 } }
+{ "query": { "type": "wildcard", "field": "title", "value": "r*st?", "max_expansions": 100 } }
+{ "query": { "type": "regex", "field": "title", "value": "r(ust|uby)", "max_expansions": 100 } }
+```
+
+Each node analyzes the input with the field's search analyzer, expands against the segment term dictionary (capped by `max_expansions` per segment), and ORs the resulting terms for scoring. `boost` is accepted on each node to influence scoring weight.
+
+### Suggestions
+
+Search requests can include an optional `suggest` map for completion-style term suggestions:
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 0,
+  "return_stored": false,
+  "suggest": {
+    "title_suggest": {
+      "type": "completion",
+      "field": "title",
+      "prefix": "ru",
+      "size": 5,
+      "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 2 }
+    }
+  }
+}
+```
+
+The response embeds deterministic suggestions keyed by name:
+
+```json
+"suggest": {
+  "title_suggest": {
+    "options": [
+      { "text": "rust", "score": 42.0, "doc_freq": 3 },
+      { "text": "ruby", "score": 21.0, "doc_freq": 1 }
+    ]
+  }
+}
+```
+
+### Search-as-you-type
+
+Text fields can opt into automatic edge n-gram indexing with `search_as_you_type` while keeping the search analyzer unchanged:
+
+```json
+{
+  "name": "title",
+  "analyzer": "default",
+  "stored": true,
+  "indexed": true,
+  "search_as_you_type": { "min_gram": 1, "max_gram": 10 }
+}
+```
+
+Queries over that field (including `query_string` and `prefix`) will match partial prefixes such as `"ru"` against `"rustacean"`. You can also roll your own by defining an analyzer with an `edge_ngram` filter and wiring it as the index analyzer while keeping a normal search analyzer.
+
 ## Multi-field Relevance Queries
 
 - `multi_match` supports `best_fields` (max score with optional `tie_breaker`), `most_fields` (sum across fields), and `cross_fields` (treat fields as one blended field). `fields` accepts `FieldSpec` entries so you can boost fields without string parsing (e.g., `{"field":"title","boost":2.0}`), and `minimum_should_match` accepts counts or percentages.

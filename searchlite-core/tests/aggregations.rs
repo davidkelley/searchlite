@@ -120,6 +120,7 @@ fn terms_and_stats_aggregations() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -196,6 +197,7 @@ fn aggregation_requires_fast_field() {
     return_stored: false,
     highlight_field: None,
     aggs,
+    suggest: BTreeMap::new(),
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
@@ -275,6 +277,7 @@ fn histogram_bucket_generation() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
@@ -357,6 +360,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
@@ -453,6 +457,7 @@ fn range_aggregation_counts() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let range = resp.aggregations.get("score_ranges").unwrap();
@@ -547,6 +552,7 @@ fn date_range_missing_and_keyed() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let range = resp.aggregations.get("ranges").unwrap();
@@ -635,6 +641,7 @@ fn extended_stats_and_value_count_include_missing() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let stats = resp.aggregations.get("stats").unwrap();
@@ -739,6 +746,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 
@@ -841,6 +849,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   let hist = resp.aggregations.get("hist").unwrap();
@@ -946,6 +955,7 @@ fn terms_size_applied_after_merge() {
       return_stored: false,
       highlight_field: None,
       aggs,
+      suggest: BTreeMap::new(),
     })
     .unwrap();
 

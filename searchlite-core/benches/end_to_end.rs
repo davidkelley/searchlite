@@ -103,6 +103,7 @@ fn bench_search(c: &mut Criterion) {
         return_stored: true,
         highlight_field: None,
         aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
       };
       let _ = reader.search(&req).unwrap();
     });
@@ -207,6 +208,7 @@ fn bench_nested_filters(c: &mut Criterion) {
         return_stored: true,
         highlight_field: None,
         aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
       };
       let _ = reader.search(&req).unwrap();
     });
@@ -268,6 +270,7 @@ fn bench_cursor_pagination(c: &mut Criterion) {
           return_stored: false,
           highlight_field: None,
           aggs: BTreeMap::new(),
+          suggest: BTreeMap::new(),
         };
         let res = reader.search(&req).unwrap();
         total += res.hits.len();

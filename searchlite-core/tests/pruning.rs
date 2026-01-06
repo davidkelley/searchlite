@@ -72,6 +72,7 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     };
     let bm25 = reader.search(&req).unwrap();
 
@@ -117,6 +118,7 @@ fn empty_query_returns_no_hits() {
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
+    suggest: BTreeMap::new(),
   };
   let resp = reader.search(&req).unwrap();
   assert!(resp.hits.is_empty());

@@ -794,6 +794,7 @@ impl Searchlite {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::<String, Aggregation>::new(),
+      suggest: BTreeMap::new(),
     };
     self.run_search(request)
   }
@@ -954,6 +955,7 @@ mod tests {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     };
     let result = reader.search(&request).unwrap();
     assert_eq!(result.hits.len(), 1);
@@ -986,6 +988,7 @@ mod tests {
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     };
     let request_json = serde_json::to_string(&request).unwrap();
     let result = idx.search_request(request_json).unwrap();

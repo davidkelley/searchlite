@@ -113,6 +113,7 @@ fn search_with_phrase_filters_and_compaction() {
       return_stored: true,
       highlight_field: Some("body".into()),
       aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
     })
     .unwrap();
   assert_eq!(result.hits.len(), 2);
