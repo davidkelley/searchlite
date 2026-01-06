@@ -216,7 +216,8 @@
         {
           "anyOf": [
             { "required": ["analyzer"] },
-            { "required": ["tokenizer"] }
+            { "required": ["tokenizer"] },
+            { "required": ["search_as_you_type"] }
           ]
         },
         { "not": { "required": ["analyzer", "tokenizer"] } },

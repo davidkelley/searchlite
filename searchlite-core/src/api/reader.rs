@@ -553,14 +553,14 @@ fn analyze_pattern_tokens(analyzer: &Analyzer, value: &str) -> Vec<String> {
     .map(|t| t.text)
     .collect();
   if tokens.is_empty() {
-    return vec![value.to_string()];
+    return vec![analyzer.normalize_pattern(value)];
   }
   if tokens.len() == 1 {
     return tokens;
   }
   // Wildcard/regex patterns often get split by analyzers; fall back to the raw pattern so we
-  // preserve the literal structure.
-  vec![value.to_string()]
+  // preserve the literal structure, but still apply lightweight normalization (e.g. lowercase).
+  vec![analyzer.normalize_pattern(value)]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +736,7 @@ fn regex_literal_prefix(pattern: &str) -> String {
   for (i, ch) in pattern.char_indices() {
     if escaped {
       match ch {
+        // Escape classes/boundaries mean we cannot keep extending the literal prefix.
         'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' => break,
         'p' | 'P' => break,
         _ => {
