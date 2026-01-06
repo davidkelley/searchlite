@@ -8,10 +8,14 @@ pub mod writer;
 pub use crate::index::Index;
 pub use builder::IndexBuilder;
 pub use errors::AggregationError;
-pub use reader::{Hit, IndexReader, SearchResult};
+pub use reader::{
+  ExecutionProfile, FunctionExplanation, Hit, HitExplanation, IndexReader, ProfileResult,
+  RescoreExplanation, SearchResult,
+};
 pub use types::{
-  Aggregation, AggregationResponse, Aggregations, Document, Filter, FuzzyOptions, IndexOptions,
-  Query, QueryNode, SearchRequest, SortOrder, SortSpec, StorageType, SuggestOption, SuggestRequest,
-  SuggestResult,
+  Aggregation, AggregationResponse, Aggregations, DecayFunction, Document, FieldValueModifier,
+  Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, FuzzyOptions, IndexOptions, Query,
+  QueryNode, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SortSpec, StorageType,
+  SuggestOption, SuggestRequest, SuggestResult,
 };
 pub use writer::IndexWriter;

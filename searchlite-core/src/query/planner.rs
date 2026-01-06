@@ -3,7 +3,8 @@ use anyhow::{bail, Result};
 
 use crate::api::query::{parse_query, ParsedQuery};
 use crate::api::types::{
-  FieldSpec, Filter, MatchOperator, MinimumShouldMatch, MultiMatchType, Query, QueryNode,
+  FieldSpec, Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, MatchOperator,
+  MinimumShouldMatch, MultiMatchType, Query, QueryNode,
 };
 
 const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
@@ -125,7 +126,7 @@ impl ScoreExpr {
     }
   }
 
-  fn evaluate(&self, leaves: &[f32]) -> f32 {
+  pub(crate) fn evaluate(&self, leaves: &[f32]) -> f32 {
     match self {
       ScoreExpr::Leaf(idx) => leaves.get(*idx).copied().unwrap_or(0.0),
       ScoreExpr::Sum(children) => children.iter().map(|c| c.evaluate(leaves)).sum(),
@@ -162,11 +163,37 @@ impl ScorePlan {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum ScoreNode {
+  Empty,
+  Expr(ScoreExpr),
+  Sum(Vec<ScoreNode>),
+  DisMax {
+    children: Vec<ScoreNode>,
+    tie_breaker: f32,
+  },
+  Constant {
+    score: f32,
+    matcher: QueryMatcher,
+  },
+  FunctionScore {
+    matcher: QueryMatcher,
+    base: Box<ScoreNode>,
+    functions: Vec<FunctionSpec>,
+    score_mode: FunctionScoreMode,
+    boost_mode: FunctionBoostMode,
+    max_boost: Option<f32>,
+    min_score: Option<f32>,
+    boost: f32,
+  },
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
   pub matcher: QueryMatcher,
   pub term_groups: Vec<TermGroupSpec>,
   pub phrase_specs: Vec<PhraseSpec>,
   pub scorer: Option<ScorePlan>,
+  pub score_tree: ScoreNode,
 }
 
 pub(crate) fn build_query_plan(query: &Query, default_fields: &[String]) -> Result<QueryPlan> {
@@ -179,7 +206,7 @@ pub(crate) fn build_query_plan(query: &Query, default_fields: &[String]) -> Resu
     Query::Node(node) => node.clone(),
   };
   let mut builder = QueryPlanBuilder::new(default_fields);
-  let (matcher, score_expr) = builder.build_node(&node, true, 1.0)?;
+  let (matcher, score_expr, score_node) = builder.build_node(&node, true, 1.0)?;
   let mut leaf_count = builder.leaf_count();
   let scorer = score_expr.map(|expr| {
     if let Some(max_leaf) = expr.max_leaf() {
@@ -195,6 +222,7 @@ pub(crate) fn build_query_plan(query: &Query, default_fields: &[String]) -> Resu
     term_groups: builder.term_groups,
     phrase_specs: builder.phrase_specs,
     scorer,
+    score_tree: score_node,
   })
 }
 
@@ -230,12 +258,12 @@ impl<'a> QueryPlanBuilder<'a> {
     node: &QueryNode,
     score: bool,
     boost: f32,
-  ) -> Result<(QueryMatcher, Option<ScoreExpr>)> {
+  ) -> Result<(QueryMatcher, Option<ScoreExpr>, ScoreNode)> {
     match node {
       QueryNode::MatchAll { boost: node_boost } => {
         // MatchAll is filter-only; boost is validated for API consistency.
         validate_boost(node_boost)?;
-        Ok((QueryMatcher::MatchAll, None))
+        Ok((QueryMatcher::MatchAll, None, ScoreNode::Empty))
       }
       QueryNode::QueryString {
         query,
@@ -314,7 +342,11 @@ impl<'a> QueryPlanBuilder<'a> {
         } else {
           Some(ScoreExpr::Sum(term_leaves))
         };
-        Ok((matcher, scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((matcher, scorer, score_node))
       }
       QueryNode::MultiMatch {
         query,
@@ -404,7 +436,11 @@ impl<'a> QueryPlanBuilder<'a> {
           not_term_groups,
           minimum_should_match: required,
         });
-        Ok((matcher, scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((matcher, scorer, score_node))
       }
       QueryNode::DisMax {
         queries,
@@ -415,11 +451,15 @@ impl<'a> QueryPlanBuilder<'a> {
         let tie = validate_tie_breaker(tie_breaker)?;
         let mut matchers = Vec::with_capacity(queries.len());
         let mut scorers = Vec::new();
+        let mut score_nodes = Vec::new();
         for child in queries.iter() {
-          let (matcher, scorer) = self.build_node(child, score, boost * node_boost)?;
+          let (matcher, scorer, score_node) = self.build_node(child, score, boost * node_boost)?;
           matchers.push(matcher);
           if let Some(expr) = scorer {
             scorers.push(expr);
+          }
+          if !matches!(score_node, ScoreNode::Empty) {
+            score_nodes.push(score_node);
           }
         }
         let matcher = QueryMatcher::DisMax(matchers);
@@ -433,7 +473,17 @@ impl<'a> QueryPlanBuilder<'a> {
             tie_breaker: tie,
           })
         };
-        Ok((matcher, scorer))
+        let score_node = if score_nodes.is_empty() {
+          ScoreNode::Empty
+        } else if score_nodes.len() == 1 {
+          score_nodes.pop().unwrap()
+        } else {
+          ScoreNode::DisMax {
+            children: score_nodes,
+            tie_breaker: tie,
+          }
+        };
+        Ok((matcher, scorer, score_node))
       }
       QueryNode::Term {
         field,
@@ -456,7 +506,11 @@ impl<'a> QueryPlanBuilder<'a> {
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
-        Ok((QueryMatcher::Term(idx), scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((QueryMatcher::Term(idx), scorer, score_node))
       }
       QueryNode::Prefix {
         field,
@@ -482,7 +536,11 @@ impl<'a> QueryPlanBuilder<'a> {
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
-        Ok((QueryMatcher::Term(idx), scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((QueryMatcher::Term(idx), scorer, score_node))
       }
       QueryNode::Wildcard {
         field,
@@ -508,7 +566,11 @@ impl<'a> QueryPlanBuilder<'a> {
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
-        Ok((QueryMatcher::Term(idx), scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((QueryMatcher::Term(idx), scorer, score_node))
       }
       QueryNode::Regex {
         field,
@@ -535,7 +597,11 @@ impl<'a> QueryPlanBuilder<'a> {
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
-        Ok((QueryMatcher::Term(idx), scorer))
+        let score_node = scorer
+          .as_ref()
+          .map(|expr| ScoreNode::Expr(expr.clone()))
+          .unwrap_or(ScoreNode::Empty);
+        Ok((QueryMatcher::Term(idx), scorer, score_node))
       }
       QueryNode::Phrase {
         field,
@@ -550,7 +616,7 @@ impl<'a> QueryPlanBuilder<'a> {
           None => self.default_fields.to_vec(),
         };
         let idx = self.push_phrase(fields, terms.clone(), slop.unwrap_or(0) as u32);
-        Ok((QueryMatcher::Phrase(idx), None))
+        Ok((QueryMatcher::Phrase(idx), None, ScoreNode::Empty))
       }
       QueryNode::Bool {
         must,
@@ -564,27 +630,37 @@ impl<'a> QueryPlanBuilder<'a> {
         let child_boost = boost * node_boost;
         let mut must_matchers = Vec::with_capacity(must.len());
         let mut scorer_parts = Vec::new();
+        let mut score_nodes = Vec::new();
         for child in must.iter() {
-          let (m, s) = self.build_node(child, score, child_boost)?;
+          let (m, s, score_node) = self.build_node(child, score, child_boost)?;
           must_matchers.push(m);
           if let Some(expr) = s {
             scorer_parts.push(expr);
           }
+          if !matches!(score_node, ScoreNode::Empty) {
+            score_nodes.push(score_node);
+          }
         }
         let mut should_matchers = Vec::with_capacity(should.len());
         for child in should.iter() {
-          let (m, s) = self.build_node(child, score, child_boost)?;
+          let (m, s, score_node) = self.build_node(child, score, child_boost)?;
           should_matchers.push(m);
           if let Some(expr) = s {
             scorer_parts.push(expr);
           }
+          if !matches!(score_node, ScoreNode::Empty) {
+            score_nodes.push(score_node);
+          }
         }
         let mut must_not_matchers = Vec::with_capacity(must_not.len());
         for child in must_not.iter() {
-          let (m, s) = self.build_node(child, false, child_boost)?;
+          let (m, s, score_node) = self.build_node(child, false, child_boost)?;
           must_not_matchers.push(m);
           if let Some(expr) = s {
             scorer_parts.push(expr);
+          }
+          if !matches!(score_node, ScoreNode::Empty) {
+            score_nodes.push(score_node);
           }
         }
         let scorer = if scorer_parts.is_empty() {
@@ -593,6 +669,13 @@ impl<'a> QueryPlanBuilder<'a> {
           Some(scorer_parts.pop().unwrap())
         } else {
           Some(ScoreExpr::Sum(scorer_parts))
+        };
+        let score_node = if score_nodes.is_empty() {
+          ScoreNode::Empty
+        } else if score_nodes.len() == 1 {
+          score_nodes.pop().unwrap()
+        } else {
+          ScoreNode::Sum(score_nodes)
         };
         Ok((
           QueryMatcher::Bool {
@@ -603,7 +686,59 @@ impl<'a> QueryPlanBuilder<'a> {
             minimum_should_match: *minimum_should_match,
           },
           scorer,
+          score_node,
         ))
+      }
+      QueryNode::ConstantScore {
+        filter,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let matcher = QueryMatcher::Bool {
+          must: Vec::new(),
+          should: Vec::new(),
+          must_not: Vec::new(),
+          filter: vec![filter.clone()],
+          minimum_should_match: None,
+        };
+        let score_node = ScoreNode::Constant {
+          score: boost * node_boost,
+          matcher: matcher.clone(),
+        };
+        Ok((matcher, None, score_node))
+      }
+      QueryNode::FunctionScore {
+        query,
+        functions,
+        score_mode,
+        boost_mode,
+        max_boost,
+        min_score,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        if let Some(val) = max_boost {
+          if !val.is_finite() {
+            bail!("function_score `max_boost` must be finite");
+          }
+        }
+        if let Some(val) = min_score {
+          if !val.is_finite() {
+            bail!("function_score `min_score` must be finite");
+          }
+        }
+        let (matcher, scorer, base_score_node) = self.build_node(query, score, boost)?;
+        let score_node = ScoreNode::FunctionScore {
+          matcher: matcher.clone(),
+          base: Box::new(base_score_node),
+          functions: functions.clone(),
+          score_mode: (*score_mode).unwrap_or(FunctionScoreMode::Sum),
+          boost_mode: (*boost_mode).unwrap_or(FunctionBoostMode::Multiply),
+          max_boost: *max_boost,
+          min_score: *min_score,
+          boost: boost * node_boost,
+        };
+        Ok((matcher, scorer, score_node))
       }
     }
   }

@@ -106,6 +106,9 @@ fn bench_terms_aggregation(c: &mut Criterion) {
     highlight_field: None,
     aggs,
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   c.bench_function("aggs_terms_high_card", |b| {
@@ -154,6 +157,9 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
     highlight_field: None,
     aggs,
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   c.bench_function("aggs_histogram_numeric", |b| {

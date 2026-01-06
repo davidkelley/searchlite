@@ -36,6 +36,9 @@ fn base_search_request(query: &str) -> SearchRequest {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   }
 }
 
@@ -130,6 +133,9 @@ fn index_and_search() {
       highlight_field: Some("body".to_string()),
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   assert!(!resp.hits.is_empty());
@@ -350,6 +356,9 @@ fn upsert_and_delete_by_id() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
   let resp = reader.search(&req).unwrap();
   assert_eq!(resp.hits.len(), 1);
@@ -434,6 +443,9 @@ fn cursor_paginates_ordered_hits() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   let mut bodies = Vec::new();
@@ -501,6 +513,9 @@ fn cursor_rejects_invalid_hex() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   assert!(reader.search(&req).is_err());
@@ -548,6 +563,9 @@ fn cursor_rejects_when_limit_zero() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap_err();
 
@@ -604,6 +622,9 @@ fn cursor_rejects_excessive_advance() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   assert!(reader.search(&req).is_err());
@@ -652,6 +673,9 @@ fn cursor_rejects_mismatched_position() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   let first = reader.search(&req).unwrap();
@@ -727,6 +751,9 @@ fn cursor_orders_stably_across_segments() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   let mut doc_ids = Vec::new();
@@ -833,6 +860,9 @@ fn in_memory_storage_keeps_disk_clean() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   assert_eq!(resp.hits.len(), 1);
@@ -958,6 +988,9 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 
@@ -1115,6 +1148,9 @@ fn nested_numeric_filters_bind_to_object_values() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 

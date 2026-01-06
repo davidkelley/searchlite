@@ -121,6 +121,9 @@ fn terms_and_stats_aggregations() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 
@@ -198,6 +201,9 @@ fn aggregation_requires_fast_field() {
     highlight_field: None,
     aggs,
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
@@ -278,6 +284,9 @@ fn histogram_bucket_generation() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
@@ -361,6 +370,9 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
@@ -458,6 +470,9 @@ fn range_aggregation_counts() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let range = resp.aggregations.get("score_ranges").unwrap();
@@ -553,6 +568,9 @@ fn date_range_missing_and_keyed() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let range = resp.aggregations.get("ranges").unwrap();
@@ -642,6 +660,9 @@ fn extended_stats_and_value_count_include_missing() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let stats = resp.aggregations.get("stats").unwrap();
@@ -747,6 +768,9 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 
@@ -850,6 +874,9 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let hist = resp.aggregations.get("hist").unwrap();
@@ -956,6 +983,9 @@ fn terms_size_applied_after_merge() {
       highlight_field: None,
       aggs,
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 

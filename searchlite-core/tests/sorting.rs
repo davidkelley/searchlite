@@ -91,6 +91,9 @@ fn sorts_numeric_and_missing_last() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 
@@ -172,6 +175,9 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
 
@@ -264,6 +270,9 @@ fn paginates_with_sorted_cursor_across_segments() {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   };
 
   let mut ranks = Vec::new();

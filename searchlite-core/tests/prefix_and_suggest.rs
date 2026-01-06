@@ -69,6 +69,9 @@ fn prefix_query_matches_docs() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let ids: HashSet<_> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
@@ -143,6 +146,9 @@ fn search_as_you_type_matches_partial_tokens() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   assert_eq!(res.hits.len(), 1);
@@ -204,6 +210,9 @@ fn fuzzy_completion_suggests_close_terms() {
       highlight_field: None,
       aggs: BTreeMap::new(),
       suggest,
+      rescore: None,
+      explain: false,
+      profile: false,
     })
     .unwrap();
   let options = res

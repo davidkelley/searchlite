@@ -10,6 +10,8 @@ use crate::DocId;
 
 const DOCID_END: DocId = u32::MAX;
 
+pub(crate) type ScoreAdjustFn<'a> = dyn FnMut(DocId, f32, &[f32]) -> Option<f32> + 'a;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RankedDoc {
   pub doc_id: DocId,
@@ -219,7 +221,15 @@ impl TermState {
   }
 }
 
-fn score_tf(tf: f32, df: f32, avgdl: f32, docs: f32, k1: f32, b: f32, weight: f32) -> f32 {
+pub(crate) fn score_tf(
+  tf: f32,
+  df: f32,
+  avgdl: f32,
+  docs: f32,
+  k1: f32,
+  b: f32,
+  weight: f32,
+) -> f32 {
   let doc_len = if avgdl > 0.0 { avgdl } else { tf };
   let base = bm25(tf, df, doc_len, avgdl, docs, k1, b);
   base * weight
@@ -283,6 +293,7 @@ pub fn execute_top_k<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     collector,
     None,
     ScoreMode::Score,
+    None,
   )
 }
 
@@ -296,7 +307,7 @@ pub fn execute_top_k_with_mode<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?
   score_mode: ScoreMode,
 ) -> Vec<RankedDoc> {
   execute_top_k_with_stats_and_mode_internal(
-    terms, k, strategy, block_size, None, accept, collector, None, score_mode,
+    terms, k, strategy, block_size, None, accept, collector, None, score_mode, None,
   )
 }
 
@@ -319,6 +330,7 @@ pub fn execute_top_k_with_stats<F: FnMut(DocId, f32) -> bool, C: DocCollector + 
     collector,
     stats,
     ScoreMode::Score,
+    None,
   )
 }
 
@@ -336,6 +348,7 @@ pub(crate) fn execute_top_k_with_stats_and_mode_internal<
   collector: Option<&mut C>,
   stats: Option<&mut QueryStats>,
   score_mode: ScoreMode,
+  score_adjust: Option<&mut ScoreAdjustFn<'_>>,
 ) -> Vec<RankedDoc> {
   let should_rank = k > 0;
   if terms.is_empty() || (!should_rank && collector.is_none()) {
@@ -351,7 +364,16 @@ pub(crate) fn execute_top_k_with_stats_and_mode_internal<
     return match_only_loop(states, accept, collector, stats);
   }
   if matches!(strategy, ExecutionStrategy::Bm25) {
-    return brute_force(&terms, k, should_rank, score_plan, accept, collector, stats);
+    return brute_force(
+      &terms,
+      k,
+      should_rank,
+      score_plan,
+      accept,
+      collector,
+      stats,
+      score_adjust,
+    );
   }
   let bsize = block_size.unwrap_or(DEFAULT_BLOCK_SIZE).max(1);
   let states: Vec<TermState> = terms
@@ -369,9 +391,11 @@ pub(crate) fn execute_top_k_with_stats_and_mode_internal<
     accept,
     collector,
     stats,
+    score_adjust,
   )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   terms: &[ScoredTerm],
   k: usize,
@@ -380,6 +404,7 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   accept: &mut F,
   mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
+  mut score_adjust: Option<&mut ScoreAdjustFn<'_>>,
 ) -> Vec<RankedDoc> {
   if let Some(plan) = score_plan {
     let mut scores: hashbrown::HashMap<DocId, Vec<f32>> = hashbrown::HashMap::new();
@@ -416,7 +441,13 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     });
     let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
     for (doc_id, leaves) in scores.into_iter() {
-      let score = plan.evaluate(&leaves);
+      let mut score = plan.evaluate(&leaves);
+      if let Some(adj) = score_adjust.as_deref_mut() {
+        let Some(adjusted) = adj(doc_id, score, &leaves) else {
+          continue;
+        };
+        score = adjusted;
+      }
       if !accept(doc_id, score) {
         continue;
       }
@@ -452,7 +483,13 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     s.candidates_examined += scored;
   });
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-  for (doc_id, score) in scores.into_iter() {
+  for (doc_id, mut score) in scores.into_iter() {
+    if let Some(adj) = score_adjust.as_deref_mut() {
+      let Some(adjusted) = adj(doc_id, score, &[]) else {
+        continue;
+      };
+      score = adjusted;
+    }
     if !accept(doc_id, score) {
       continue;
     }
@@ -512,6 +549,7 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   accept: &mut F,
   mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
+  mut score_adjust: Option<&mut ScoreAdjustFn<'_>>,
 ) -> Vec<RankedDoc> {
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
   let mut order: Vec<usize> = (0..terms.len()).collect();
@@ -582,6 +620,12 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           score = plan.evaluate(buf);
         }
       }
+      let leaves_slice = leaf_scores.as_deref().unwrap_or(&[]);
+      let score_opt = if let Some(adj) = score_adjust.as_deref_mut() {
+        adj(doc_id, score, leaves_slice)
+      } else {
+        Some(score)
+      };
       if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
         for idx in touched.drain(..) {
           buf[idx] = 0.0;
@@ -590,6 +634,10 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       } else {
         touched.clear();
       }
+      let Some(score) = score_opt else {
+        requeue_terms(&mut order, &terms, &mut mutated);
+        continue;
+      };
       let accepted = accept(doc_id, score);
       if accepted {
         if let Some(collector) = collector.as_deref_mut() {
@@ -746,6 +794,7 @@ mod tests {
       true,
       None,
       &mut accept,
+      None,
       None,
       None,
     );

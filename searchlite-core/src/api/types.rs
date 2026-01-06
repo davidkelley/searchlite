@@ -106,6 +106,79 @@ pub enum MinimumShouldMatch {
   Percentage(String),
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionScoreMode {
+  Sum,
+  Multiply,
+  Max,
+  Min,
+  Avg,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionBoostMode {
+  Multiply,
+  Sum,
+  Replace,
+  Max,
+  Min,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldValueModifier {
+  None,
+  Log,
+  Log1p,
+  Log2p,
+  Sqrt,
+  Reciprocal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecayFunction {
+  Exp,
+  Gauss,
+  Linear,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FunctionSpec {
+  Weight {
+    weight: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<Filter>,
+  },
+  FieldValueFactor {
+    field: String,
+    #[serde(default = "default_factor")]
+    factor: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modifier: Option<FieldValueModifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<Filter>,
+  },
+  Decay {
+    field: String,
+    origin: f64,
+    scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offset: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decay: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function: Option<DecayFunction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<Filter>,
+  },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryNode {
@@ -201,6 +274,25 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+  ConstantScore {
+    filter: Filter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
+  FunctionScore {
+    query: Box<QueryNode>,
+    functions: Vec<FunctionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    score_mode: Option<FunctionScoreMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost_mode: Option<FunctionBoostMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_boost: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +362,12 @@ pub struct SearchRequest {
   pub aggs: BTreeMap<String, Aggregation>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub suggest: BTreeMap<String, SuggestRequest>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rescore: Option<RescoreRequest>,
+  #[serde(default)]
+  pub explain: bool,
+  #[serde(default)]
+  pub profile: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +399,12 @@ struct SearchRequestHelper {
   pub aggs: BTreeMap<String, Aggregation>,
   #[serde(default)]
   pub suggest: BTreeMap<String, SuggestRequest>,
+  #[serde(default)]
+  pub rescore: Option<RescoreRequest>,
+  #[serde(default)]
+  pub explain: bool,
+  #[serde(default)]
+  pub profile: bool,
 }
 
 impl<'de> Deserialize<'de> for SearchRequest {
@@ -331,8 +435,36 @@ impl<'de> Deserialize<'de> for SearchRequest {
       highlight_field: helper.highlight_field,
       aggs: helper.aggs,
       suggest: helper.suggest,
+      rescore: helper.rescore,
+      explain: helper.explain,
+      profile: helper.profile,
     })
   }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RescoreRequest {
+  pub window_size: usize,
+  pub query: QueryNode,
+  #[serde(default)]
+  pub score_mode: RescoreMode,
+}
+
+/// How to combine the original document score with a rescore query score.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RescoreMode {
+  #[default]
+  /// Sum the original score and the rescore score (`orig + rescore`).
+  Total,
+  /// Multiply the original score and the rescore score.
+  Multiply,
+  /// Backwards-compatible alias for [`RescoreMode::Total`].
+  Sum,
+  /// Use the maximum of the original and rescore scores.
+  Max,
+  /// Use the minimum of the original and rescore scores.
+  Min,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +506,10 @@ fn default_fuzzy_min_length() -> usize {
   3
 }
 
+fn default_factor() -> f32 {
+  1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SuggestRequest {
@@ -403,7 +539,7 @@ fn default_suggest_size() -> usize {
   5
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Filter {
   KeywordEq { field: String, value: String },
   KeywordIn { field: String, values: Vec<String> },

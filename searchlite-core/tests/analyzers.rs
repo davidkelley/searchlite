@@ -41,6 +41,9 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     highlight_field: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
+    rescore: None,
+    explain: false,
+    profile: false,
   }
 }
 

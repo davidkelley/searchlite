@@ -1,7 +1,9 @@
 use hashbrown::{HashMap, HashSet};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -10,15 +12,16 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
-  Aggregation, AggregationResponse, DateHistogramAggregation, Filter, FuzzyOptions,
-  HistogramAggregation, IndexOptions, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
+  Aggregation, AggregationResponse, DateHistogramAggregation, DecayFunction, Filter,
+  FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions, Query,
+  RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
   SuggestResult,
 };
 use crate::api::AggregationError;
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
 use crate::index::manifest::{FieldKind, Manifest, Schema, SchemaAnalyzers};
-use crate::index::postings::PostingEntry;
+use crate::index::postings::{PostingEntry, PostingsReader};
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
 use crate::query::aggregation::AggregationPipeline;
@@ -27,10 +30,17 @@ use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::{passes_filter, passes_filters};
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{
-  build_query_plan, PhraseSpec, QueryMatcher, ScorePlan, TermExpansion, TermGroupSpec,
+  build_query_plan, PhraseSpec, QueryMatcher, ScoreExpr, ScoreNode, ScorePlan, TermExpansion,
+  TermGroupSpec,
+};
+use crate::query::score_functions::{
+  apply_boost_mode, combine_function_scores, compile_functions, CompiledFunction,
 };
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
-use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
+use crate::query::wand::{
+  execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
+  ScoredTerm,
+};
 use crate::util::regex::anchored_regex;
 use crate::DocId;
 
@@ -42,6 +52,34 @@ pub struct Hit {
   pub score: f32,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub explanation: Option<HitExplanation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionExplanation {
+  pub r#type: String,
+  pub value: f32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RescoreExplanation {
+  pub rescore_score: f32,
+  pub combined_score: f32,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub functions: Vec<FunctionExplanation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitExplanation {
+  pub base_score: f32,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub functions: Vec<FunctionExplanation>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rescore: Option<RescoreExplanation>,
+  pub final_score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +92,24 @@ pub struct SearchResult {
   pub aggregations: BTreeMap<String, AggregationResponse>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub suggest: BTreeMap<String, SuggestResult>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub profile: Option<ProfileResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ExecutionProfile {
+  pub scored_docs: usize,
+  pub candidates_examined: usize,
+  pub postings_advanced: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileResult {
+  pub execution: ExecutionProfile,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rescore: Option<ExecutionProfile>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub timings: BTreeMap<String, f64>,
 }
 
 fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder) -> SortKey {
@@ -67,6 +123,253 @@ fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder)
   }
 }
 
+#[derive(Clone, Debug)]
+enum CompiledScoreNode {
+  Empty,
+  Expr(ScoreExpr),
+  Sum(Vec<CompiledScoreNode>),
+  DisMax {
+    children: Vec<CompiledScoreNode>,
+    tie_breaker: f32,
+  },
+  Constant {
+    score: f32,
+    matcher: QueryMatcher,
+  },
+  FunctionScore {
+    matcher: QueryMatcher,
+    base: Box<CompiledScoreNode>,
+    functions: Vec<CompiledFunction>,
+    score_mode: FunctionScoreMode,
+    boost_mode: FunctionBoostMode,
+    max_boost: Option<f32>,
+    min_score: Option<f32>,
+    boost: f32,
+  },
+}
+
+fn compile_score_node(node: &ScoreNode, schema: &Schema) -> Result<CompiledScoreNode> {
+  Ok(match node {
+    ScoreNode::Empty => CompiledScoreNode::Empty,
+    ScoreNode::Expr(expr) => CompiledScoreNode::Expr(expr.clone()),
+    ScoreNode::Sum(children) => {
+      let mut out = Vec::with_capacity(children.len());
+      for child in children.iter() {
+        out.push(compile_score_node(child, schema)?);
+      }
+      CompiledScoreNode::Sum(out)
+    }
+    ScoreNode::DisMax {
+      children,
+      tie_breaker,
+    } => {
+      let mut out = Vec::with_capacity(children.len());
+      for child in children.iter() {
+        out.push(compile_score_node(child, schema)?);
+      }
+      CompiledScoreNode::DisMax {
+        children: out,
+        tie_breaker: *tie_breaker,
+      }
+    }
+    ScoreNode::Constant { score, matcher } => CompiledScoreNode::Constant {
+      score: *score,
+      matcher: matcher.clone(),
+    },
+    ScoreNode::FunctionScore {
+      matcher,
+      base,
+      functions,
+      score_mode,
+      boost_mode,
+      max_boost,
+      min_score,
+      boost,
+    } => CompiledScoreNode::FunctionScore {
+      matcher: matcher.clone(),
+      base: Box::new(compile_score_node(base, schema)?),
+      functions: compile_functions(functions, schema)?,
+      score_mode: *score_mode,
+      boost_mode: *boost_mode,
+      max_boost: *max_boost,
+      min_score: *min_score,
+      boost: *boost,
+    },
+  })
+}
+
+fn has_custom_scoring(node: &CompiledScoreNode) -> bool {
+  match node {
+    CompiledScoreNode::Empty | CompiledScoreNode::Expr(_) => false,
+    CompiledScoreNode::Sum(children) | CompiledScoreNode::DisMax { children, .. } => {
+      children.iter().any(has_custom_scoring)
+    }
+    CompiledScoreNode::Constant { .. } | CompiledScoreNode::FunctionScore { .. } => true,
+  }
+}
+
+fn describe_function(func: &CompiledFunction, value: f32) -> FunctionExplanation {
+  match func {
+    CompiledFunction::Weight { .. } => FunctionExplanation {
+      r#type: "weight".to_string(),
+      value,
+      field: None,
+    },
+    CompiledFunction::FieldValueFactor { field, .. } => FunctionExplanation {
+      r#type: "field_value_factor".to_string(),
+      value,
+      field: Some(field.clone()),
+    },
+    CompiledFunction::Decay {
+      field, function, ..
+    } => {
+      let name = match function {
+        DecayFunction::Exp => "decay_exp",
+        DecayFunction::Gauss => "decay_gauss",
+        DecayFunction::Linear => "decay_linear",
+      };
+      FunctionExplanation {
+        r#type: name.to_string(),
+        value,
+        field: Some(field.clone()),
+      }
+    }
+  }
+}
+
+fn evaluate_compiled_score(
+  node: &CompiledScoreNode,
+  evaluator: &QueryEvaluator<'_>,
+  fast_fields: &FastFieldsReader,
+  doc_id: DocId,
+  leaf_scores: &[f32],
+  collect_functions: bool,
+  out_functions: &mut Vec<FunctionExplanation>,
+) -> Option<f32> {
+  match node {
+    CompiledScoreNode::Empty => Some(1.0),
+    CompiledScoreNode::Expr(expr) => Some(expr.evaluate(leaf_scores)),
+    CompiledScoreNode::Sum(children) => {
+      let mut sum = 0.0_f32;
+      let mut has_score = false;
+      for child in children.iter() {
+        if let Some(score) = evaluate_compiled_score(
+          child,
+          evaluator,
+          fast_fields,
+          doc_id,
+          leaf_scores,
+          collect_functions,
+          out_functions,
+        ) {
+          has_score = true;
+          sum += score;
+        }
+      }
+      if has_score || children.is_empty() {
+        Some(sum)
+      } else {
+        None
+      }
+    }
+    CompiledScoreNode::DisMax {
+      children,
+      tie_breaker,
+    } => {
+      if children.is_empty() {
+        return Some(0.0);
+      }
+      let mut sum = 0.0_f32;
+      let mut max = f32::NEG_INFINITY;
+      let mut has_score = false;
+      for child in children.iter() {
+        if let Some(score) = evaluate_compiled_score(
+          child,
+          evaluator,
+          fast_fields,
+          doc_id,
+          leaf_scores,
+          collect_functions,
+          out_functions,
+        ) {
+          has_score = true;
+          max = max.max(score);
+          sum += score;
+        }
+      }
+      if has_score {
+        Some(max + *tie_breaker * (sum - max))
+      } else {
+        None
+      }
+    }
+    CompiledScoreNode::Constant { score, matcher } => {
+      if evaluator.matches_subquery(matcher, doc_id) {
+        Some(*score)
+      } else {
+        Some(0.0)
+      }
+    }
+    CompiledScoreNode::FunctionScore {
+      matcher,
+      base,
+      functions,
+      score_mode,
+      boost_mode,
+      max_boost,
+      min_score,
+      boost,
+    } => {
+      if !evaluator.matches_subquery(matcher, doc_id) {
+        return Some(0.0);
+      }
+      let base_score = evaluate_compiled_score(
+        base,
+        evaluator,
+        fast_fields,
+        doc_id,
+        leaf_scores,
+        collect_functions,
+        out_functions,
+      )?;
+      let mut function_values = Vec::new();
+      let mut fn_expls = Vec::new();
+      for func in functions.iter() {
+        if let Some(val) = func.evaluate(fast_fields, doc_id) {
+          function_values.push(val);
+          if collect_functions {
+            fn_expls.push(describe_function(func, val));
+          }
+        }
+      }
+      let mut effective_base = base_score;
+      if effective_base.abs() <= f32::EPSILON && !function_values.is_empty() {
+        // Preserve function contributions even when the base query scored 0.0,
+        // so multiplicative boost modes do not erase function-only scoring.
+        effective_base = 1.0;
+      }
+      let mut combined =
+        if let Some(func_score) = combine_function_scores(&function_values, *score_mode) {
+          apply_boost_mode(effective_base, func_score, *boost_mode)
+        } else {
+          effective_base
+        };
+      if let Some(max) = max_boost {
+        combined = combined.min(*max);
+      }
+      if let Some(min) = min_score {
+        if combined < *min {
+          return None;
+        }
+      }
+      combined *= *boost;
+      if collect_functions {
+        out_functions.extend(fn_expls);
+      }
+      Some(combined)
+    }
+  }
+}
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 21;
 const CURSOR_HEX_LEN: usize = CURSOR_BYTES * 2;
@@ -220,6 +523,7 @@ fn hex_decode(raw: &str) -> Result<Vec<u8>> {
 struct RankedHit {
   key: SortKey,
   score: f32,
+  explanation: Option<HitExplanation>,
 }
 
 impl PartialEq for RankedHit {
@@ -391,6 +695,10 @@ struct SegmentSearchParams<'a> {
   term_groups: &'a [TermMatchGroup],
   phrase_fields: &'a [PhraseFieldConfig],
   scorer: Option<&'a ScorePlan>,
+  score_tree: &'a CompiledScoreNode,
+  needs_score_hook: bool,
+  explain: bool,
+  profile: bool,
   root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
@@ -401,6 +709,7 @@ struct SegmentSearchParams<'a> {
   saw_cursor: &'a mut bool,
   sort_plan: &'a SortPlan,
   collect_hits: Option<&'a mut dyn FnMut(SortKey, f32)>,
+  stats: Option<&'a mut QueryStats>,
 }
 
 fn build_term_key(field: &str, term: &str) -> String {
@@ -1012,6 +1321,10 @@ impl<'a> QueryEvaluator<'a> {
     }
   }
 
+  fn matches_subquery(&self, matcher: &QueryMatcher, doc_id: DocId) -> bool {
+    self.matches_node(matcher, doc_id)
+  }
+
   fn term_group_matches(&self, group_idx: usize, doc_id: DocId) -> bool {
     let Some(group) = self.term_group_lists.get(group_idx) else {
       return false;
@@ -1085,6 +1398,42 @@ fn expand_phrase_fields(
       PhraseFieldConfig {
         slop: phrase.slop,
         fields,
+      }
+    })
+    .collect()
+}
+
+fn build_phrase_runtimes(
+  seg: &SegmentReader,
+  phrase_fields: &[PhraseFieldConfig],
+) -> Vec<PhraseRuntime> {
+  phrase_fields
+    .iter()
+    .map(|config| {
+      let variants = config
+        .fields
+        .iter()
+        .filter_map(|(field, positions)| {
+          let mut per_position: Vec<Vec<PostingEntry>> = Vec::new();
+          for alternatives in positions.iter() {
+            let mut lists = Vec::new();
+            for term in alternatives.iter() {
+              let key = build_term_key(field, term);
+              if let Some(posts) = seg.postings(&key) {
+                lists.push(posts.iter().cloned().collect());
+              }
+            }
+            if lists.is_empty() {
+              return None;
+            }
+            per_position.push(merge_postings_lists(lists));
+          }
+          Some(per_position)
+        })
+        .collect::<Vec<Vec<Vec<PostingEntry>>>>();
+      PhraseRuntime {
+        slop: config.slop,
+        variants,
       }
     })
     .collect()
@@ -1409,6 +1758,8 @@ impl IndexReader {
         .collect()
     };
     let query_plan = build_query_plan(&req.query, &default_fields)?;
+    let compiled_score = compile_score_node(&query_plan.score_tree, &self.manifest.schema)?;
+    let needs_score_hook = has_custom_scoring(&compiled_score);
     let (qualified_terms, term_groups) = expand_term_groups(
       &self.segments,
       &query_plan.term_groups,
@@ -1445,6 +1796,9 @@ impl IndexReader {
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
+    let search_start = Instant::now();
+    let mut timings: BTreeMap<String, f64> = BTreeMap::new();
+    let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
     let agg_pipeline =
       AggregationPipeline::from_request(&req.aggs, &highlight_terms, &self.manifest.schema);
@@ -1455,11 +1809,19 @@ impl IndexReader {
         .transpose()?;
       let mut noop_collector = NoopCollector;
       let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
-      if !score_fast_path && req.limit > 0 {
+      if !score_fast_path && req.limit > 0 && !req.explain {
         let heap_limit = top_k;
         let heap_ref = &mut heap;
         collect_hits = Some(Box::new(move |key: SortKey, score: f32| {
-          push_ranked(heap_ref, RankedHit { key, score }, heap_limit);
+          push_ranked(
+            heap_ref,
+            RankedHit {
+              key,
+              score,
+              explanation: None,
+            },
+            heap_limit,
+          );
         }));
       }
       let mut seg_hits = {
@@ -1474,24 +1836,40 @@ impl IndexReader {
         } else {
           None
         };
+        let segment_rank_limit = if score_fast_path {
+          top_k
+        } else if req.explain {
+          seg.live_docs() as usize
+        } else {
+          0
+        };
         let params = SegmentSearchParams {
           qualified_terms: &qualified_terms,
           matcher: &query_plan.matcher,
           term_groups: &term_groups,
           phrase_fields: &phrase_fields,
           scorer: query_plan.scorer.as_ref(),
+          score_tree: &compiled_score,
+          needs_score_hook,
+          explain: req.explain,
+          profile: req.profile,
           root_filter,
           agg_collector: agg_ref,
           match_counter: counter,
           req,
           segment_ord: segment_ord as u32,
-          rank_limit: if score_fast_path { top_k } else { 0 },
+          rank_limit: segment_rank_limit,
           cursor_key: cursor_key.clone(),
           saw_cursor: &mut saw_cursor,
           sort_plan: &sort_plan,
           collect_hits: collect_hits
             .as_mut()
             .map(|f| f as &mut dyn FnMut(SortKey, f32)),
+          stats: if req.profile {
+            Some(&mut search_stats)
+          } else {
+            None
+          },
         };
         self.search_segment(seg, params)?
       };
@@ -1509,6 +1887,50 @@ impl IndexReader {
       hits.extend(heap);
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
+    let search_phase_end = if req.profile {
+      Some(Instant::now())
+    } else {
+      None
+    };
+    let mut rescore_stats = QueryStats::default();
+    if let Some(rescore_req) = req.rescore.as_ref() {
+      let rescore_start = Instant::now();
+      self.rescore_hits(
+        &mut hits,
+        rescore_req,
+        &default_fields,
+        &sort_plan,
+        req,
+        &mut rescore_stats,
+      )?;
+      if req.profile {
+        timings.insert(
+          "rescore_ms".to_string(),
+          rescore_start.elapsed().as_secs_f64() * 1000.0,
+        );
+      }
+    }
+    if req.explain {
+      for hit in hits.iter_mut() {
+        if let Some(expl) = hit.explanation.as_mut() {
+          expl.final_score = hit.score;
+        } else {
+          hit.explanation = Some(HitExplanation {
+            base_score: hit.score,
+            functions: Vec::new(),
+            rescore: None,
+            final_score: hit.score,
+          });
+        }
+      }
+    }
+    if req.profile {
+      let end = search_phase_end.unwrap_or_else(Instant::now);
+      timings.insert(
+        "search_ms".to_string(),
+        end.duration_since(search_start).as_secs_f64() * 1000.0,
+      );
+    }
     let mut next_cursor = None;
     if req.limit > 0 && hits.len() > req.limit {
       let last = &hits[req.limit - 1];
@@ -1549,6 +1971,19 @@ impl IndexReader {
       next_cursor,
       aggregations,
       suggest,
+      profile: if req.profile {
+        Some(ProfileResult {
+          execution: to_execution_profile(&search_stats),
+          rescore: if req.rescore.is_some() {
+            Some(to_execution_profile(&rescore_stats))
+          } else {
+            None
+          },
+          timings,
+        })
+      } else {
+        None
+      },
     })
   }
 
@@ -1563,6 +1998,10 @@ impl IndexReader {
       term_groups,
       phrase_fields,
       scorer,
+      score_tree,
+      needs_score_hook,
+      explain,
+      profile: _profile,
       root_filter,
       agg_collector,
       match_counter,
@@ -1573,43 +2012,16 @@ impl IndexReader {
       saw_cursor,
       sort_plan,
       collect_hits,
+      stats,
     } = params;
-    let score_mode = if sort_plan.uses_score() {
+    let use_score_hook = needs_score_hook || explain;
+    let score_mode = if sort_plan.uses_score() || use_score_hook {
       ScoreMode::Score
     } else {
       ScoreMode::MatchOnly
     };
     let term_doc_lists = build_term_doc_lists(seg, term_groups);
-    let phrase_postings: Vec<PhraseRuntime> = phrase_fields
-      .iter()
-      .map(|config| {
-        let variants = config
-          .fields
-          .iter()
-          .filter_map(|(field, positions)| {
-            let mut per_position: Vec<Vec<PostingEntry>> = Vec::new();
-            for alternatives in positions.iter() {
-              let mut lists = Vec::new();
-              for term in alternatives.iter() {
-                let key = build_term_key(field, term);
-                if let Some(posts) = seg.postings(&key) {
-                  lists.push(posts.iter().cloned().collect());
-                }
-              }
-              if lists.is_empty() {
-                return None;
-              }
-              per_position.push(merge_postings_lists(lists));
-            }
-            Some(per_position)
-          })
-          .collect::<Vec<Vec<Vec<PostingEntry>>>>();
-        PhraseRuntime {
-          slop: config.slop,
-          variants,
-        }
-      })
-      .collect();
+    let phrase_postings: Vec<PhraseRuntime> = build_phrase_runtimes(seg, phrase_fields);
     let query_eval = QueryEvaluator {
       matcher,
       term_docs: &term_doc_lists.lists,
@@ -1630,8 +2042,14 @@ impl IndexReader {
         saw_cursor,
         sort_plan,
         collect_hits,
+        score_tree,
+        needs_score_hook,
+        explain,
+        scorer,
+        stats,
       );
     }
+    let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
     let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
     for term in qualified_terms.iter() {
       let entry =
@@ -1696,24 +2114,92 @@ impl IndexReader {
       true
     };
 
-    let ranked = execute_top_k_with_stats_and_mode_internal(
-      terms,
-      rank_limit,
-      req.execution.clone(),
-      req.bmw_block_size,
-      scorer,
-      &mut accept,
-      agg_collector,
-      None,
-      score_mode,
-    );
+    let ranked = if use_score_hook {
+      let score_plan = scorer;
+      let score_tree_ref = score_tree;
+      let eval_ref = &query_eval;
+      let explain_enabled = explain;
+      let fast_fields = seg.fast_fields();
+      let explanations_ref = &explanations;
+      let mut adjust: Box<ScoreAdjustFn<'_>> =
+        Box::new(move |doc_id: DocId, raw_score: f32, leaves: &[f32]| {
+          let mut fn_details = Vec::new();
+          let final_score = evaluate_compiled_score(
+            score_tree_ref,
+            eval_ref,
+            fast_fields,
+            doc_id,
+            leaves,
+            explain_enabled,
+            &mut fn_details,
+          )?;
+          if explain_enabled {
+            let base_score = if let Some(plan) = score_plan {
+              plan.evaluate(leaves)
+            } else {
+              raw_score
+            };
+            explanations_ref.borrow_mut().insert(
+              doc_id,
+              HitExplanation {
+                base_score,
+                functions: fn_details,
+                rescore: None,
+                final_score,
+              },
+            );
+          }
+          Some(final_score)
+        });
+      execute_top_k_with_stats_and_mode_internal(
+        terms,
+        rank_limit,
+        req.execution.clone(),
+        req.bmw_block_size,
+        scorer,
+        &mut accept,
+        agg_collector,
+        stats,
+        score_mode,
+        Some(&mut adjust),
+      )
+    } else {
+      execute_top_k_with_stats_and_mode_internal(
+        terms,
+        rank_limit,
+        req.execution.clone(),
+        req.bmw_block_size,
+        scorer,
+        &mut accept,
+        agg_collector,
+        stats,
+        score_mode,
+        None,
+      )
+    };
+    let mut explanations_map = explanations.into_inner();
 
     Ok(
       ranked
         .into_iter()
-        .map(|rd| RankedHit {
-          key: sort_plan.build_key(seg, rd.doc_id, rd.score, segment_ord),
-          score: rd.score,
+        .map(|rd| {
+          let explanation = explanations_map.remove(&rd.doc_id).or_else(|| {
+            if explain {
+              Some(HitExplanation {
+                base_score: rd.score,
+                functions: Vec::new(),
+                rescore: None,
+                final_score: rd.score,
+              })
+            } else {
+              None
+            }
+          });
+          RankedHit {
+            key: sort_plan.build_key(seg, rd.doc_id, rd.score, segment_ord),
+            score: rd.score,
+            explanation,
+          }
         })
         .collect(),
     )
@@ -1733,9 +2219,15 @@ impl IndexReader {
     saw_cursor: &mut bool,
     sort_plan: &SortPlan,
     mut collect_hits: Option<&mut dyn FnMut(SortKey, f32)>,
+    score_tree: &CompiledScoreNode,
+    needs_score_hook: bool,
+    explain: bool,
+    scorer: Option<&ScorePlan>,
+    mut stats: Option<&mut QueryStats>,
   ) -> Result<Vec<RankedHit>> {
     let mut local_heap = std::collections::BinaryHeap::<RankedHit>::new();
-    let score = if sort_plan.uses_score() { 1.0 } else { 0.0 };
+    let default_score = if sort_plan.uses_score() { 1.0 } else { 0.0 };
+    let mut explanations: HashMap<DocId, HitExplanation> = HashMap::new();
     let mut match_counter = match_counter;
     for raw in 0..seg.meta.doc_count {
       let doc_id = raw as DocId;
@@ -1748,7 +2240,29 @@ impl IndexReader {
       if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
         continue;
       }
-      let key = sort_plan.build_key(seg, doc_id, score, segment_ord);
+      let mut fn_details = Vec::new();
+      let computed_score = if needs_score_hook || explain {
+        let result = evaluate_compiled_score(
+          score_tree,
+          query_eval,
+          seg.fast_fields(),
+          doc_id,
+          &[],
+          explain,
+          &mut fn_details,
+        );
+        match result {
+          Some(score) => score,
+          None => continue,
+        }
+      } else {
+        default_score
+      };
+      if let Some(stats) = stats.as_deref_mut() {
+        stats.candidates_examined += 1;
+        stats.scored_docs += 1;
+      }
+      let key = sort_plan.build_key(seg, doc_id, computed_score, segment_ord);
       if let Some(cur) = &cursor_key {
         let ord = key.cmp(cur);
         if ord.is_lt() || ord.is_eq() {
@@ -1761,16 +2275,192 @@ impl IndexReader {
       if let Some(counter) = match_counter.as_mut() {
         **counter += 1;
       }
+      if explain {
+        let base_score = if let Some(plan) = scorer {
+          plan.evaluate(&[])
+        } else {
+          default_score
+        };
+        explanations.insert(
+          doc_id,
+          HitExplanation {
+            base_score,
+            functions: fn_details,
+            rescore: None,
+            final_score: computed_score,
+          },
+        );
+      }
       if let Some(collector) = agg_collector.as_deref_mut() {
-        collector.collect(doc_id, score);
+        collector.collect(doc_id, computed_score);
       }
       if let Some(collector) = collect_hits.as_mut() {
-        (*collector)(key, score);
+        (*collector)(key, computed_score);
       } else if rank_limit > 0 {
-        push_ranked(&mut local_heap, RankedHit { key, score }, rank_limit);
+        let explanation = explanations.remove(&doc_id);
+        push_ranked(
+          &mut local_heap,
+          RankedHit {
+            key,
+            score: computed_score,
+            explanation,
+          },
+          rank_limit,
+        );
       }
     }
     Ok(local_heap.into_iter().collect())
+  }
+
+  fn rescore_hits(
+    &self,
+    hits: &mut Vec<RankedHit>,
+    rescore: &RescoreRequest,
+    default_fields: &[String],
+    sort_plan: &SortPlan,
+    req: &SearchRequest,
+    stats: &mut QueryStats,
+  ) -> Result<()> {
+    if hits.is_empty() {
+      return Ok(());
+    }
+    let window = rescore.window_size.min(hits.len());
+    if window == 0 {
+      return Ok(());
+    }
+    let rescore_plan = build_query_plan(&Query::Node(rescore.query.clone()), default_fields)?;
+    let compiled_score = compile_score_node(&rescore_plan.score_tree, &self.manifest.schema)?;
+    let (qualified_terms, term_groups) = expand_term_groups(
+      &self.segments,
+      &rescore_plan.term_groups,
+      req.fuzzy.as_ref(),
+      &self.analysis,
+      &self.manifest.schema,
+    )?;
+    let phrase_fields = expand_phrase_fields(
+      &rescore_plan.phrase_specs,
+      &self.analysis,
+      &self.manifest.schema,
+    );
+    let mut per_segment: HashMap<u32, Vec<(DocId, usize)>> = HashMap::new();
+    for (idx, hit) in hits.iter().take(window).enumerate() {
+      per_segment
+        .entry(hit.key.segment_ord)
+        .or_default()
+        .push((hit.key.doc_id, idx));
+    }
+    let mut to_remove: Vec<usize> = Vec::new();
+    for (segment_ord, docs) in per_segment.into_iter() {
+      let Some(seg) = self.segments.get(segment_ord as usize) else {
+        continue;
+      };
+      let term_doc_lists = build_term_doc_lists(seg, &term_groups);
+      let phrase_postings = build_phrase_runtimes(seg, &phrase_fields);
+      let query_eval = QueryEvaluator {
+        matcher: &rescore_plan.matcher,
+        term_docs: &term_doc_lists.lists,
+        term_group_lists: &term_doc_lists.group_lists,
+        phrase_postings: &phrase_postings,
+        fast_fields: seg.fast_fields(),
+      };
+      let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
+      for term in qualified_terms.iter() {
+        let entry =
+          term_weights
+            .entry(term.key.clone())
+            .or_insert((term.field.clone(), 0.0, term.leaf));
+        entry.1 += term.weight;
+      }
+      let docs_count = seg.live_docs() as f32;
+      let mut terms: Vec<ScoredTerm> = Vec::new();
+      for (key, (field, weight, leaf)) in term_weights.into_iter() {
+        if let Some(postings) = seg.postings(&key) {
+          terms.push(ScoredTerm {
+            postings,
+            weight,
+            avgdl: seg.avg_field_length(&field),
+            docs: docs_count,
+            k1: self.options.bm25_k1,
+            b: self.options.bm25_b,
+            leaf,
+          });
+        }
+      }
+      for (doc_id, hit_idx) in docs.into_iter() {
+        if seg.is_deleted(doc_id) {
+          continue;
+        }
+        if !query_eval.matches(doc_id) {
+          continue;
+        }
+        stats.candidates_examined += 1;
+        let mut leaf_scores = rescore_plan
+          .scorer
+          .as_ref()
+          .map(|plan| vec![0.0_f32; plan.leaf_count])
+          .unwrap_or_default();
+        for term in terms.iter() {
+          if let Some(tf) = term_freq_for_doc(&term.postings, doc_id) {
+            let df = term.postings.len() as f32;
+            let contribution =
+              score_tf(tf, df, term.avgdl, term.docs, term.k1, term.b, term.weight);
+            if let Some(buf) = leaf_scores.get_mut(term.leaf) {
+              *buf += contribution;
+            }
+          }
+        }
+        let mut fn_details = Vec::new();
+        let rescore_score = match evaluate_compiled_score(
+          &compiled_score,
+          &query_eval,
+          seg.fast_fields(),
+          doc_id,
+          &leaf_scores,
+          req.explain,
+          &mut fn_details,
+        ) {
+          Some(score) => score,
+          None => {
+            to_remove.push(hit_idx);
+            continue;
+          }
+        };
+        stats.scored_docs += 1;
+        stats.postings_advanced += terms.len();
+        let hit = hits.get_mut(hit_idx).unwrap();
+        let orig_score = hit.score;
+        let combined = combine_rescore_scores(rescore.score_mode, orig_score, rescore_score);
+        hit.score = combined;
+        hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
+        if req.explain {
+          let mut expl = hit.explanation.take().unwrap_or(HitExplanation {
+            base_score: orig_score,
+            functions: Vec::new(),
+            rescore: None,
+            final_score: orig_score,
+          });
+          expl.rescore = Some(RescoreExplanation {
+            rescore_score,
+            combined_score: combined,
+            functions: fn_details,
+          });
+          expl.final_score = combined;
+          hit.explanation = Some(expl);
+        }
+      }
+    }
+    if !to_remove.is_empty() {
+      to_remove.sort_unstable();
+      to_remove.dedup();
+      for idx in to_remove.into_iter().rev() {
+        hits.remove(idx);
+      }
+    }
+    let sort_window = rescore.window_size.min(hits.len());
+    if sort_window > 0 {
+      hits[..sort_window].sort_by(|a, b| a.key.cmp(&b.key));
+    }
+    Ok(())
   }
 
   fn materialize_hit(
@@ -1808,7 +2498,32 @@ impl IndexReader {
       score: ranked.score,
       fields: fields_val,
       snippet,
+      explanation: ranked.explanation,
     })
+  }
+}
+
+fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
+  let entries = postings.entries();
+  let idx = entries.binary_search_by_key(&doc_id, |e| e.doc_id).ok()?;
+  Some(entries.get(idx)?.term_freq as f32)
+}
+
+fn combine_rescore_scores(mode: RescoreMode, original: f32, rescore: f32) -> f32 {
+  match mode {
+    // Total is intentionally an alias for Sum to match Elasticsearch naming.
+    RescoreMode::Total | RescoreMode::Sum => original + rescore,
+    RescoreMode::Multiply => original * rescore,
+    RescoreMode::Max => original.max(rescore),
+    RescoreMode::Min => original.min(rescore),
+  }
+}
+
+fn to_execution_profile(stats: &QueryStats) -> ExecutionProfile {
+  ExecutionProfile {
+    scored_docs: stats.scored_docs,
+    candidates_examined: stats.candidates_examined,
+    postings_advanced: stats.postings_advanced,
   }
 }
 
@@ -2277,6 +2992,7 @@ mod tests {
       None::<&mut crate::query::collector::MatchCountingCollector>,
       None,
       ScoreMode::Score,
+      None,
     );
     let ranked_ids: Vec<_> = ranked
       .iter()
@@ -2325,6 +3041,9 @@ mod tests {
         highlight_field: None,
         aggs: BTreeMap::new(),
         suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
       })
       .unwrap();
     let ids: Vec<_> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
