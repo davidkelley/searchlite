@@ -450,14 +450,20 @@ pub struct RescoreRequest {
   pub score_mode: RescoreMode,
 }
 
+/// How to combine the original document score with a rescore query score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RescoreMode {
   #[default]
+  /// Sum the original score and the rescore score (`orig + rescore`).
   Total,
+  /// Multiply the original score and the rescore score.
   Multiply,
+  /// Backwards-compatible alias for [`RescoreMode::Total`].
   Sum,
+  /// Use the maximum of the original and rescore scores.
   Max,
+  /// Use the minimum of the original and rescore scores.
   Min,
 }
 

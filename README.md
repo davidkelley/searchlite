@@ -352,6 +352,7 @@ Phrase slop example (allows one gap between terms):
 
 - `constant_score` wraps a filter-only query and returns a fixed score (default 1.0) when the filter matches.
 - `function_score` lets you blend deterministic functions with the base BM25 score. Functions can be filtered, combined with `score_mode`, and merged with the base score via `boost_mode`.
+- `decay` functions (exp/gauss/linear) are available inside `function_score` for distance-based scoring on numeric fast fields; configure `origin`, `scale`, optional `offset`, and `decay` (default 0.5).
 
 ```json
 {
@@ -360,6 +361,15 @@ Phrase slop example (allows one gap between terms):
     "query": { "type": "match_all" },
     "functions": [
       { "type": "weight", "weight": 2.0, "filter": { "KeywordEq": { "field": "lang", "value": "en" } } },
+      {
+        "type": "decay",
+        "field": "age_days",
+        "origin": 0,
+        "scale": 30,
+        "offset": 0,
+        "decay": 0.5,
+        "function": "linear"
+      },
       {
         "type": "field_value_factor",
         "field": "popularity",

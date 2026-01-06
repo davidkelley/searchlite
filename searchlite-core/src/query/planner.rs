@@ -726,7 +726,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost_mode: (*boost_mode).unwrap_or(FunctionBoostMode::Multiply),
           max_boost: *max_boost,
           min_score: *min_score,
-          boost: node_boost,
+          boost: boost * node_boost,
         };
         Ok((matcher, scorer, score_node))
       }

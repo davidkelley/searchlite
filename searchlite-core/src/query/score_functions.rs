@@ -74,8 +74,8 @@ pub(crate) fn compile_functions(
           bail!("decay scale must be > 0");
         }
         let decay = decay.unwrap_or(0.5);
-        if decay <= 0.0 {
-          bail!("decay factor must be > 0");
+        if decay <= 0.0 || decay > 1.0 {
+          bail!("decay factor must be in the range (0, 1]");
         }
         compiled.push(CompiledFunction::Decay {
           field: field.clone(),
@@ -96,14 +96,17 @@ pub(crate) fn combine_function_scores(values: &[f32], mode: FunctionScoreMode) -
   if values.is_empty() {
     return None;
   }
-  let iter = values.iter().copied();
   match mode {
     FunctionScoreMode::Sum => Some(values.iter().copied().sum()),
     FunctionScoreMode::Multiply => Some(values.iter().copied().product()),
-    FunctionScoreMode::Max => iter
+    FunctionScoreMode::Max => values
+      .iter()
+      .copied()
       .reduce(|a, b| a.max(b))
       .or_else(|| values.first().copied()),
-    FunctionScoreMode::Min => iter
+    FunctionScoreMode::Min => values
+      .iter()
+      .copied()
       .reduce(|a, b| a.min(b))
       .or_else(|| values.first().copied()),
     FunctionScoreMode::Avg => Some(values.iter().copied().sum::<f32>() / values.len() as f32),

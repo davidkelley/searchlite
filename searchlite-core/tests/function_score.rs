@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, FieldValueModifier, Filter, FunctionBoostMode, FunctionScoreMode,
-  FunctionSpec, IndexOptions, KeywordField, NumericField, Query, QueryNode, RescoreMode,
-  RescoreRequest, Schema, SearchRequest, StorageType,
+  DecayFunction, Document, ExecutionStrategy, FieldValueModifier, Filter, FunctionBoostMode,
+  FunctionScoreMode, FunctionSpec, IndexOptions, KeywordField, NumericField, Query, QueryNode,
+  RescoreMode, RescoreRequest, Schema, SearchRequest, StorageType,
 };
 use searchlite_core::api::{Index, SearchResult};
 
@@ -217,4 +217,56 @@ fn explain_returns_function_details() {
     }
   }
   assert_eq!(matched, 2);
+}
+
+#[test]
+fn field_value_modifier_variants_apply() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::Reciprocal),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // Reciprocal yields higher scores for smaller values.
+  assert_eq!(ids(&resp), vec!["doc-2", "doc-3", "doc-1"]);
+  assert!(resp.hits[0].score > resp.hits[1].score);
+  assert!(resp.hits[1].score > resp.hits[2].score);
+}
+
+#[test]
+fn decay_function_orders_by_distance() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-2=1, doc-3=5, doc-1=10; linear decay should rank by proximity to origin.
+  assert_eq!(ids(&resp), vec!["doc-2", "doc-3", "doc-1"]);
+  assert!(resp.hits[0].score > resp.hits[1].score);
+  assert!(resp.hits[1].score > resp.hits[2].score);
 }

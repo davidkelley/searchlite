@@ -330,6 +330,8 @@ fn evaluate_compiled_score(
       }
       let mut effective_base = base_score;
       if effective_base == 0.0 && !function_values.is_empty() {
+        // Preserve function contributions even when the base query scored 0.0,
+        // so multiplicative boost modes do not erase function-only scoring.
         effective_base = 1.0;
       }
       let mut combined =
@@ -1820,6 +1822,13 @@ impl IndexReader {
         } else {
           None
         };
+        let segment_rank_limit = if score_fast_path {
+          top_k
+        } else if req.explain {
+          seg.live_docs() as usize
+        } else {
+          0
+        };
         let params = SegmentSearchParams {
           qualified_terms: &qualified_terms,
           matcher: &query_plan.matcher,
@@ -1835,11 +1844,7 @@ impl IndexReader {
           match_counter: counter,
           req,
           segment_ord: segment_ord as u32,
-          rank_limit: if score_fast_path || req.explain {
-            top_k
-          } else {
-            0
-          },
+          rank_limit: segment_rank_limit,
           cursor_key: cursor_key.clone(),
           saw_cursor: &mut saw_cursor,
           sort_plan: &sort_plan,
@@ -1868,6 +1873,11 @@ impl IndexReader {
       hits.extend(heap);
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
+    let search_phase_end = if req.profile {
+      Some(Instant::now())
+    } else {
+      None
+    };
     let mut rescore_stats = QueryStats::default();
     if let Some(rescore_req) = req.rescore.as_ref() {
       let rescore_start = Instant::now();
@@ -1901,9 +1911,10 @@ impl IndexReader {
       }
     }
     if req.profile {
+      let end = search_phase_end.unwrap_or_else(Instant::now);
       timings.insert(
         "search_ms".to_string(),
-        search_start.elapsed().as_secs_f64() * 1000.0,
+        end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
     let mut next_cursor = None;
@@ -2364,10 +2375,10 @@ impl IndexReader {
         if seg.is_deleted(doc_id) {
           continue;
         }
-        stats.candidates_examined += 1;
         if !query_eval.matches(doc_id) {
           continue;
         }
+        stats.candidates_examined += 1;
         let mut leaf_scores = rescore_plan
           .scorer
           .as_ref()
@@ -2475,6 +2486,7 @@ fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
 
 fn combine_rescore_scores(mode: RescoreMode, original: f32, rescore: f32) -> f32 {
   match mode {
+    // Total is intentionally an alias for Sum to match Elasticsearch naming.
     RescoreMode::Total | RescoreMode::Sum => original + rescore,
     RescoreMode::Multiply => original * rescore,
     RescoreMode::Max => original.max(rescore),
