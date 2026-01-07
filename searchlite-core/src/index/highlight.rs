@@ -14,7 +14,7 @@ pub fn highlight_fragments(
   phrases: &[Vec<String>],
   opts: HighlightOptions<'_>,
 ) -> Vec<String> {
-  if text.is_empty() || terms.is_empty() {
+  if text.is_empty() || (terms.is_empty() && phrases.is_empty()) {
     return Vec::new();
   }
   let mut patterns: Vec<String> = Vec::new();

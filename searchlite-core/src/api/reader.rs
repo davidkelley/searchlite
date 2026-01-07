@@ -3154,9 +3154,8 @@ impl IndexReader {
             } else {
               highlight_terms.to_vec()
             };
-          if terms.is_empty() {
-            terms = highlight_terms.to_vec();
-          }
+          // If analysis strips everything (e.g., stopwords), keep the analyzed set (even if empty)
+          // to avoid mixing analyzed and unanalyzed terms.
           let field_phrases = normalize_phrase_terms(
             phrase_terms.get(field).map(|v| v.as_slice()).unwrap_or(&[]),
             self.analysis.search_analyzer(field.as_str()),
@@ -3221,11 +3220,7 @@ impl IndexReader {
     } else {
       sort_plan.clone()
     };
-    let inner_size = collapse
-      .inner_hits
-      .as_ref()
-      .and_then(|c| c.size)
-      .unwrap_or(0);
+    let inner_size = collapse.inner_hits.as_ref().and_then(|c| c.size);
     let inner_from = collapse
       .inner_hits
       .as_ref()
@@ -3240,19 +3235,25 @@ impl IndexReader {
         let mut iter = list.into_iter();
         if let Some(top) = iter.next() {
           let mut inner: Vec<RankedHit> = iter.collect();
-          if !inner.is_empty() && !same_sort {
-            inner = self.resort_hits(&inner, &inner_plan)?;
-          }
-          if inner_from > 0 {
-            if inner_from >= inner.len() {
-              inner.clear();
-            } else {
-              inner.drain(0..inner_from);
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            if !inner.is_empty() && !same_sort {
+              inner = self.resort_hits(&inner, &inner_plan)?;
             }
-          }
-          if inner_size > 0 && inner.len() > inner_size {
-            inner.truncate(inner_size);
-          } else if collapse.inner_hits.is_none() {
+            if inner_from > 0 {
+              if inner_from >= inner.len() {
+                inner.clear();
+              } else {
+                inner.drain(0..inner_from);
+              }
+            }
+            if let Some(size) = cfg.size {
+              if size == 0 {
+                inner.clear();
+              } else if inner.len() > size {
+                inner.truncate(size);
+              }
+            }
+          } else {
             inner.clear();
           }
           out.push((top, inner));
