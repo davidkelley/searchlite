@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-#[cfg(feature = "vectors")]
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -867,7 +866,10 @@ impl<'a> SegmentWriter<'a> {
       &seg_file_meta,
     )?;
 
+    #[cfg(feature = "vectors")]
     let mut checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    #[cfg(not(feature = "vectors"))]
+    let checksums = collect_checksums(self.storage.as_ref(), &paths)?;
     #[cfg(feature = "vectors")]
     for (field, _meta) in vector_meta.iter() {
       let (vec_path, hnsw_path) = vector_paths(&paths, field)?;

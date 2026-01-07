@@ -16,7 +16,7 @@ use crate::api::types::VectorQuery;
 use crate::api::types::{
   Aggregation, AggregationResponse, DateHistogramAggregation, DecayFunction, Filter,
   FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions, Query,
-  QueryNode, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
+  RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
   SuggestResult,
 };
 use crate::api::AggregationError;
@@ -1733,6 +1733,7 @@ impl IndexReader {
 
   #[cfg(feature = "vectors")]
   fn build_vector_plan(&self, req: &SearchRequest) -> Result<Option<VectorPlan>> {
+    use crate::api::types::QueryNode;
     let vector_node = match &req.query {
       Query::Node(QueryNode::Vector(vq)) => Some(vq.clone()),
       _ => None,
