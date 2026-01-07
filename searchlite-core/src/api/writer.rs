@@ -96,7 +96,8 @@ impl IndexWriter {
   }
 
   pub fn commit(&mut self) -> Result<()> {
-    let _guard = self.inner.writer_lock.lock();
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
     if self.pending_ops.is_empty() {
       return Ok(());
     }
@@ -164,7 +165,9 @@ impl IndexWriter {
       }
     }
     manifest.committed_at = Utc::now().to_rfc3339();
-    manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
+    let store_result = manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path());
+    drop(manifest);
+    store_result?;
     self.wal.append_commit()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
