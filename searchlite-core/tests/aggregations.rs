@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, DateHistogramAggregation, Document, ExecutionStrategy, HistogramAggregation,
-  IndexOptions, MetricAggregation, NumericField, RangeAggregation, Schema, SearchRequest,
-  StorageType, TermsAggregation,
+  Aggregation, CardinalityAggregation, CompositeAggregation, CompositeSource,
+  DateHistogramAggregation, Document, ExecutionStrategy, HistogramAggregation, IndexOptions,
+  MetricAggregation, NumericField, PercentileRanksAggregation, PercentilesAggregation,
+  RangeAggregation, Schema, SearchRequest, StorageType, TermsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -122,6 +123,8 @@ fn terms_and_stats_aggregations() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -205,6 +208,8 @@ fn aggregation_requires_fast_field() {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs,
     suggest: BTreeMap::new(),
     rescore: None,
@@ -291,6 +296,8 @@ fn histogram_bucket_generation() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -380,6 +387,8 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -483,6 +492,8 @@ fn range_aggregation_counts() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -584,6 +595,8 @@ fn date_range_missing_and_keyed() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -680,6 +693,8 @@ fn extended_stats_and_value_count_include_missing() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -791,6 +806,8 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -900,6 +917,8 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -1012,6 +1031,8 @@ fn terms_size_applied_after_merge() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -1027,5 +1048,466 @@ fn terms_size_applied_after_merge() {
     assert_eq!(buckets[0].doc_count, 4);
   } else {
     panic!("expected terms response");
+  }
+}
+
+#[test]
+fn filter_aggregation_counts_and_sub_aggs() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
+  let mut writer = idx.writer().expect("writer");
+  let docs = [
+    doc("f-1", vec![("body", json!("rust")), ("tag", json!("tech"))]),
+    doc("f-2", vec![("body", json!("rust")), ("tag", json!("tech"))]),
+    doc(
+      "f-3",
+      vec![("body", json!("rust")), ("tag", json!("hobby"))],
+    ),
+  ];
+  for doc in docs.iter() {
+    writer.add_document(doc).unwrap();
+  }
+  writer.commit().unwrap();
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "only_tech".into(),
+    Aggregation::Filter(Box::new(searchlite_core::api::types::FilterAggregation {
+      filter: searchlite_core::api::types::Filter::KeywordEq {
+        field: "tag".into(),
+        value: "tech".into(),
+      },
+      aggs: BTreeMap::from([(
+        "tags".into(),
+        Aggregation::Terms(Box::new(TermsAggregation {
+          field: "tag".into(),
+          size: Some(10),
+          shard_size: None,
+          min_doc_count: None,
+          missing: None,
+          aggs: BTreeMap::new(),
+        })),
+      )]),
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 0,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  let filter = resp.aggregations.get("only_tech").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Filter {
+    doc_count,
+    aggregations,
+  } = filter
+  {
+    assert_eq!(*doc_count, 2);
+    if let Some(searchlite_core::api::types::AggregationResponse::Terms { buckets, .. }) =
+      aggregations.get("tags")
+    {
+      assert_eq!(buckets.len(), 1);
+      assert_eq!(buckets[0].key, json!("tech"));
+    } else {
+      panic!("expected nested terms agg");
+    }
+  } else {
+    panic!("expected filter agg");
+  }
+}
+
+#[test]
+fn composite_aggregation_paginates() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
+  let mut writer = idx.writer().expect("writer");
+  for tag in ["a", "b", "c"] {
+    writer
+      .add_document(&doc(
+        &format!("c-{tag}"),
+        vec![("body", json!("rust")), ("tag", json!(tag))],
+      ))
+      .unwrap();
+  }
+  writer.commit().unwrap();
+  let make_req = |after: Option<serde_json::Value>| -> SearchRequest {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "cmp".into(),
+      Aggregation::Composite(Box::new(CompositeAggregation {
+        sources: vec![CompositeSource::Terms {
+          name: "tag".into(),
+          field: "tag".into(),
+        }],
+        size: 2,
+        after,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 0,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  };
+  let first = idx.reader().unwrap().search(&make_req(None)).unwrap();
+  let cmp = first.aggregations.get("cmp").unwrap();
+  let after_key = match cmp {
+    searchlite_core::api::types::AggregationResponse::Composite {
+      buckets, after_key, ..
+    } => {
+      assert_eq!(buckets.len(), 2);
+      after_key.clone()
+    }
+    _ => panic!("expected composite agg"),
+  };
+  let second = idx.reader().unwrap().search(&make_req(after_key)).unwrap();
+  let cmp2 = second.aggregations.get("cmp").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Composite {
+    buckets, after_key, ..
+  } = cmp2
+  {
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(after_key.is_some(), false);
+  } else {
+    panic!("expected composite agg");
+  }
+}
+
+#[test]
+fn cardinality_and_percentiles_metrics() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "latency".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for (i, val) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("p-{i}"),
+          vec![("body", json!("rust")), ("latency", json!(val))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "card".into(),
+    Aggregation::Cardinality(CardinalityAggregation {
+      field: "latency".into(),
+      precision_threshold: None,
+      missing: None,
+    }),
+  );
+  aggs.insert(
+    "pct".into(),
+    Aggregation::Percentiles(PercentilesAggregation {
+      field: "latency".into(),
+      percents: Some(vec![50.0]),
+      missing: None,
+    }),
+  );
+  aggs.insert(
+    "pct_ranks".into(),
+    Aggregation::PercentileRanks(PercentileRanksAggregation {
+      field: "latency".into(),
+      values: vec![20.0, 35.0],
+      missing: None,
+    }),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 0,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Cardinality(val) =
+    resp.aggregations.get("card").unwrap()
+  {
+    assert_eq!(val.value, 4);
+  } else {
+    panic!("expected cardinality agg");
+  }
+  if let searchlite_core::api::types::AggregationResponse::Percentiles(p) =
+    resp.aggregations.get("pct").unwrap()
+  {
+    assert_eq!(p.values.get("50").copied().unwrap() as i64, 25);
+  } else {
+    panic!("expected percentiles agg");
+  }
+  if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
+    resp.aggregations.get("pct_ranks").unwrap()
+  {
+    let v20 = p.values.get("20").unwrap();
+    let v35 = p.values.get("35").unwrap();
+    assert!(*v20 > 0.0);
+    assert!(*v35 > *v20);
+  } else {
+    panic!("expected percentile ranks agg");
+  }
+}
+
+#[test]
+fn bucket_sort_and_avg_bucket_pipeline() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for (tag, sc) in [("a", 1.0), ("b", 5.0), ("c", 3.0)] {
+      writer
+        .add_document(&doc(
+          &format!("bs-{tag}"),
+          vec![
+            ("body", json!("rust")),
+            ("tag", json!(tag)),
+            ("score", json!(sc)),
+          ],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut sub = BTreeMap::new();
+  sub.insert(
+    "score_stats".into(),
+    Aggregation::Stats(MetricAggregation {
+      field: "score".into(),
+      missing: None,
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "tags".into(),
+    Aggregation::Terms(Box::new(TermsAggregation {
+      field: "tag".into(),
+      size: Some(10),
+      shard_size: None,
+      min_doc_count: None,
+      missing: None,
+      aggs: {
+        let mut m = sub.clone();
+        m.insert(
+          "sorted".into(),
+          Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+            sort: vec![searchlite_core::api::types::BucketSortSpec {
+              field: "score_stats.avg".into(),
+              order: searchlite_core::api::types::SortOrder::Desc,
+            }],
+            from: Some(0),
+            size: Some(2),
+          }),
+        );
+        m.insert(
+          "avg_scores".into(),
+          Aggregation::AvgBucket(searchlite_core::api::types::BucketMetricAggregation {
+            buckets_path: "score_stats.avg".into(),
+          }),
+        );
+        m
+      },
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 0,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Terms {
+    buckets,
+    aggregations,
+  } = resp.aggregations.get("tags").unwrap()
+  {
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0].key, json!("b"));
+    if let Some(searchlite_core::api::types::AggregationResponse::AvgBucket(val)) =
+      aggregations.get("avg_scores")
+    {
+      assert!(val.value > 0.0);
+    } else {
+      panic!("expected avg_bucket");
+    }
+  } else {
+    panic!("expected terms agg");
   }
 }

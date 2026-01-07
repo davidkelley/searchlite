@@ -1276,10 +1276,10 @@ impl<'a> CompositeCollector<'a> {
   }
 
   fn finish(self) -> AggregationIntermediate {
-    let mut buckets: Vec<BucketIntermediate> = self
+    let buckets: Vec<BucketIntermediate> = self
       .buckets
       .into_iter()
-      .map(|(key, state)| BucketIntermediate {
+      .map(|(_, state)| BucketIntermediate {
         key: state.key,
         doc_count: state.doc_count,
         aggs: finalize_children(state.aggs),
