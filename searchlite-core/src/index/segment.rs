@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
-use std::iter::ExactSizeIterator;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -579,10 +578,9 @@ impl<'a> SegmentWriter<'a> {
   #[allow(dead_code)]
   pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
   where
-    I: IntoIterator<Item = Document>,
-    I::IntoIter: ExactSizeIterator,
+    I: IntoIterator<Item = Result<Document>>,
   {
-    let docs_vec: Vec<Document> = docs.into_iter().collect();
+    let docs_vec: Vec<Document> = docs.into_iter().collect::<Result<_, _>>()?;
     self.write_segment(&docs_vec, generation)
   }
 
