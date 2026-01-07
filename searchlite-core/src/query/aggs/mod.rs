@@ -1278,8 +1278,8 @@ impl<'a> CompositeCollector<'a> {
   fn finish(self) -> AggregationIntermediate {
     let buckets: Vec<BucketIntermediate> = self
       .buckets
-      .into_iter()
-      .map(|(_, state)| BucketIntermediate {
+      .into_values()
+      .map(|state| BucketIntermediate {
         key: state.key,
         doc_count: state.doc_count,
         aggs: finalize_children(state.aggs),
@@ -1636,9 +1636,7 @@ fn merge_intermediate_in_place(
       AggregationIntermediate::Cardinality(target_state),
       AggregationIntermediate::Cardinality(incoming_state),
     ) => {
-      target_state
-        .values
-        .extend(incoming_state.values.into_iter());
+      target_state.values.extend(incoming_state.values);
       if target_state.precision_threshold.is_none() {
         target_state.precision_threshold = incoming_state.precision_threshold;
       }
@@ -1647,9 +1645,7 @@ fn merge_intermediate_in_place(
       AggregationIntermediate::Percentiles(target_state),
       AggregationIntermediate::Percentiles(incoming_state),
     ) => {
-      target_state
-        .values
-        .extend(incoming_state.values.into_iter());
+      target_state.values.extend(incoming_state.values);
       if target_state.percents.is_empty() {
         target_state.percents = incoming_state.percents;
       }
@@ -1658,9 +1654,7 @@ fn merge_intermediate_in_place(
       AggregationIntermediate::PercentileRanks(target_state),
       AggregationIntermediate::PercentileRanks(incoming_state),
     ) => {
-      target_state
-        .values
-        .extend(incoming_state.values.into_iter());
+      target_state.values.extend(incoming_state.values);
       if target_state.targets.is_empty() {
         target_state.targets = incoming_state.targets;
       }
