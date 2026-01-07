@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 
-use crate::api::types::{IndexOptions, StorageType};
+use crate::api::types::{Document, IndexOptions, StorageType};
 use crate::index::directory::ensure_root;
 use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::SegmentWriter;
@@ -100,34 +100,39 @@ impl Index {
   }
 
   pub fn compact(&self) -> Result<()> {
+    let _writer_guard = self.inner.writer_lock.lock();
     let reader = self.reader()?;
     let manifest_snapshot = reader.manifest.clone();
     if manifest_snapshot.segments.len() <= 1 {
       return Ok(());
     }
-    let mut all_docs = Vec::new();
-    for seg in reader.segments.iter() {
-      for doc_id in 0..seg.meta.doc_count {
-        if seg.is_deleted(doc_id) {
-          continue;
-        }
-        let doc_json = seg.get_doc(doc_id)?;
-        if let Some(map) = doc_json.as_object() {
-          let fields = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-          all_docs.push(crate::api::types::Document { fields });
-        }
-      }
-    }
     let inner = &self.inner;
     let schema = manifest_snapshot.schema.clone();
-    let mut manifest_guard = inner.manifest.write();
-    let generation = manifest_guard
+    let generation = manifest_snapshot
       .segments
       .iter()
       .map(|s| s.generation)
       .max()
       .unwrap_or(0)
       + 1;
+    let docs = reader.segments.iter().flat_map(|seg| {
+      (0..seg.meta.doc_count).filter_map(move |doc_id| {
+        if seg.is_deleted(doc_id) {
+          return None;
+        }
+        Some(seg.get_doc(doc_id).and_then(|doc_json| {
+          let map = doc_json.as_object().ok_or_else(|| {
+            anyhow!(
+              "document {doc_id} in segment {} is not an object",
+              seg.meta.id
+            )
+          })?;
+          let fields = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+          Ok(Document { fields })
+        }))
+      })
+    });
+    let mut manifest_guard = inner.manifest.write();
     let writer = SegmentWriter::new(
       &inner.path,
       &schema,
@@ -135,7 +140,7 @@ impl Index {
       cfg!(feature = "zstd"),
       inner.storage.clone(),
     );
-    let new_seg = writer.write_segment(&all_docs, generation)?;
+    let new_seg = writer.write_segment_from_iter(docs, generation)?;
     manifest_guard.segments = vec![new_seg];
     manifest_guard.committed_at = Utc::now().to_rfc3339();
     manifest_guard.store(
