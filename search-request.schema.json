@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/davidkelley/searchlite/search-request.schema.json",
+  "title": "Searchlite Search Request",
+  "description": "Structured JSON payload accepted by Searchlite readers (also used by the CLI and FFI bindings).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["query"],
+  "properties": {
+    "query": {
+      "description": "Query string or structured query AST node.",
+      "anyOf": [{ "type": "string" }, { "type": "object" }]
+    },
+    "fields": {
+      "description": "Subset of default fields to search (null or omitted means schema defaults).",
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "filter": {
+      "description": "Single structured filter node applied to all results.",
+      "type": ["object", "null"]
+    },
+    "filters": {
+      "description": "Deprecated AND'ed filter array (prefer `filter`).",
+      "type": "array",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "limit": { "type": "integer", "minimum": 0, "default": 10 },
+    "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
+    "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },
+    "execution": { "type": "string", "enum": ["bm25", "wand", "bmw"], "default": "wand" },
+    "bmw_block_size": { "type": ["integer", "null"], "minimum": 1 },
+    "fuzzy": { "type": ["object", "null"], "description": "Fuzzy matching options." },
+    "return_stored": { "type": "boolean", "default": false },
+    "highlight_field": {
+      "type": ["string", "null"],
+      "description": "Legacy single-field highlight returning a snippet on the hit."
+    },
+    "highlight": { "$ref": "#/$defs/highlight" },
+    "collapse": { "$ref": "#/$defs/collapse" },
+    "aggs": {
+      "type": "object",
+      "description": "Aggregation definitions keyed by name.",
+      "additionalProperties": { "$ref": "#/$defs/aggregation" },
+      "default": {}
+    },
+    "suggest": { "type": "object", "description": "Completion suggest requests keyed by name.", "default": {} },
+    "rescore": { "type": ["object", "null"], "description": "Optional rescore query applied to the top window." },
+    "explain": { "type": "boolean", "default": false },
+    "profile": { "type": "boolean", "default": false }
+  },
+  "$defs": {
+    "sort_spec": {
+      "type": "object",
+      "description": "Sort clause applied to hits (and inner_hits).",
+      "additionalProperties": false,
+      "required": ["field"],
+      "properties": {
+        "field": { "type": "string", "description": "Field name or `_score`." },
+        "order": { "type": "string", "enum": ["asc", "desc"], "default": "asc" }
+      }
+    },
+    "highlight": {
+      "type": "object",
+      "description": "Configurable multi-field highlighting with custom tags and fragment sizing.",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/highlight_field" },
+          "description": "Per-field highlight options."
+        }
+      }
+    },
+    "highlight_field": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pre_tag": { "type": "string", "default": "<em>" },
+        "post_tag": { "type": "string", "default": "</em>" },
+        "fragment_size": { "type": "integer", "minimum": 1, "default": 160 },
+        "number_of_fragments": { "type": "integer", "minimum": 1, "default": 1 }
+      }
+    },
+    "collapse": {
+      "type": "object",
+      "description": "Field collapsing/grouping settings.",
+      "additionalProperties": false,
+      "required": ["field"],
+      "properties": {
+        "field": { "type": "string", "description": "Fast keyword field used for grouping." },
+        "inner_hits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": { "type": "integer", "minimum": 0, "default": 0 },
+            "from": { "type": "integer", "minimum": 0, "default": 0 },
+            "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] }
+          }
+        }
+      }
+    },
+    "aggregation": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            { "$ref": "#/$defs/terms_agg" },
+            { "$ref": "#/$defs/range_agg" },
+            { "$ref": "#/$defs/histogram_agg" },
+            { "$ref": "#/$defs/date_histogram_agg" },
+            { "$ref": "#/$defs/filter_agg" },
+            { "$ref": "#/$defs/composite_agg" },
+            { "$ref": "#/$defs/stats_agg" },
+            { "$ref": "#/$defs/value_count_agg" },
+            { "$ref": "#/$defs/top_hits_agg" },
+            { "$ref": "#/$defs/cardinality_agg" },
+            { "$ref": "#/$defs/percentiles_agg" },
+            { "$ref": "#/$defs/percentile_ranks_agg" },
+            { "$ref": "#/$defs/bucket_sort_agg" },
+            { "$ref": "#/$defs/avg_bucket_agg" },
+            { "$ref": "#/$defs/sum_bucket_agg" }
+          ]
+        }
+      ]
+    },
+    "terms_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "terms" },
+        "field": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "min_doc_count": { "type": "integer", "minimum": 0 },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "range_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "range" },
+        "field": { "type": "string" },
+        "ranges": { "type": "array", "items": { "type": "object" } },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "histogram_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "histogram" },
+        "field": { "type": "string" },
+        "interval": { "type": "number" },
+        "offset": { "type": "number" },
+        "min_doc_count": { "type": "integer", "minimum": 0 },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "date_histogram_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "date_histogram" },
+        "field": { "type": "string" },
+        "calendar_interval": { "type": "string" },
+        "fixed_interval": { "type": "string" },
+        "offset": { "type": "string" },
+        "min_doc_count": { "type": "integer", "minimum": 0 },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "filter_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "filter" },
+        "filter": { "type": "object", "description": "Any filter AST node." },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "composite_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "composite" },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type", "field"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string", "enum": ["terms", "histogram"] },
+              "field": { "type": "string" },
+              "interval": { "type": "number", "description": "For histogram sources." }
+            }
+          }
+        },
+        "size": { "type": "integer", "minimum": 1 },
+        "after": { "type": "object", "description": "Pagination key from the previous page." },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "stats_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["stats", "extended_stats"] },
+        "field": { "type": "string" }
+      }
+    },
+    "value_count_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "type": { "const": "value_count" }, "field": { "type": "string" } }
+    },
+    "top_hits_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "top_hits" },
+        "size": { "type": "integer", "minimum": 0 },
+        "from": { "type": "integer", "minimum": 0 },
+        "fields": { "type": "array", "items": { "type": "string" } },
+        "highlight_field": { "type": "string" }
+      }
+    },
+    "cardinality_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "cardinality" },
+        "field": { "type": "string" },
+        "precision_threshold": { "type": "integer", "minimum": 1 },
+        "missing": { "description": "Value to use when the field is absent." }
+      }
+    },
+    "percentiles_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "percentiles" },
+        "field": { "type": "string" },
+        "percents": { "type": "array", "items": { "type": "number" }, "description": "Defaults to [1,5,25,50,75,95,99] when omitted." },
+        "missing": { "description": "Value to use when the field is absent." }
+      }
+    },
+    "percentile_ranks_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "percentile_ranks" },
+        "field": { "type": "string" },
+        "values": { "type": "array", "items": { "type": "number" } },
+        "missing": { "description": "Value to use when the field is absent." }
+      }
+    },
+    "bucket_sort_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "bucket_sort" },
+        "sort": {
+          "type": "array",
+          "description": "Each entry sorts by bucket key, _count, or a metric path.",
+          "items": {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 1,
+            "additionalProperties": { "$ref": "#/$defs/sort_direction" }
+          }
+        },
+        "from": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "avg_bucket_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "avg_bucket" },
+        "buckets_path": { "type": "string", "description": "Dot-separated metric path (e.g., `histogram.score_stats.avg`)." }
+      }
+    },
+    "sum_bucket_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "sum_bucket" },
+        "buckets_path": { "type": "string", "description": "Dot-separated metric path (e.g., `by_tag.score`)." }
+      }
+    },
+    "sort_direction": { "type": "string", "enum": ["asc", "desc"] }
+  }
+}

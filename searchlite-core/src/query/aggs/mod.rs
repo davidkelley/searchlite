@@ -1408,7 +1408,7 @@ impl<'a> TopHitsCollector<'a> {
       let snippet = if let (Some(field), Some(doc_val)) = (&self.highlight_field, fetched.as_ref())
       {
         if let Some(text) = doc_val.get(field).and_then(|v| v.as_str()) {
-          make_snippet(text, self.highlight_terms)
+          make_snippet(text, self.highlight_terms, &[])
         } else {
           None
         }

@@ -1433,6 +1433,43 @@ fn expand_phrase_fields(
     .collect()
 }
 
+fn normalize_phrase_terms(
+  phrases: &[Vec<String>],
+  analyzer: Option<&Analyzer>,
+) -> Vec<Vec<String>> {
+  if let Some(analyzer) = analyzer {
+    let mut out = Vec::new();
+    for phrase in phrases.iter() {
+      let mut seq = Vec::new();
+      for term in phrase.iter() {
+        for tok in analyzer.analyze(term) {
+          seq.push(tok.text);
+        }
+      }
+      if !seq.is_empty() {
+        out.push(seq);
+      }
+    }
+    if !out.is_empty() {
+      return out;
+    }
+  }
+  phrases.to_vec()
+}
+
+fn build_phrase_term_map(phrase_specs: &[PhraseSpec]) -> BTreeMap<String, Vec<Vec<String>>> {
+  let mut out = BTreeMap::new();
+  for phrase in phrase_specs.iter() {
+    for field in phrase.fields.iter() {
+      out
+        .entry(field.clone())
+        .or_insert_with(Vec::new)
+        .push(phrase.terms.clone());
+    }
+  }
+  out
+}
+
 fn build_phrase_runtimes(
   seg: &SegmentReader,
   phrase_fields: &[PhraseFieldConfig],
@@ -2013,15 +2050,16 @@ impl IndexReader {
       )?);
       hits.truncate(req.limit);
     }
+    let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
     let hits: Vec<Hit> = hits
       .into_iter()
       .enumerate()
       .filter_map(|(idx, h)| {
-        let mut hit = self.materialize_hit(h, req, &[])?;
+        let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
         if let Some(inner) = group_inner_hits.get(idx) {
           let inner_hits: Vec<Hit> = inner
             .iter()
-            .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[]))
+            .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
             .collect();
           if !inner_hits.is_empty() {
             hit.inner_hits = Some(inner_hits);
@@ -2332,6 +2370,7 @@ impl IndexReader {
       &self.analysis,
       &self.manifest.schema,
     );
+    let highlight_phrases = build_phrase_term_map(&query_plan.phrase_specs);
     let root_filter = if let Some(filter) = req.filter.as_ref() {
       RootFilter::Node(filter)
     } else if !req.filters.is_empty() {
@@ -2533,11 +2572,13 @@ impl IndexReader {
       .into_iter()
       .enumerate()
       .filter_map(|(idx, h)| {
-        let mut hit = self.materialize_hit(h, req, &highlight_terms)?;
+        let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
         if let Some(inner) = group_inner_hits.get(idx) {
           let inner_hits: Vec<Hit> = inner
             .iter()
-            .filter_map(|ih| self.materialize_hit(ih.clone(), req, &highlight_terms))
+            .filter_map(|ih| {
+              self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
+            })
             .collect();
           if !inner_hits.is_empty() {
             hit.inner_hits = Some(inner_hits);
@@ -3062,6 +3103,7 @@ impl IndexReader {
     ranked: RankedHit,
     req: &SearchRequest,
     highlight_terms: &[String],
+    phrase_terms: &BTreeMap<String, Vec<Vec<String>>>,
   ) -> Option<Hit> {
     let seg = self.segments.get(ranked.key.segment_ord as usize)?;
     let doc_id_str = seg.doc_id(ranked.key.doc_id)?;
@@ -3073,7 +3115,11 @@ impl IndexReader {
 
     let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
       if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
-        make_snippet(text_val, highlight_terms)
+        let phrase_list = normalize_phrase_terms(
+          phrase_terms.get(field).map(|v| v.as_slice()).unwrap_or(&[]),
+          self.analysis.search_analyzer(field.as_str()),
+        );
+        make_snippet(text_val, highlight_terms, &phrase_list)
       } else {
         None
       }
@@ -3111,9 +3157,14 @@ impl IndexReader {
           if terms.is_empty() {
             terms = highlight_terms.to_vec();
           }
+          let field_phrases = normalize_phrase_terms(
+            phrase_terms.get(field).map(|v| v.as_slice()).unwrap_or(&[]),
+            self.analysis.search_analyzer(field.as_str()),
+          );
           let frags = highlight_fragments(
             text_val,
             &terms,
+            &field_phrases,
             HighlightOptions {
               pre_tag: &opts.pre_tag,
               post_tag: &opts.post_tag,

@@ -331,6 +331,7 @@ Beyond the basics (`query`/`filter`/`sort`/`limit`), the request supports:
 - `aggs`: map of aggregation specs. New options include filter buckets (`{"type":"filter","filter":{...},"aggs":{...}}`), composite buckets (`{"type":"composite","sources":[{"type":"terms","name":"lang","field":"lang"},{"type":"histogram","name":"year","field":"year","interval":5}],"size":10,"after":{...},"aggs":{...}}`), and metric/pipeline aggs (`cardinality`, `percentiles`, `percentile_ranks`, `bucket_sort`, `avg_bucket`, `sum_bucket`). Pipeline `buckets_path` values walk the parent bucket tree with dot-separated paths like `"by_tag.score_stats.avg"`.
 - `collapse`: `{ "field": "author", "inner_hits": { "size": 3, "from": 0, "sort": [{ "field": "_score", "order": "desc" }] } }` groups results by a fast keyword field and keeps the top hit per group; responses include `total_groups` plus optional `inner_hits` per group.
 - `highlight`: `{ "fields": { "body": { "pre_tag": "<em>", "post_tag": "</em>", "fragment_size": 160, "number_of_fragments": 2 } } }` adds a `highlights` map to hits. The legacy `highlight_field` string still returns a single snippet when you only need a default highlight.
+- A reference JSON Schema for search requests lives at `search-request.schema.json` in the repo root to help clients validate payloads.
 
 ### Prefix, wildcard, and regex queries
 

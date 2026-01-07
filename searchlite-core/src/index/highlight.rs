@@ -7,19 +7,39 @@ pub struct HighlightOptions<'a> {
   pub number_of_fragments: usize,
 }
 
+/// Highlight terms and phrase sequences using a phrase-aware, token-boundary regex.
 pub fn highlight_fragments(
   text: &str,
   terms: &[String],
+  phrases: &[Vec<String>],
   opts: HighlightOptions<'_>,
 ) -> Vec<String> {
   if text.is_empty() || terms.is_empty() {
     return Vec::new();
   }
-  let pattern = terms
-    .iter()
-    .map(|t| regex::escape(t))
-    .collect::<Vec<_>>()
-    .join("|");
+  let mut patterns: Vec<String> = Vec::new();
+  // Phrase patterns first to prefer longer matches.
+  for phrase in phrases.iter() {
+    if phrase.is_empty() {
+      continue;
+    }
+    let joined = phrase
+      .iter()
+      .map(|p| regex::escape(p))
+      .collect::<Vec<_>>()
+      .join(r"\W+");
+    patterns.push(format!(r"\b{joined}\b"));
+  }
+  for term in terms.iter() {
+    if term.is_empty() {
+      continue;
+    }
+    patterns.push(format!(r"\b{}\b", regex::escape(term)));
+  }
+  if patterns.is_empty() {
+    return Vec::new();
+  }
+  let pattern = patterns.join("|");
   let Ok(re) = RegexBuilder::new(&pattern).case_insensitive(true).build() else {
     return Vec::new();
   };
@@ -44,10 +64,11 @@ pub fn highlight_fragments(
   out
 }
 
-pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
+pub fn make_snippet(text: &str, terms: &[String], phrases: &[Vec<String>]) -> Option<String> {
   let mut frags = highlight_fragments(
     text,
     terms,
+    phrases,
     HighlightOptions {
       pre_tag: "**",
       post_tag: "**",
@@ -65,9 +86,9 @@ mod tests {
   #[test]
   fn highlights_first_term() {
     let text = "Rust is a systems programming language";
-    let snippet = make_snippet(text, &[String::from("systems")]).unwrap();
+    let snippet = make_snippet(text, &[String::from("systems")], &[]).unwrap();
     assert!(snippet.contains("**systems**"));
-    let none = make_snippet("", &[String::from("systems")]);
+    let none = make_snippet("", &[String::from("systems")], &[]);
     assert!(none.is_none());
   }
 }
