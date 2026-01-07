@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, SortOrder, SortSpec,
-  StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, SearchRequest,
+  SortOrder, SortSpec, StorageType, VectorQuery,
 };
 use searchlite_core::api::Index;
 
@@ -66,6 +66,15 @@ enum Commands {
     #[cfg(feature = "vectors")]
     #[arg(long, default_value_t = 0.5)]
     alpha: f32,
+    #[cfg(feature = "vectors")]
+    #[arg(long)]
+    vector_k: Option<usize>,
+    #[cfg(feature = "vectors")]
+    #[arg(long)]
+    vector_ef_search: Option<usize>,
+    #[cfg(feature = "vectors")]
+    #[arg(long)]
+    vector_candidates: Option<usize>,
     /// Aggregations JSON (Elasticsearch-style map)
     #[arg(long)]
     aggs: Option<String>,
@@ -107,6 +116,12 @@ fn main() -> Result<()> {
       vector,
       #[cfg(feature = "vectors")]
       alpha,
+      #[cfg(feature = "vectors")]
+      vector_k,
+      #[cfg(feature = "vectors")]
+      vector_ef_search,
+      #[cfg(feature = "vectors")]
+      vector_candidates,
       aggs,
       aggs_file,
     } => {
@@ -129,6 +144,12 @@ fn main() -> Result<()> {
           vector,
           #[cfg(feature = "vectors")]
           alpha,
+          #[cfg(feature = "vectors")]
+          vector_k,
+          #[cfg(feature = "vectors")]
+          vector_ef_search,
+          #[cfg(feature = "vectors")]
+          vector_candidates,
           aggs,
           aggs_file,
         })?
@@ -169,6 +190,12 @@ struct SearchCliArgs {
   vector: Option<String>,
   #[cfg(feature = "vectors")]
   alpha: f32,
+  #[cfg(feature = "vectors")]
+  vector_k: Option<usize>,
+  #[cfg(feature = "vectors")]
+  vector_ef_search: Option<usize>,
+  #[cfg(feature = "vectors")]
+  vector_candidates: Option<usize>,
   aggs: Option<String>,
   aggs_file: Option<PathBuf>,
 }
@@ -266,15 +293,52 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     vector,
     #[cfg(feature = "vectors")]
     alpha,
+    #[cfg(feature = "vectors")]
+    vector_k,
+    #[cfg(feature = "vectors")]
+    vector_ef_search,
+    #[cfg(feature = "vectors")]
+    vector_candidates,
     aggs,
     aggs_file,
   } = args;
+  #[cfg(feature = "vectors")]
+  let vector_opts = build_vector_query(
+    vector_field,
+    vector,
+    alpha,
+    vector_k,
+    vector_ef_search,
+    vector_candidates,
+  )?;
+  #[cfg(not(feature = "vectors"))]
+  let vector_opts: Option<searchlite_core::api::types::VectorQuery> = None;
   let query = match query {
-    Some(q) => q,
-    None => bail!("search query is required unless --request or --request-stdin is provided"),
+    Some(q) => Query::String(q),
+    None => {
+      #[cfg(feature = "vectors")]
+      {
+        if let Some(v) = vector_opts.clone() {
+          Query::Node(QueryNode::Vector(v))
+        } else {
+          bail!("search query is required unless --request or --request-stdin is provided");
+        }
+      }
+      #[cfg(not(feature = "vectors"))]
+      {
+        bail!("search query is required unless --request or --request-stdin is provided");
+      }
+    }
+  };
+  #[cfg(feature = "vectors")]
+  let legacy_vector_query = match &query {
+    Query::Node(QueryNode::Vector(_)) => None,
+    _ => vector_opts
+      .as_ref()
+      .map(|v| (v.field.clone(), v.vector.clone(), v.alpha.unwrap_or(alpha))),
   };
   Ok(SearchRequest {
-    query: query.into(),
+    query,
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
     filter: None,
     filters: Vec::new(),
@@ -284,7 +348,9 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     bmw_block_size,
     fuzzy: None,
     #[cfg(feature = "vectors")]
-    vector_query: build_vector_query(vector_field, vector, alpha)?,
+    vector_query: legacy_vector_query,
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored,
     highlight_field: highlight,
     cursor,
@@ -375,10 +441,21 @@ fn build_vector_query(
   vector_field: Option<String>,
   vector: Option<String>,
   alpha: f32,
-) -> Result<Option<(String, Vec<f32>, f32)>> {
+  vector_k: Option<usize>,
+  vector_ef_search: Option<usize>,
+  vector_candidates: Option<usize>,
+) -> Result<Option<VectorQuery>> {
   if let (Some(field), Some(vec_str)) = (vector_field, vector) {
     let parsed: Vec<f32> = serde_json::from_str(&vec_str)?;
-    return Ok(Some((field, parsed, alpha)));
+    return Ok(Some(VectorQuery {
+      field,
+      vector: parsed,
+      k: vector_k,
+      alpha: Some(alpha),
+      ef_search: vector_ef_search,
+      candidate_size: vector_candidates,
+      boost: None,
+    }));
   }
   Ok(None)
 }
@@ -389,7 +466,10 @@ fn build_vector_query(
   _vector_field: Option<String>,
   _vector: Option<String>,
   _alpha: f32,
-) -> Result<Option<(String, Vec<f32>, f32)>> {
+  _vector_k: Option<usize>,
+  _vector_ef_search: Option<usize>,
+  _vector_candidates: Option<usize>,
+) -> Result<Option<VectorQuery>> {
   Ok(None)
 }
 
@@ -447,6 +527,12 @@ mod tests {
       vector: None,
       #[cfg(feature = "vectors")]
       alpha: 0.5,
+      #[cfg(feature = "vectors")]
+      vector_k: None,
+      #[cfg(feature = "vectors")]
+      vector_ef_search: None,
+      #[cfg(feature = "vectors")]
+      vector_candidates: None,
       aggs: None,
       aggs_file: None,
     })
@@ -483,6 +569,9 @@ mod tests {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
       aggs: BTreeMap::new(),

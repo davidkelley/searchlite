@@ -100,6 +100,9 @@ fn bench_search(c: &mut Criterion) {
         fuzzy: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
+
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
         return_stored: true,
         highlight_field: None,
         aggs: BTreeMap::new(),
@@ -208,6 +211,9 @@ fn bench_nested_filters(c: &mut Criterion) {
         fuzzy: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
+
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
         return_stored: true,
         highlight_field: None,
         aggs: BTreeMap::new(),
@@ -273,6 +279,9 @@ fn bench_cursor_pagination(c: &mut Criterion) {
           fuzzy: None,
           #[cfg(feature = "vectors")]
           vector_query: None,
+
+          #[cfg(feature = "vectors")]
+          vector_filter: None,
           return_stored: false,
           highlight_field: None,
           aggs: BTreeMap::new(),

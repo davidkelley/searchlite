@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
 use crate::analysis::analyzer::Analyzer;
+#[cfg(feature = "vectors")]
+use crate::api::types::VectorQuery;
 use crate::api::types::{
   Aggregation, AggregationResponse, DateHistogramAggregation, DecayFunction, Filter,
   FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions, Query,
-  RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
+  QueryNode, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
   SuggestResult,
 };
 use crate::api::AggregationError;
@@ -42,6 +44,10 @@ use crate::query::wand::{
   ScoredTerm,
 };
 use crate::util::regex::anchored_regex;
+#[cfg(feature = "vectors")]
+use crate::vectors::hnsw::DEFAULT_EF_SEARCH;
+#[cfg(feature = "vectors")]
+use crate::vectors::{blend_scores, normalize_in_place, DEFAULT_VECTOR_ALPHA};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
@@ -50,6 +56,8 @@ const MAX_CURSOR_ADVANCE: usize = 50_000;
 pub struct Hit {
   pub doc_id: String,
   pub score: f32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vector_score: Option<f32>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +118,19 @@ pub struct ProfileResult {
   pub rescore: Option<ExecutionProfile>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub timings: BTreeMap<String, f64>,
+}
+
+#[cfg(feature = "vectors")]
+#[derive(Clone)]
+struct VectorPlan {
+  field: String,
+  vector: Vec<f32>,
+  k: usize,
+  alpha: f32,
+  ef_search: usize,
+  candidate_size: usize,
+  boost: f32,
+  vector_only: bool,
 }
 
 fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder) -> SortKey {
@@ -523,12 +544,15 @@ fn hex_decode(raw: &str) -> Result<Vec<u8>> {
 struct RankedHit {
   key: SortKey,
   score: f32,
+  vector_score: Option<f32>,
   explanation: Option<HitExplanation>,
 }
 
 impl PartialEq for RankedHit {
   fn eq(&self, other: &Self) -> bool {
-    self.key == other.key && self.score.to_bits() == other.score.to_bits()
+    self.key == other.key
+      && self.score.to_bits() == other.score.to_bits()
+      && self.vector_score.map(f32::to_bits) == other.vector_score.map(f32::to_bits)
   }
 }
 
@@ -1707,6 +1731,380 @@ impl IndexReader {
     Ok(responses)
   }
 
+  #[cfg(feature = "vectors")]
+  fn build_vector_plan(&self, req: &SearchRequest) -> Result<Option<VectorPlan>> {
+    let vector_node = match &req.query {
+      Query::Node(QueryNode::Vector(vq)) => Some(vq.clone()),
+      _ => None,
+    };
+    if vector_node.is_some() && req.vector_query.is_some() {
+      bail!("cannot set both `vector_query` and a `vector` query node");
+    }
+    let (vector_query, vector_only) = if let Some(vq) = vector_node {
+      (vq, true)
+    } else if let Some((field, vec, alpha)) = &req.vector_query {
+      (
+        VectorQuery {
+          field: field.clone(),
+          vector: vec.clone(),
+          k: None,
+          alpha: Some(*alpha),
+          ef_search: None,
+          candidate_size: None,
+          boost: None,
+        },
+        false,
+      )
+    } else {
+      return Ok(None);
+    };
+    let schema_field = self
+      .manifest
+      .schema
+      .vector_field(&vector_query.field)
+      .ok_or_else(|| anyhow::anyhow!("unknown vector field `{}`", vector_query.field))?;
+    if vector_query.vector.len() != schema_field.dim {
+      bail!(
+        "vector field `{}` expects dimension {}, got {}",
+        schema_field.name,
+        schema_field.dim,
+        vector_query.vector.len()
+      );
+    }
+    let mut query_vec = vector_query.vector.clone();
+    if matches!(
+      schema_field.metric,
+      crate::index::manifest::VectorMetric::Cosine
+    ) {
+      normalize_in_place(&mut query_vec);
+    }
+    let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);
+    if !(0.0..=1.0).contains(&alpha) {
+      bail!("vector alpha must be between 0 and 1 inclusive");
+    }
+    if vector_only && query_vec.is_empty() {
+      return Ok(None);
+    }
+    let default_k = if req.limit == 0 {
+      vector_query.k.unwrap_or(10)
+    } else {
+      vector_query.k.unwrap_or(req.limit)
+    };
+    let k = default_k.max(1);
+    let mut candidate_size = vector_query
+      .candidate_size
+      .unwrap_or_else(|| k.max(req.limit).max(10).saturating_mul(2));
+    if candidate_size < k {
+      candidate_size = k;
+    }
+    let ef_search = vector_query
+      .ef_search
+      .unwrap_or_else(|| DEFAULT_EF_SEARCH.max(candidate_size));
+    let boost = vector_query.boost.unwrap_or(1.0).max(0.0);
+    Ok(Some(VectorPlan {
+      field: vector_query.field.clone(),
+      vector: query_vec,
+      k,
+      alpha,
+      ef_search,
+      candidate_size,
+      boost,
+      vector_only,
+    }))
+  }
+
+  #[cfg(feature = "vectors")]
+  #[allow(clippy::too_many_arguments)]
+  fn search_vector_only(
+    &self,
+    req: &SearchRequest,
+    sort_plan: SortPlan,
+    manifest_generation: u32,
+    cursor_state: Option<CursorState>,
+    plan: &VectorPlan,
+  ) -> Result<SearchResult> {
+    let score_fast_path =
+      sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
+    let cursor_key = cursor_state.as_ref().map(|c| c.key.clone());
+    let cursor_returned = cursor_state
+      .as_ref()
+      .map(|c| c.returned as usize)
+      .unwrap_or(0);
+    let heap_limit = if req.limit == 0 {
+      0
+    } else {
+      plan
+        .candidate_size
+        .max(req.limit.max(plan.k))
+        .saturating_add(1)
+    };
+    let root_filter = if let Some(filter) = req.filter.as_ref() {
+      RootFilter::Node(filter)
+    } else if !req.filters.is_empty() {
+      RootFilter::AndSlice(req.filters.as_slice())
+    } else {
+      RootFilter::None
+    };
+    let vector_filter = req.vector_filter.as_ref();
+    let mut heap = BinaryHeap::<RankedHit>::new();
+    let mut agg_results = Vec::new();
+    let mut total_matches: u64 = 0;
+    let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
+    let mut search_stats = QueryStats::default();
+    validate_aggregations(&self.manifest.schema, &req.aggs)?;
+    let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &[], &self.manifest.schema);
+    for (segment_ord, seg) in self.segments.iter().enumerate() {
+      let mut agg_collector = agg_pipeline
+        .as_ref()
+        .map(|p| p.for_segment(seg, segment_ord as u32))
+        .transpose()?;
+      let candidates = if let Some((index, _store)) = seg.vector_components(&plan.field) {
+        index.search(
+          &plan.vector,
+          plan.candidate_size.max(plan.k),
+          plan.ef_search,
+        )
+      } else {
+        Vec::new()
+      };
+      for (doc_id, mut vscore) in candidates.into_iter() {
+        if seg.is_deleted(doc_id) {
+          continue;
+        }
+        if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
+          continue;
+        }
+        if let Some(filt) = vector_filter {
+          if !passes_filter(seg.fast_fields(), doc_id, filt) {
+            continue;
+          }
+        }
+        vscore *= plan.boost;
+        let key = sort_plan.build_key(seg, doc_id, vscore, segment_ord as u32);
+        if let Some(cur) = &cursor_key {
+          let ord = key.cmp(cur);
+          if ord.is_lt() || ord.is_eq() {
+            if ord.is_eq() {
+              saw_cursor = true;
+            }
+            continue;
+          }
+        }
+        total_matches += 1;
+        if let Some(col) = agg_collector.as_mut() {
+          col.collect(doc_id, vscore);
+        }
+        if req.profile {
+          search_stats.candidates_examined += 1;
+          search_stats.scored_docs += 1;
+        }
+        let hit = RankedHit {
+          key,
+          score: vscore,
+          vector_score: Some(vscore),
+          explanation: None,
+        };
+        if heap_limit == 0 {
+          heap.push(hit);
+        } else {
+          push_ranked(&mut heap, hit, heap_limit);
+        }
+      }
+      if let Some(collector) = agg_collector {
+        agg_results.push(collector.finish());
+      }
+    }
+    if !saw_cursor {
+      bail!("stale or invalid cursor for this result set");
+    }
+    let mut hits: Vec<RankedHit> = heap.into_iter().collect();
+    if req.limit == 0 {
+      hits.clear();
+    } else {
+      hits.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+    let mut next_cursor = None;
+    if req.limit > 0 && hits.len() > req.limit {
+      let key = hits[req.limit - 1].key.clone();
+      next_cursor = Some(encode_cursor(
+        manifest_generation,
+        (cursor_returned + req.limit) as u32,
+        &key,
+        &sort_plan,
+        score_fast_path,
+      )?);
+      hits.truncate(req.limit);
+    }
+    let hits: Vec<Hit> = hits
+      .into_iter()
+      .filter_map(|h| self.materialize_hit(h, req, &[]))
+      .collect();
+    let aggregations = if let Some(pipeline) = agg_pipeline {
+      pipeline.merge(agg_results)?
+    } else {
+      BTreeMap::new()
+    };
+    let suggest = if req.suggest.is_empty() {
+      BTreeMap::new()
+    } else {
+      self.execute_suggest(&req.suggest)?
+    };
+    Ok(SearchResult {
+      total_hits_estimate: if req.limit == 0 {
+        total_matches
+      } else {
+        hits.len() as u64
+      },
+      hits,
+      next_cursor,
+      aggregations,
+      suggest,
+      profile: if req.profile {
+        Some(ProfileResult {
+          execution: to_execution_profile(&search_stats),
+          rescore: None,
+          timings: BTreeMap::new(),
+        })
+      } else {
+        None
+      },
+    })
+  }
+
+  #[cfg(feature = "vectors")]
+  #[allow(clippy::too_many_arguments)]
+  fn collect_vector_scores(
+    &self,
+    plan: &VectorPlan,
+    root_filter: RootFilter<'_>,
+    vector_filter: Option<&Filter>,
+    require_text_match: bool,
+    term_groups: &[TermMatchGroup],
+    phrase_fields: &[PhraseFieldConfig],
+    matcher: &QueryMatcher,
+  ) -> Result<HashMap<(u32, DocId), f32>> {
+    let mut scores = HashMap::new();
+    for (segment_ord, seg) in self.segments.iter().enumerate() {
+      let Some((index, _store)) = seg.vector_components(&plan.field) else {
+        continue;
+      };
+      let mut _term_doc_holder = None;
+      let mut _phrase_holder = None;
+      let query_eval = if require_text_match {
+        _term_doc_holder = Some(build_term_doc_lists(seg, term_groups));
+        _phrase_holder = Some(build_phrase_runtimes(seg, phrase_fields));
+        let eval = QueryEvaluator {
+          matcher,
+          term_docs: &_term_doc_holder.as_ref().unwrap().lists,
+          term_group_lists: &_term_doc_holder.as_ref().unwrap().group_lists,
+          phrase_postings: _phrase_holder.as_ref().unwrap(),
+          fast_fields: seg.fast_fields(),
+        };
+        Some(eval)
+      } else {
+        None
+      };
+      let candidates = index.search(
+        &plan.vector,
+        plan.candidate_size.max(plan.k),
+        plan.ef_search,
+      );
+      for (doc_id, mut vscore) in candidates.into_iter() {
+        if seg.is_deleted(doc_id) {
+          continue;
+        }
+        if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
+          continue;
+        }
+        if let Some(filt) = vector_filter {
+          if !passes_filter(seg.fast_fields(), doc_id, filt) {
+            continue;
+          }
+        }
+        if let Some(eval) = query_eval.as_ref() {
+          if !eval.matches(doc_id) {
+            continue;
+          }
+        }
+        vscore *= plan.boost;
+        scores.insert((segment_ord as u32, doc_id), vscore);
+      }
+    }
+    Ok(scores)
+  }
+
+  #[cfg(feature = "vectors")]
+  #[allow(clippy::too_many_arguments)]
+  fn merge_vector_hits(
+    &self,
+    hits: Vec<RankedHit>,
+    vector_scores: HashMap<(u32, DocId), f32>,
+    plan: &VectorPlan,
+    sort_plan: &SortPlan,
+    cursor_key: Option<&SortKey>,
+    saw_cursor: &mut bool,
+    heap_limit: usize,
+  ) -> Result<Vec<RankedHit>> {
+    let mut heap = BinaryHeap::new();
+    let mut bm25_map: HashMap<(u32, DocId), RankedHit> = HashMap::new();
+    for hit in hits.into_iter() {
+      bm25_map.insert((hit.key.segment_ord, hit.key.doc_id), hit);
+    }
+    for ((seg_ord, doc_id), vscore) in vector_scores.into_iter() {
+      let mut bm25_score = 0.0_f32;
+      let mut explanation = None;
+      if let Some(existing) = bm25_map.remove(&(seg_ord, doc_id)) {
+        bm25_score = existing.score;
+        explanation = existing.explanation;
+      }
+      let final_score = if plan.alpha == 1.0 {
+        bm25_score
+      } else if plan.alpha == 0.0 {
+        vscore
+      } else {
+        blend_scores(bm25_score, vscore, plan.alpha, true)
+      };
+      if let Some(expl) = explanation.as_mut() {
+        expl.final_score = final_score;
+      }
+      let seg = self
+        .segments
+        .get(seg_ord as usize)
+        .ok_or_else(|| anyhow::anyhow!("missing segment {}", seg_ord))?;
+      let key = sort_plan.build_key(seg, doc_id, final_score, seg_ord);
+      if let Some(cur) = cursor_key {
+        let ord = key.cmp(cur);
+        if ord.is_lt() || ord.is_eq() {
+          if ord.is_eq() {
+            *saw_cursor = true;
+          }
+          continue;
+        }
+      }
+      let ranked = RankedHit {
+        key,
+        score: final_score,
+        vector_score: Some(vscore),
+        explanation,
+      };
+      if heap_limit == 0 {
+        heap.push(ranked);
+      } else {
+        push_ranked(&mut heap, ranked, heap_limit);
+      }
+    }
+    if plan.alpha > 0.0 {
+      for (_key, hit) in bm25_map.into_iter() {
+        if heap_limit == 0 {
+          heap.push(hit);
+        } else {
+          push_ranked(&mut heap, hit, heap_limit);
+        }
+      }
+    }
+    Ok(heap.into_iter().collect())
+  }
+
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0; set a positive limit to page results");
@@ -1741,11 +2139,6 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
-    let top_k = if req.limit == 0 {
-      0
-    } else {
-      req.limit.saturating_add(1)
-    };
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
     } else {
@@ -1757,6 +2150,26 @@ impl IndexReader {
         .map(|f| f.name.clone())
         .collect()
     };
+    #[cfg(feature = "vectors")]
+    let vector_plan = self.build_vector_plan(req)?;
+    #[cfg(feature = "vectors")]
+    let effective_limit = vector_plan
+      .as_ref()
+      .map(|p| p.candidate_size.max(req.limit.max(p.k)))
+      .unwrap_or(req.limit);
+    #[cfg(not(feature = "vectors"))]
+    let effective_limit = req.limit;
+    let top_k = if effective_limit == 0 {
+      0
+    } else {
+      effective_limit.saturating_add(1)
+    };
+    #[cfg(feature = "vectors")]
+    if let Some(plan) = vector_plan.as_ref() {
+      if plan.vector_only {
+        return self.search_vector_only(req, sort_plan, manifest_generation, cursor_state, plan);
+      }
+    }
     let query_plan = build_query_plan(&req.query, &default_fields)?;
     let compiled_score = compile_score_node(&query_plan.score_tree, &self.manifest.schema)?;
     let needs_score_hook = has_custom_scoring(&compiled_score);
@@ -1818,6 +2231,7 @@ impl IndexReader {
             RankedHit {
               key,
               score,
+              vector_score: None,
               explanation: None,
             },
             heap_limit,
@@ -1885,6 +2299,29 @@ impl IndexReader {
 
     if !score_fast_path {
       hits.extend(heap);
+    }
+    #[cfg(feature = "vectors")]
+    if let Some(plan) = vector_plan.as_ref() {
+      let vector_scores = self.collect_vector_scores(
+        plan,
+        root_filter,
+        req.vector_filter.as_ref(),
+        true,
+        &term_groups,
+        &phrase_fields,
+        &query_plan.matcher,
+      )?;
+      if plan.alpha < 1.0 || !vector_scores.is_empty() {
+        hits = self.merge_vector_hits(
+          hits,
+          vector_scores,
+          plan,
+          &sort_plan,
+          cursor_key.as_ref(),
+          &mut saw_cursor,
+          top_k,
+        )?;
+      }
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
     let search_phase_end = if req.profile {
@@ -2198,6 +2635,7 @@ impl IndexReader {
           RankedHit {
             key: sort_plan.build_key(seg, rd.doc_id, rd.score, segment_ord),
             score: rd.score,
+            vector_score: None,
             explanation,
           }
         })
@@ -2303,6 +2741,7 @@ impl IndexReader {
           RankedHit {
             key,
             score: computed_score,
+            vector_score: None,
             explanation,
           },
           rank_limit,
@@ -2496,6 +2935,7 @@ impl IndexReader {
     Some(Hit {
       doc_id: doc_id_str.to_string(),
       score: ranked.score,
+      vector_score: ranked.vector_score,
       fields: fields_val,
       snippet,
       explanation: ranked.explanation,
@@ -3037,6 +3477,9 @@ mod tests {
         fuzzy: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
+
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
         return_stored: false,
         highlight_field: None,
         aggs: BTreeMap::new(),

@@ -740,6 +740,9 @@ impl<'a> QueryPlanBuilder<'a> {
         };
         Ok((matcher, scorer, score_node))
       }
+      QueryNode::Vector(_) => {
+        bail!("vector query nodes are handled separately from BM25 planning")
+      }
     }
   }
 

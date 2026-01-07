@@ -10,7 +10,8 @@ use futures::channel::oneshot;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use searchlite_core::api::types::{
-  Aggregation, ExecutionStrategy, Filter, IndexOptions, SearchRequest, SortSpec, StorageType,
+  Aggregation, ExecutionStrategy, Filter, IndexOptions, Query, QueryNode, SearchRequest, SortSpec,
+  StorageType,
 };
 use searchlite_core::api::{Document, IndexReader, IndexWriter};
 use searchlite_core::storage::{DynFile, InMemoryStorage, Storage, StorageFile};
@@ -778,8 +779,11 @@ impl Searchlite {
   }
 
   pub fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
+    let parsed_query = serde_json::from_str::<QueryNode>(&query)
+      .map(Query::Node)
+      .unwrap_or(Query::String(query));
     let request = SearchRequest {
-      query: query.into(),
+      query: parsed_query,
       fields: None,
       filter: None,
       filters: Vec::<Filter>::new(),
@@ -791,6 +795,9 @@ impl Searchlite {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::<String, Aggregation>::new(),
@@ -955,6 +962,9 @@ mod tests {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -991,6 +1001,9 @@ mod tests {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),

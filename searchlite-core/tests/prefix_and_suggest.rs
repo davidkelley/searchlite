@@ -65,6 +65,9 @@ fn prefix_query_matches_docs() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -142,6 +145,9 @@ fn search_as_you_type_matches_partial_tokens() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -206,6 +212,9 @@ fn fuzzy_completion_suggests_close_terms() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),

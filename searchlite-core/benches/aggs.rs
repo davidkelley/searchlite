@@ -102,6 +102,9 @@ fn bench_terms_aggregation(c: &mut Criterion) {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,
@@ -153,6 +156,9 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,

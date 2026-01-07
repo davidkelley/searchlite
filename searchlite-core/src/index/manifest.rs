@@ -41,6 +41,9 @@ pub struct SegmentPaths {
   pub docstore: String,
   pub fast: String,
   pub meta: String,
+  #[cfg(feature = "vectors")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vector_dir: Option<String>,
 }
 
 impl Manifest {
@@ -144,6 +147,15 @@ impl Schema {
         "doc_id_field `{}` must not overlap with other schema fields",
         self.doc_id_field
       );
+    }
+    #[cfg(feature = "vectors")]
+    for vf in self.vector_fields.iter() {
+      if vf.dim == 0 {
+        anyhow::bail!("vector field `{}` must have dim > 0", vf.name);
+      }
+      if self.resolved_fields().iter().any(|f| f.path == vf.name) {
+        anyhow::bail!("vector field `{}` conflicts with another field", vf.name);
+      }
     }
     Ok(())
   }

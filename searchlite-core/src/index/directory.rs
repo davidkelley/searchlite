@@ -35,6 +35,13 @@ pub fn segment_paths(root: &Path, id: &str) -> SegmentPaths {
       .join(format!("seg_{}.meta", id))
       .to_string_lossy()
       .into(),
+    #[cfg(feature = "vectors")]
+    vector_dir: Some(
+      root
+        .join(format!("seg_{}_vectors", id))
+        .to_string_lossy()
+        .into(),
+    ),
   }
 }
 
@@ -62,5 +69,10 @@ mod tests {
     assert!(paths.terms.ends_with("seg_abc.terms"));
     assert!(paths.postings.ends_with("seg_abc.post"));
     assert_eq!(wal_path(dir.path()), dir.path().join("wal.log"));
+    #[cfg(feature = "vectors")]
+    {
+      let vector_dir = paths.vector_dir.as_deref().expect("vector dir set");
+      assert!(vector_dir.ends_with("seg_abc_vectors"));
+    }
   }
 }

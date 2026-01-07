@@ -741,6 +741,8 @@ let results = reader.search(&SearchRequest {
     .collect(),
     #[cfg(feature = "vectors")]
     vector_query: None,
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
 })?;
 for hit in results.hits {
     println!("doc {} score {:.3} fields {:?}", hit.doc_id, hit.score, hit.fields);
@@ -762,6 +764,41 @@ Search responses include a `next_cursor` when additional hits remain.
 - `bmw_block_size`: optional block size when using BMW pruning.
 
 The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthetic benchmark that compares the strategies lives in `searchlite-core/examples/pruning.rs` (`cargo run -p searchlite-core --example pruning`).
+
+### Vector search
+
+- Define vector fields in the schema (requires the `vectors` feature):
+
+```json
+{
+  "vector_fields": [{ "name": "embedding", "dim": 2, "metric": "Cosine" }]
+}
+```
+
+- Vector-only: set the query node to a vector clause. Missing vectors are skipped.
+
+```json
+{ "type": "vector", "field": "embedding", "vector": [1.0, 0.0], "k": 3, "alpha": 0.0 }
+```
+
+- Hybrid: combine a text query with a legacy `vector_query` tuple to blend BM25 and vector similarity. `alpha=1.0` uses BM25 only; `alpha=0.0` uses vector similarity only.
+
+```json
+{
+  "query": { "type": "query_string", "query": "rust", "boost": null, "fields": null },
+  "limit": 5,
+  "vector_query": ["embedding", [1.0, 0.0], 0.25]
+}
+```
+
+- Tunables (vector queries):
+  - `k`: number of neighbors to retrieve (defaults to `limit`).
+  - `candidate_size`: optional oversampling during ANN search.
+  - `ef_search`: ANN beam width (defaults to a sensible value if omitted).
+  - `vector_filter`: optional filter applied during vector candidate selection.
+- Responses include `vector_score` when vector search runs; `_score` is the blended score.
+- Cosine vectors are normalized automatically; vectors with the wrong dimension are rejected.
+- ANN is approximate (HNSW); raise `candidate_size`/`ef_search` for higher recall.
 
 ### In-memory indexes
 
