@@ -575,15 +575,6 @@ impl<'a> SegmentWriter<'a> {
     }
   }
 
-  #[allow(dead_code)]
-  pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
-  where
-    I: IntoIterator<Item = Result<Document>>,
-  {
-    let docs_vec: Vec<Document> = docs.into_iter().collect::<Result<_, _>>()?;
-    self.write_segment(&docs_vec, generation)
-  }
-
   pub fn write_segment(&self, docs: &[Document], generation: u32) -> Result<SegmentMeta> {
     let id = Uuid::new_v4().simple().to_string();
     let paths = directory::segment_paths(self.root, &id);
@@ -900,6 +891,15 @@ impl<'a> SegmentWriter<'a> {
       checksums,
     };
     Ok(meta)
+  }
+
+  #[allow(dead_code)]
+  pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
+  where
+    I: IntoIterator<Item = Result<Document>>,
+  {
+    let docs_vec: Vec<Document> = docs.into_iter().collect::<Result<_, _>>()?;
+    self.write_segment(&docs_vec, generation)
   }
 }
 
