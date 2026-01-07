@@ -1,17 +1,22 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
-#[cfg(feature = "vectors")]
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+#[cfg(feature = "vectors")]
+use bincode::Options;
+#[cfg(feature = "vectors")]
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::types::Document;
+#[cfg(feature = "vectors")]
+use crate::api::types::VectorMetric as ApiVectorMetric;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
 use crate::index::fastfields::{
@@ -24,7 +29,15 @@ use crate::index::postings::{InvertedIndexBuilder, PostingsReader, PostingsWrite
 use crate::index::terms::{read_terms, write_terms};
 use crate::storage::{Storage, StorageFile};
 use crate::util::checksum::checksum;
+#[cfg(feature = "vectors")]
+use crate::vectors::hnsw::HnswParams;
+#[cfg(feature = "vectors")]
+use crate::vectors::hnsw::{HnswGraph, HnswIndex};
+#[cfg(feature = "vectors")]
+use crate::vectors::VectorStore;
 use crate::DocId;
+#[cfg(feature = "vectors")]
+use std::io::Cursor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentFileMeta {
@@ -33,8 +46,20 @@ pub struct SegmentFileMeta {
   pub doc_ids: Vec<String>,
   pub avg_field_lengths: HashMap<String, f32>,
   #[cfg(feature = "vectors")]
-  pub vectors: HashMap<String, Vec<Vec<f32>>>,
+  #[serde(default)]
+  pub vector_fields: HashMap<String, VectorFieldMeta>,
   pub use_zstd: bool,
+}
+
+#[cfg(feature = "vectors")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorFieldMeta {
+  pub dim: usize,
+  pub metric: crate::index::manifest::VectorMetric,
+  #[serde(default)]
+  pub vectors: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub hnsw: Option<HnswParams>,
 }
 
 #[derive(Default)]
@@ -51,6 +76,8 @@ struct CollectedDocument {
   nested_counts: HashMap<String, usize>,
   nested_parents: HashMap<String, Vec<usize>>,
   nested_stored: HashMap<String, serde_json::Value>,
+  #[cfg(feature = "vectors")]
+  vectors: HashMap<String, Option<Vec<f32>>>,
 }
 
 impl CollectedDocument {
@@ -437,6 +464,43 @@ fn stored_nested_value(
   }
 }
 
+#[cfg(feature = "vectors")]
+fn collect_vector_value(
+  schema: &Schema,
+  field: &str,
+  value: &serde_json::Value,
+) -> Result<Option<Vec<f32>>> {
+  use crate::index::manifest::VectorMetric;
+  use crate::vectors::normalize_in_place;
+  let Some(vf) = schema.vector_field(field) else {
+    bail!("unknown vector field {field}");
+  };
+  if value.is_null() {
+    return Ok(None);
+  }
+  let arr = value
+    .as_array()
+    .ok_or_else(|| anyhow!("vector field {field} must be an array"))?;
+  let mut vecvals: Vec<f32> = Vec::with_capacity(arr.len());
+  for v in arr.iter() {
+    let Some(num) = v.as_f64() else {
+      bail!("vector field {field} must contain numbers");
+    };
+    vecvals.push(num as f32);
+  }
+  if vecvals.len() != vf.dim {
+    bail!(
+      "vector field {field} expected dimension {}, got {}",
+      vf.dim,
+      vecvals.len()
+    );
+  }
+  if matches!(vf.metric, VectorMetric::Cosine) {
+    normalize_in_place(&mut vecvals);
+  }
+  Ok(Some(vecvals))
+}
+
 fn collect_document(
   schema: &Schema,
   doc: &Document,
@@ -455,6 +519,12 @@ fn collect_document(
   );
   for (field, value) in doc.fields.iter() {
     if field == schema.doc_id_field() {
+      continue;
+    }
+    #[cfg(feature = "vectors")]
+    if schema.vector_fields.iter().any(|vf| vf.name == *field) {
+      let vec_value = collect_vector_value(schema, field, value)?;
+      collected.vectors.insert(field.clone(), vec_value);
       continue;
     }
     if let Some(meta) = resolved.get(field) {
@@ -477,10 +547,6 @@ fn collect_document(
         None,
       )?;
     } else {
-      #[cfg(feature = "vectors")]
-      if schema.vector_fields.iter().any(|vf| vf.name == *field) {
-        continue;
-      }
       bail!("unknown field {field}");
     }
   }
@@ -513,12 +579,20 @@ impl<'a> SegmentWriter<'a> {
   }
 
   pub fn write_segment(&self, docs: &[Document], generation: u32) -> Result<SegmentMeta> {
-    self.write_segment_from_iter(docs.iter().cloned().map(Ok), generation)
+    self.write_segment_stream(docs.iter().map(|doc| Ok(Cow::Borrowed(doc))), generation)
   }
 
+  #[allow(dead_code)]
   pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
   where
     I: IntoIterator<Item = Result<Document>>,
+  {
+    self.write_segment_stream(docs.into_iter().map(|doc| doc.map(Cow::Owned)), generation)
+  }
+
+  fn write_segment_stream<'doc, I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
+  where
+    I: IntoIterator<Item = Result<Cow<'doc, Document>>>,
   {
     let id = Uuid::new_v4().simple().to_string();
     let paths = directory::segment_paths(self.root, &id);
@@ -548,15 +622,15 @@ impl<'a> SegmentWriter<'a> {
     let mut doc_writer = DocStoreWriter::new(&mut *docstore_file, self.use_zstd);
 
     #[cfg(feature = "vectors")]
-    let mut vector_fields: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    let mut vector_fields: HashMap<String, Vec<Option<Vec<f32>>>> = HashMap::new();
     let mut doc_ids: Vec<String> = Vec::new();
-    let mut doc_count: u64 = 0;
 
-    for (doc_id_u64, doc) in docs.into_iter().enumerate() {
-      let doc = doc?;
-      let doc_ord = doc_id_u64 as DocId;
-      self.schema.validate_document(&doc)?;
-      let collected = collect_document(self.schema, &doc, &resolved)?;
+    for doc_res in docs.into_iter() {
+      let doc = doc_res?;
+      let doc_ref = doc.as_ref();
+      let doc_ord = doc_ids.len() as DocId;
+      self.schema.validate_document(doc_ref)?;
+      let collected = collect_document(self.schema, doc_ref, &resolved)?;
       let doc_key = collected
         .doc_id
         .clone()
@@ -721,36 +795,21 @@ impl<'a> SegmentWriter<'a> {
         }
       }
 
+      #[cfg(feature = "vectors")]
+      let collected_vectors = collected.vectors.clone();
       let stored = collected.finalize_stored();
 
       #[cfg(feature = "vectors")]
       for vf in self.schema.vector_fields.iter() {
         let entry = vector_fields.entry(vf.name.clone()).or_default();
-        if let Some(val) = doc.fields.get(&vf.name) {
-          if let Some(arr) = val.as_array() {
-            let mut vecvals: Vec<f32> = arr
-              .iter()
-              .filter_map(|v| v.as_f64())
-              .map(|v| v as f32)
-              .collect();
-            match vecvals.len().cmp(&vf.dim) {
-              Ordering::Less => vecvals.resize(vf.dim, 0.0),
-              Ordering::Greater => vecvals.truncate(vf.dim),
-              Ordering::Equal => {}
-            }
-            entry.push(vecvals);
-            continue;
-          }
-        }
-        entry.push(vec![0.0; vf.dim]);
+        entry.push(collected_vectors.get(&vf.name).cloned().unwrap_or(None));
       }
 
       doc_writer.add_document(&serde_json::Value::Object(stored))?;
-      doc_count += 1;
     }
     let doc_offsets = doc_writer.offsets().to_vec();
     drop(doc_writer);
-    docstore_file.sync_all()?;
+    drop(docstore_file);
 
     let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
     let mut postings_writer = PostingsWriter::new(&mut *postings_file, self.enable_positions);
@@ -767,16 +826,59 @@ impl<'a> SegmentWriter<'a> {
       &term_offsets,
     )?;
 
-    let avg_field_lengths = compute_avg_lengths(&doc_lengths, doc_count);
+    let total_docs = doc_ids.len();
+    let avg_field_lengths = compute_avg_lengths(&doc_lengths, total_docs as u64);
 
     fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
+
+    #[cfg(feature = "vectors")]
+    let mut vector_meta: HashMap<String, VectorFieldMeta> = HashMap::new();
+    #[cfg(feature = "vectors")]
+    {
+      if !self.schema.vector_fields.is_empty() {
+        if let Some(dir) = paths.vector_dir.as_deref() {
+          self.storage.ensure_dir(Path::new(dir))?;
+        }
+      }
+      for vf in self.schema.vector_fields.iter() {
+        let field_vectors = vector_fields
+          .remove(&vf.name)
+          .unwrap_or_else(|| vec![None; total_docs]);
+        if field_vectors.len() != total_docs {
+          bail!("vector field {} missing values", vf.name);
+        }
+        let (store, present) = build_vector_store(vf, &field_vectors)?;
+        let (vec_path, hnsw_path) = vector_paths(&paths, &vf.name)?;
+        write_vector_file(self.storage.as_ref(), &vec_path, &store)?;
+        let params = vf.hnsw.unwrap_or_default();
+        let store_arc = Arc::new(store);
+        let mut index = HnswIndex::new(store_arc.clone(), params);
+        for doc_id in 0..total_docs {
+          if store_arc.vector(doc_id as u32).is_some() {
+            index.add_vector(doc_id as u32);
+          }
+        }
+        let graph = index.into_graph();
+        let graph_bytes = serde_json::to_vec(&graph)?;
+        self.storage.write_all(&hnsw_path, &graph_bytes)?;
+        vector_meta.insert(
+          vf.name.clone(),
+          VectorFieldMeta {
+            dim: vf.dim,
+            metric: vf.metric.clone(),
+            vectors: present,
+            hnsw: Some(params),
+          },
+        );
+      }
+    }
 
     let seg_file_meta = SegmentFileMeta {
       doc_offsets,
       doc_ids,
       avg_field_lengths: avg_field_lengths.clone(),
       #[cfg(feature = "vectors")]
-      vectors: vector_fields,
+      vector_fields: vector_meta.clone(),
       use_zstd: self.use_zstd,
     };
     write_segment_meta(
@@ -785,14 +887,25 @@ impl<'a> SegmentWriter<'a> {
       &seg_file_meta,
     )?;
 
+    #[cfg(feature = "vectors")]
+    let mut checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    #[cfg(not(feature = "vectors"))]
     let checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    #[cfg(feature = "vectors")]
+    for (field, _meta) in vector_meta.iter() {
+      let (vec_path, hnsw_path) = vector_paths(&paths, field)?;
+      let vec_buf = self.storage.read_to_end(&vec_path)?;
+      let hnsw_buf = self.storage.read_to_end(&hnsw_path)?;
+      checksums.insert(format!("vector_{}_bin", field), checksum(&vec_buf));
+      checksums.insert(format!("vector_{}_hnsw", field), checksum(&hnsw_buf));
+    }
 
     let meta = SegmentMeta {
       id,
       generation,
       paths,
-      doc_count: doc_count as u32,
-      max_doc_id: doc_count.saturating_sub(1) as u32,
+      doc_count: total_docs as u32,
+      max_doc_id: total_docs.saturating_sub(1) as u32,
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,
@@ -825,6 +938,170 @@ fn compute_avg_lengths(lengths: &HashMap<String, u64>, total_docs: u64) -> HashM
   out
 }
 
+#[cfg(feature = "vectors")]
+const VECTOR_FILE_MAGIC: u32 = 0x56435452; // "VCTR"
+#[cfg(feature = "vectors")]
+const VECTOR_FILE_VERSION: u32 = 1;
+
+#[cfg(feature = "vectors")]
+fn vector_paths(
+  paths: &SegmentPaths,
+  field: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+  let dir = paths
+    .vector_dir
+    .as_deref()
+    .ok_or_else(|| anyhow!("segment missing vector directory path"))?;
+  let base = Path::new(dir);
+  Ok((
+    base.join(format!("{field}.bin")),
+    base.join(format!("{field}.hnsw")),
+  ))
+}
+
+#[cfg(feature = "vectors")]
+fn metric_code(metric: &ApiVectorMetric) -> u8 {
+  match metric {
+    ApiVectorMetric::Cosine => 0,
+    ApiVectorMetric::L2 => 1,
+  }
+}
+
+#[cfg(feature = "vectors")]
+fn metric_from_code(code: u8) -> Option<ApiVectorMetric> {
+  match code {
+    0 => Some(ApiVectorMetric::Cosine),
+    1 => Some(ApiVectorMetric::L2),
+    _ => None,
+  }
+}
+
+#[cfg(feature = "vectors")]
+fn build_vector_store(
+  field: &crate::index::manifest::VectorField,
+  vectors: &[Option<Vec<f32>>],
+) -> Result<(VectorStore, u32)> {
+  let mut offsets = vec![u32::MAX; vectors.len()];
+  let mut values = Vec::new();
+  let mut present = 0u32;
+  for (doc_id, vec_opt) in vectors.iter().enumerate() {
+    if let Some(vecvals) = vec_opt {
+      if vecvals.len() != field.dim {
+        bail!(
+          "vector field {} expected dim {}, got {} on doc {}",
+          field.name,
+          field.dim,
+          vecvals.len(),
+          doc_id
+        );
+      }
+      let vals = vecvals.clone();
+      offsets[doc_id] = present;
+      present = present.saturating_add(1);
+      values.extend_from_slice(&vals);
+    }
+  }
+  let metric: ApiVectorMetric = field.metric.clone().into();
+  Ok((
+    VectorStore::new(field.dim, metric, offsets, values),
+    present,
+  ))
+}
+
+#[cfg(feature = "vectors")]
+fn write_vector_file(storage: &dyn Storage, path: &Path, store: &VectorStore) -> Result<()> {
+  let mut buf: Vec<u8> = Vec::new();
+  buf.write_u32::<LittleEndian>(VECTOR_FILE_MAGIC)?;
+  buf.write_u32::<LittleEndian>(VECTOR_FILE_VERSION)?;
+  buf.write_u32::<LittleEndian>(store.dim() as u32)?;
+  buf.write_u8(metric_code(&store.metric()))?;
+  buf.write_u8(0)?;
+  buf.write_u16::<LittleEndian>(0)?;
+  buf.write_u32::<LittleEndian>(store.len() as u32)?;
+  let value_len = store
+    .offsets()
+    .iter()
+    .filter(|&&off| off != u32::MAX)
+    .count();
+  buf.write_u32::<LittleEndian>(value_len as u32)?;
+  for off in store.offsets().iter() {
+    buf.write_u32::<LittleEndian>(*off)?;
+  }
+  let values = store.values();
+  for v in values.iter() {
+    buf.write_f32::<LittleEndian>(*v)?;
+  }
+  storage.write_all(path, &buf)?;
+  Ok(())
+}
+
+#[cfg(feature = "vectors")]
+fn read_vector_file(
+  storage: &dyn Storage,
+  path: &Path,
+  expected_docs: usize,
+  expected_dim: usize,
+  expected_metric: &ApiVectorMetric,
+) -> Result<VectorStore> {
+  let bytes = storage.read_to_end(path)?;
+  let mut cursor = Cursor::new(bytes);
+  let magic = cursor.read_u32::<LittleEndian>()?;
+  if magic != VECTOR_FILE_MAGIC {
+    bail!("invalid vector file magic for {:?}", path);
+  }
+  let version = cursor.read_u32::<LittleEndian>()?;
+  if version != VECTOR_FILE_VERSION {
+    bail!("unsupported vector file version {} for {:?}", version, path);
+  }
+  let dim = cursor.read_u32::<LittleEndian>()? as usize;
+  if dim != expected_dim {
+    bail!(
+      "vector dim mismatch for {:?}: expected {}, found {}",
+      path,
+      expected_dim,
+      dim
+    );
+  }
+  let metric_code_raw = cursor.read_u8()?;
+  let Some(metric) = metric_from_code(metric_code_raw) else {
+    bail!(
+      "unknown vector metric code {} in {:?}",
+      metric_code_raw,
+      path
+    );
+  };
+  if &metric != expected_metric {
+    bail!(
+      "vector metric mismatch for {:?}: expected {:?}, found {:?}",
+      path,
+      expected_metric,
+      metric
+    );
+  }
+  // skip reserved bytes
+  let _ = cursor.read_u8()?;
+  let _ = cursor.read_u16::<LittleEndian>()?;
+  let doc_count = cursor.read_u32::<LittleEndian>()? as usize;
+  if doc_count != expected_docs {
+    bail!(
+      "vector doc count mismatch for {:?}: expected {}, found {}",
+      path,
+      expected_docs,
+      doc_count
+    );
+  }
+  let vector_count = cursor.read_u32::<LittleEndian>()? as usize;
+  let mut offsets = Vec::with_capacity(doc_count);
+  for _ in 0..doc_count {
+    offsets.push(cursor.read_u32::<LittleEndian>()?);
+  }
+  let mut values = Vec::with_capacity(vector_count.saturating_mul(dim));
+  for _ in 0..vector_count.saturating_mul(dim) {
+    values.push(cursor.read_f32::<LittleEndian>()?);
+  }
+  Ok(VectorStore::new(dim, metric, offsets, values))
+}
+
 fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
   let mut map = HashMap::new();
   for (name, path_str) in [
@@ -840,6 +1117,12 @@ fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<Hash
   Ok(map)
 }
 
+#[cfg(feature = "vectors")]
+struct VectorFieldReader {
+  store: Arc<VectorStore>,
+  index: HnswIndex,
+}
+
 pub struct SegmentReader {
   pub meta: SegmentMeta,
   terms: TinyTerms,
@@ -850,6 +1133,8 @@ pub struct SegmentReader {
   fast_fields: FastFieldsReader,
   keep_positions: bool,
   seg_meta: SegmentFileMeta,
+  #[cfg(feature = "vectors")]
+  vectors: HashMap<String, VectorFieldReader>,
 }
 
 impl SegmentReader {
@@ -874,6 +1159,51 @@ impl SegmentReader {
     let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
     let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
     let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
+    #[cfg(feature = "vectors")]
+    let mut vector_fields = HashMap::new();
+    #[cfg(feature = "vectors")]
+    {
+      for (field, vmeta) in seg_meta.vector_fields.iter() {
+        let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
+        let expected_metric: ApiVectorMetric = vmeta.metric.clone().into();
+        let store = read_vector_file(
+          storage.as_ref(),
+          &vec_path,
+          meta.doc_count as usize,
+          vmeta.dim,
+          &expected_metric,
+        )?;
+        let graph_bytes = storage.read_to_end(&hnsw_path)?;
+        let graph: HnswGraph = bincode::options()
+          .with_fixint_encoding()
+          .deserialize(&graph_bytes)
+          .or_else(|_| serde_json::from_slice(&graph_bytes))
+          .map_err(|e| {
+            anyhow!(
+              "failed to read HNSW graph for field {} in segment {}: {}",
+              field,
+              meta.id,
+              e
+            )
+          })?;
+        if graph.dim != vmeta.dim || graph.metric != expected_metric {
+          bail!(
+            "vector index metadata mismatch for field {} in segment {}",
+            field,
+            meta.id
+          );
+        }
+        let store_arc = Arc::new(store);
+        let index = HnswIndex::from_graph(graph, store_arc.clone());
+        vector_fields.insert(
+          field.clone(),
+          VectorFieldReader {
+            store: store_arc,
+            index,
+          },
+        );
+      }
+    }
     Ok(Self {
       meta,
       terms: TinyTerms(terms),
@@ -884,6 +1214,8 @@ impl SegmentReader {
       fast_fields,
       keep_positions,
       seg_meta,
+      #[cfg(feature = "vectors")]
+      vectors: vector_fields,
     })
   }
 
@@ -932,11 +1264,17 @@ impl SegmentReader {
   #[cfg(feature = "vectors")]
   pub fn vector(&self, field: &str, doc_id: DocId) -> Option<Vec<f32>> {
     self
-      .seg_meta
       .vectors
-      .get(field)?
-      .get(doc_id as usize)
-      .cloned()
+      .get(field)
+      .and_then(|vf| vf.store.vector(doc_id).map(|v| v.to_vec()))
+  }
+
+  #[cfg(feature = "vectors")]
+  pub fn vector_components(&self, field: &str) -> Option<(&HnswIndex, Arc<VectorStore>)> {
+    self
+      .vectors
+      .get(field)
+      .map(|vf| (&vf.index, vf.store.clone()))
   }
 }
 

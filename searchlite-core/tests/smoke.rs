@@ -32,6 +32,9 @@ fn base_search_request(query: &str) -> SearchRequest {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -129,6 +132,9 @@ fn index_and_search() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
       aggs: BTreeMap::new(),
@@ -352,6 +358,9 @@ fn upsert_and_delete_by_id() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -439,6 +448,9 @@ fn cursor_paginates_ordered_hits() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -509,6 +521,9 @@ fn cursor_rejects_invalid_hex() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -559,6 +574,9 @@ fn cursor_rejects_when_limit_zero() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -618,6 +636,9 @@ fn cursor_rejects_excessive_advance() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -669,6 +690,9 @@ fn cursor_rejects_mismatched_position() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -747,6 +771,9 @@ fn cursor_orders_stably_across_segments() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),
@@ -856,6 +883,9 @@ fn in_memory_storage_keeps_disk_clean() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -984,6 +1014,9 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -1144,6 +1177,9 @@ fn nested_numeric_filters_bind_to_object_values() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),

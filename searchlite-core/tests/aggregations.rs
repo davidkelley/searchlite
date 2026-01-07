@@ -117,6 +117,9 @@ fn terms_and_stats_aggregations() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -197,6 +200,9 @@ fn aggregation_requires_fast_field() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,
@@ -280,6 +286,9 @@ fn histogram_bucket_generation() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -366,6 +375,9 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -466,6 +478,9 @@ fn range_aggregation_counts() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -564,6 +579,9 @@ fn date_range_missing_and_keyed() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -656,6 +674,9 @@ fn extended_stats_and_value_count_include_missing() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -764,6 +785,9 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -870,6 +894,9 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -979,6 +1006,9 @@ fn terms_size_applied_after_merge() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,

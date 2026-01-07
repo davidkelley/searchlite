@@ -87,6 +87,9 @@ fn sorts_numeric_and_missing_last() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -171,6 +174,9 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -266,6 +272,9 @@ fn paginates_with_sorted_cursor_across_segments() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: true,
     highlight_field: None,
     aggs: BTreeMap::new(),

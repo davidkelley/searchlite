@@ -110,6 +110,9 @@ fn search_with_phrase_filters_and_compaction() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: Some("body".into()),
       aggs: BTreeMap::new(),

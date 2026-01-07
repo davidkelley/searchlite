@@ -69,6 +69,9 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs: BTreeMap::new(),
@@ -118,6 +121,9 @@ fn empty_query_returns_no_hits() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),

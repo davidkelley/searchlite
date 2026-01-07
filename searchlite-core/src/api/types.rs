@@ -40,10 +40,39 @@ pub struct VectorOptions {
 }
 
 #[cfg(feature = "vectors")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VectorMetric {
   Cosine,
   L2,
+}
+
+#[cfg(feature = "vectors")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyVectorQuery(pub String, pub Vec<f32>, pub f32);
+
+#[cfg(feature = "vectors")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum VectorQuerySpec {
+  Structured(VectorQuery),
+  Legacy(LegacyVectorQuery),
+}
+
+#[cfg(feature = "vectors")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VectorQuery {
+  pub field: String,
+  pub vector: Vec<f32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub k: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub alpha: Option<f32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub ef_search: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub candidate_size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub boost: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,6 +322,8 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+  #[cfg(feature = "vectors")]
+  Vector(VectorQuery),
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,7 +386,11 @@ pub struct SearchRequest {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fuzzy: Option<FuzzyOptions>,
   #[cfg(feature = "vectors")]
-  pub vector_query: Option<(String, Vec<f32>, f32)>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vector_query: Option<VectorQuerySpec>,
+  #[cfg(feature = "vectors")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vector_filter: Option<Filter>,
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
@@ -392,7 +427,10 @@ struct SearchRequestHelper {
   pub fuzzy: Option<FuzzyOptions>,
   #[cfg(feature = "vectors")]
   #[serde(default)]
-  pub vector_query: Option<(String, Vec<f32>, f32)>,
+  pub vector_query: Option<VectorQuerySpec>,
+  #[cfg(feature = "vectors")]
+  #[serde(default)]
+  pub vector_filter: Option<Filter>,
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
@@ -431,6 +469,8 @@ impl<'de> Deserialize<'de> for SearchRequest {
       fuzzy: helper.fuzzy,
       #[cfg(feature = "vectors")]
       vector_query: helper.vector_query,
+      #[cfg(feature = "vectors")]
+      vector_filter: helper.vector_filter,
       return_stored: helper.return_stored,
       highlight_field: helper.highlight_field,
       aggs: helper.aggs,

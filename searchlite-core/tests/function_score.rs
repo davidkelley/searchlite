@@ -75,6 +75,9 @@ fn base_request(query: impl Into<Query>) -> SearchRequest {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs: BTreeMap::new(),

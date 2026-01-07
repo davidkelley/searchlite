@@ -93,6 +93,9 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -161,6 +164,9 @@ fn histogram_requires_positive_interval() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,
@@ -250,6 +256,9 @@ fn nested_terms_stats_aggregation() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -330,6 +339,9 @@ fn date_histogram_rejects_invalid_config() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,
@@ -378,6 +390,9 @@ fn date_histogram_rejects_invalid_config() {
     fuzzy: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
     return_stored: false,
     highlight_field: None,
     aggs,
@@ -445,6 +460,9 @@ fn top_hits_returns_requested_docs() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -539,6 +557,9 @@ fn top_hits_applies_sort_spec() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,
@@ -638,6 +659,9 @@ fn date_histogram_calendar_month_interval() {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: false,
       highlight_field: None,
       aggs,

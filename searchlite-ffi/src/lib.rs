@@ -4,7 +4,8 @@ use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, IndexOptions, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, SearchRequest,
+  StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -126,6 +127,9 @@ pub unsafe extern "C" fn searchlite_search(
   }
   let h = &mut *handle;
   let query_str = CStr::from_ptr(query).to_string_lossy().to_string();
+  let query_node: Query = serde_json::from_str::<QueryNode>(&query_str)
+    .map(Query::Node)
+    .unwrap_or_else(|_| query_str.clone().into());
   let reader = match h.index.reader() {
     Ok(r) => r,
     Err(_) => return 0,
@@ -149,7 +153,7 @@ pub unsafe extern "C" fn searchlite_search(
     BTreeMap::new()
   };
   let req = SearchRequest {
-    query: query_str.into(),
+    query: query_node,
     fields: None,
     filter: None,
     filters: vec![],
@@ -168,6 +172,9 @@ pub unsafe extern "C" fn searchlite_search(
     profile: false,
     #[cfg(feature = "vectors")]
     vector_query: None,
+
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
   };
   let res = match reader.search(&req) {
     Ok(r) => r,

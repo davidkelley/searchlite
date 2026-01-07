@@ -740,6 +740,12 @@ impl<'a> QueryPlanBuilder<'a> {
         };
         Ok((matcher, scorer, score_node))
       }
+      #[cfg(feature = "vectors")]
+      QueryNode::Vector(_) => {
+        // Vector clauses are handled by the vector search path; treat as MatchAll
+        // for BM25 planning so mixed queries can proceed.
+        Ok((QueryMatcher::MatchAll, None, ScoreNode::Empty))
+      }
     }
   }
 
