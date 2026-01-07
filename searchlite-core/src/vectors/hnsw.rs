@@ -99,6 +99,14 @@ impl HnswIndex {
     self.graph
   }
 
+  pub fn len(&self) -> usize {
+    self.store.present()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
   pub fn add_vector(&mut self, id: u32) {
     let Some(vector) = self.store.vector(id) else {
       return;

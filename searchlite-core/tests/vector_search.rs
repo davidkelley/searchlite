@@ -319,3 +319,54 @@ fn vector_filter_limits_results() {
   assert_eq!(hits.len(), 1);
   assert_eq!(hits[0].doc_id, "keep");
 }
+
+#[test]
+fn vector_search_caps_to_available_vectors() {
+  let dir = tempdir().unwrap();
+  let mut schema = schema();
+  schema.vector_fields[0].dim = 3;
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("only-one")),
+          ("body".into(), serde_json::json!("rust caps k")),
+          ("embedding".into(), serde_json::json!([1.0, 0.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("no-vector")),
+          ("body".into(), serde_json::json!("rust none")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0, 0.0],
+      k: Some(10),
+      alpha: Some(0.0),
+      ef_search: Some(50),
+      candidate_size: Some(20),
+      boost: None,
+    })),
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 10)
+  };
+  let hits = reader.search(&req).unwrap().hits;
+  assert_eq!(hits.len(), 1);
+  assert_eq!(hits[0].doc_id, "only-one");
+}

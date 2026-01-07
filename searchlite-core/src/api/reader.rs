@@ -1860,11 +1860,12 @@ impl IndexReader {
         .map(|p| p.for_segment(seg, segment_ord as u32))
         .transpose()?;
       let candidates = if let Some((index, _store)) = seg.vector_components(&plan.field) {
-        index.search(
-          &plan.vector,
-          plan.candidate_size.max(plan.k),
-          plan.ef_search,
-        )
+        if index.is_empty() {
+          Vec::new()
+        } else {
+          let search_k = plan.candidate_size.max(plan.k).min(index.len().max(1));
+          index.search(&plan.vector, search_k, plan.ef_search)
+        }
       } else {
         Vec::new()
       };
@@ -2005,11 +2006,12 @@ impl IndexReader {
       } else {
         None
       };
-      let candidates = index.search(
-        &plan.vector,
-        plan.candidate_size.max(plan.k),
-        plan.ef_search,
-      );
+      let available = index.len();
+      if available == 0 {
+        continue;
+      }
+      let search_k = plan.candidate_size.max(plan.k).min(available.max(1));
+      let candidates = index.search(&plan.vector, search_k, plan.ef_search);
       for (doc_id, mut vscore) in candidates.into_iter() {
         if seg.is_deleted(doc_id) {
           continue;
