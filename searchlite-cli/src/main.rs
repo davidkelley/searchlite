@@ -140,10 +140,10 @@ fn main() -> Result<()> {
   }
 }
 
-fn default_options(path: &Path) -> IndexOptions {
+fn options(path: &Path, create_if_missing: bool) -> IndexOptions {
   IndexOptions {
     path: path.to_path_buf(),
-    create_if_missing: true,
+    create_if_missing,
     enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
@@ -174,7 +174,7 @@ struct SearchCliArgs {
 }
 
 fn cmd_init(index: &Path, schema_path: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, true);
   let schema_str = fs::read_to_string(schema_path)?;
   let schema: searchlite_core::api::types::Schema = serde_json::from_str(&schema_str)?;
   IndexBuilder::create(index, schema, opts)?;
@@ -183,7 +183,7 @@ fn cmd_init(index: &Path, schema_path: &Path) -> Result<()> {
 }
 
 fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer()?;
   let content =
@@ -207,7 +207,7 @@ fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
 }
 
 fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer()?;
   let content = fs::read_to_string(ids_path)
@@ -232,7 +232,7 @@ fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
 }
 
 fn cmd_commit(index: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer()?;
   writer.commit()?;
@@ -241,7 +241,7 @@ fn cmd_commit(index: &Path) -> Result<()> {
 }
 
 fn cmd_search(index: PathBuf, request: SearchRequest) -> Result<()> {
-  let opts = default_options(index.as_path());
+  let opts = options(index.as_path(), false);
   let idx = Index::open(opts)?;
   let reader = idx.reader()?;
   let result = reader.search(&request)?;
@@ -394,7 +394,7 @@ fn build_vector_query(
 }
 
 fn cmd_inspect(index: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, false);
   let idx = Index::open(opts)?;
   let manifest = idx.manifest();
   println!("manifest: {}", serde_json::to_string_pretty(&manifest)?);
@@ -402,7 +402,7 @@ fn cmd_inspect(index: &Path) -> Result<()> {
 }
 
 fn cmd_compact(index: &Path) -> Result<()> {
-  let opts = default_options(index);
+  let opts = options(index, false);
   let idx = Index::open(opts)?;
   idx.compact()?;
   println!("compaction complete");
@@ -496,5 +496,37 @@ mod tests {
 
     let parsed = read_request(Some(request_path), false).unwrap().unwrap();
     cmd_search(index.clone(), parsed).unwrap();
+  }
+
+  #[test]
+  fn search_fails_when_index_missing() {
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx-missing");
+    let request = SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 5,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      return_stored: true,
+      highlight_field: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let err = cmd_search(index, request).unwrap_err();
+    assert!(
+      err.to_string().contains("index does not exist"),
+      "unexpected error: {err}"
+    );
   }
 }
