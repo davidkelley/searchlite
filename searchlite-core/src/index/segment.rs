@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 #[cfg(feature = "vectors")]
+use bincode::Options;
+#[cfg(feature = "vectors")]
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
@@ -838,7 +840,9 @@ impl<'a> SegmentWriter<'a> {
           }
         }
         let graph = index.into_graph();
-        let graph_bytes = serde_json::to_vec(&graph)?;
+        let graph_bytes = bincode::options()
+          .with_fixint_encoding()
+          .serialize(&graph)?;
         self.storage.write_all(&hnsw_path, &graph_bytes)?;
         vector_meta.insert(
           vf.name.clone(),
@@ -1162,7 +1166,18 @@ impl SegmentReader {
           &expected_metric,
         )?;
         let graph_bytes = storage.read_to_end(&hnsw_path)?;
-        let graph: HnswGraph = serde_json::from_slice(&graph_bytes)?;
+        let graph: HnswGraph = bincode::options()
+          .with_fixint_encoding()
+          .deserialize(&graph_bytes)
+          .or_else(|_| serde_json::from_slice(&graph_bytes))
+          .map_err(|e| {
+            anyhow!(
+              "failed to read HNSW graph for field {} in segment {}: {}",
+              field,
+              meta.id,
+              e
+            )
+          })?;
         if graph.dim != vmeta.dim || graph.metric != expected_metric {
           bail!(
             "vector index metadata mismatch for field {} in segment {}",

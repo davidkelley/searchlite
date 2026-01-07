@@ -42,6 +42,9 @@ pub struct HnswIndex {
   store: Arc<VectorStore>,
 }
 
+// NOTE: This is a single-layer (flat) HNSW graph; hierarchical layers are
+// omitted for now to keep construction/search simple for small/medium indexes.
+// Add multi-layer support if larger-scale performance demands it.
 #[derive(Debug, Clone, Copy)]
 struct Scored {
   id: u32,

@@ -778,7 +778,9 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
 - Vector-only: set the query node to a vector clause. Missing vectors are skipped.
 
 ```json
-{ "type": "vector", "field": "embedding", "vector": [1.0, 0.0], "k": 3, "alpha": 0.0 }
+{
+  "query": { "type": "vector", "field": "embedding", "vector": [1.0, 0.0], "k": 3, "alpha": 0.0 }
+}
 ```
 
 - Hybrid: combine a text query with a legacy `vector_query` tuple to blend BM25 and vector similarity. `alpha=1.0` uses BM25 only; `alpha=0.0` uses vector similarity only.

@@ -1783,9 +1783,6 @@ impl IndexReader {
     if !(0.0..=1.0).contains(&alpha) {
       bail!("vector alpha must be between 0 and 1 inclusive");
     }
-    if vector_only && query_vec.is_empty() {
-      return Ok(None);
-    }
     let default_k = if req.limit == 0 {
       vector_query.k.unwrap_or(10)
     } else {
@@ -2365,23 +2362,6 @@ impl IndexReader {
       }
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
-    if let Some(cur) = cursor_key.as_ref() {
-      let mut filtered = Vec::with_capacity(hits.len());
-      for hit in hits.into_iter() {
-        if hit.key.segment_ord == cur.segment_ord && hit.key.doc_id == cur.doc_id {
-          continue;
-        }
-        let ord = hit.key.cmp(cur);
-        if ord.is_lt() {
-          continue;
-        }
-        if ord.is_eq() {
-          continue;
-        }
-        filtered.push(hit);
-      }
-      hits = filtered;
-    }
     let search_phase_end = if req.profile {
       Some(Instant::now())
     } else {

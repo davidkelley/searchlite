@@ -10,7 +10,7 @@ publish = false
 [features]
 default = []
 browser = []
-vectors = ["bytemuck"]
+vectors = ["bytemuck", "bincode"]
 gpu = []
 zstd = ["dep:zstd"]
 ffi = []
@@ -27,6 +27,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 byteorder = { workspace = true }
 bytemuck = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
 serde_with = { workspace = true }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }
