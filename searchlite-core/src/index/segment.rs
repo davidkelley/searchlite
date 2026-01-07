@@ -576,13 +576,6 @@ impl<'a> SegmentWriter<'a> {
   }
 
   pub fn write_segment(&self, docs: &[Document], generation: u32) -> Result<SegmentMeta> {
-    self.write_segment_from_iter(docs.iter().cloned().map(Ok), generation)
-  }
-
-  pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
-  where
-    I: IntoIterator<Item = Result<Document>>,
-  {
     let id = Uuid::new_v4().simple().to_string();
     let paths = directory::segment_paths(self.root, &id);
     let analyzers = self.schema.build_analyzers()?;
@@ -613,13 +606,11 @@ impl<'a> SegmentWriter<'a> {
     #[cfg(feature = "vectors")]
     let mut vector_fields: HashMap<String, Vec<Option<Vec<f32>>>> = HashMap::new();
     let mut doc_ids: Vec<String> = Vec::new();
-    let mut doc_count: u64 = 0;
 
-    for (doc_id_u64, doc) in docs.into_iter().enumerate() {
-      let doc = doc?;
+    for (doc_id_u64, doc) in docs.iter().enumerate() {
       let doc_ord = doc_id_u64 as DocId;
-      self.schema.validate_document(&doc)?;
-      let collected = collect_document(self.schema, &doc, &resolved)?;
+      self.schema.validate_document(doc)?;
+      let collected = collect_document(self.schema, doc, &resolved)?;
       let doc_key = collected
         .doc_id
         .clone()
@@ -795,7 +786,6 @@ impl<'a> SegmentWriter<'a> {
       }
 
       doc_writer.add_document(&serde_json::Value::Object(stored))?;
-      doc_count += 1;
     }
     let doc_offsets = doc_writer.offsets().to_vec();
     drop(doc_writer);
@@ -816,7 +806,7 @@ impl<'a> SegmentWriter<'a> {
       &term_offsets,
     )?;
 
-    let avg_field_lengths = compute_avg_lengths(&doc_lengths, doc_count);
+    let avg_field_lengths = compute_avg_lengths(&doc_lengths, docs.len() as u64);
 
     fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
 
@@ -893,8 +883,8 @@ impl<'a> SegmentWriter<'a> {
       id,
       generation,
       paths,
-      doc_count: doc_count as u32,
-      max_doc_id: doc_count.saturating_sub(1) as u32,
+      doc_count: docs.len() as u32,
+      max_doc_id: docs.len().saturating_sub(1) as u32,
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,

@@ -604,6 +604,8 @@ mod tests {
       fuzzy: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
       return_stored: true,
       highlight_field: None,
       aggs: BTreeMap::new(),
