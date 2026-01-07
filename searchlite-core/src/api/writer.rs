@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 
 use crate::api::types::Document;
@@ -165,15 +165,10 @@ impl IndexWriter {
       }
     }
     manifest.committed_at = Utc::now().to_rfc3339();
-    self.wal.append_commit()?;
     let store_result = manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path());
     drop(manifest);
-    if let Err(err) = store_result {
-      self
-        .restore_pending_wal()
-        .context("restoring WAL after manifest persistence failure")?;
-      return Err(err);
-    }
+    store_result?;
+    self.wal.append_commit()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
     self.live_docs = live_docs;
@@ -184,17 +179,6 @@ impl IndexWriter {
     let _guard = self.inner.writer_lock.lock();
     self.pending_ops.clear();
     self.wal.truncate()?;
-    Ok(())
-  }
-
-  fn restore_pending_wal(&mut self) -> Result<()> {
-    self.wal.truncate()?;
-    for op in self.pending_ops.iter() {
-      match op {
-        PendingOp::Add { doc, .. } => self.wal.append_add_doc(doc)?,
-        PendingOp::Delete { doc_id } => self.wal.append_delete_doc_id(doc_id)?,
-      }
-    }
     Ok(())
   }
 }
