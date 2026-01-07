@@ -1253,7 +1253,7 @@ fn composite_aggregation_paginates() {
   } = cmp2
   {
     assert_eq!(buckets.len(), 1);
-    assert_eq!(after_key.is_some(), false);
+    assert!(after_key.is_none());
   } else {
     panic!("expected composite agg");
   }

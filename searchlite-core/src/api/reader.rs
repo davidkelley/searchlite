@@ -3235,14 +3235,14 @@ impl IndexReader {
     let same_sort = inner_plan.hash() == sort_plan.hash();
     for key in order.into_iter() {
       if let Some(mut list) = groups.remove(&key) {
-        if same_sort {
-          list.sort_by(|a, b| a.key.cmp(&b.key));
-        } else {
-          list = self.resort_hits(&list, &inner_plan)?;
-        }
+        // Ensure main-sort ordering for the representative hit.
+        list.sort_by(|a, b| a.key.cmp(&b.key));
         let mut iter = list.into_iter();
         if let Some(top) = iter.next() {
           let mut inner: Vec<RankedHit> = iter.collect();
+          if !inner.is_empty() && !same_sort {
+            inner = self.resort_hits(&inner, &inner_plan)?;
+          }
           if inner_from > 0 {
             if inner_from >= inner.len() {
               inner.clear();

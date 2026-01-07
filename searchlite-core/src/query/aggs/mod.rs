@@ -2017,7 +2017,7 @@ fn apply_pipeline_aggs(
 fn bucket_sort_buckets(buckets: &mut Vec<BucketResponse>, cfg: &BucketSortAggregation) {
   buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &cfg.sort));
   let from = cfg.from.unwrap_or(0);
-  if from > 0 && from < buckets.len() {
+  if from > 0 {
     buckets.drain(0..from.min(buckets.len()));
   }
   if let Some(size) = cfg.size {
@@ -2196,14 +2196,11 @@ fn finalize_composite(
         .unwrap_or(true)
     });
   }
-  let mut has_more = buckets.len() > size;
-  if buckets.len() > size {
+  let has_more = buckets.len() > size;
+  if has_more {
     buckets.truncate(size);
   }
   let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
-  if buckets.len() < size {
-    has_more = false;
-  }
   let after_key = if has_more {
     buckets.last().map(|b| b.key.clone())
   } else {

@@ -206,7 +206,7 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 - Field requirements: `terms` needs a fast keyword field; `range`/`date_range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
 - Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided; `percentile_ranks` report the percent of values at or below each supplied `values` entry.
 - Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page.
-- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram>stats.avg"`) from the parent bucket tree.
+- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree.
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
 
@@ -217,7 +217,7 @@ cat > /tmp/aggs-advanced.json <<'EOF'
 {
   "rust_only": {
     "type": "filter",
-    "filter": { "KeywordEq": { "field": "lang", "value": "en" } },
+    "filter": { "KeywordEq": { "field": "lang", "value": "rust" } },
     "aggs": { "tags": { "type": "terms", "field": "tag", "size": 3 } }
   },
   "by_lang_year": {
