@@ -1,24 +1,61 @@
-pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
+use regex::RegexBuilder;
+
+pub struct HighlightOptions<'a> {
+  pub pre_tag: &'a str,
+  pub post_tag: &'a str,
+  pub fragment_size: usize,
+  pub number_of_fragments: usize,
+}
+
+pub fn highlight_fragments(
+  text: &str,
+  terms: &[String],
+  opts: HighlightOptions<'_>,
+) -> Vec<String> {
   if text.is_empty() || terms.is_empty() {
-    return None;
+    return Vec::new();
   }
-  let lower = text.to_ascii_lowercase();
-  let mut best_pos = None;
-  for term in terms {
-    if let Some(pos) = lower.find(&term.to_ascii_lowercase()) {
-      best_pos = Some(pos);
+  let pattern = terms
+    .iter()
+    .map(|t| regex::escape(t))
+    .collect::<Vec<_>>()
+    .join("|");
+  let Ok(re) = RegexBuilder::new(&pattern).case_insensitive(true).build() else {
+    return Vec::new();
+  };
+  let mut out = Vec::new();
+  let mut offset = 0usize;
+  for _ in 0..opts.number_of_fragments {
+    if let Some(m) = re.find_at(text, offset) {
+      let start = m.start().saturating_sub(opts.fragment_size / 2);
+      let end = usize::min(text.len(), start.saturating_add(opts.fragment_size));
+      let fragment = text.get(start..end).unwrap_or("").to_string();
+      let highlighted = re
+        .replace_all(&fragment, |caps: &regex::Captures<'_>| {
+          format!("{}{}{}", opts.pre_tag, &caps[0], opts.post_tag)
+        })
+        .into_owned();
+      out.push(highlighted);
+      offset = m.end();
+    } else {
       break;
     }
   }
-  let pos = best_pos.unwrap_or(0);
-  let start = pos.saturating_sub(40);
-  let end = usize::min(text.len(), pos + 80);
-  let mut snippet = String::from(&text[start..end]);
-  for term in terms {
-    let pat = term;
-    snippet = snippet.replace(pat, &format!("**{}**", pat));
-  }
-  Some(snippet)
+  out
+}
+
+pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
+  let mut frags = highlight_fragments(
+    text,
+    terms,
+    HighlightOptions {
+      pre_tag: "**",
+      post_tag: "**",
+      fragment_size: 120,
+      number_of_fragments: 1,
+    },
+  );
+  frags.pop()
 }
 
 #[cfg(test)]

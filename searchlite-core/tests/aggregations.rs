@@ -131,7 +131,7 @@ fn terms_and_stats_aggregations() {
     .unwrap();
 
   let tags = resp.aggregations.get("tags").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Terms { buckets } = tags {
+  if let searchlite_core::api::types::AggregationResponse::Terms { buckets, .. } = tags {
     assert_eq!(buckets[0].key, json!("tech"));
     assert_eq!(buckets[0].doc_count, 2);
   }
@@ -299,7 +299,7 @@ fn histogram_bucket_generation() {
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
     assert_eq!(buckets.len(), 3);
     assert_eq!(buckets[0].doc_count, 2);
   }
@@ -388,7 +388,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
     })
     .unwrap();
   let hist = resp.aggregations.get("views_hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
     assert_eq!(buckets.len(), 2);
     assert_eq!(buckets[0].key, json!(0.0));
     assert_eq!(buckets[0].doc_count, 2); // both 0 and 4 land in the first bucket
@@ -592,7 +592,8 @@ fn date_range_missing_and_keyed() {
     })
     .unwrap();
   let range = resp.aggregations.get("ranges").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::DateRange { buckets, keyed } = range {
+  if let searchlite_core::api::types::AggregationResponse::DateRange { buckets, keyed, .. } = range
+  {
     assert!(keyed);
     assert_eq!(buckets.len(), 2);
     assert_eq!(buckets[0].doc_count, 2); // early bucket includes missing
@@ -799,7 +800,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
     .unwrap();
 
   let hist = resp.aggregations.get("hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(
       keys,
@@ -907,7 +908,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
     })
     .unwrap();
   let hist = resp.aggregations.get("hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(keys, vec![json!(1_000), json!(2_000)]);
     assert_eq!(buckets[0].doc_count, 1);
@@ -1020,7 +1021,7 @@ fn terms_size_applied_after_merge() {
     .unwrap();
 
   let agg = resp.aggregations.get("tags").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Terms { buckets } = agg {
+  if let searchlite_core::api::types::AggregationResponse::Terms { buckets, .. } = agg {
     assert_eq!(buckets.len(), 1);
     assert_eq!(buckets[0].key, json!("b"));
     assert_eq!(buckets[0].doc_count, 4);

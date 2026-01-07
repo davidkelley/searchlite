@@ -107,7 +107,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
     .unwrap();
 
   let hist = resp.aggregations.get("hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(
       keys,
@@ -270,7 +270,7 @@ fn nested_terms_stats_aggregation() {
     .unwrap();
 
   let terms = resp.aggregations.get("langs").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Terms { buckets } = terms {
+  if let searchlite_core::api::types::AggregationResponse::Terms { buckets, .. } = terms {
     let rust_bucket = buckets
       .iter()
       .find(|b| b.key == json!("rust"))
@@ -673,7 +673,7 @@ fn date_histogram_calendar_month_interval() {
     .unwrap();
 
   let agg = resp.aggregations.get("dates").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets } = agg {
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(
       keys,

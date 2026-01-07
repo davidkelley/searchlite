@@ -69,6 +69,8 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::<String, Aggregation>::new(),
     suggest: BTreeMap::new(),
     rescore: None,

@@ -393,6 +393,10 @@ pub struct SearchRequest {
   pub vector_filter: Option<Filter>,
   pub return_stored: bool,
   pub highlight_field: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub highlight: Option<HighlightRequest>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub collapse: Option<CollapseRequest>,
   #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -434,6 +438,10 @@ struct SearchRequestHelper {
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
+  pub highlight: Option<HighlightRequest>,
+  #[serde(default)]
+  pub collapse: Option<CollapseRequest>,
+  #[serde(default)]
   pub aggs: BTreeMap<String, Aggregation>,
   #[serde(default)]
   pub suggest: BTreeMap<String, SuggestRequest>,
@@ -473,6 +481,8 @@ impl<'de> Deserialize<'de> for SearchRequest {
       vector_filter: helper.vector_filter,
       return_stored: helper.return_stored,
       highlight_field: helper.highlight_field,
+      highlight: helper.highlight,
+      collapse: helper.collapse,
       aggs: helper.aggs,
       suggest: helper.suggest,
       rescore: helper.rescore,
@@ -517,6 +527,57 @@ pub struct FuzzyOptions {
   pub max_expansions: usize,
   #[serde(default = "default_fuzzy_min_length")]
   pub min_length: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollapseRequest {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub inner_hits: Option<InnerHitsRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InnerHitsRequest {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub from: Option<usize>,
+  #[serde(default)]
+  pub sort: Vec<SortSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct HighlightRequest {
+  #[serde(default)]
+  pub fields: BTreeMap<String, HighlightField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HighlightField {
+  #[serde(default = "default_pre_tag")]
+  pub pre_tag: String,
+  #[serde(default = "default_post_tag")]
+  pub post_tag: String,
+  #[serde(default = "default_fragment_size")]
+  pub fragment_size: usize,
+  #[serde(default = "default_num_fragments")]
+  pub number_of_fragments: usize,
+}
+
+fn default_pre_tag() -> String {
+  "<em>".to_string()
+}
+
+fn default_post_tag() -> String {
+  "</em>".to_string()
+}
+
+fn default_fragment_size() -> usize {
+  160
+}
+
+fn default_num_fragments() -> usize {
+  1
 }
 
 impl Default for FuzzyOptions {
@@ -595,6 +656,110 @@ pub enum Filter {
 pub struct Aggregations(pub BTreeMap<String, Aggregation>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilterAggregation {
+  pub filter: Filter,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompositeAggregation {
+  pub sources: Vec<CompositeSource>,
+  pub size: usize,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub after: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompositeSource {
+  Terms {
+    name: String,
+    field: String,
+  },
+  Histogram {
+    name: String,
+    field: String,
+    interval: f64,
+  },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CardinalityAggregation {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub precision_threshold: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub missing: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PercentilesAggregation {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub percents: Option<Vec<f64>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub missing: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PercentileRanksAggregation {
+  pub field: String,
+  pub values: Vec<f64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub missing: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BucketSortAggregation {
+  pub sort: Vec<BucketSortSpec>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub from: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub size: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketSortSpec {
+  pub field: String,
+  pub order: SortOrder,
+}
+
+impl<'de> Deserialize<'de> for BucketSortSpec {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let map: BTreeMap<String, SortOrder> = BTreeMap::deserialize(deserializer)?;
+    if map.len() != 1 {
+      return Err(serde::de::Error::custom(
+        "bucket_sort sort entry must contain exactly one field",
+      ));
+    }
+    let (field, order) = map.into_iter().next().unwrap();
+    Ok(Self { field, order })
+  }
+}
+
+impl Serialize for BucketSortSpec {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let mut map = BTreeMap::new();
+    map.insert(self.field.clone(), self.order);
+    map.serialize(serializer)
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BucketMetricAggregation {
+  pub buckets_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Aggregation {
   Terms(Box<TermsAggregation>),
@@ -602,10 +767,18 @@ pub enum Aggregation {
   DateRange(Box<DateRangeAggregation>),
   Histogram(Box<HistogramAggregation>),
   DateHistogram(Box<DateHistogramAggregation>),
+  Filter(Box<FilterAggregation>),
+  Composite(Box<CompositeAggregation>),
   Stats(MetricAggregation),
   ExtendedStats(MetricAggregation),
   ValueCount(MetricAggregation),
+  Cardinality(CardinalityAggregation),
+  Percentiles(PercentilesAggregation),
+  PercentileRanks(PercentileRanksAggregation),
   TopHits(TopHitsAggregation),
+  BucketSort(BucketSortAggregation),
+  AvgBucket(BucketMetricAggregation),
+  SumBucket(BucketMetricAggregation),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -743,25 +916,58 @@ pub struct BucketResponse {
 pub enum AggregationResponse {
   Terms {
     buckets: Vec<BucketResponse>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
   },
   Range {
     buckets: Vec<BucketResponse>,
     keyed: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
   },
   DateRange {
     buckets: Vec<BucketResponse>,
     keyed: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
   },
   Histogram {
     buckets: Vec<BucketResponse>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
   },
   DateHistogram {
     buckets: Vec<BucketResponse>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
+  },
+  Filter {
+    doc_count: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
+  },
+  Composite {
+    buckets: Vec<BucketResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after_key: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
   },
   Stats(StatsResponse),
   ExtendedStats(ExtendedStatsResponse),
   ValueCount(ValueCountResponse),
+  Cardinality(CardinalityResponse),
+  Percentiles(PercentilesResponse),
+  PercentileRanks(PercentileRanksResponse),
   TopHits(TopHitsResponse),
+  BucketSort {
+    #[serde(default)]
+    from: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<usize>,
+  },
+  AvgBucket(BucketMetricResponse),
+  SumBucket(BucketMetricResponse),
 }
 
 /// Aggregate statistics over the numeric field values contributing to the bucket.
@@ -794,6 +1000,21 @@ pub struct ValueCountResponse {
   pub value: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardinalityResponse {
+  pub value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PercentilesResponse {
+  pub values: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PercentileRanksResponse {
+  pub values: BTreeMap<String, f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopHitsResponse {
   pub total: u64,
@@ -806,6 +1027,11 @@ pub struct TopHit {
   pub score: Option<f32>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BucketMetricResponse {
+  pub value: f64,
 }
 
 pub use crate::index::manifest::{
