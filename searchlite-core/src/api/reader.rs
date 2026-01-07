@@ -2048,6 +2048,16 @@ impl IndexReader {
     saw_cursor: &mut bool,
     heap_limit: usize,
   ) -> Result<Vec<RankedHit>> {
+    let vector_metric = self
+      .manifest
+      .schema
+      .vector_field(&plan.field)
+      .map(|vf| vf.metric.clone())
+      .unwrap_or(crate::index::manifest::VectorMetric::Cosine);
+    let missing_vector_score = match vector_metric {
+      crate::index::manifest::VectorMetric::Cosine => -1.0,
+      crate::index::manifest::VectorMetric::L2 => f32::MIN,
+    };
     let mut heap = BinaryHeap::new();
     let mut bm25_map: HashMap<(u32, DocId), RankedHit> = HashMap::new();
     for hit in hits.into_iter() {
@@ -2105,13 +2115,23 @@ impl IndexReader {
         let final_score = if plan.alpha == 1.0 {
           hit.score
         } else {
-          blend_scores(hit.score, 0.0, plan.alpha, true)
+          blend_scores(hit.score, missing_vector_score, plan.alpha, true)
         };
         if let Some(expl) = hit.explanation.as_mut() {
           expl.final_score = final_score;
         }
         hit.score = final_score;
-        hit.key = sort_plan.build_key(seg, hit.key.doc_id, final_score, hit.key.segment_ord);
+        let key = sort_plan.build_key(seg, hit.key.doc_id, final_score, hit.key.segment_ord);
+        if let Some(cur) = cursor_key {
+          let ord = key.cmp(cur);
+          if ord.is_lt() || ord.is_eq() {
+            if ord.is_eq() {
+              *saw_cursor = true;
+            }
+            continue;
+          }
+        }
+        hit.key = key;
         if heap_limit == 0 {
           heap.push(hit);
         } else {
@@ -2170,10 +2190,14 @@ impl IndexReader {
     #[cfg(feature = "vectors")]
     let vector_plan = self.build_vector_plan(req)?;
     #[cfg(feature = "vectors")]
-    let effective_limit = vector_plan
-      .as_ref()
-      .map(|p| p.candidate_size.max(req.limit.max(p.k)))
-      .unwrap_or(req.limit);
+    let effective_limit = if req.limit == 0 {
+      0
+    } else {
+      vector_plan
+        .as_ref()
+        .map(|p| p.candidate_size.max(req.limit.max(p.k)))
+        .unwrap_or(req.limit)
+    };
     #[cfg(not(feature = "vectors"))]
     let effective_limit = req.limit;
     let top_k = if effective_limit == 0 {
@@ -2341,6 +2365,23 @@ impl IndexReader {
       }
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
+    if let Some(cur) = cursor_key.as_ref() {
+      let mut filtered = Vec::with_capacity(hits.len());
+      for hit in hits.into_iter() {
+        if hit.key.segment_ord == cur.segment_ord && hit.key.doc_id == cur.doc_id {
+          continue;
+        }
+        let ord = hit.key.cmp(cur);
+        if ord.is_lt() {
+          continue;
+        }
+        if ord.is_eq() {
+          continue;
+        }
+        filtered.push(hit);
+      }
+      hits = filtered;
+    }
     let search_phase_end = if req.profile {
       Some(Instant::now())
     } else {

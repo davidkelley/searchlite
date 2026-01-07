@@ -31,7 +31,7 @@ use crate::vectors::hnsw::HnswParams;
 #[cfg(feature = "vectors")]
 use crate::vectors::hnsw::{HnswGraph, HnswIndex};
 #[cfg(feature = "vectors")]
-use crate::vectors::{normalize_in_place, VectorStore};
+use crate::vectors::VectorStore;
 use crate::DocId;
 #[cfg(feature = "vectors")]
 use std::io::Cursor;
@@ -974,10 +974,7 @@ fn build_vector_store(
           doc_id
         );
       }
-      let mut vals = vecvals.clone();
-      if matches!(field.metric, crate::index::manifest::VectorMetric::Cosine) {
-        normalize_in_place(&mut vals);
-      }
+      let vals = vecvals.clone();
       offsets[doc_id] = present;
       present = present.saturating_add(1);
       values.extend_from_slice(&vals);

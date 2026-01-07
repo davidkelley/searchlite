@@ -139,6 +139,45 @@ fn vector_only_search_skips_missing_vectors() {
 }
 
 #[test]
+fn vector_query_with_limit_zero_returns_no_hits() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("only")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 0)
+  };
+  let res = reader.search(&req).unwrap();
+  assert_eq!(res.hits.len(), 0);
+}
+
+#[test]
 fn hybrid_blends_text_and_vector() {
   let dir = tempdir().unwrap();
   let schema = schema();
@@ -199,6 +238,63 @@ fn hybrid_blends_text_and_vector() {
   );
   assert!(blended_hits[0].score > blended_hits[1].score);
   assert!(blended_hits[0].vector_score.is_some());
+}
+
+fn schema_l2() -> Schema {
+  serde_json::from_value(json!({
+    "doc_id_field": "_id",
+    "text_fields": [
+      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+    ],
+    "keyword_fields": [],
+    "numeric_fields": [],
+    "nested_fields": [],
+    "vector_fields": [
+      { "name": "embedding", "dim": 2, "metric": "L2" }
+    ]
+  }))
+  .expect("schema")
+}
+
+#[test]
+fn hybrid_l2_penalizes_missing_vectors() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("with-vector")),
+          ("body".into(), serde_json::json!("rust vector")),
+          ("embedding".into(), serde_json::json!([0.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("bm25-only")),
+          ("body".into(), serde_json::json!("rust vector")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    #[cfg(feature = "vectors")]
+    vector_query: Some(("embedding".into(), vec![1.0, 1.0], 0.2)),
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..base_request("rust".into(), 2)
+  };
+  let hits = reader.search(&req).unwrap().hits;
+  assert_eq!(hits.first().map(|h| h.doc_id.as_str()), Some("with-vector"));
+  assert!(hits.iter().any(|h| h.doc_id == "bm25-only"));
 }
 
 #[test]
