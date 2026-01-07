@@ -3138,7 +3138,7 @@ impl IndexReader {
       let mut map = BTreeMap::new();
       for (field, opts) in config.fields.iter() {
         if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
-          let mut terms: Vec<String> =
+          let terms: Vec<String> =
             if let Some(analyzer) = self.analysis.search_analyzer(field.as_str()) {
               let mut tokens = Vec::new();
               for term in highlight_terms {
@@ -3220,7 +3220,6 @@ impl IndexReader {
     } else {
       sort_plan.clone()
     };
-    let inner_size = collapse.inner_hits.as_ref().and_then(|c| c.size);
     let inner_from = collapse
       .inner_hits
       .as_ref()
