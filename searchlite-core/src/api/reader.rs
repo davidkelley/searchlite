@@ -2094,7 +2094,21 @@ impl IndexReader {
       }
     }
     if plan.alpha > 0.0 {
-      for (_key, hit) in bm25_map.into_iter() {
+      for (_key, mut hit) in bm25_map.into_iter() {
+        let seg = self
+          .segments
+          .get(hit.key.segment_ord as usize)
+          .ok_or_else(|| anyhow::anyhow!("missing segment {}", hit.key.segment_ord))?;
+        let final_score = if plan.alpha == 1.0 {
+          hit.score
+        } else {
+          blend_scores(hit.score, 0.0, plan.alpha, true)
+        };
+        if let Some(expl) = hit.explanation.as_mut() {
+          expl.final_score = final_score;
+        }
+        hit.score = final_score;
+        hit.key = sort_plan.build_key(seg, hit.key.doc_id, final_score, hit.key.segment_ord);
         if heap_limit == 0 {
           heap.push(hit);
         } else {

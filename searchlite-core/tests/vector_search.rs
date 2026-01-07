@@ -202,6 +202,69 @@ fn hybrid_blends_text_and_vector() {
 }
 
 #[test]
+fn hybrid_applies_alpha_to_docs_without_vectors() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("with-vector")),
+          ("body".into(), serde_json::json!("rust")),
+          ("embedding".into(), serde_json::json!([1.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("bm25-heavy")),
+          ("body".into(), serde_json::json!("rust rust rust rust rust")),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let bm25_heavy = SearchRequest {
+    #[cfg(feature = "vectors")]
+    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 1.0)),
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..base_request(
+      QueryNode::QueryString {
+        query: "rust".into(),
+        fields: None,
+        boost: None,
+      }
+      .into(),
+      2,
+    )
+  };
+  let blended = SearchRequest {
+    #[cfg(feature = "vectors")]
+    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 0.2)),
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..bm25_heavy.clone()
+  };
+  let bm25_hits = reader.search(&bm25_heavy).unwrap().hits;
+  let blended_hits = reader.search(&blended).unwrap().hits;
+  assert_eq!(
+    bm25_hits.first().map(|h| h.doc_id.as_str()),
+    Some("bm25-heavy")
+  );
+  assert_eq!(
+    blended_hits.first().map(|h| h.doc_id.as_str()),
+    Some("with-vector")
+  );
+}
+
+#[test]
 fn vector_filter_limits_results() {
   let dir = tempdir().unwrap();
   let schema = schema();
