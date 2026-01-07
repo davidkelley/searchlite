@@ -792,6 +792,8 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
   "vector_query": ["embedding", [1.0, 0.0], 0.25]
 }
 ```
+- `vector_query` also accepts an object form to tune ANN parameters: `{ "field": "embedding", "vector": [1.0, 0.0], "alpha": 0.25, "k": 20, "candidate_size": 40, "ef_search": 40 }`. The tuple form still works for compatibility.
+- Per-field HNSW settings can be set on `vector_fields` via `hnsw: { "m": 16, "ef_construction": 64 }`; defaults are used when omitted.
 
 - Tunables (vector queries):
   - `k`: number of neighbors to retrieve (defaults to `limit`).

@@ -156,6 +156,17 @@ impl Schema {
       if self.resolved_fields().iter().any(|f| f.path == vf.name) {
         anyhow::bail!("vector field `{}` conflicts with another field", vf.name);
       }
+      if let Some(hnsw) = &vf.hnsw {
+        if hnsw.m == 0 {
+          anyhow::bail!("vector field `{}` must set hnsw.m > 0", vf.name);
+        }
+        if hnsw.ef_construction == 0 {
+          anyhow::bail!(
+            "vector field `{}` must set hnsw.ef_construction > 0",
+            vf.name
+          );
+        }
+      }
     }
     Ok(())
   }
@@ -943,6 +954,8 @@ pub struct VectorField {
   pub name: String,
   pub dim: usize,
   pub metric: VectorMetric,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub hnsw: Option<crate::vectors::hnsw::HnswParams>,
 }
 
 #[cfg(feature = "vectors")]

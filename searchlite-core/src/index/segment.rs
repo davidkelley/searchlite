@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
@@ -578,6 +579,21 @@ impl<'a> SegmentWriter<'a> {
   }
 
   pub fn write_segment(&self, docs: &[Document], generation: u32) -> Result<SegmentMeta> {
+    self.write_segment_stream(docs.iter().map(|doc| Ok(Cow::Borrowed(doc))), generation)
+  }
+
+  #[allow(dead_code)]
+  pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
+  where
+    I: IntoIterator<Item = Result<Document>>,
+  {
+    self.write_segment_stream(docs.into_iter().map(|doc| doc.map(Cow::Owned)), generation)
+  }
+
+  fn write_segment_stream<'doc, I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
+  where
+    I: IntoIterator<Item = Result<Cow<'doc, Document>>>,
+  {
     let id = Uuid::new_v4().simple().to_string();
     let paths = directory::segment_paths(self.root, &id);
     let analyzers = self.schema.build_analyzers()?;
@@ -609,10 +625,12 @@ impl<'a> SegmentWriter<'a> {
     let mut vector_fields: HashMap<String, Vec<Option<Vec<f32>>>> = HashMap::new();
     let mut doc_ids: Vec<String> = Vec::new();
 
-    for (doc_id_u64, doc) in docs.iter().enumerate() {
-      let doc_ord = doc_id_u64 as DocId;
-      self.schema.validate_document(doc)?;
-      let collected = collect_document(self.schema, doc, &resolved)?;
+    for doc_res in docs.into_iter() {
+      let doc = doc_res?;
+      let doc_ref = doc.as_ref();
+      let doc_ord = doc_ids.len() as DocId;
+      self.schema.validate_document(doc_ref)?;
+      let collected = collect_document(self.schema, doc_ref, &resolved)?;
       let doc_key = collected
         .doc_id
         .clone()
@@ -791,7 +809,7 @@ impl<'a> SegmentWriter<'a> {
     }
     let doc_offsets = doc_writer.offsets().to_vec();
     drop(doc_writer);
-    docstore_file.sync_all()?;
+    drop(docstore_file);
 
     let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
     let mut postings_writer = PostingsWriter::new(&mut *postings_file, self.enable_positions);
@@ -808,7 +826,8 @@ impl<'a> SegmentWriter<'a> {
       &term_offsets,
     )?;
 
-    let avg_field_lengths = compute_avg_lengths(&doc_lengths, docs.len() as u64);
+    let total_docs = doc_ids.len();
+    let avg_field_lengths = compute_avg_lengths(&doc_lengths, total_docs as u64);
 
     fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
 
@@ -824,25 +843,23 @@ impl<'a> SegmentWriter<'a> {
       for vf in self.schema.vector_fields.iter() {
         let field_vectors = vector_fields
           .remove(&vf.name)
-          .unwrap_or_else(|| vec![None; docs.len()]);
-        if field_vectors.len() != docs.len() {
+          .unwrap_or_else(|| vec![None; total_docs]);
+        if field_vectors.len() != total_docs {
           bail!("vector field {} missing values", vf.name);
         }
         let (store, present) = build_vector_store(vf, &field_vectors)?;
         let (vec_path, hnsw_path) = vector_paths(&paths, &vf.name)?;
         write_vector_file(self.storage.as_ref(), &vec_path, &store)?;
-        let params = HnswParams::default();
+        let params = vf.hnsw.unwrap_or_default();
         let store_arc = Arc::new(store);
         let mut index = HnswIndex::new(store_arc.clone(), params);
-        for doc_id in 0..docs.len() {
+        for doc_id in 0..total_docs {
           if store_arc.vector(doc_id as u32).is_some() {
             index.add_vector(doc_id as u32);
           }
         }
         let graph = index.into_graph();
-        let graph_bytes = bincode::options()
-          .with_fixint_encoding()
-          .serialize(&graph)?;
+        let graph_bytes = serde_json::to_vec(&graph)?;
         self.storage.write_all(&hnsw_path, &graph_bytes)?;
         vector_meta.insert(
           vf.name.clone(),
@@ -887,23 +904,14 @@ impl<'a> SegmentWriter<'a> {
       id,
       generation,
       paths,
-      doc_count: docs.len() as u32,
-      max_doc_id: docs.len().saturating_sub(1) as u32,
+      doc_count: total_docs as u32,
+      max_doc_id: total_docs.saturating_sub(1) as u32,
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,
       checksums,
     };
     Ok(meta)
-  }
-
-  #[allow(dead_code)]
-  pub fn write_segment_from_iter<I>(&self, docs: I, generation: u32) -> Result<SegmentMeta>
-  where
-    I: IntoIterator<Item = Result<Document>>,
-  {
-    let docs_vec: Vec<Document> = docs.into_iter().collect::<Result<_, _>>()?;
-    self.write_segment(&docs_vec, generation)
   }
 }
 

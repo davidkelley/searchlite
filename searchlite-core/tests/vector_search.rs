@@ -5,8 +5,8 @@ use std::path::Path;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, Filter, IndexOptions, Query, QueryNode, SearchRequest,
-  SortSpec, StorageType, VectorQuery,
+  Aggregation, Document, ExecutionStrategy, Filter, IndexOptions, LegacyVectorQuery, Query,
+  QueryNode, SearchRequest, SortSpec, StorageType, VectorQuery, VectorQuerySpec,
 };
 use searchlite_core::{Index, Schema};
 use serde_json::json;
@@ -209,7 +209,11 @@ fn hybrid_blends_text_and_vector() {
   let reader = idx.reader().unwrap();
   let bm25_only = SearchRequest {
     #[cfg(feature = "vectors")]
-    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 1.0)),
+    vector_query: Some(VectorQuerySpec::Legacy(LegacyVectorQuery(
+      "embedding".into(),
+      vec![1.0, 0.0],
+      1.0,
+    ))),
     #[cfg(feature = "vectors")]
     vector_filter: None,
     ..base_request(
@@ -224,7 +228,11 @@ fn hybrid_blends_text_and_vector() {
   };
   let blended = SearchRequest {
     #[cfg(feature = "vectors")]
-    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 0.2)),
+    vector_query: Some(VectorQuerySpec::Legacy(LegacyVectorQuery(
+      "embedding".into(),
+      vec![1.0, 0.0],
+      0.2,
+    ))),
     #[cfg(feature = "vectors")]
     vector_filter: None,
     ..bm25_only.clone()
@@ -287,7 +295,11 @@ fn hybrid_l2_penalizes_missing_vectors() {
   let reader = idx.reader().unwrap();
   let req = SearchRequest {
     #[cfg(feature = "vectors")]
-    vector_query: Some(("embedding".into(), vec![1.0, 1.0], 0.2)),
+    vector_query: Some(VectorQuerySpec::Legacy(LegacyVectorQuery(
+      "embedding".into(),
+      vec![1.0, 1.0],
+      0.2,
+    ))),
     #[cfg(feature = "vectors")]
     vector_filter: None,
     ..base_request("rust".into(), 2)
@@ -328,7 +340,11 @@ fn hybrid_applies_alpha_to_docs_without_vectors() {
   let reader = idx.reader().unwrap();
   let bm25_heavy = SearchRequest {
     #[cfg(feature = "vectors")]
-    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 1.0)),
+    vector_query: Some(VectorQuerySpec::Legacy(LegacyVectorQuery(
+      "embedding".into(),
+      vec![1.0, 0.0],
+      1.0,
+    ))),
     #[cfg(feature = "vectors")]
     vector_filter: None,
     ..base_request(
@@ -343,7 +359,11 @@ fn hybrid_applies_alpha_to_docs_without_vectors() {
   };
   let blended = SearchRequest {
     #[cfg(feature = "vectors")]
-    vector_query: Some(("embedding".into(), vec![1.0, 0.0], 0.2)),
+    vector_query: Some(VectorQuerySpec::Legacy(LegacyVectorQuery(
+      "embedding".into(),
+      vec![1.0, 0.0],
+      0.2,
+    ))),
     #[cfg(feature = "vectors")]
     vector_filter: None,
     ..bm25_heavy.clone()

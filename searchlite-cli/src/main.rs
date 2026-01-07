@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, SearchRequest,
-  SortOrder, SortSpec, StorageType, VectorQuery,
+  SortOrder, SortSpec, StorageType, VectorQuery, VectorQuerySpec,
 };
 use searchlite_core::api::Index;
 
@@ -331,11 +331,9 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     }
   };
   #[cfg(feature = "vectors")]
-  let legacy_vector_query = match &query {
+  let request_vector_query = match &query {
     Query::Node(QueryNode::Vector(_)) => None,
-    _ => vector_opts
-      .as_ref()
-      .map(|v| (v.field.clone(), v.vector.clone(), v.alpha.unwrap_or(alpha))),
+    _ => vector_opts.clone().map(VectorQuerySpec::Structured),
   };
   Ok(SearchRequest {
     query,
@@ -348,7 +346,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     bmw_block_size,
     fuzzy: None,
     #[cfg(feature = "vectors")]
-    vector_query: legacy_vector_query,
+    vector_query: request_vector_query,
     #[cfg(feature = "vectors")]
     vector_filter: None,
     return_stored,

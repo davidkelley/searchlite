@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
 use crate::analysis::analyzer::Analyzer;
-#[cfg(feature = "vectors")]
-use crate::api::types::VectorQuery;
 use crate::api::types::{
   Aggregation, AggregationResponse, DateHistogramAggregation, DecayFunction, Filter,
   FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions, Query,
   RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
   SuggestResult,
 };
+#[cfg(feature = "vectors")]
+use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
 use crate::api::AggregationError;
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
@@ -1734,18 +1734,71 @@ impl IndexReader {
   #[cfg(feature = "vectors")]
   fn build_vector_plan(&self, req: &SearchRequest) -> Result<Option<VectorPlan>> {
     use crate::api::types::QueryNode;
-    let vector_node = match &req.query {
-      Query::Node(QueryNode::Vector(vq)) => Some(vq.clone()),
-      _ => None,
-    };
-    if vector_node.is_some() && req.vector_query.is_some() {
+    fn collect_vectors(
+      node: &QueryNode,
+      vectors: &mut Vec<VectorQuery>,
+      has_non_vector: &mut bool,
+    ) {
+      match node {
+        QueryNode::Vector(vq) => vectors.push(vq.clone()),
+        QueryNode::Bool {
+          must,
+          should,
+          must_not,
+          filter,
+          ..
+        } => {
+          if !filter.is_empty() {
+            *has_non_vector = true;
+          }
+          for q in must.iter().chain(should.iter()).chain(must_not.iter()) {
+            collect_vectors(q, vectors, has_non_vector);
+            if !matches!(q, QueryNode::Vector(_)) {
+              *has_non_vector = true;
+            }
+          }
+        }
+        QueryNode::DisMax { queries, .. } => {
+          for q in queries {
+            collect_vectors(q, vectors, has_non_vector);
+            if !matches!(q, QueryNode::Vector(_)) {
+              *has_non_vector = true;
+            }
+          }
+        }
+        QueryNode::FunctionScore { query, .. } => {
+          collect_vectors(query, vectors, has_non_vector);
+          *has_non_vector = true;
+        }
+        _ => {
+          *has_non_vector = true;
+        }
+      }
+    }
+    fn find_vectors(query: &Query) -> (Vec<VectorQuery>, bool) {
+      match query {
+        Query::Node(node) => {
+          let mut vectors = Vec::new();
+          let mut has_non_vector = false;
+          collect_vectors(node, &mut vectors, &mut has_non_vector);
+          (vectors, has_non_vector)
+        }
+        _ => (Vec::new(), true),
+      }
+    }
+    let (vector_nodes, has_non_vector_nodes) = find_vectors(&req.query);
+    if !vector_nodes.is_empty() && req.vector_query.is_some() {
       bail!("cannot set both `vector_query` and a `vector` query node");
     }
-    let (vector_query, vector_only) = if let Some(vq) = vector_node {
-      (vq, true)
-    } else if let Some((field, vec, alpha)) = &req.vector_query {
-      (
-        VectorQuery {
+    if vector_nodes.len() > 1 {
+      bail!("multiple vector clauses are not supported in a single query");
+    }
+    let (vector_query, vector_only) = if let Some(vq) = vector_nodes.first() {
+      (vq.clone(), !has_non_vector_nodes)
+    } else if let Some(spec) = req.vector_query.as_ref() {
+      let vq = match spec {
+        VectorQuerySpec::Structured(v) => v.clone(),
+        VectorQuerySpec::Legacy(LegacyVectorQuery(field, vec, alpha)) => VectorQuery {
           field: field.clone(),
           vector: vec.clone(),
           k: None,
@@ -1754,8 +1807,8 @@ impl IndexReader {
           candidate_size: None,
           boost: None,
         },
-        false,
-      )
+      };
+      (vq, false)
     } else {
       return Ok(None);
     };
@@ -1782,6 +1835,9 @@ impl IndexReader {
     let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);
     if !(0.0..=1.0).contains(&alpha) {
       bail!("vector alpha must be between 0 and 1 inclusive");
+    }
+    if vector_only && query_vec.is_empty() {
+      return Ok(None);
     }
     let default_k = if req.limit == 0 {
       vector_query.k.unwrap_or(10)
@@ -1844,7 +1900,11 @@ impl IndexReader {
       RootFilter::None
     };
     let vector_filter = req.vector_filter.as_ref();
-    let mut heap = BinaryHeap::<RankedHit>::new();
+    let mut heap = if req.limit == 0 {
+      None
+    } else {
+      Some(BinaryHeap::<RankedHit>::new())
+    };
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
@@ -1897,16 +1957,18 @@ impl IndexReader {
           search_stats.candidates_examined += 1;
           search_stats.scored_docs += 1;
         }
-        let hit = RankedHit {
-          key,
-          score: vscore,
-          vector_score: Some(vscore),
-          explanation: None,
-        };
-        if heap_limit == 0 {
-          heap.push(hit);
-        } else {
-          push_ranked(&mut heap, hit, heap_limit);
+        if let Some(heap_ref) = heap.as_mut() {
+          let hit = RankedHit {
+            key,
+            score: vscore,
+            vector_score: Some(vscore),
+            explanation: None,
+          };
+          if heap_limit == 0 {
+            heap_ref.push(hit);
+          } else {
+            push_ranked(heap_ref, hit, heap_limit);
+          }
         }
       }
       if let Some(collector) = agg_collector {
@@ -1916,7 +1978,9 @@ impl IndexReader {
     if !saw_cursor {
       bail!("stale or invalid cursor for this result set");
     }
-    let mut hits: Vec<RankedHit> = heap.into_iter().collect();
+    let mut hits: Vec<RankedHit> = heap
+      .map(|h| h.into_iter().collect())
+      .unwrap_or_else(Vec::new);
     if req.limit == 0 {
       hits.clear();
     } else {
@@ -2185,7 +2249,13 @@ impl IndexReader {
         .collect()
     };
     #[cfg(feature = "vectors")]
-    let vector_plan = self.build_vector_plan(req)?;
+    let mut vector_plan = self.build_vector_plan(req)?;
+    #[cfg(feature = "vectors")]
+    if let Some(plan) = vector_plan.as_ref() {
+      if !plan.vector_only && plan.alpha >= 1.0 {
+        vector_plan = None;
+      }
+    }
     #[cfg(feature = "vectors")]
     let effective_limit = if req.limit == 0 {
       0

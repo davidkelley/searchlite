@@ -742,7 +742,9 @@ impl<'a> QueryPlanBuilder<'a> {
       }
       #[cfg(feature = "vectors")]
       QueryNode::Vector(_) => {
-        bail!("vector query nodes are handled separately from BM25 planning")
+        // Vector clauses are handled by the vector search path; treat as MatchAll
+        // for BM25 planning so mixed queries can proceed.
+        Ok((QueryMatcher::MatchAll, None, ScoreNode::Empty))
       }
     }
   }
