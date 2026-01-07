@@ -12,7 +12,7 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 **Core capabilities**
 
 - Single-writer, multi-reader index backed by a WAL and atomic manifest updates.
-- BM25 scoring (`k1=0.9`, `b=0.4` by default) with phrase matching and basic highlighting.
+- BM25 scoring (`k1=0.9`, `b=0.4` by default) with phrase matching and configurable multi-field highlighting.
 - Block-level max scores per term (WAND/BMW pruning) for faster exact top-k.
 - Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
 - Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
@@ -203,12 +203,91 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 ### Aggregations quick reference
 
-- Field requirements: `terms` needs a fast keyword field; `range`, `histogram`, `stats`, `date_histogram` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `top_hits` has no field requirement but returns stored fields/snippets when enabled.
-- Stats semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value).
-- Value count semantics: `value_count` counts field values (each entry from multi-valued fields, plus one per `missing` fill), not documents-with-values; this mirrors Elasticsearch's `value_count`.
-- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`.
+- Field requirements: `terms` needs a fast keyword field; `range`/`date_range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
+- Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided; `percentile_ranks` report the percent of values at or below each supplied `values` entry.
+- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page.
+- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree.
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
+
+#### Filter, composite, and pipeline aggregation examples
+
+```bash
+cat > /tmp/aggs-advanced.json <<'EOF'
+{
+  "rust_only": {
+    "type": "filter",
+    "filter": { "KeywordEq": { "field": "lang", "value": "rust" } },
+    "aggs": { "tags": { "type": "terms", "field": "tag", "size": 3 } }
+  },
+  "by_lang_year": {
+    "type": "composite",
+    "size": 2,
+    "sources": [
+      { "type": "terms", "name": "lang", "field": "lang" },
+      { "type": "histogram", "name": "year", "field": "year", "interval": 5 }
+    ],
+    "aggs": {
+      "latency_p95": { "type": "percentiles", "field": "latency_ms", "percents": [50, 95] },
+      "bucket_order": { "type": "bucket_sort", "sort": [ { "_count": "desc" } ], "size": 2 }
+    }
+  },
+  "by_tag": {
+    "type": "terms",
+    "field": "tag",
+    "aggs": {
+      "score_stats": { "type": "stats", "field": "score" },
+      "sorted": { "type": "bucket_sort", "sort": [ { "score_stats.avg": "desc" } ], "size": 3 },
+      "avg_scores": { "type": "avg_bucket", "buckets_path": "score_stats.avg" }
+    }
+  },
+  "unique_authors": { "type": "cardinality", "field": "author" },
+  "slow_ranks": { "type": "percentile_ranks", "field": "latency_ms", "values": [100, 500] }
+}
+EOF
+
+cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file /tmp/aggs-advanced.json
+```
+
+`composite` returns an `after_key` so you can page deterministically across buckets by sending that object back as `after` in the next request. Pipeline aggregations operate on the current bucket tree: `bucket_sort` reorders/truncates buckets, while `avg_bucket`/`sum_bucket` read metrics via dot-separated `buckets_path` selectors.
+
+### Field collapsing and inner hits
+
+Collapse results by a fast keyword field to return one top hit per group, with optional `inner_hits` to see more from each group. The overall hit count still reflects all matching documents; responses also include `total_groups`.
+
+```json
+{
+  "query": "rust systems",
+  "sort": [{ "field": "published_at", "order": "desc" }, { "field": "_score", "order": "desc" }],
+  "collapse": {
+    "field": "author",
+    "inner_hits": { "size": 3, "from": 0, "sort": [{ "field": "_score", "order": "desc" }] }
+  },
+  "limit": 10,
+  "return_stored": true
+}
+```
+
+The first hit per group follows the request sort and is stable within the group. `inner_hits` return additional hits per group (sorted independently if you supply `sort` on `inner_hits`).
+
+### Highlighting
+
+Multi-field highlighting is configurable per field with custom tags and fragment sizes. Hits include a `highlights` map when configured, while the legacy `highlight_field` still emits a single snippet for backward compatibility.
+
+```json
+{
+  "query": "rust systems",
+  "highlight": {
+    "fields": {
+      "body": { "pre_tag": "<em>", "post_tag": "</em>", "fragment_size": 120, "number_of_fragments": 2 },
+      "title": { "pre_tag": "<b>", "post_tag": "</b>", "fragment_size": 60, "number_of_fragments": 1 }
+    }
+  },
+  "return_stored": true
+}
+```
+
+Highlighting uses the field's search analyzer (including synonyms and edge n-grams) to find matches, is phrase-aware, and centers fragments around the first match.
 
 The `query_string` node (and legacy string queries) supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
 
@@ -244,6 +323,15 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.jso
 Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
 
 Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
+
+### Search request JSON shape (extras)
+
+Beyond the basics (`query`/`filter`/`sort`/`limit`), the request supports:
+
+- `aggs`: map of aggregation specs. New options include filter buckets (`{"type":"filter","filter":{...},"aggs":{...}}`), composite buckets (`{"type":"composite","sources":[{"type":"terms","name":"lang","field":"lang"},{"type":"histogram","name":"year","field":"year","interval":5}],"size":10,"after":{...},"aggs":{...}}`), and metric/pipeline aggs (`cardinality`, `percentiles`, `percentile_ranks`, `bucket_sort`, `avg_bucket`, `sum_bucket`). Pipeline `buckets_path` values walk the parent bucket tree with dot-separated paths like `"by_tag.score_stats.avg"`.
+- `collapse`: `{ "field": "author", "inner_hits": { "size": 3, "from": 0, "sort": [{ "field": "_score", "order": "desc" }] } }` groups results by a fast keyword field and keeps the top hit per group; responses include `total_groups` plus optional `inner_hits` per group.
+- `highlight`: `{ "fields": { "body": { "pre_tag": "<em>", "post_tag": "</em>", "fragment_size": 160, "number_of_fragments": 2 } } }` adds a `highlights` map to hits. The legacy `highlight_field` string still returns a single snippet when you only need a default highlight.
+- A reference JSON Schema for search requests lives at `search-request.schema.json` in the repo root to help clients validate payloads.
 
 ### Prefix, wildcard, and regex queries
 

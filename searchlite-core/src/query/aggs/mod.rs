@@ -1,20 +1,23 @@
 use std::cmp::Ordering;
 use std::collections::{
-  btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, BinaryHeap, HashMap,
-  HashSet,
+  btree_map::Entry as BTreeEntry, hash_map::DefaultHasher, hash_map::Entry as HashEntry, BTreeMap,
+  BinaryHeap, HashMap, HashSet,
 };
 use std::hash::{Hash, Hasher};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, BucketResponse, DateHistogramAggregation, DateRangeAggregation,
-  HistogramAggregation, RangeAggregation, StatsResponse, TermsAggregation, TopHit,
-  TopHitsAggregation, TopHitsResponse, ValueCountResponse,
+  Aggregation, AggregationResponse, BucketMetricResponse, BucketResponse, BucketSortAggregation,
+  BucketSortSpec, CardinalityResponse, CompositeAggregation, CompositeSource,
+  DateHistogramAggregation, DateRangeAggregation, Filter, FilterAggregation, HistogramAggregation,
+  PercentileRanksResponse, PercentilesResponse, RangeAggregation, SortOrder, StatsResponse,
+  TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse, ValueCountResponse,
 };
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
 use crate::index::manifest::Schema;
 use crate::index::segment::SegmentReader;
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
+use crate::query::filters::passes_filter;
 use crate::query::sort::{SortKey, SortPlan};
 use crate::DocId;
 
@@ -40,25 +43,44 @@ pub enum AggregationIntermediate {
     buckets: Vec<BucketIntermediate>,
     size: Option<usize>,
     shard_size: Option<usize>,
+    pipeline: BTreeMap<String, Aggregation>,
   },
   Range {
     buckets: Vec<BucketIntermediate>,
     keyed: bool,
+    pipeline: BTreeMap<String, Aggregation>,
   },
   DateRange {
     buckets: Vec<BucketIntermediate>,
     keyed: bool,
+    pipeline: BTreeMap<String, Aggregation>,
   },
   Histogram {
     buckets: Vec<BucketIntermediate>,
+    pipeline: BTreeMap<String, Aggregation>,
   },
   DateHistogram {
     buckets: Vec<BucketIntermediate>,
+    pipeline: BTreeMap<String, Aggregation>,
   },
   Stats(StatsState),
   ExtendedStats(StatsState),
   ValueCount(ValueCountState),
+  Cardinality(CardinalityState),
+  Percentiles(PercentileState),
+  PercentileRanks(PercentileRankState),
   TopHits(TopHitsState),
+  Filter {
+    bucket: BucketIntermediate,
+    pipeline: BTreeMap<String, Aggregation>,
+  },
+  Composite {
+    buckets: Vec<BucketIntermediate>,
+    size: usize,
+    after: Option<serde_json::Value>,
+    pipeline: BTreeMap<String, Aggregation>,
+    sources: Vec<CompositeSource>,
+  },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -73,6 +95,24 @@ pub struct StatsState {
 #[derive(Clone, Copy, Default)]
 pub struct ValueCountState {
   pub value: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct CardinalityState {
+  pub values: HashSet<u64>,
+  pub precision_threshold: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct PercentileState {
+  pub values: Vec<f64>,
+  pub percents: Vec<f64>,
+}
+
+#[derive(Clone)]
+pub struct PercentileRankState {
+  pub values: Vec<f64>,
+  pub targets: Vec<f64>,
 }
 
 fn numeric_values(
@@ -179,6 +219,11 @@ pub(crate) enum AggregationNode<'a> {
   ExtendedStats(Box<StatsCollector<'a>>),
   ValueCount(Box<ValueCountCollector<'a>>),
   TopHits(Box<TopHitsCollector<'a>>),
+  Cardinality(Box<CardinalityCollector<'a>>),
+  Percentiles(Box<PercentilesCollector<'a>>),
+  PercentileRanks(Box<PercentileRanksCollector<'a>>),
+  Filter(Box<FilterCollector<'a>>),
+  Composite(Box<CompositeCollector<'a>>),
 }
 
 impl<'a> AggregationNode<'a> {
@@ -203,6 +248,22 @@ impl<'a> AggregationNode<'a> {
         AggregationNode::ValueCount(Box::new(ValueCountCollector::new(ctx, m)))
       }
       Aggregation::TopHits(t) => AggregationNode::TopHits(Box::new(TopHitsCollector::new(ctx, t))),
+      Aggregation::Cardinality(c) => {
+        AggregationNode::Cardinality(Box::new(CardinalityCollector::new(ctx, c)))
+      }
+      Aggregation::Percentiles(p) => {
+        AggregationNode::Percentiles(Box::new(PercentilesCollector::new(ctx, p)))
+      }
+      Aggregation::PercentileRanks(p) => {
+        AggregationNode::PercentileRanks(Box::new(PercentileRanksCollector::new(ctx, p)))
+      }
+      Aggregation::Filter(f) => AggregationNode::Filter(Box::new(FilterCollector::new(ctx, f))),
+      Aggregation::Composite(c) => {
+        AggregationNode::Composite(Box::new(CompositeCollector::new(ctx, c)))
+      }
+      Aggregation::BucketSort(_) | Aggregation::AvgBucket(_) | Aggregation::SumBucket(_) => {
+        unreachable!("pipeline aggregations are applied during finalize")
+      }
     }
   }
 
@@ -217,6 +278,11 @@ impl<'a> AggregationNode<'a> {
       AggregationNode::ExtendedStats(inner) => inner.collect(doc_id, score),
       AggregationNode::ValueCount(inner) => inner.collect(doc_id, score),
       AggregationNode::TopHits(inner) => inner.collect(doc_id, score),
+      AggregationNode::Cardinality(inner) => inner.collect(doc_id, score),
+      AggregationNode::Percentiles(inner) => inner.collect(doc_id, score),
+      AggregationNode::PercentileRanks(inner) => inner.collect(doc_id, score),
+      AggregationNode::Filter(inner) => inner.collect(doc_id, score),
+      AggregationNode::Composite(inner) => inner.collect(doc_id, score),
     }
   }
 
@@ -233,6 +299,13 @@ impl<'a> AggregationNode<'a> {
       }
       AggregationNode::ValueCount(inner) => AggregationIntermediate::ValueCount(inner.finish()),
       AggregationNode::TopHits(inner) => AggregationIntermediate::TopHits(inner.finish()),
+      AggregationNode::Cardinality(inner) => AggregationIntermediate::Cardinality(inner.finish()),
+      AggregationNode::Percentiles(inner) => AggregationIntermediate::Percentiles(inner.finish()),
+      AggregationNode::PercentileRanks(inner) => {
+        AggregationIntermediate::PercentileRanks(inner.finish())
+      }
+      AggregationNode::Filter(inner) => inner.finish(),
+      AggregationNode::Composite(inner) => inner.finish(),
     }
   }
 }
@@ -246,6 +319,7 @@ pub(crate) struct TermsCollector<'a> {
   missing_key: Option<String>,
   buckets: HashMap<BucketKey<'a>, BucketState<'a>>,
   sub_aggs: BTreeMap<String, Aggregation>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
   ctx: AggregationContext<'a>,
 }
 
@@ -287,6 +361,7 @@ impl Hash for BucketKey<'_> {
 impl<'a> TermsCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &TermsAggregation) -> Self {
     let min_doc_count = agg.min_doc_count.unwrap_or(1);
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
     Self {
       field: agg.field.clone(),
       size: agg.size,
@@ -298,7 +373,8 @@ impl<'a> TermsCollector<'a> {
         other => other.to_string(),
       }),
       buckets: HashMap::new(),
-      sub_aggs: agg.aggs.clone(),
+      sub_aggs,
+      pipeline_aggs,
       ctx,
     }
   }
@@ -372,6 +448,7 @@ impl<'a> TermsCollector<'a> {
         .collect(),
       size: self.size,
       shard_size: self.shard_size,
+      pipeline: self.pipeline_aggs,
     }
   }
 }
@@ -381,6 +458,7 @@ pub(crate) struct RangeCollector<'a> {
   keyed: bool,
   ranges: Vec<RangeEntry<'a>>,
   missing: Option<f64>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
   ctx: AggregationContext<'a>,
 }
 
@@ -393,6 +471,7 @@ pub(crate) struct RangeEntry<'a> {
 
 impl<'a> RangeCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &RangeAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
     let ranges = agg
       .ranges
       .iter()
@@ -403,7 +482,7 @@ impl<'a> RangeCollector<'a> {
         bucket: BucketState {
           key: serde_json::Value::Null,
           doc_count: 0,
-          aggs: build_children(&ctx, &agg.aggs),
+          aggs: build_children(&ctx, &sub_aggs),
         },
       })
       .collect();
@@ -416,6 +495,7 @@ impl<'a> RangeCollector<'a> {
       keyed: agg.keyed,
       ranges,
       missing,
+      pipeline_aggs,
       ctx,
     }
   }
@@ -459,6 +539,7 @@ impl<'a> RangeCollector<'a> {
     AggregationIntermediate::Range {
       buckets,
       keyed: self.keyed,
+      pipeline: self.pipeline_aggs,
     }
   }
 }
@@ -504,12 +585,19 @@ impl<'a> DateRangeCollector<'a> {
   }
 
   fn finish(self) -> AggregationIntermediate {
-    AggregationIntermediate::DateRange {
-      keyed: self.inner.keyed,
-      buckets: if let AggregationIntermediate::Range { buckets, .. } = self.inner.finish() {
-        buckets
-      } else {
-        Vec::new()
+    let keyed = self.inner.keyed;
+    match self.inner.finish() {
+      AggregationIntermediate::Range {
+        buckets, pipeline, ..
+      } => AggregationIntermediate::DateRange {
+        keyed,
+        buckets,
+        pipeline,
+      },
+      _ => AggregationIntermediate::DateRange {
+        keyed,
+        buckets: Vec::new(),
+        pipeline: BTreeMap::new(),
       },
     }
   }
@@ -525,11 +613,13 @@ pub(crate) struct HistogramCollector<'a> {
   hard_bounds: Option<(f64, f64)>,
   missing: Option<f64>,
   sub_aggs: BTreeMap<String, Aggregation>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
   ctx: AggregationContext<'a>,
 }
 
 impl<'a> HistogramCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &HistogramAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
     let offset = agg.offset.unwrap_or(0.0);
     let extended_bounds = agg.extended_bounds.as_ref().map(|b| (b.min, b.max));
     let hard_bounds = agg.hard_bounds.as_ref().map(|b| (b.min, b.max));
@@ -543,7 +633,8 @@ impl<'a> HistogramCollector<'a> {
       extended_bounds,
       hard_bounds,
       missing: agg.missing,
-      sub_aggs: agg.aggs.clone(),
+      sub_aggs,
+      pipeline_aggs,
       ctx,
     }
   }
@@ -623,7 +714,10 @@ impl<'a> HistogramCollector<'a> {
       })
       .collect();
     buckets.sort_by(|a, b| cmp_bucket_value(&a.key, &b.key));
-    AggregationIntermediate::Histogram { buckets }
+    AggregationIntermediate::Histogram {
+      buckets,
+      pipeline: self.pipeline_aggs,
+    }
   }
 }
 
@@ -637,11 +731,13 @@ pub(crate) struct DateHistogramCollector<'a> {
   hard_bounds: Option<(i64, i64)>,
   missing: Option<i64>,
   sub_aggs: BTreeMap<String, Aggregation>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
   ctx: AggregationContext<'a>,
 }
 
 impl<'a> DateHistogramCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &DateHistogramAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
     let interval = if let Some(cal) = agg
       .calendar_interval
       .as_ref()
@@ -685,7 +781,8 @@ impl<'a> DateHistogramCollector<'a> {
       extended_bounds,
       hard_bounds,
       missing,
-      sub_aggs: agg.aggs.clone(),
+      sub_aggs,
+      pipeline_aggs,
       ctx,
     }
   }
@@ -769,7 +866,10 @@ impl<'a> DateHistogramCollector<'a> {
       })
       .collect();
     buckets.sort_by(|a, b| cmp_bucket_value(&a.key, &b.key));
-    AggregationIntermediate::DateHistogram { buckets }
+    AggregationIntermediate::DateHistogram {
+      buckets,
+      pipeline: self.pipeline_aggs,
+    }
   }
 }
 
@@ -845,6 +945,355 @@ impl<'a> ValueCountCollector<'a> {
   }
 }
 
+pub(crate) struct CardinalityCollector<'a> {
+  field: String,
+  missing: Option<serde_json::Value>,
+  kind: crate::index::manifest::FieldKind,
+  numeric_i64: bool,
+  state: CardinalityState,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> CardinalityCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &crate::api::types::CardinalityAggregation) -> Self {
+    let meta = ctx.schema.field_meta(&agg.field);
+    let kind = meta
+      .as_ref()
+      .map(|m| m.kind.clone())
+      .unwrap_or(crate::index::manifest::FieldKind::Unknown);
+    let numeric_i64 = meta.and_then(|m| m.numeric_i64).unwrap_or(false);
+    Self {
+      field: agg.field.clone(),
+      missing: agg.missing.clone(),
+      kind,
+      numeric_i64,
+      state: CardinalityState {
+        values: HashSet::new(),
+        precision_threshold: agg.precision_threshold,
+      },
+      ctx,
+    }
+  }
+
+  fn collect(&mut self, doc_id: DocId, _score: f32) {
+    match self.kind {
+      crate::index::manifest::FieldKind::Keyword => {
+        let mut values: Vec<String> = self
+          .ctx
+          .fast_fields
+          .str_values(&self.field, doc_id)
+          .iter()
+          .map(|s| s.to_string())
+          .collect();
+        if values.is_empty() {
+          if let Some(missing) = self.missing.as_ref().and_then(|v| v.as_str()) {
+            values.push(missing.to_string());
+          }
+        }
+        for v in values {
+          self.state.values.insert(hash_cardinality(&v));
+        }
+      }
+      crate::index::manifest::FieldKind::Numeric => {
+        if self.numeric_i64 {
+          let mut values = self.ctx.fast_fields.i64_values(&self.field, doc_id);
+          if values.is_empty() {
+            if let Some(m) = self.missing.as_ref().and_then(|v| v.as_i64()) {
+              values.push(m);
+            }
+          }
+          for v in values {
+            self.state.values.insert(hash_cardinality(&v));
+          }
+        } else {
+          let mut values = self.ctx.fast_fields.f64_values(&self.field, doc_id);
+          if values.is_empty() {
+            if let Some(m) = self.missing.as_ref().and_then(|v| {
+              v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            }) {
+              values.push(m);
+            }
+          }
+          for v in values {
+            self.state.values.insert(hash_cardinality(&v.to_bits()));
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+
+  fn finish(self) -> CardinalityState {
+    self.state
+  }
+}
+
+pub(crate) struct PercentilesCollector<'a> {
+  field: String,
+  missing: Option<f64>,
+  values: Vec<f64>,
+  percents: Vec<f64>,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> PercentilesCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &crate::api::types::PercentilesAggregation) -> Self {
+    let percents = agg
+      .percents
+      .clone()
+      .unwrap_or_else(default_percentiles_list);
+    Self {
+      field: agg.field.clone(),
+      missing: agg.missing.as_ref().and_then(|v| {
+        v.as_f64()
+          .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+      }),
+      values: Vec::new(),
+      percents,
+      ctx,
+    }
+  }
+
+  fn collect(&mut self, doc_id: DocId, _score: f32) {
+    let vals = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
+    self.values.extend(vals);
+  }
+
+  fn finish(self) -> PercentileState {
+    PercentileState {
+      values: self.values,
+      percents: self.percents,
+    }
+  }
+}
+
+pub(crate) struct PercentileRanksCollector<'a> {
+  field: String,
+  missing: Option<f64>,
+  values: Vec<f64>,
+  targets: Vec<f64>,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> PercentileRanksCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &crate::api::types::PercentileRanksAggregation) -> Self {
+    Self {
+      field: agg.field.clone(),
+      missing: agg.missing.as_ref().and_then(|v| {
+        v.as_f64()
+          .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+      }),
+      values: Vec::new(),
+      targets: agg.values.clone(),
+      ctx,
+    }
+  }
+
+  fn collect(&mut self, doc_id: DocId, _score: f32) {
+    let vals = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
+    self.values.extend(vals);
+  }
+
+  fn finish(self) -> PercentileRankState {
+    PercentileRankState {
+      values: self.values,
+      targets: self.targets,
+    }
+  }
+}
+
+pub(crate) struct FilterCollector<'a> {
+  filter: Filter,
+  bucket: BucketState<'a>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> FilterCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &FilterAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
+    Self {
+      filter: agg.filter.clone(),
+      bucket: BucketState {
+        key: serde_json::Value::Null,
+        doc_count: 0,
+        aggs: build_children(&ctx, &sub_aggs),
+      },
+      pipeline_aggs,
+      ctx,
+    }
+  }
+
+  fn collect(&mut self, doc_id: DocId, score: f32) {
+    if passes_filter(self.ctx.fast_fields, doc_id, &self.filter) {
+      self.bucket.doc_count += 1;
+      for child in self.bucket.aggs.values_mut() {
+        child.collect(doc_id, score);
+      }
+    }
+  }
+
+  fn finish(self) -> AggregationIntermediate {
+    AggregationIntermediate::Filter {
+      bucket: BucketIntermediate {
+        key: serde_json::Value::Null,
+        doc_count: self.bucket.doc_count,
+        aggs: finalize_children(self.bucket.aggs),
+      },
+      pipeline: self.pipeline_aggs,
+    }
+  }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CompositeKey {
+  parts: Vec<CompositeKeyPart>,
+}
+
+impl Ord for CompositeKey {
+  fn cmp(&self, other: &Self) -> Ordering {
+    for (a, b) in self.parts.iter().zip(other.parts.iter()) {
+      let ord = a.cmp(b);
+      if !ord.is_eq() {
+        return ord;
+      }
+    }
+    self.parts.len().cmp(&other.parts.len())
+  }
+}
+
+impl PartialOrd for CompositeKey {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum CompositeKeyPart {
+  Str(String),
+  F64(u64),
+}
+
+impl CompositeKeyPart {
+  fn cmp(&self, other: &Self) -> Ordering {
+    match (self, other) {
+      (CompositeKeyPart::Str(a), CompositeKeyPart::Str(b)) => a.cmp(b),
+      (CompositeKeyPart::F64(a), CompositeKeyPart::F64(b)) => {
+        f64::from_bits(*a).total_cmp(&f64::from_bits(*b))
+      }
+      (CompositeKeyPart::Str(_), CompositeKeyPart::F64(_)) => Ordering::Less,
+      (CompositeKeyPart::F64(_), CompositeKeyPart::Str(_)) => Ordering::Greater,
+    }
+  }
+
+  fn to_json(&self) -> serde_json::Value {
+    match self {
+      CompositeKeyPart::Str(s) => serde_json::Value::String(s.clone()),
+      CompositeKeyPart::F64(bits) => serde_json::Number::from_f64(f64::from_bits(*bits))
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null),
+    }
+  }
+}
+
+pub(crate) struct CompositeCollector<'a> {
+  sources: Vec<CompositeSource>,
+  size: usize,
+  after: Option<serde_json::Value>,
+  buckets: HashMap<CompositeKey, BucketState<'a>>,
+  sub_aggs: BTreeMap<String, Aggregation>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> CompositeCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &CompositeAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
+    Self {
+      sources: agg.sources.clone(),
+      size: agg.size,
+      after: agg.after.clone(),
+      buckets: HashMap::new(),
+      sub_aggs,
+      pipeline_aggs,
+      ctx,
+    }
+  }
+
+  fn collect(&mut self, doc_id: DocId, score: f32) {
+    let mut per_source_values: Vec<Vec<CompositeKeyPart>> = Vec::with_capacity(self.sources.len());
+    for source in self.sources.iter() {
+      let values = match source {
+        CompositeSource::Terms { field, .. } => self
+          .ctx
+          .fast_fields
+          .str_values(field, doc_id)
+          .into_iter()
+          .map(|s| CompositeKeyPart::Str(s.to_string()))
+          .collect::<Vec<_>>(),
+        CompositeSource::Histogram {
+          field, interval, ..
+        } => self
+          .ctx
+          .fast_fields
+          .f64_values(field, doc_id)
+          .into_iter()
+          .map(|v| {
+            let bucket = (v / interval).floor() * interval;
+            CompositeKeyPart::F64(bucket.to_bits())
+          })
+          .collect::<Vec<_>>(),
+      };
+      if values.is_empty() {
+        return;
+      }
+      per_source_values.push(values);
+    }
+    let mut combos: Vec<CompositeKey> = Vec::new();
+    build_composite_keys(&per_source_values, 0, &mut Vec::new(), &mut combos);
+    let mut seen = HashSet::new();
+    for key in combos.into_iter() {
+      if !seen.insert(key.clone()) {
+        continue;
+      }
+      let bucket = self
+        .buckets
+        .entry(key.clone())
+        .or_insert_with(|| BucketState {
+          key: composite_key_to_json(&key, &self.sources),
+          doc_count: 0,
+          aggs: build_children(&self.ctx, &self.sub_aggs),
+        });
+      if bucket.aggs.is_empty() && !self.sub_aggs.is_empty() {
+        bucket.aggs = build_children(&self.ctx, &self.sub_aggs);
+      }
+      bucket.doc_count += 1;
+      for child in bucket.aggs.values_mut() {
+        child.collect(doc_id, score);
+      }
+    }
+  }
+
+  fn finish(self) -> AggregationIntermediate {
+    let buckets: Vec<BucketIntermediate> = self
+      .buckets
+      .into_values()
+      .map(|state| BucketIntermediate {
+        key: state.key,
+        doc_count: state.doc_count,
+        aggs: finalize_children(state.aggs),
+      })
+      .collect();
+    AggregationIntermediate::Composite {
+      buckets,
+      size: self.size,
+      after: self.after,
+      pipeline: self.pipeline_aggs,
+      sources: self.sources,
+    }
+  }
+}
 #[derive(Clone, Debug)]
 struct RankedDoc {
   key: SortKey,
@@ -959,7 +1408,7 @@ impl<'a> TopHitsCollector<'a> {
       let snippet = if let (Some(field), Some(doc_val)) = (&self.highlight_field, fetched.as_ref())
       {
         if let Some(text) = doc_val.get(field).and_then(|v| v.as_str()) {
-          make_snippet(text, self.highlight_terms)
+          make_snippet(text, self.highlight_terms, &[])
         } else {
           None
         }
@@ -1004,6 +1453,24 @@ fn finalize_children(
   aggs: BTreeMap<String, AggregationNode>,
 ) -> BTreeMap<String, AggregationIntermediate> {
   aggs.into_iter().map(|(k, v)| (k, v.finish())).collect()
+}
+
+fn split_pipeline_aggs(
+  defs: &BTreeMap<String, Aggregation>,
+) -> (BTreeMap<String, Aggregation>, BTreeMap<String, Aggregation>) {
+  let mut bucket_aggs = BTreeMap::new();
+  let mut pipeline_aggs = BTreeMap::new();
+  for (name, agg) in defs.iter() {
+    match agg {
+      Aggregation::BucketSort(_) | Aggregation::AvgBucket(_) | Aggregation::SumBucket(_) => {
+        pipeline_aggs.insert(name.clone(), agg.clone());
+      }
+      _ => {
+        bucket_aggs.insert(name.clone(), agg.clone());
+      }
+    }
+  }
+  (bucket_aggs, pipeline_aggs)
 }
 
 fn merge_stats(a: StatsState, b: StatsState) -> StatsState {
@@ -1058,11 +1525,13 @@ fn merge_intermediate_in_place(
         buckets: target_buckets,
         size,
         shard_size,
+        pipeline: target_pipeline,
       },
       AggregationIntermediate::Terms {
         buckets: incoming_buckets,
         size: incoming_size,
         shard_size: incoming_shard,
+        pipeline: incoming_pipeline,
       },
     ) => {
       merge_bucket_lists(target_buckets, incoming_buckets);
@@ -1071,6 +1540,9 @@ fn merge_intermediate_in_place(
       }
       if shard_size.is_none() {
         *shard_size = incoming_shard;
+      }
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
       }
       let limit = shard_size.unwrap_or_else(|| target_buckets.len());
       target_buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
@@ -1081,43 +1553,67 @@ fn merge_intermediate_in_place(
     (
       AggregationIntermediate::Range {
         buckets: target_buckets,
-        ..
+        pipeline: target_pipeline,
+        keyed: _,
       },
       AggregationIntermediate::Range {
         buckets: incoming_buckets,
-        ..
+        pipeline: incoming_pipeline,
+        keyed: _,
       },
     ) => {
       merge_bucket_lists(target_buckets, incoming_buckets);
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
     }
     (
       AggregationIntermediate::DateRange {
         buckets: target_buckets,
-        ..
+        pipeline: target_pipeline,
+        keyed: _,
       },
       AggregationIntermediate::DateRange {
         buckets: incoming_buckets,
-        ..
+        pipeline: incoming_pipeline,
+        keyed: _,
       },
     ) => {
       merge_bucket_lists(target_buckets, incoming_buckets);
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
     }
     (
       AggregationIntermediate::Histogram {
         buckets: target_buckets,
+        pipeline: target_pipeline,
       },
       AggregationIntermediate::Histogram {
         buckets: incoming_buckets,
+        pipeline: incoming_pipeline,
       },
-    ) => merge_bucket_lists(target_buckets, incoming_buckets),
+    ) => {
+      merge_bucket_lists(target_buckets, incoming_buckets);
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
+    }
     (
       AggregationIntermediate::DateHistogram {
         buckets: target_buckets,
+        pipeline: target_pipeline,
       },
       AggregationIntermediate::DateHistogram {
         buckets: incoming_buckets,
+        pipeline: incoming_pipeline,
       },
-    ) => merge_bucket_lists(target_buckets, incoming_buckets),
+    ) => {
+      merge_bucket_lists(target_buckets, incoming_buckets);
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
+    }
     (
       AggregationIntermediate::Stats(target_stats),
       AggregationIntermediate::Stats(incoming_stats),
@@ -1137,9 +1633,86 @@ fn merge_intermediate_in_place(
       target_val.value += incoming_val.value;
     }
     (
+      AggregationIntermediate::Cardinality(target_state),
+      AggregationIntermediate::Cardinality(incoming_state),
+    ) => {
+      target_state.values.extend(incoming_state.values);
+      if target_state.precision_threshold.is_none() {
+        target_state.precision_threshold = incoming_state.precision_threshold;
+      }
+    }
+    (
+      AggregationIntermediate::Percentiles(target_state),
+      AggregationIntermediate::Percentiles(incoming_state),
+    ) => {
+      target_state.values.extend(incoming_state.values);
+      if target_state.percents.is_empty() {
+        target_state.percents = incoming_state.percents;
+      }
+    }
+    (
+      AggregationIntermediate::PercentileRanks(target_state),
+      AggregationIntermediate::PercentileRanks(incoming_state),
+    ) => {
+      target_state.values.extend(incoming_state.values);
+      if target_state.targets.is_empty() {
+        target_state.targets = incoming_state.targets;
+      }
+    }
+    (
       AggregationIntermediate::TopHits(target_hits),
       AggregationIntermediate::TopHits(incoming_hits),
     ) => merge_top_hits(target_hits, incoming_hits),
+    (
+      AggregationIntermediate::Filter {
+        bucket: target_bucket,
+        pipeline: target_pipeline,
+      },
+      AggregationIntermediate::Filter {
+        bucket: incoming_bucket,
+        pipeline: incoming_pipeline,
+      },
+    ) => {
+      target_bucket.doc_count += incoming_bucket.doc_count;
+      for (name, agg) in incoming_bucket.aggs.into_iter() {
+        match target_bucket.aggs.entry(name) {
+          BTreeEntry::Vacant(entry) => {
+            entry.insert(agg);
+          }
+          BTreeEntry::Occupied(mut entry) => {
+            merge_intermediate_in_place(entry.get_mut(), agg);
+          }
+        }
+      }
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
+    }
+    (
+      AggregationIntermediate::Composite {
+        buckets: target_buckets,
+        size: target_size,
+        after: target_after,
+        pipeline: target_pipeline,
+        sources: _,
+      },
+      AggregationIntermediate::Composite {
+        buckets: incoming_buckets,
+        size: incoming_size,
+        after: incoming_after,
+        pipeline: incoming_pipeline,
+        sources: _,
+      },
+    ) => {
+      merge_bucket_lists(target_buckets, incoming_buckets);
+      *target_size = (*target_size).max(incoming_size);
+      if target_after.is_none() {
+        *target_after = incoming_after;
+      }
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
+    }
     _ => {}
   }
 }
@@ -1231,30 +1804,64 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
       mut buckets,
       size,
       shard_size,
+      pipeline,
     } => {
       buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
       let limit = size.unwrap_or(shard_size.unwrap_or(buckets.len()));
       if buckets.len() > limit {
         buckets.truncate(limit);
       }
+      let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+      let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
       AggregationResponse::Terms {
-        buckets: buckets.into_iter().map(finalize_bucket).collect(),
+        buckets,
+        aggregations,
       }
     }
-    AggregationIntermediate::Range { buckets, keyed } => AggregationResponse::Range {
-      buckets: buckets.into_iter().map(finalize_bucket).collect(),
+    AggregationIntermediate::Range {
+      buckets,
       keyed,
-    },
-    AggregationIntermediate::DateRange { buckets, keyed } => AggregationResponse::DateRange {
-      buckets: buckets.into_iter().map(finalize_bucket).collect(),
+      pipeline,
+    } => {
+      let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+      let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
+      AggregationResponse::Range {
+        buckets,
+        keyed,
+        aggregations,
+      }
+    }
+    AggregationIntermediate::DateRange {
+      buckets,
       keyed,
-    },
-    AggregationIntermediate::Histogram { buckets } => AggregationResponse::Histogram {
-      buckets: buckets.into_iter().map(finalize_bucket).collect(),
-    },
-    AggregationIntermediate::DateHistogram { buckets } => AggregationResponse::DateHistogram {
-      buckets: buckets.into_iter().map(finalize_bucket).collect(),
-    },
+      pipeline,
+    } => {
+      let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+      let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
+      AggregationResponse::DateRange {
+        buckets,
+        keyed,
+        aggregations,
+      }
+    }
+    AggregationIntermediate::Histogram { buckets, pipeline } => {
+      let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+      buckets.sort_by(|a, b| cmp_bucket_value(&a.key, &b.key));
+      let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
+      AggregationResponse::Histogram {
+        buckets,
+        aggregations,
+      }
+    }
+    AggregationIntermediate::DateHistogram { buckets, pipeline } => {
+      let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+      buckets.sort_by(|a, b| cmp_bucket_value(&a.key, &b.key));
+      let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
+      AggregationResponse::DateHistogram {
+        buckets,
+        aggregations,
+      }
+    }
     AggregationIntermediate::Stats(stats) => AggregationResponse::Stats(StatsResponse {
       count: stats.count,
       min: stats.min,
@@ -1289,10 +1896,47 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
     AggregationIntermediate::ValueCount(val) => {
       AggregationResponse::ValueCount(ValueCountResponse { value: val.value })
     }
+    AggregationIntermediate::Cardinality(state) => {
+      AggregationResponse::Cardinality(CardinalityResponse {
+        value: state.values.len() as u64,
+      })
+    }
+    AggregationIntermediate::Percentiles(state) => {
+      AggregationResponse::Percentiles(PercentilesResponse {
+        values: compute_percentiles(state.values, &state.percents),
+      })
+    }
+    AggregationIntermediate::PercentileRanks(state) => {
+      AggregationResponse::PercentileRanks(PercentileRanksResponse {
+        values: compute_percentile_ranks(state.values, &state.targets),
+      })
+    }
     AggregationIntermediate::TopHits(state) => AggregationResponse::TopHits(TopHitsResponse {
       total: state.total,
       hits: state.hits.into_iter().map(|h| h.hit).collect(),
     }),
+    AggregationIntermediate::Filter { bucket, pipeline } => {
+      let mut bucket_resp = finalize_bucket(bucket);
+      let mut bucket_list = vec![bucket_resp.clone()];
+      let mut aggregations = apply_pipeline_aggs(&pipeline, &mut bucket_list);
+      if let Some(mut b) = bucket_list.pop() {
+        for (name, agg) in std::mem::take(&mut b.aggregations) {
+          aggregations.insert(name, agg);
+        }
+        bucket_resp = b;
+      }
+      AggregationResponse::Filter {
+        doc_count: bucket_resp.doc_count,
+        aggregations,
+      }
+    }
+    AggregationIntermediate::Composite {
+      buckets,
+      size,
+      after,
+      pipeline,
+      sources,
+    } => finalize_composite(buckets, size, after, pipeline, sources),
   }
 }
 
@@ -1308,11 +1952,337 @@ fn finalize_bucket(bucket: BucketIntermediate) -> BucketResponse {
   }
 }
 
+fn apply_pipeline_aggs(
+  pipeline: &BTreeMap<String, Aggregation>,
+  buckets: &mut Vec<BucketResponse>,
+) -> BTreeMap<String, AggregationResponse> {
+  let mut responses = BTreeMap::new();
+  for (name, agg) in pipeline
+    .iter()
+    .filter(|(_, a)| matches!(a, Aggregation::BucketSort(_)))
+  {
+    if let Aggregation::BucketSort(cfg) = agg {
+      bucket_sort_buckets(buckets, cfg);
+      responses.insert(
+        name.clone(),
+        AggregationResponse::BucketSort {
+          from: cfg.from.unwrap_or(0),
+          size: cfg.size,
+        },
+      );
+    }
+  }
+  for (name, agg) in pipeline.iter() {
+    match agg {
+      Aggregation::AvgBucket(cfg) => {
+        let mut sum = 0.0_f64;
+        let mut count = 0usize;
+        for bucket in buckets.iter() {
+          if let Some(val) = bucket_metric_value(bucket, &cfg.buckets_path) {
+            sum += val;
+            count += 1;
+          }
+        }
+        let value = if count > 0 { sum / count as f64 } else { 0.0 };
+        responses.insert(
+          name.clone(),
+          AggregationResponse::AvgBucket(BucketMetricResponse { value }),
+        );
+      }
+      Aggregation::SumBucket(cfg) => {
+        let mut sum = 0.0_f64;
+        for bucket in buckets.iter() {
+          if let Some(val) = bucket_metric_value(bucket, &cfg.buckets_path) {
+            sum += val;
+          }
+        }
+        responses.insert(
+          name.clone(),
+          AggregationResponse::SumBucket(BucketMetricResponse { value: sum }),
+        );
+      }
+      Aggregation::BucketSort(_) => {}
+      _ => {}
+    }
+  }
+  responses
+}
+
+fn bucket_sort_buckets(buckets: &mut Vec<BucketResponse>, cfg: &BucketSortAggregation) {
+  buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &cfg.sort));
+  let from = cfg.from.unwrap_or(0);
+  if from > 0 {
+    buckets.drain(0..from.min(buckets.len()));
+  }
+  if let Some(size) = cfg.size {
+    if buckets.len() > size {
+      buckets.truncate(size);
+    }
+  }
+}
+
+#[derive(Clone)]
+enum BucketSortComparable {
+  Missing,
+  F64(f64),
+  Str(String),
+}
+
+fn bucket_sort_cmp(a: &BucketResponse, b: &BucketResponse, specs: &[BucketSortSpec]) -> Ordering {
+  for spec in specs.iter() {
+    let a_val = bucket_sort_value(a, spec);
+    let b_val = bucket_sort_value(b, spec);
+    let ord = compare_sort_values(&a_val, &b_val, spec.order);
+    if !ord.is_eq() {
+      return ord;
+    }
+  }
+  bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key))
+}
+
+fn bucket_sort_value(bucket: &BucketResponse, spec: &BucketSortSpec) -> BucketSortComparable {
+  match spec.field.as_str() {
+    "_count" => BucketSortComparable::F64(bucket.doc_count as f64),
+    "key" | "_key" => BucketSortComparable::Str(bucket_key_string(&bucket.key)),
+    path => bucket_metric_value(bucket, path)
+      .map(BucketSortComparable::F64)
+      .unwrap_or(BucketSortComparable::Missing),
+  }
+}
+
+fn compare_sort_values(
+  a: &BucketSortComparable,
+  b: &BucketSortComparable,
+  order: SortOrder,
+) -> Ordering {
+  match (a, b) {
+    (BucketSortComparable::Missing, BucketSortComparable::Missing) => Ordering::Equal,
+    (BucketSortComparable::Missing, _) => Ordering::Greater,
+    (_, BucketSortComparable::Missing) => Ordering::Less,
+    (BucketSortComparable::F64(va), BucketSortComparable::F64(vb)) => match order {
+      SortOrder::Asc => va.total_cmp(vb),
+      SortOrder::Desc => vb.total_cmp(va),
+    },
+    (BucketSortComparable::Str(sa), BucketSortComparable::Str(sb)) => match order {
+      SortOrder::Asc => sa.cmp(sb),
+      SortOrder::Desc => sb.cmp(sa),
+    },
+    (BucketSortComparable::F64(_), BucketSortComparable::Str(_)) => Ordering::Less,
+    (BucketSortComparable::Str(_), BucketSortComparable::F64(_)) => Ordering::Greater,
+  }
+}
+
+fn bucket_metric_value(bucket: &BucketResponse, path: &str) -> Option<f64> {
+  let mut parts: Vec<&str> = path.split('.').collect();
+  if parts.is_empty() {
+    return None;
+  }
+  let agg_name = parts.remove(0);
+  let agg = bucket.aggregations.get(agg_name)?;
+  extract_metric_from_response(agg, &parts)
+}
+
+fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Option<f64> {
+  match resp {
+    AggregationResponse::Stats(stats) => {
+      let field = path.first().copied().unwrap_or("avg");
+      match field {
+        "avg" => Some(stats.avg),
+        "min" => Some(stats.min),
+        "max" => Some(stats.max),
+        "sum" => Some(stats.sum),
+        "count" => Some(stats.count as f64),
+        _ => None,
+      }
+    }
+    AggregationResponse::ExtendedStats(stats) => {
+      let field = path.first().copied().unwrap_or("avg");
+      match field {
+        "avg" => Some(stats.avg),
+        "min" => Some(stats.min),
+        "max" => Some(stats.max),
+        "sum" => Some(stats.sum),
+        "count" => Some(stats.count as f64),
+        "variance" => Some(stats.variance),
+        "std_deviation" => Some(stats.std_deviation),
+        _ => None,
+      }
+    }
+    AggregationResponse::ValueCount(val) => Some(val.value as f64),
+    AggregationResponse::Cardinality(val) => Some(val.value as f64),
+    AggregationResponse::Percentiles(vals) => {
+      let key = path.first().copied()?;
+      vals.values.get(key).copied()
+    }
+    AggregationResponse::PercentileRanks(vals) => {
+      let key = path.first().copied()?;
+      vals.values.get(key).copied()
+    }
+    AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => Some(val.value),
+    _ => None,
+  }
+}
+
 fn cmp_bucket_value(a: &serde_json::Value, b: &serde_json::Value) -> Ordering {
   if let (Some(va), Some(vb)) = (a.as_f64(), b.as_f64()) {
     return va.partial_cmp(&vb).unwrap_or(Ordering::Equal);
   }
   a.to_string().cmp(&b.to_string())
+}
+
+fn compute_percentiles(mut values: Vec<f64>, percents: &[f64]) -> BTreeMap<String, f64> {
+  let mut out = BTreeMap::new();
+  if values.is_empty() {
+    for p in percents {
+      out.insert(format!("{p}"), 0.0);
+    }
+    return out;
+  }
+  values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+  let n = values.len() as f64;
+  for p in percents {
+    let rank = ((p.clamp(0.0, 100.0) / 100.0) * (n - 1.0)).max(0.0);
+    let low = rank.floor() as usize;
+    let high = rank.ceil() as usize;
+    let value = if low == high {
+      values[low]
+    } else {
+      let weight = rank - low as f64;
+      values[low] * (1.0 - weight) + values[high] * weight
+    };
+    out.insert(format!("{p}"), value);
+  }
+  out
+}
+
+fn compute_percentile_ranks(values: Vec<f64>, targets: &[f64]) -> BTreeMap<String, f64> {
+  let mut out = BTreeMap::new();
+  if values.is_empty() {
+    for t in targets {
+      out.insert(format!("{t}"), 0.0);
+    }
+    return out;
+  }
+  for target in targets.iter() {
+    let count = values.iter().filter(|v| **v <= *target).count();
+    let pct = (count as f64 / values.len() as f64) * 100.0;
+    out.insert(format!("{target}"), pct);
+  }
+  out
+}
+
+fn finalize_composite(
+  buckets: Vec<BucketIntermediate>,
+  size: usize,
+  after: Option<serde_json::Value>,
+  pipeline: BTreeMap<String, Aggregation>,
+  sources: Vec<CompositeSource>,
+) -> AggregationResponse {
+  let mut buckets: Vec<BucketResponse> = buckets.into_iter().map(finalize_bucket).collect();
+  buckets.sort_by(|a, b| cmp_composite_bucket(a, b, &sources));
+  if let Some(after_val) = after
+    .as_ref()
+    .and_then(|v| composite_key_from_value(v, &sources))
+  {
+    buckets.retain(|b| {
+      composite_key_from_value(&b.key, &sources)
+        .map(|k| k > after_val)
+        .unwrap_or(true)
+    });
+  }
+  let has_more = buckets.len() > size;
+  if has_more {
+    buckets.truncate(size);
+  }
+  let aggregations = apply_pipeline_aggs(&pipeline, &mut buckets);
+  let after_key = if has_more {
+    buckets.last().map(|b| b.key.clone())
+  } else {
+    None
+  };
+  AggregationResponse::Composite {
+    buckets,
+    after_key,
+    aggregations,
+  }
+}
+
+fn cmp_composite_bucket(
+  a: &BucketResponse,
+  b: &BucketResponse,
+  sources: &[CompositeSource],
+) -> Ordering {
+  let a_key = composite_key_from_value(&a.key, sources);
+  let b_key = composite_key_from_value(&b.key, sources);
+  match (a_key, b_key) {
+    (Some(ka), Some(kb)) => ka.cmp(&kb),
+    (Some(_), None) => Ordering::Less,
+    (None, Some(_)) => Ordering::Greater,
+    (None, None) => bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key)),
+  }
+}
+
+fn composite_key_from_value(
+  value: &serde_json::Value,
+  sources: &[CompositeSource],
+) -> Option<CompositeKey> {
+  let obj = value.as_object()?;
+  let mut parts = Vec::with_capacity(sources.len());
+  for source in sources.iter() {
+    let (name, is_terms) = match source {
+      CompositeSource::Terms { name, .. } => (name, true),
+      CompositeSource::Histogram { name, .. } => (name, false),
+    };
+    let val = obj.get(name)?;
+    let part = if is_terms {
+      Some(CompositeKeyPart::Str(val.as_str()?.to_string()))
+    } else {
+      val.as_f64().map(|v| CompositeKeyPart::F64(v.to_bits()))
+    }?;
+    parts.push(part);
+  }
+  Some(CompositeKey { parts })
+}
+
+fn composite_key_to_json(key: &CompositeKey, sources: &[CompositeSource]) -> serde_json::Value {
+  let mut obj = serde_json::Map::new();
+  for (part, source) in key.parts.iter().zip(sources.iter()) {
+    let name = match source {
+      CompositeSource::Terms { name, .. } => name,
+      CompositeSource::Histogram { name, .. } => name,
+    };
+    obj.insert(name.clone(), part.to_json());
+  }
+  serde_json::Value::Object(obj)
+}
+
+fn build_composite_keys(
+  sources: &[Vec<CompositeKeyPart>],
+  idx: usize,
+  current: &mut Vec<CompositeKeyPart>,
+  out: &mut Vec<CompositeKey>,
+) {
+  if idx == sources.len() {
+    out.push(CompositeKey {
+      parts: current.clone(),
+    });
+    return;
+  }
+  for val in sources[idx].iter() {
+    current.push(val.clone());
+    build_composite_keys(sources, idx + 1, current, out);
+    current.pop();
+  }
+}
+
+fn hash_cardinality<T: Hash>(value: &T) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  value.hash(&mut hasher);
+  hasher.finish()
+}
+
+fn default_percentiles_list() -> Vec<f64> {
+  vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
 }
 
 pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {

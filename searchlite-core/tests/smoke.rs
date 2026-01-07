@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, FuzzyOptions, IndexOptions, KeywordField, NestedField,
-  NestedProperty, NumericField, Schema, SearchRequest, StorageType, TextField,
+  CollapseRequest, Document, ExecutionStrategy, FuzzyOptions, HighlightField, HighlightRequest,
+  IndexOptions, InnerHitsRequest, KeywordField, NestedField, NestedProperty, NumericField, Schema,
+  SearchRequest, StorageType, TextField,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -37,6 +38,8 @@ fn base_search_request(query: &str) -> SearchRequest {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -137,6 +140,8 @@ fn index_and_search() {
       vector_filter: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -363,6 +368,8 @@ fn upsert_and_delete_by_id() {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -453,6 +460,8 @@ fn cursor_paginates_ordered_hits() {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -526,6 +535,8 @@ fn cursor_rejects_invalid_hex() {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -579,6 +590,8 @@ fn cursor_rejects_when_limit_zero() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -641,6 +654,8 @@ fn cursor_rejects_excessive_advance() {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -695,6 +710,8 @@ fn cursor_rejects_mismatched_position() {
     vector_filter: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -776,6 +793,8 @@ fn cursor_orders_stably_across_segments() {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,
@@ -888,6 +907,8 @@ fn in_memory_storage_keeps_disk_clean() {
       vector_filter: None,
       return_stored: true,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -1019,6 +1040,8 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       vector_filter: None,
       return_stored: true,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -1182,6 +1205,8 @@ fn nested_numeric_filters_bind_to_object_values() {
       vector_filter: None,
       return_stored: true,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -1204,4 +1229,197 @@ fn nested_numeric_filters_bind_to_object_values() {
     .expect("alice review object");
   assert_eq!(alice.get("rating"), Some(&serde_json::json!(5)));
   assert!(alice.get("score").is_none());
+}
+
+#[test]
+fn collapse_returns_top_hit_per_group_with_inner_hits() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.keyword_fields.push(KeywordField {
+    name: "author".into(),
+    stored: true,
+    indexed: true,
+    fast: true,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "a-1",
+        vec![("body", json!("rust search")), ("author", json!("alice"))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "a-2",
+        vec![("body", json!("rust systems")), ("author", json!("alice"))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "b-1",
+        vec![("body", json!("rust memory")), ("author", json!("bob"))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 10,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: true,
+      highlight_field: None,
+      highlight: None,
+      collapse: Some(CollapseRequest {
+        field: "author".into(),
+        inner_hits: Some(InnerHitsRequest {
+          size: Some(2),
+          from: Some(0),
+          sort: Vec::new(),
+        }),
+      }),
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  assert_eq!(resp.total_groups, Some(2));
+  assert_eq!(resp.hits.len(), 2);
+  let mut saw_inner = false;
+  for hit in resp.hits.iter() {
+    if let Some(inner) = &hit.inner_hits {
+      if !inner.is_empty() {
+        saw_inner = true;
+      }
+    }
+  }
+  assert!(
+    saw_inner,
+    "expected at least one group to return inner hits"
+  );
+}
+
+#[test]
+fn highlight_configuration_applies_tags() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.text_fields.push(TextField {
+    name: "title".into(),
+    analyzer: "default".into(),
+    search_analyzer: None,
+    stored: true,
+    indexed: true,
+    nullable: false,
+    search_as_you_type: None,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "1",
+        vec![
+          ("body", json!("Rust is a systems programming language")),
+          ("title", json!("Learning Rust systems")),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let mut highlight_fields = BTreeMap::new();
+  highlight_fields.insert(
+    "body".into(),
+    HighlightField {
+      pre_tag: "<em>".into(),
+      post_tag: "</em>".into(),
+      fragment_size: 64,
+      number_of_fragments: 1,
+    },
+  );
+  highlight_fields.insert(
+    "title".into(),
+    HighlightField {
+      pre_tag: "<b>".into(),
+      post_tag: "</b>".into(),
+      fragment_size: 32,
+      number_of_fragments: 1,
+    },
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust systems".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 5,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: true,
+      highlight_field: None,
+      highlight: Some(HighlightRequest {
+        fields: highlight_fields,
+      }),
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  assert_eq!(resp.hits.len(), 1);
+  let highlights = resp.hits[0].highlights.as_ref().unwrap();
+  let body_frag = highlights.get("body").unwrap()[0].clone();
+  let title_frag = highlights.get("title").unwrap()[0].clone();
+  assert!(body_frag.contains("<em>rust</em>") || body_frag.contains("<em>Rust</em>"));
+  assert!(title_frag.contains("<b>Rust</b>") || title_frag.contains("<b>rust</b>"));
 }

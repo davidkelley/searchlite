@@ -98,6 +98,8 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -107,7 +109,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
     .unwrap();
 
   let hist = resp.aggregations.get("hist").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets } = hist {
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(
       keys,
@@ -169,6 +171,8 @@ fn histogram_requires_positive_interval() {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs,
     suggest: BTreeMap::new(),
     rescore: None,
@@ -261,6 +265,8 @@ fn nested_terms_stats_aggregation() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -270,7 +276,7 @@ fn nested_terms_stats_aggregation() {
     .unwrap();
 
   let terms = resp.aggregations.get("langs").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::Terms { buckets } = terms {
+  if let searchlite_core::api::types::AggregationResponse::Terms { buckets, .. } = terms {
     let rust_bucket = buckets
       .iter()
       .find(|b| b.key == json!("rust"))
@@ -344,6 +350,8 @@ fn date_histogram_rejects_invalid_config() {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs,
     suggest: BTreeMap::new(),
     rescore: None,
@@ -395,6 +403,8 @@ fn date_histogram_rejects_invalid_config() {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs,
     suggest: BTreeMap::new(),
     rescore: None,
@@ -465,6 +475,8 @@ fn top_hits_returns_requested_docs() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -562,6 +574,8 @@ fn top_hits_applies_sort_spec() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -664,6 +678,8 @@ fn date_histogram_calendar_month_interval() {
       vector_filter: None,
       return_stored: false,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs,
       suggest: BTreeMap::new(),
       rescore: None,
@@ -673,7 +689,7 @@ fn date_histogram_calendar_month_interval() {
     .unwrap();
 
   let agg = resp.aggregations.get("dates").unwrap();
-  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets } = agg {
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     assert_eq!(
       keys,

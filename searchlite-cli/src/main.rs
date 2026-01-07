@@ -6,10 +6,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use searchlite_core::api::builder::IndexBuilder;
+#[cfg(feature = "vectors")]
+use searchlite_core::api::types::QueryNode;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, SearchRequest,
-  SortOrder, SortSpec, StorageType, VectorQuery, VectorQuerySpec,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, SearchRequest, SortOrder,
+  SortSpec, StorageType,
 };
+#[cfg(feature = "vectors")]
+use searchlite_core::api::types::{VectorQuery, VectorQuerySpec};
 use searchlite_core::api::Index;
 
 #[derive(Parser)]
@@ -312,7 +316,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     vector_candidates,
   )?;
   #[cfg(not(feature = "vectors"))]
-  let vector_opts: Option<searchlite_core::api::types::VectorQuery> = None;
+  let _vector_opts: Option<()> = None;
   let query = match query {
     Some(q) => Query::String(q),
     None => {
@@ -351,6 +355,8 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     vector_filter: None,
     return_stored,
     highlight_field: highlight,
+    highlight: None,
+    collapse: None,
     cursor,
     aggs: load_aggs(aggs, aggs_file)?,
     suggest: BTreeMap::new(),
@@ -467,7 +473,7 @@ fn build_vector_query(
   _vector_k: Option<usize>,
   _vector_ef_search: Option<usize>,
   _vector_candidates: Option<usize>,
-) -> Result<Option<VectorQuery>> {
+) -> Result<Option<()>> {
   Ok(None)
 }
 
@@ -572,6 +578,8 @@ mod tests {
       vector_filter: None,
       return_stored: true,
       highlight_field: Some("body".to_string()),
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,
@@ -606,6 +614,8 @@ mod tests {
       vector_filter: None,
       return_stored: true,
       highlight_field: None,
+      highlight: None,
+      collapse: None,
       aggs: BTreeMap::new(),
       suggest: BTreeMap::new(),
       rescore: None,

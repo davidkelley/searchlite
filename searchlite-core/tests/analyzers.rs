@@ -42,6 +42,8 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     vector_filter: None,
     return_stored: false,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     aggs: BTreeMap::new(),
     suggest: BTreeMap::new(),
     rescore: None,

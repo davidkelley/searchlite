@@ -164,6 +164,8 @@ pub unsafe extern "C" fn searchlite_search(
     fuzzy: None,
     return_stored: true,
     highlight_field: None,
+    highlight: None,
+    collapse: None,
     cursor,
     aggs: aggs_map,
     suggest: BTreeMap::new(),

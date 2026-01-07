@@ -12,16 +12,16 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
-  Aggregation, AggregationResponse, DateHistogramAggregation, DecayFunction, Filter,
-  FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions, Query,
-  RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
+  Aggregation, AggregationResponse, CollapseRequest, DateHistogramAggregation, DecayFunction,
+  Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions,
+  Query, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
   SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
 use crate::api::AggregationError;
 use crate::index::fastfields::FastFieldsReader;
-use crate::index::highlight::make_snippet;
+use crate::index::highlight::{highlight_fragments, make_snippet, HighlightOptions};
 use crate::index::manifest::{FieldKind, Manifest, Schema, SchemaAnalyzers};
 use crate::index::postings::{PostingEntry, PostingsReader};
 use crate::index::segment::SegmentReader;
@@ -62,6 +62,10 @@ pub struct Hit {
   pub snippet: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub explanation: Option<HitExplanation>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub highlights: Option<BTreeMap<String, Vec<String>>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub inner_hits: Option<Vec<Hit>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,8 @@ pub struct HitExplanation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
   pub total_hits_estimate: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub total_groups: Option<u64>,
   pub hits: Vec<Hit>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub next_cursor: Option<String>,
@@ -1427,6 +1433,43 @@ fn expand_phrase_fields(
     .collect()
 }
 
+fn normalize_phrase_terms(
+  phrases: &[Vec<String>],
+  analyzer: Option<&Analyzer>,
+) -> Vec<Vec<String>> {
+  if let Some(analyzer) = analyzer {
+    let mut out = Vec::new();
+    for phrase in phrases.iter() {
+      let mut seq = Vec::new();
+      for term in phrase.iter() {
+        for tok in analyzer.analyze(term) {
+          seq.push(tok.text);
+        }
+      }
+      if !seq.is_empty() {
+        out.push(seq);
+      }
+    }
+    if !out.is_empty() {
+      return out;
+    }
+  }
+  phrases.to_vec()
+}
+
+fn build_phrase_term_map(phrase_specs: &[PhraseSpec]) -> BTreeMap<String, Vec<Vec<String>>> {
+  let mut out = BTreeMap::new();
+  for phrase in phrase_specs.iter() {
+    for field in phrase.fields.iter() {
+      out
+        .entry(field.clone())
+        .or_insert_with(Vec::new)
+        .push(phrase.terms.clone());
+    }
+  }
+  out
+}
+
 fn build_phrase_runtimes(
   seg: &SegmentReader,
   phrase_fields: &[PhraseFieldConfig],
@@ -1986,6 +2029,15 @@ impl IndexReader {
     } else {
       hits.sort_by(|a, b| a.key.cmp(&b.key));
     }
+    let total_hits_value = total_matches;
+    let mut total_groups = None;
+    let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
+    if let Some(collapse) = req.collapse.as_ref() {
+      let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
+      total_groups = Some(groups.len() as u64);
+      group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
+      hits = groups.into_iter().map(|(top, _)| top).collect();
+    }
     let mut next_cursor = None;
     if req.limit > 0 && hits.len() > req.limit {
       let key = hits[req.limit - 1].key.clone();
@@ -1998,9 +2050,23 @@ impl IndexReader {
       )?);
       hits.truncate(req.limit);
     }
+    let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
     let hits: Vec<Hit> = hits
       .into_iter()
-      .filter_map(|h| self.materialize_hit(h, req, &[]))
+      .enumerate()
+      .filter_map(|(idx, h)| {
+        let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
+        if let Some(inner) = group_inner_hits.get(idx) {
+          let inner_hits: Vec<Hit> = inner
+            .iter()
+            .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
+            .collect();
+          if !inner_hits.is_empty() {
+            hit.inner_hits = Some(inner_hits);
+          }
+        }
+        Some(hit)
+      })
       .collect();
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
@@ -2013,11 +2079,8 @@ impl IndexReader {
       self.execute_suggest(&req.suggest)?
     };
     Ok(SearchResult {
-      total_hits_estimate: if req.limit == 0 {
-        total_matches
-      } else {
-        hits.len() as u64
-      },
+      total_hits_estimate: total_hits_value,
+      total_groups,
       hits,
       next_cursor,
       aggregations,
@@ -2210,6 +2273,9 @@ impl IndexReader {
     if req.filter.is_some() && !req.filters.is_empty() {
       bail!("search request cannot set both `filter` and `filters`");
     }
+    if let Some(collapse) = req.collapse.as_ref() {
+      ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
+    }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
     let score_fast_path =
       sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
@@ -2304,6 +2370,7 @@ impl IndexReader {
       &self.analysis,
       &self.manifest.schema,
     );
+    let highlight_phrases = build_phrase_term_map(&query_plan.phrase_specs);
     let root_filter = if let Some(filter) = req.filter.as_ref() {
       RootFilter::Node(filter)
     } else if !req.filters.is_empty() {
@@ -2476,6 +2543,15 @@ impl IndexReader {
         end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
+    let total_hits_value = total_matches;
+    let mut total_groups = None;
+    let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
+    if let Some(collapse) = req.collapse.as_ref() {
+      let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
+      total_groups = Some(groups.len() as u64);
+      group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
+      hits = groups.into_iter().map(|(top, _)| top).collect();
+    }
     let mut next_cursor = None;
     if req.limit > 0 && hits.len() > req.limit {
       let last = &hits[req.limit - 1];
@@ -2494,7 +2570,22 @@ impl IndexReader {
     }
     let hits: Vec<Hit> = hits
       .into_iter()
-      .filter_map(|h| self.materialize_hit(h, req, &highlight_terms))
+      .enumerate()
+      .filter_map(|(idx, h)| {
+        let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
+        if let Some(inner) = group_inner_hits.get(idx) {
+          let inner_hits: Vec<Hit> = inner
+            .iter()
+            .filter_map(|ih| {
+              self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
+            })
+            .collect();
+          if !inner_hits.is_empty() {
+            hit.inner_hits = Some(inner_hits);
+          }
+        }
+        Some(hit)
+      })
       .collect();
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
@@ -2507,11 +2598,8 @@ impl IndexReader {
       self.execute_suggest(&req.suggest)?
     };
     Ok(SearchResult {
-      total_hits_estimate: if req.limit == 0 {
-        total_matches
-      } else {
-        hits.len() as u64
-      },
+      total_hits_estimate: total_hits_value,
+      total_groups,
       hits,
       next_cursor,
       aggregations,
@@ -3015,10 +3103,11 @@ impl IndexReader {
     ranked: RankedHit,
     req: &SearchRequest,
     highlight_terms: &[String],
+    phrase_terms: &BTreeMap<String, Vec<Vec<String>>>,
   ) -> Option<Hit> {
     let seg = self.segments.get(ranked.key.segment_ord as usize)?;
     let doc_id_str = seg.doc_id(ranked.key.doc_id)?;
-    let need_doc = req.return_stored || req.highlight_field.is_some();
+    let need_doc = req.return_stored || req.highlight_field.is_some() || req.highlight.is_some();
     let mut doc_cache = None;
     if need_doc {
       doc_cache = seg.get_doc(ranked.key.doc_id).ok();
@@ -3026,7 +3115,11 @@ impl IndexReader {
 
     let snippet = if let (Some(field), Some(doc)) = (&req.highlight_field, doc_cache.as_ref()) {
       if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
-        make_snippet(text_val, highlight_terms)
+        let phrase_list = normalize_phrase_terms(
+          phrase_terms.get(field).map(|v| v.as_slice()).unwrap_or(&[]),
+          self.analysis.search_analyzer(field.as_str()),
+        );
+        make_snippet(text_val, highlight_terms, &phrase_list)
       } else {
         None
       }
@@ -3040,6 +3133,58 @@ impl IndexReader {
       None
     };
 
+    let highlights = if let (Some(config), Some(doc)) = (req.highlight.as_ref(), doc_cache.as_ref())
+    {
+      let mut map = BTreeMap::new();
+      for (field, opts) in config.fields.iter() {
+        if let Some(text_val) = doc.get(field).and_then(|v| v.as_str()) {
+          let terms: Vec<String> =
+            if let Some(analyzer) = self.analysis.search_analyzer(field.as_str()) {
+              let mut tokens = Vec::new();
+              for term in highlight_terms {
+                for tok in analyzer.analyze(term).into_iter() {
+                  tokens.push(tok.text);
+                }
+              }
+              let mut seen = HashSet::new();
+              tokens
+                .into_iter()
+                .filter(|t| seen.insert(t.clone()))
+                .collect()
+            } else {
+              highlight_terms.to_vec()
+            };
+          // If analysis strips everything (e.g., stopwords), keep the analyzed set (even if empty)
+          // to avoid mixing analyzed and unanalyzed terms.
+          let field_phrases = normalize_phrase_terms(
+            phrase_terms.get(field).map(|v| v.as_slice()).unwrap_or(&[]),
+            self.analysis.search_analyzer(field.as_str()),
+          );
+          let frags = highlight_fragments(
+            text_val,
+            &terms,
+            &field_phrases,
+            HighlightOptions {
+              pre_tag: &opts.pre_tag,
+              post_tag: &opts.post_tag,
+              fragment_size: opts.fragment_size,
+              number_of_fragments: opts.number_of_fragments,
+            },
+          );
+          if !frags.is_empty() {
+            map.insert(field.clone(), frags);
+          }
+        }
+      }
+      if map.is_empty() {
+        None
+      } else {
+        Some(map)
+      }
+    } else {
+      None
+    };
+
     Some(Hit {
       doc_id: doc_id_str.to_string(),
       score: ranked.score,
@@ -3047,7 +3192,94 @@ impl IndexReader {
       fields: fields_val,
       snippet,
       explanation: ranked.explanation,
+      highlights,
+      inner_hits: None,
     })
+  }
+
+  fn collapse_hits(
+    &self,
+    hits: Vec<RankedHit>,
+    collapse: &CollapseRequest,
+    sort_plan: &SortPlan,
+  ) -> Result<Vec<(RankedHit, Vec<RankedHit>)>> {
+    let mut groups: BTreeMap<String, Vec<RankedHit>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for hit in hits.into_iter() {
+      let Some(key) = self.collapse_key(&hit, &collapse.field) else {
+        continue;
+      };
+      if !groups.contains_key(&key) {
+        order.push(key.clone());
+      }
+      groups.entry(key).or_default().push(hit);
+    }
+    let inner_plan = if let Some(cfg) = collapse.inner_hits.as_ref() {
+      SortPlan::from_request(&self.manifest.schema, &cfg.sort)
+        .with_context(|| format!("invalid inner_hits sort for collapse on {}", collapse.field))?
+    } else {
+      sort_plan.clone()
+    };
+    let inner_from = collapse
+      .inner_hits
+      .as_ref()
+      .and_then(|c| c.from)
+      .unwrap_or(0);
+    let mut out = Vec::with_capacity(order.len());
+    let same_sort = inner_plan.hash() == sort_plan.hash();
+    for key in order.into_iter() {
+      if let Some(mut list) = groups.remove(&key) {
+        // Ensure main-sort ordering for the representative hit.
+        list.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut iter = list.into_iter();
+        if let Some(top) = iter.next() {
+          let mut inner: Vec<RankedHit> = iter.collect();
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            if !inner.is_empty() && !same_sort {
+              inner = self.resort_hits(&inner, &inner_plan)?;
+            }
+            if inner_from > 0 {
+              if inner_from >= inner.len() {
+                inner.clear();
+              } else {
+                inner.drain(0..inner_from);
+              }
+            }
+            if let Some(size) = cfg.size {
+              if size == 0 {
+                inner.clear();
+              } else if inner.len() > size {
+                inner.truncate(size);
+              }
+            }
+          } else {
+            inner.clear();
+          }
+          out.push((top, inner));
+        }
+      }
+    }
+    Ok(out)
+  }
+
+  fn resort_hits(&self, hits: &[RankedHit], plan: &SortPlan) -> Result<Vec<RankedHit>> {
+    let mut keyed = Vec::with_capacity(hits.len());
+    for hit in hits.iter() {
+      let seg = self
+        .segments
+        .get(hit.key.segment_ord as usize)
+        .ok_or_else(|| anyhow::anyhow!("missing segment {}", hit.key.segment_ord))?;
+      let key = plan.build_key(seg, hit.key.doc_id, hit.score, hit.key.segment_ord);
+      keyed.push((key, hit.clone()));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(keyed.into_iter().map(|(_, hit)| hit).collect())
+  }
+
+  fn collapse_key(&self, hit: &RankedHit, field: &str) -> Option<String> {
+    let seg = self.segments.get(hit.key.segment_ord as usize)?;
+    let values = seg.fast_fields().str_values(field, hit.key.doc_id);
+    values.first().map(|v| v.to_string())
   }
 }
 
@@ -3103,6 +3335,26 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
         ensure_numeric_fast(schema, &m.field, name)?
       }
+      Aggregation::Percentiles(p) => ensure_numeric_fast(schema, &p.field, name)?,
+      Aggregation::PercentileRanks(p) => ensure_numeric_fast(schema, &p.field, name)?,
+      Aggregation::Cardinality(c) => ensure_keyword_or_numeric_fast(schema, &c.field, name)?,
+      Aggregation::Filter(f) => {
+        validate_aggregations(schema, &f.aggs)?;
+      }
+      Aggregation::Composite(c) => {
+        for source in c.sources.iter() {
+          match source {
+            crate::api::types::CompositeSource::Terms { field, .. } => {
+              ensure_keyword_fast(schema, field, name)?
+            }
+            crate::api::types::CompositeSource::Histogram { field, .. } => {
+              ensure_numeric_fast(schema, field, name)?
+            }
+          }
+        }
+        validate_aggregations(schema, &c.aggs)?;
+      }
+      Aggregation::BucketSort(_) | Aggregation::AvgBucket(_) | Aggregation::SumBucket(_) => {}
       Aggregation::TopHits(t) => {
         SortPlan::from_request(schema, &t.sort)
           .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
@@ -3153,6 +3405,31 @@ fn ensure_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
       agg: agg.to_string(),
       field: field.to_string(),
       expected: "fast numeric field".to_string(),
+    }
+    .into(),
+  )
+}
+
+fn ensure_keyword_or_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
+  if schema
+    .keyword_fields
+    .iter()
+    .any(|f| f.name == field && f.fast)
+  {
+    return Ok(());
+  }
+  if schema
+    .numeric_fields
+    .iter()
+    .any(|f| f.name == field && f.fast)
+  {
+    return Ok(());
+  }
+  Err(
+    AggregationError::UnsupportedFieldType {
+      agg: agg.to_string(),
+      field: field.to_string(),
+      expected: "fast keyword or numeric field".to_string(),
     }
     .into(),
   )
@@ -3590,6 +3867,8 @@ mod tests {
         vector_filter: None,
         return_stored: false,
         highlight_field: None,
+        highlight: None,
+        collapse: None,
         aggs: BTreeMap::new(),
         suggest: BTreeMap::new(),
         rescore: None,
