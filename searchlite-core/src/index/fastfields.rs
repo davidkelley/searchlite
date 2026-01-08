@@ -555,7 +555,7 @@ impl FastFieldsReader {
           lookup[start..end].iter().any(|idx| {
             dict
               .get(*idx as usize)
-              .map(|s| values.iter().any(|v| s.eq_ignore_ascii_case(v)))
+              .map(|s| values.iter().any(|v| case_insensitive_equals(s, v)))
               .unwrap_or(false)
           })
         } else {

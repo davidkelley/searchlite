@@ -204,6 +204,11 @@ mod tests {
     writer.set("cat", 0, FastValue::Str("News".into()));
     writer.set("topic", 0, FastValue::Str("ÜMLAUT".into()));
     writer.set(
+      "tags",
+      0,
+      FastValue::StrList(vec!["Ümlaut".into(), "NEWS".into()]),
+    );
+    writer.set(
       &nested_count_key("comment"),
       0,
       FastValue::NestedCount { objects: 1 },
@@ -227,6 +232,10 @@ mod tests {
       Filter::KeywordEq {
         field: "topic".into(),
         value: "ümlaut".into(),
+      },
+      Filter::KeywordIn {
+        field: "tags".into(),
+        values: vec!["ümlaut".into(), "news".into()],
       },
       Filter::KeywordIn {
         field: "cat".into(),
