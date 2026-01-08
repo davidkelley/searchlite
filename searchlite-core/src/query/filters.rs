@@ -1,5 +1,5 @@
 use crate::api::types::Filter;
-use crate::index::fastfields::FastFieldsReader;
+use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
 
 pub fn passes_filters(reader: &FastFieldsReader, doc_id: DocId, filters: &[Filter]) -> bool {
@@ -95,7 +95,7 @@ fn filter_matches(
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
           .get(idx)
-          .map(|vals| vals.iter().any(|v| v.eq_ignore_ascii_case(value)))
+          .map(|vals| vals.iter().any(|v| case_insensitive_equals(v, value)))
           .unwrap_or(false),
         None => reader.matches_keyword(&full, doc_id, value),
       }
@@ -109,7 +109,7 @@ fn filter_matches(
           .map(|vals| {
             vals
               .iter()
-              .any(|v| values.iter().any(|t| t.eq_ignore_ascii_case(v)))
+              .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
           })
           .unwrap_or(false),
         None => reader.matches_keyword_in(&full, doc_id, values),
@@ -202,6 +202,7 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let mut writer = FastFieldsWriter::new();
     writer.set("cat", 0, FastValue::Str("News".into()));
+    writer.set("topic", 0, FastValue::Str("ÜMLAUT".into()));
     writer.set(
       &nested_count_key("comment"),
       0,
@@ -212,7 +213,7 @@ mod tests {
       0,
       FastValue::StrNested {
         object: 0,
-        values: vec!["Alice".into()],
+        values: vec!["Alice".into(), "Δelta".into()],
       },
     );
     writer.write_to(&storage, &path).unwrap();
@@ -223,6 +224,10 @@ mod tests {
         field: "cat".into(),
         value: "news".into(),
       },
+      Filter::KeywordEq {
+        field: "topic".into(),
+        value: "ümlaut".into(),
+      },
       Filter::KeywordIn {
         field: "cat".into(),
         values: vec!["sports".into(), "NEWS".into()],
@@ -232,6 +237,13 @@ mod tests {
         filter: Box::new(Filter::KeywordEq {
           field: "author".into(),
           value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "δELTA".into(),
         }),
       },
     ];
