@@ -43,6 +43,23 @@ fn schema() -> Schema {
   .expect("schema")
 }
 
+fn multi_vector_schema() -> Schema {
+  serde_json::from_value(json!({
+    "doc_id_field": "_id",
+    "text_fields": [
+      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+    ],
+    "keyword_fields": [],
+    "numeric_fields": [],
+    "nested_fields": [],
+    "vector_fields": [
+      { "name": "vec_a", "dim": 2, "metric": "Cosine" },
+      { "name": "vec_b", "dim": 2, "metric": "Cosine" }
+    ]
+  }))
+  .expect("schema")
+}
+
 fn add_docs(idx: &Index, docs: &[Document]) {
   let mut writer = idx.writer().expect("writer");
   for doc in docs {
@@ -58,6 +75,7 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     filter: None,
     filters: Vec::new(),
     limit,
+    candidate_size: None,
     sort: Vec::<SortSpec>::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -487,4 +505,87 @@ fn vector_search_caps_to_available_vectors() {
   let hits = reader.search(&req).unwrap().hits;
   assert_eq!(hits.len(), 1);
   assert_eq!(hits[0].doc_id, "only-one");
+}
+
+#[test]
+fn multiple_vector_clauses_merge_candidates() {
+  let dir = tempdir().unwrap();
+  let schema = multi_vector_schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("doc-1")),
+          ("body".into(), serde_json::json!("first")),
+          ("vec_a".into(), serde_json::json!([1.0, 0.0])),
+          ("vec_b".into(), serde_json::json!([0.0, 1.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("doc-2")),
+          ("body".into(), serde_json::json!("second")),
+          ("vec_a".into(), serde_json::json!([0.0, 1.0])),
+          ("vec_b".into(), serde_json::json!([0.0, 1.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("doc-3")),
+          ("body".into(), serde_json::json!("third")),
+          ("vec_a".into(), serde_json::json!([0.0, 1.0])),
+          ("vec_b".into(), serde_json::json!([1.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Vector(VectorQuery {
+        field: "vec_a".into(),
+        vector: vec![1.0, 0.0],
+        k: Some(3),
+        alpha: Some(0.0),
+        ef_search: None,
+        candidate_size: Some(3),
+        boost: Some(1.0),
+      }),
+      QueryNode::Vector(VectorQuery {
+        field: "vec_b".into(),
+        vector: vec![0.0, 1.0],
+        k: Some(3),
+        alpha: Some(0.0),
+        ef_search: None,
+        candidate_size: Some(3),
+        boost: Some(1.0),
+      }),
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let req = SearchRequest {
+    query: Query::Node(query),
+    limit: 3,
+    #[cfg(feature = "vectors")]
+    vector_query: None,
+    #[cfg(feature = "vectors")]
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let hits = reader.search(&req).unwrap().hits;
+  let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+  assert_eq!(ids, vec!["doc-1", "doc-2", "doc-3"]);
 }

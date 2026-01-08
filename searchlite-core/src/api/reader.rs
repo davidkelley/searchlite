@@ -14,8 +14,8 @@ use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
   Aggregation, AggregationResponse, CollapseRequest, DateHistogramAggregation, DecayFunction,
   Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions,
-  Query, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest,
-  SuggestResult,
+  Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption,
+  SuggestRequest, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -38,6 +38,7 @@ use crate::query::planner::{
 use crate::query::score_functions::{
   apply_boost_mode, combine_function_scores, compile_functions, CompiledFunction,
 };
+use crate::query::script::{compile_script, CompiledScript};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
 use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
@@ -126,9 +127,22 @@ pub struct ProfileResult {
   pub timings: BTreeMap<String, f64>,
 }
 
+const MAX_CANDIDATE_SIZE: usize = 20_000;
+
+#[cfg(feature = "vectors")]
+const MAX_VECTOR_CLAUSES: usize = 8;
+#[cfg(feature = "vectors")]
+const MAX_VECTOR_K: usize = 1024;
+#[cfg(feature = "vectors")]
+const MAX_VECTOR_CANDIDATE_SIZE: usize = 10_000;
+#[cfg(feature = "vectors")]
+const MAX_VECTOR_EF_SEARCH: usize = 65_536;
+#[cfg(feature = "vectors")]
+const MAX_GLOBAL_CANDIDATES: usize = MAX_CANDIDATE_SIZE;
+
 #[cfg(feature = "vectors")]
 #[derive(Clone)]
-struct VectorPlan {
+struct VectorClausePlan {
   field: String,
   vector: Vec<f32>,
   k: usize,
@@ -136,6 +150,14 @@ struct VectorPlan {
   ef_search: usize,
   candidate_size: usize,
   boost: f32,
+  metric: crate::index::manifest::VectorMetric,
+}
+
+#[cfg(feature = "vectors")]
+#[derive(Clone)]
+struct VectorPlan {
+  clauses: Vec<VectorClausePlan>,
+  candidate_size: usize,
   vector_only: bool,
 }
 
@@ -148,6 +170,101 @@ fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder)
     segment_ord,
     doc_id,
   }
+}
+
+fn ensure_numeric_fast_field(schema: &Schema, field: &str, ctx: &str) -> Result<()> {
+  let Some(meta) = schema.field_meta(field) else {
+    bail!("{ctx} field `{field}` is not present in schema");
+  };
+  match meta.kind {
+    FieldKind::Numeric => {
+      if !meta.fast {
+        bail!("{ctx} field `{field}` must be fast");
+      }
+      Ok(())
+    }
+    _ => bail!("{ctx} field `{field}` must be a numeric fast field"),
+  }
+}
+
+fn rank_numeric_value(reader: &FastFieldsReader, field: &str, doc_id: DocId, missing: f32) -> f64 {
+  reader
+    .f64_value(field, doc_id)
+    .or_else(|| reader.i64_value(field, doc_id).map(|v| v as f64))
+    .unwrap_or(missing as f64)
+}
+
+fn apply_rank_modifier(value: f64, modifier: &RankFeatureModifier) -> f64 {
+  match modifier {
+    RankFeatureModifier::None => value,
+    RankFeatureModifier::Log => {
+      if value <= 0.0 {
+        0.0
+      } else {
+        value.ln()
+      }
+    }
+    RankFeatureModifier::Log1p => {
+      if value <= -1.0 {
+        0.0
+      } else {
+        value.ln_1p()
+      }
+    }
+    RankFeatureModifier::Sqrt => {
+      if value < 0.0 {
+        0.0
+      } else {
+        value.sqrt()
+      }
+    }
+    RankFeatureModifier::Reciprocal => {
+      if value == 0.0 {
+        0.0
+      } else {
+        1.0 / value
+      }
+    }
+  }
+}
+
+#[cfg(feature = "vectors")]
+fn missing_vector_score(metric: &crate::index::manifest::VectorMetric) -> f32 {
+  match metric {
+    crate::index::manifest::VectorMetric::Cosine => -1.0,
+    crate::index::manifest::VectorMetric::L2 => f32::MIN,
+  }
+}
+
+#[cfg(feature = "vectors")]
+fn compute_hybrid_score(
+  key: (u32, DocId),
+  bm25_score: f32,
+  plan: &VectorPlan,
+  vector_scores: &[HashMap<(u32, DocId), f32>],
+) -> (f32, Option<f32>) {
+  let mut blended_sum = 0.0_f32;
+  let mut vector_sum = 0.0_f32;
+  let mut has_vector = false;
+  for (clause, scores) in plan.clauses.iter().zip(vector_scores.iter()) {
+    let raw_vec = scores.get(&key).copied();
+    if let Some(vs) = raw_vec {
+      vector_sum += vs;
+      has_vector = true;
+    }
+    let vec_score = raw_vec.unwrap_or_else(|| missing_vector_score(&clause.metric));
+    let blended = if clause.alpha >= 1.0 {
+      bm25_score
+    } else if clause.alpha <= 0.0 {
+      vec_score
+    } else {
+      blend_scores(bm25_score, vec_score, clause.alpha, true)
+    } * clause.boost;
+    blended_sum += blended;
+  }
+  let denom = plan.clauses.len().max(1) as f32;
+  let final_score = blended_sum / denom;
+  (final_score, has_vector.then_some(vector_sum))
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +288,19 @@ enum CompiledScoreNode {
     boost_mode: FunctionBoostMode,
     max_boost: Option<f32>,
     min_score: Option<f32>,
+    boost: f32,
+  },
+  RankFeature {
+    matcher: QueryMatcher,
+    field: String,
+    modifier: RankFeatureModifier,
+    missing: f32,
+    boost: f32,
+  },
+  ScriptScore {
+    matcher: QueryMatcher,
+    base: Box<CompiledScoreNode>,
+    script: CompiledScript,
     boost: f32,
   },
 }
@@ -222,6 +352,38 @@ fn compile_score_node(node: &ScoreNode, schema: &Schema) -> Result<CompiledScore
       min_score: *min_score,
       boost: *boost,
     },
+    ScoreNode::RankFeature {
+      matcher,
+      field,
+      modifier,
+      missing,
+      boost,
+    } => {
+      let missing_val = missing.unwrap_or(0.0);
+      if !missing_val.is_finite() {
+        bail!("rank_feature `missing` must be finite");
+      }
+      ensure_numeric_fast_field(schema, field, "rank_feature")?;
+      CompiledScoreNode::RankFeature {
+        matcher: matcher.clone(),
+        field: field.clone(),
+        modifier: modifier.unwrap_or(RankFeatureModifier::None),
+        missing: missing_val,
+        boost: *boost,
+      }
+    }
+    ScoreNode::ScriptScore {
+      matcher,
+      base,
+      script,
+      params,
+      boost,
+    } => CompiledScoreNode::ScriptScore {
+      matcher: matcher.clone(),
+      base: Box::new(compile_score_node(base, schema)?),
+      script: compile_script(script, params, schema)?,
+      boost: *boost,
+    },
   })
 }
 
@@ -231,7 +393,10 @@ fn has_custom_scoring(node: &CompiledScoreNode) -> bool {
     CompiledScoreNode::Sum(children) | CompiledScoreNode::DisMax { children, .. } => {
       children.iter().any(has_custom_scoring)
     }
-    CompiledScoreNode::Constant { .. } | CompiledScoreNode::FunctionScore { .. } => true,
+    CompiledScoreNode::Constant { .. }
+    | CompiledScoreNode::FunctionScore { .. }
+    | CompiledScoreNode::RankFeature { .. }
+    | CompiledScoreNode::ScriptScore { .. } => true,
   }
 }
 
@@ -394,6 +559,69 @@ fn evaluate_compiled_score(
         out_functions.extend(fn_expls);
       }
       Some(combined)
+    }
+    CompiledScoreNode::RankFeature {
+      matcher,
+      field,
+      modifier,
+      missing,
+      boost,
+    } => {
+      if !evaluator.matches_subquery(matcher, doc_id) {
+        return Some(0.0);
+      }
+      let raw = rank_numeric_value(fast_fields, field, doc_id, *missing);
+      let modified = apply_rank_modifier(raw, modifier);
+      if !modified.is_finite() {
+        return None;
+      }
+      let score = (modified as f32) * *boost;
+      if !score.is_finite() {
+        return None;
+      }
+      if collect_functions {
+        out_functions.push(FunctionExplanation {
+          r#type: "rank_feature".to_string(),
+          value: score,
+          field: Some(field.clone()),
+        });
+      }
+      Some(score)
+    }
+    CompiledScoreNode::ScriptScore {
+      matcher,
+      base,
+      script,
+      boost,
+    } => {
+      if !evaluator.matches_subquery(matcher, doc_id) {
+        return Some(0.0);
+      }
+      let base_score = evaluate_compiled_score(
+        base,
+        evaluator,
+        fast_fields,
+        doc_id,
+        leaf_scores,
+        collect_functions,
+        out_functions,
+      )?;
+      let script_score = script.evaluate(fast_fields, doc_id, base_score)?;
+      if !script_score.is_finite() {
+        return None;
+      }
+      let score = script_score * *boost;
+      if !score.is_finite() {
+        return None;
+      }
+      if collect_functions {
+        out_functions.push(FunctionExplanation {
+          r#type: "script_score".to_string(),
+          value: score,
+          field: None,
+        });
+      }
+      Some(score)
     }
   }
 }
@@ -1813,6 +2041,13 @@ impl IndexReader {
           collect_vectors(query, vectors, has_non_vector);
           *has_non_vector = true;
         }
+        QueryNode::ScriptScore { query, .. } => {
+          collect_vectors(query, vectors, has_non_vector);
+          *has_non_vector = true;
+        }
+        QueryNode::RankFeature { .. } => {
+          *has_non_vector = true;
+        }
         _ => {
           *has_non_vector = true;
         }
@@ -1833,13 +2068,10 @@ impl IndexReader {
     if !vector_nodes.is_empty() && req.vector_query.is_some() {
       bail!("cannot set both `vector_query` and a `vector` query node");
     }
-    if vector_nodes.len() > 1 {
-      bail!("multiple vector clauses are not supported in a single query");
-    }
-    let (vector_query, vector_only) = if let Some(vq) = vector_nodes.first() {
-      (vq.clone(), !has_non_vector_nodes)
+    let mut vectors: Vec<VectorQuery> = if !vector_nodes.is_empty() {
+      vector_nodes
     } else if let Some(spec) = req.vector_query.as_ref() {
-      let vq = match spec {
+      vec![match spec {
         VectorQuerySpec::Structured(v) => v.clone(),
         VectorQuerySpec::Legacy(LegacyVectorQuery(field, vec, alpha)) => VectorQuery {
           field: field.clone(),
@@ -1850,62 +2082,107 @@ impl IndexReader {
           candidate_size: None,
           boost: None,
         },
-      };
-      (vq, false)
+      }]
     } else {
       return Ok(None);
     };
-    let schema_field = self
-      .manifest
-      .schema
-      .vector_field(&vector_query.field)
-      .ok_or_else(|| anyhow::anyhow!("unknown vector field `{}`", vector_query.field))?;
-    if vector_query.vector.len() != schema_field.dim {
+    if vectors.len() > MAX_VECTOR_CLAUSES {
       bail!(
-        "vector field `{}` expects dimension {}, got {}",
-        schema_field.name,
-        schema_field.dim,
-        vector_query.vector.len()
+        "too many vector clauses: got {}, max supported {}",
+        vectors.len(),
+        MAX_VECTOR_CLAUSES
       );
     }
-    let mut query_vec = vector_query.vector.clone();
-    if matches!(
-      schema_field.metric,
-      crate::index::manifest::VectorMetric::Cosine
-    ) {
-      normalize_in_place(&mut query_vec);
+    let vector_only = !has_non_vector_nodes;
+    let mut clauses = Vec::with_capacity(vectors.len());
+    let mut max_k = 0usize;
+    let mut total_k = 0usize;
+    let base_candidate = req
+      .candidate_size
+      .unwrap_or_else(|| req.limit.max(10).saturating_mul(2))
+      .max(req.limit)
+      .min(MAX_GLOBAL_CANDIDATES);
+    for vector_query in vectors.drain(..) {
+      let schema_field = self
+        .manifest
+        .schema
+        .vector_field(&vector_query.field)
+        .ok_or_else(|| anyhow::anyhow!("unknown vector field `{}`", vector_query.field))?;
+      if vector_query.vector.len() != schema_field.dim {
+        bail!(
+          "vector field `{}` expects dimension {}, got {}",
+          schema_field.name,
+          schema_field.dim,
+          vector_query.vector.len()
+        );
+      }
+      let mut query_vec = vector_query.vector.clone();
+      if matches!(
+        schema_field.metric,
+        crate::index::manifest::VectorMetric::Cosine
+      ) {
+        normalize_in_place(&mut query_vec);
+      }
+      let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);
+      if !(0.0..=1.0).contains(&alpha) || !alpha.is_finite() {
+        bail!("vector alpha must be a finite value between 0 and 1 inclusive");
+      }
+      if vector_only && query_vec.is_empty() {
+        continue;
+      }
+      let default_k = if req.limit == 0 {
+        vector_query.k.unwrap_or(10)
+      } else {
+        vector_query.k.unwrap_or(req.limit)
+      };
+      let mut k = default_k.max(1);
+      if k > MAX_VECTOR_K {
+        k = MAX_VECTOR_K;
+      }
+      let mut candidate_size = vector_query
+        .candidate_size
+        .unwrap_or_else(|| k.max(req.limit).max(10).saturating_mul(2));
+      if candidate_size < k {
+        candidate_size = k;
+      }
+      candidate_size = candidate_size.min(MAX_VECTOR_CANDIDATE_SIZE);
+      let mut ef_search = vector_query
+        .ef_search
+        .unwrap_or_else(|| DEFAULT_EF_SEARCH.max(candidate_size));
+      if ef_search > MAX_VECTOR_EF_SEARCH {
+        ef_search = MAX_VECTOR_EF_SEARCH;
+      }
+      let boost = vector_query.boost.unwrap_or(1.0);
+      if boost < 0.0 || !boost.is_finite() {
+        bail!("vector boost must be finite and non-negative");
+      }
+      max_k = max_k.max(k);
+      total_k = total_k.saturating_add(k);
+      clauses.push(VectorClausePlan {
+        field: vector_query.field.clone(),
+        vector: query_vec,
+        k,
+        alpha,
+        ef_search,
+        candidate_size,
+        boost,
+        metric: schema_field.metric.clone(),
+      });
     }
-    let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);
-    if !(0.0..=1.0).contains(&alpha) {
-      bail!("vector alpha must be between 0 and 1 inclusive");
-    }
-    if vector_only && query_vec.is_empty() {
+    if clauses.is_empty() {
       return Ok(None);
     }
-    let default_k = if req.limit == 0 {
-      vector_query.k.unwrap_or(10)
-    } else {
-      vector_query.k.unwrap_or(req.limit)
-    };
-    let k = default_k.max(1);
-    let mut candidate_size = vector_query
-      .candidate_size
-      .unwrap_or_else(|| k.max(req.limit).max(10).saturating_mul(2));
-    if candidate_size < k {
-      candidate_size = k;
+    let mut candidate_size = base_candidate.max(max_k);
+    let union_estimate = candidate_size.saturating_add(total_k);
+    if union_estimate > MAX_GLOBAL_CANDIDATES {
+      candidate_size = MAX_GLOBAL_CANDIDATES.saturating_sub(total_k).max(req.limit);
     }
-    let ef_search = vector_query
-      .ef_search
-      .unwrap_or_else(|| DEFAULT_EF_SEARCH.max(candidate_size));
-    let boost = vector_query.boost.unwrap_or(1.0).max(0.0);
+    if candidate_size == 0 {
+      candidate_size = max_k.max(1);
+    }
     Ok(Some(VectorPlan {
-      field: vector_query.field.clone(),
-      vector: query_vec,
-      k,
-      alpha,
-      ef_search,
+      clauses,
       candidate_size,
-      boost,
       vector_only,
     }))
   }
@@ -1930,10 +2207,7 @@ impl IndexReader {
     let heap_limit = if req.limit == 0 {
       0
     } else {
-      plan
-        .candidate_size
-        .max(req.limit.max(plan.k))
-        .saturating_add(1)
+      plan.candidate_size.max(req.limit).saturating_add(1)
     };
     let root_filter = if let Some(filter) = req.filter.as_ref() {
       RootFilter::Node(filter)
@@ -1954,35 +2228,33 @@ impl IndexReader {
     let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
     let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &[], &self.manifest.schema);
+    let vector_scores = self.collect_vector_maps(
+      plan,
+      root_filter,
+      vector_filter,
+      false,
+      &[],
+      &[],
+      &QueryMatcher::MatchAll,
+    )?;
     for (segment_ord, seg) in self.segments.iter().enumerate() {
       let mut agg_collector = agg_pipeline
         .as_ref()
         .map(|p| p.for_segment(seg, segment_ord as u32))
         .transpose()?;
-      let candidates = if let Some((index, _store)) = seg.vector_components(&plan.field) {
-        if index.is_empty() {
-          Vec::new()
-        } else {
-          let search_k = plan.candidate_size.max(plan.k).min(index.len().max(1));
-          index.search(&plan.vector, search_k, plan.ef_search)
-        }
-      } else {
-        Vec::new()
-      };
-      for (doc_id, mut vscore) in candidates.into_iter() {
-        if seg.is_deleted(doc_id) {
-          continue;
-        }
-        if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
-          continue;
-        }
-        if let Some(filt) = vector_filter {
-          if !passes_filter(seg.fast_fields(), doc_id, filt) {
-            continue;
+      let mut seg_docs: HashSet<DocId> = HashSet::new();
+      for scores in vector_scores.iter() {
+        for ((seg_idx, doc_id), _) in scores.iter() {
+          if *seg_idx == segment_ord as u32 {
+            seg_docs.insert(*doc_id);
           }
         }
-        vscore *= plan.boost;
-        let key = sort_plan.build_key(seg, doc_id, vscore, segment_ord as u32);
+      }
+      for doc_id in seg_docs.into_iter() {
+        let key_tuple = (segment_ord as u32, doc_id);
+        let (final_score, vector_score) =
+          compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores);
+        let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
         if let Some(cur) = &cursor_key {
           let ord = key.cmp(cur);
           if ord.is_lt() || ord.is_eq() {
@@ -1994,7 +2266,7 @@ impl IndexReader {
         }
         total_matches += 1;
         if let Some(col) = agg_collector.as_mut() {
-          col.collect(doc_id, vscore);
+          col.collect(doc_id, final_score);
         }
         if req.profile {
           search_stats.candidates_examined += 1;
@@ -2003,8 +2275,8 @@ impl IndexReader {
         if let Some(heap_ref) = heap.as_mut() {
           let hit = RankedHit {
             key,
-            score: vscore,
-            vector_score: Some(vscore),
+            score: final_score,
+            vector_score,
             explanation: None,
           };
           if heap_limit == 0 {
@@ -2099,7 +2371,7 @@ impl IndexReader {
 
   #[cfg(feature = "vectors")]
   #[allow(clippy::too_many_arguments)]
-  fn collect_vector_scores(
+  fn collect_vector_maps(
     &self,
     plan: &VectorPlan,
     root_filter: RootFilter<'_>,
@@ -2108,12 +2380,16 @@ impl IndexReader {
     term_groups: &[TermMatchGroup],
     phrase_fields: &[PhraseFieldConfig],
     matcher: &QueryMatcher,
-  ) -> Result<HashMap<(u32, DocId), f32>> {
-    let mut scores = HashMap::new();
+  ) -> Result<Vec<HashMap<(u32, DocId), f32>>> {
+    #[derive(Clone, Copy)]
+    struct VectorCandidate {
+      segment_ord: u32,
+      doc_id: DocId,
+      score: f32,
+    }
+    let mut per_clause: Vec<Vec<VectorCandidate>> =
+      plan.clauses.iter().map(|_| Vec::new()).collect();
     for (segment_ord, seg) in self.segments.iter().enumerate() {
-      let Some((index, _store)) = seg.vector_components(&plan.field) else {
-        continue;
-      };
       let mut _term_doc_holder = None;
       let mut _phrase_holder = None;
       let query_eval = if require_text_match {
@@ -2130,34 +2406,62 @@ impl IndexReader {
       } else {
         None
       };
-      let available = index.len();
-      if available == 0 {
-        continue;
-      }
-      let search_k = plan.candidate_size.max(plan.k).min(available.max(1));
-      let candidates = index.search(&plan.vector, search_k, plan.ef_search);
-      for (doc_id, mut vscore) in candidates.into_iter() {
-        if seg.is_deleted(doc_id) {
+      for (idx, clause) in plan.clauses.iter().enumerate() {
+        let Some((index, _store)) = seg.vector_components(&clause.field) else {
+          continue;
+        };
+        let available = index.len();
+        if available == 0 {
           continue;
         }
-        if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
-          continue;
-        }
-        if let Some(filt) = vector_filter {
-          if !passes_filter(seg.fast_fields(), doc_id, filt) {
+        let search_k = clause.candidate_size.max(clause.k).min(available.max(1));
+        let candidates = index.search(&clause.vector, search_k, clause.ef_search);
+        for (doc_id, mut vscore) in candidates.into_iter() {
+          if seg.is_deleted(doc_id) {
             continue;
           }
-        }
-        if let Some(eval) = query_eval.as_ref() {
-          if !eval.matches(doc_id) {
+          if !passes_root_filter(seg.fast_fields(), doc_id, root_filter) {
             continue;
           }
+          if let Some(filt) = vector_filter {
+            if !passes_filter(seg.fast_fields(), doc_id, filt) {
+              continue;
+            }
+          }
+          if let Some(eval) = query_eval.as_ref() {
+            if !eval.matches(doc_id) {
+              continue;
+            }
+          }
+          vscore *= clause.boost;
+          per_clause[idx].push(VectorCandidate {
+            segment_ord: segment_ord as u32,
+            doc_id,
+            score: vscore,
+          });
         }
-        vscore *= plan.boost;
-        scores.insert((segment_ord as u32, doc_id), vscore);
       }
     }
-    Ok(scores)
+    let mut out = Vec::with_capacity(plan.clauses.len());
+    for (idx, mut candidates) in per_clause.into_iter().enumerate() {
+      candidates.sort_by(|a, b| {
+        b.score
+          .to_bits()
+          .cmp(&a.score.to_bits())
+          .then_with(|| a.segment_ord.cmp(&b.segment_ord))
+          .then_with(|| a.doc_id.cmp(&b.doc_id))
+      });
+      let k = plan.clauses.get(idx).map(|c| c.k).unwrap_or(0);
+      if k > 0 && candidates.len() > k {
+        candidates.truncate(k);
+      }
+      let mut map = HashMap::with_capacity(candidates.len());
+      for cand in candidates.into_iter() {
+        map.insert((cand.segment_ord, cand.doc_id), cand.score);
+      }
+      out.push(map);
+    }
+    Ok(out)
   }
 
   #[cfg(feature = "vectors")]
@@ -2165,42 +2469,32 @@ impl IndexReader {
   fn merge_vector_hits(
     &self,
     hits: Vec<RankedHit>,
-    vector_scores: HashMap<(u32, DocId), f32>,
+    vector_scores: &[HashMap<(u32, DocId), f32>],
     plan: &VectorPlan,
     sort_plan: &SortPlan,
     cursor_key: Option<&SortKey>,
     saw_cursor: &mut bool,
     heap_limit: usize,
   ) -> Result<Vec<RankedHit>> {
-    let vector_metric = self
-      .manifest
-      .schema
-      .vector_field(&plan.field)
-      .map(|vf| vf.metric.clone())
-      .unwrap_or(crate::index::manifest::VectorMetric::Cosine);
-    let missing_vector_score = match vector_metric {
-      crate::index::manifest::VectorMetric::Cosine => -1.0,
-      crate::index::manifest::VectorMetric::L2 => f32::MIN,
-    };
     let mut heap = BinaryHeap::new();
     let mut bm25_map: HashMap<(u32, DocId), RankedHit> = HashMap::new();
     for hit in hits.into_iter() {
       bm25_map.insert((hit.key.segment_ord, hit.key.doc_id), hit);
     }
-    for ((seg_ord, doc_id), vscore) in vector_scores.into_iter() {
+    let mut candidate_keys: HashSet<(u32, DocId)> =
+      bm25_map.keys().copied().collect::<HashSet<_>>();
+    for map in vector_scores.iter() {
+      candidate_keys.extend(map.keys().copied());
+    }
+    for (seg_ord, doc_id) in candidate_keys.into_iter() {
       let mut bm25_score = 0.0_f32;
       let mut explanation = None;
       if let Some(existing) = bm25_map.remove(&(seg_ord, doc_id)) {
         bm25_score = existing.score;
         explanation = existing.explanation;
       }
-      let final_score = if plan.alpha == 1.0 {
-        bm25_score
-      } else if plan.alpha == 0.0 {
-        vscore
-      } else {
-        blend_scores(bm25_score, vscore, plan.alpha, true)
-      };
+      let (final_score, vector_score) =
+        compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores);
       if let Some(expl) = explanation.as_mut() {
         expl.final_score = final_score;
       }
@@ -2221,46 +2515,13 @@ impl IndexReader {
       let ranked = RankedHit {
         key,
         score: final_score,
-        vector_score: Some(vscore),
+        vector_score,
         explanation,
       };
       if heap_limit == 0 {
         heap.push(ranked);
       } else {
         push_ranked(&mut heap, ranked, heap_limit);
-      }
-    }
-    if plan.alpha > 0.0 {
-      for (_key, mut hit) in bm25_map.into_iter() {
-        let seg = self
-          .segments
-          .get(hit.key.segment_ord as usize)
-          .ok_or_else(|| anyhow::anyhow!("missing segment {}", hit.key.segment_ord))?;
-        let final_score = if plan.alpha == 1.0 {
-          hit.score
-        } else {
-          blend_scores(hit.score, missing_vector_score, plan.alpha, true)
-        };
-        if let Some(expl) = hit.explanation.as_mut() {
-          expl.final_score = final_score;
-        }
-        hit.score = final_score;
-        let key = sort_plan.build_key(seg, hit.key.doc_id, final_score, hit.key.segment_ord);
-        if let Some(cur) = cursor_key {
-          let ord = key.cmp(cur);
-          if ord.is_lt() || ord.is_eq() {
-            if ord.is_eq() {
-              *saw_cursor = true;
-            }
-            continue;
-          }
-        }
-        hit.key = key;
-        if heap_limit == 0 {
-          heap.push(hit);
-        } else {
-          push_ranked(&mut heap, hit, heap_limit);
-        }
       }
     }
     Ok(heap.into_iter().collect())
@@ -2318,21 +2579,30 @@ impl IndexReader {
     let mut vector_plan = self.build_vector_plan(req)?;
     #[cfg(feature = "vectors")]
     if let Some(plan) = vector_plan.as_ref() {
-      if !plan.vector_only && plan.alpha >= 1.0 {
+      if !plan.vector_only && plan.clauses.iter().all(|c| c.alpha >= 1.0) {
         vector_plan = None;
       }
     }
+    let base_candidate = if req.limit == 0 {
+      0
+    } else {
+      req
+        .candidate_size
+        .unwrap_or(req.limit)
+        .max(req.limit)
+        .min(MAX_CANDIDATE_SIZE)
+    };
     #[cfg(feature = "vectors")]
     let effective_limit = if req.limit == 0 {
       0
     } else {
       vector_plan
         .as_ref()
-        .map(|p| p.candidate_size.max(req.limit.max(p.k)))
-        .unwrap_or(req.limit)
+        .map(|p| p.candidate_size.max(req.limit))
+        .unwrap_or(base_candidate)
     };
     #[cfg(not(feature = "vectors"))]
-    let effective_limit = req.limit;
+    let effective_limit = base_candidate;
     let top_k = if effective_limit == 0 {
       0
     } else {
@@ -2472,26 +2742,25 @@ impl IndexReader {
     }
     #[cfg(feature = "vectors")]
     if let Some(plan) = vector_plan.as_ref() {
-      let vector_scores = self.collect_vector_scores(
+      let require_text_match = !plan.vector_only;
+      let vector_scores = self.collect_vector_maps(
         plan,
         root_filter,
         req.vector_filter.as_ref(),
-        true,
+        require_text_match,
         &term_groups,
         &phrase_fields,
         &query_plan.matcher,
       )?;
-      if plan.alpha < 1.0 || !vector_scores.is_empty() {
-        hits = self.merge_vector_hits(
-          hits,
-          vector_scores,
-          plan,
-          &sort_plan,
-          cursor_key.as_ref(),
-          &mut saw_cursor,
-          top_k,
-        )?;
-      }
+      hits = self.merge_vector_hits(
+        hits,
+        &vector_scores,
+        plan,
+        &sort_plan,
+        cursor_key.as_ref(),
+        &mut saw_cursor,
+        top_k,
+      )?;
     }
     hits.sort_by(|a, b| a.key.cmp(&b.key));
     let search_phase_end = if req.profile {
@@ -3850,6 +4119,7 @@ mod tests {
         filter: None,
         filters: vec![],
         limit: 5,
+        candidate_size: None,
         sort: Vec::new(),
         cursor: None,
         execution: ExecutionStrategy::Wand,

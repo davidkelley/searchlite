@@ -168,6 +168,16 @@ pub enum FieldValueModifier {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum RankFeatureModifier {
+  None,
+  Log,
+  Log1p,
+  Sqrt,
+  Reciprocal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DecayFunction {
   Exp,
   Gauss,
@@ -322,6 +332,23 @@ pub enum QueryNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boost: Option<f32>,
   },
+  RankFeature {
+    field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modifier: Option<RankFeatureModifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing: Option<f32>,
+  },
+  ScriptScore {
+    query: Box<QueryNode>,
+    script: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<BTreeMap<String, f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boost: Option<f32>,
+  },
   #[cfg(feature = "vectors")]
   Vector(VectorQuery),
 }
@@ -375,6 +402,8 @@ pub struct SearchRequest {
   #[serde(default)]
   pub filters: Vec<Filter>,
   pub limit: usize,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub candidate_size: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -419,6 +448,8 @@ struct SearchRequestHelper {
   #[serde(default)]
   pub filters: Vec<Filter>,
   pub limit: usize,
+  #[serde(default)]
+  pub candidate_size: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -470,6 +501,7 @@ impl<'de> Deserialize<'de> for SearchRequest {
       filter: helper.filter,
       filters: helper.filters,
       limit: helper.limit,
+      candidate_size: helper.candidate_size,
       sort: helper.sort,
       cursor: helper.cursor,
       execution: helper.execution,

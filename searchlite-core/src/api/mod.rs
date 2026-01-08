@@ -15,8 +15,8 @@ pub use reader::{
 pub use types::{
   Aggregation, AggregationResponse, Aggregations, CollapseRequest, DecayFunction, Document,
   FieldValueModifier, Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, FuzzyOptions,
-  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, Query, QueryNode, RescoreMode,
-  RescoreRequest, SearchRequest, SortOrder, SortSpec, StorageType, SuggestOption, SuggestRequest,
-  SuggestResult,
+  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, Query, QueryNode,
+  RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SortSpec,
+  StorageType, SuggestOption, SuggestRequest, SuggestResult,
 };
 pub use writer::IndexWriter;

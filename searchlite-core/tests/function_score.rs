@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use searchlite_core::api::types::{
   DecayFunction, Document, ExecutionStrategy, FieldValueModifier, Filter, FunctionBoostMode,
   FunctionScoreMode, FunctionSpec, IndexOptions, KeywordField, NumericField, Query, QueryNode,
-  RescoreMode, RescoreRequest, Schema, SearchRequest, StorageType,
+  RankFeatureModifier, RescoreMode, RescoreRequest, Schema, SearchRequest, StorageType,
 };
 use searchlite_core::api::{Index, SearchResult};
 
@@ -68,6 +68,7 @@ fn base_request(query: impl Into<Query>) -> SearchRequest {
     filter: None,
     filters: vec![],
     limit: 10,
+    candidate_size: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -339,4 +340,34 @@ fn rescore_min_score_filters_hits() {
   assert!(ids.contains(&"doc-1".to_string()));
   assert!(ids.contains(&"doc-2".to_string()));
   assert!(!ids.contains(&"doc-3".to_string()));
+}
+
+#[test]
+fn rank_feature_uses_numeric_fast_field() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::RankFeature {
+    field: "popularity".into(),
+    boost: Some(1.0),
+    modifier: Some(RankFeatureModifier::Sqrt),
+    missing: Some(0.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(scores[0] > scores[1] && scores[1] > scores[2]);
+}
+
+#[test]
+fn script_score_evaluates_expression_with_score_and_field() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "_score + popularity * 0.1".into(),
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(scores[0] > scores[1] && scores[1] > scores[2]);
 }

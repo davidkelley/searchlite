@@ -334,6 +334,16 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
       }
     }
   };
+  let candidate_size = {
+    #[cfg(feature = "vectors")]
+    {
+      vector_candidates
+    }
+    #[cfg(not(feature = "vectors"))]
+    {
+      None
+    }
+  };
   #[cfg(feature = "vectors")]
   let request_vector_query = match &query {
     Query::Node(QueryNode::Vector(_)) => None,
@@ -345,6 +355,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     filter: None,
     filters: Vec::new(),
     limit,
+    candidate_size,
     sort: parse_sort(sort)?,
     execution: parse_execution(&execution),
     bmw_block_size,
@@ -566,6 +577,7 @@ mod tests {
       filter: None,
       filters: vec![],
       limit: 5,
+      candidate_size: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -603,6 +615,7 @@ mod tests {
       filter: None,
       filters: vec![],
       limit: 5,
+      candidate_size: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

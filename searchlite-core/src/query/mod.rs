@@ -7,5 +7,6 @@ pub mod filters;
 pub mod phrase;
 pub mod planner;
 pub mod score_functions;
+pub mod script;
 pub mod sort;
 pub mod wand;
