@@ -2029,7 +2029,7 @@ impl IndexReader {
     } else {
       hits.sort_by(|a, b| a.key.cmp(&b.key));
     }
-    let total_hits_value = total_matches;
+    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if let Some(collapse) = req.collapse.as_ref() {
@@ -2420,11 +2420,6 @@ impl IndexReader {
         if !score_fast_path && agg_ref.is_none() && req.limit > 0 {
           agg_ref = Some(&mut noop_collector);
         }
-        let counter = if req.limit == 0 && agg_ref.is_some() {
-          Some(&mut total_matches)
-        } else {
-          None
-        };
         let segment_rank_limit = if score_fast_path {
           top_k
         } else if req.explain {
@@ -2444,7 +2439,7 @@ impl IndexReader {
           profile: req.profile,
           root_filter,
           agg_collector: agg_ref,
-          match_counter: counter,
+          match_counter: Some(&mut total_matches),
           req,
           segment_ord: segment_ord as u32,
           rank_limit: segment_rank_limit,
@@ -2543,7 +2538,7 @@ impl IndexReader {
         end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
-    let total_hits_value = total_matches;
+    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if let Some(collapse) = req.collapse.as_ref() {

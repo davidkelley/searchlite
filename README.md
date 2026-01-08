@@ -17,6 +17,18 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
 - Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
 
+## Install the CLI
+
+Prebuilt binaries are published on every GitHub release:
+
+```bash
+curl -fsSL https://searchlite.dev/install | sh
+```
+
+- Set `SEARCHLITE_VERSION` to pin a tag (e.g., `v0.4.0`), `SEARCHLITE_INSTALL_DIR` to override the destination, and `SEARCHLITE_BIN_NAME` to change the installed name (defaults to `searchlite`).
+- Supported targets match release artifacts: `x86_64`/`aarch64` for Linux/macOS, and Windows via Git Bash/WSL (downloads the `.zip` and installs `searchlite.exe`).
+- The script downloads from GitHub releases (`searchlite-cli-<target>.{tar.gz,zip}`) and falls back to `~/.local/bin` if `/usr/local/bin` is not writable.
+
 ## Development setup
 
 - Rust toolchain is pinned to `1.78.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
@@ -200,6 +212,97 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 - Sort targets must be fast keyword or numeric fields; the default order is ascending (descending for `_score`).
 - Multi-valued fields use the minimum value for ascending sorts and the maximum for descending sorts; documents missing the field are placed last.
 - Ordering is stable and tiebroken by segment/doc id so cursor pagination works reliably.
+
+## HTTP Service
+
+#### WARNING
+
+This HTTP service provides no authentication, authorization, or rate limiting. Do not expose it directly to untrusted networks; front it with your own proxy or API gateway that enforces access control and rate limits.
+
+Run the bundled HTTP server for a single index:
+
+```bash
+cargo run -p searchlite-http -- --index /tmp/searchlite_idx --bind 0.0.0.0:8080
+# Env-style config is supported too:
+SEARCHLITE_INDEX_PATH=/tmp/searchlite_idx \
+SEARCHLITE_BIND_ADDR=0.0.0.0:8080 \
+SEARCHLITE_MAX_BODY_BYTES=$((50*1024*1024)) \
+cargo run -p searchlite-http -- --refresh-on-commit
+```
+
+Flags/env:
+
+- `--index` / `SEARCHLITE_INDEX_PATH`: directory for the single index served by this instance.
+- `--bind` / `SEARCHLITE_BIND_ADDR`: listen address (default `127.0.0.1:8080`).
+- `--require-existing-index`: fail fast at startup if the manifest is missing.
+- `--max-body-bytes`, `--max-concurrency`, `--request-timeout-secs`, `--shutdown-grace-secs`, `--refresh-on-commit`: resource limits and shutdown behavior.
+
+All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/add`, `/bulk`, or `/delete` are queued in the writer and become durable/searchable only after calling `/commit` (optionally followed by `/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
+
+### Example requests
+
+- Init (fails if the index already exists):
+
+```bash
+curl -XPOST http://localhost:8080/init \
+  -H 'Content-Type: application/json' \
+  --data-binary @schema.json
+```
+
+- Stream writes:
+
+```bash
+curl -XPOST http://localhost:8080/add \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @docs.ndjson
+curl -XPOST http://localhost:8080/commit
+```
+
+- JSON bulk ingest:
+
+```bash
+curl -XPOST http://localhost:8080/bulk \
+  -H 'Content-Type: application/json' \
+  -d '{"docs":[{"_id":"1","body":"Rust search"},{"_id":"2","body":"More docs"}]}'
+```
+
+- Search + highlight + collapse + aggregations:
+
+```bash
+cat > /tmp/search.json <<'EOF'
+{
+  "query": { "type": "query_string", "query": "rust" },
+  "limit": 5,
+  "return_stored": true,
+  "highlight_field": "body",
+  "collapse": { "field": "lang" },
+  "aggs": { "langs": { "type": "terms", "field": "lang", "size": 5 } },
+  "suggest": {
+    "complete": { "type": "completion", "field": "body", "prefix": "ru", "size": 3 }
+  }
+}
+EOF
+curl -XPOST http://localhost:8080/search \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/search.json
+```
+
+- Vector-only query (when built with `--features vectors`):
+
+```bash
+curl -XPOST http://localhost:8080/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"type":"vector","field":"embedding","vector":[1.0,0.0],"k":5,"alpha":0.0},"limit":5,"return_stored":true}'
+```
+
+- Maintenance endpoints:
+
+```bash
+curl -XPOST http://localhost:8080/refresh   # lightweight reader reload
+curl -XPOST http://localhost:8080/compact   # merge segments
+curl -XGET  http://localhost:8080/inspect   # manifest + segments
+curl -XGET  http://localhost:8080/stats     # doc/segment counts
+```
 
 ### Aggregations quick reference
 

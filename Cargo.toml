@@ -4,6 +4,7 @@ members = [
   "searchlite-cli",
   "searchlite-ffi",
   "searchlite-wasm",
+  "searchlite-http",
 ]
 resolver = "2"
 

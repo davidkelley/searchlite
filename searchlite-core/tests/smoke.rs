@@ -494,6 +494,29 @@ fn cursor_paginates_ordered_hits() {
 }
 
 #[test]
+fn total_hits_estimate_counts_across_pages() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("apple tart"))]),
+    doc("doc-2", vec![("body", json!("apple pie recipe"))]),
+    doc("doc-3", vec![("body", json!("green apple salad"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("apple");
+  req.limit = 2;
+
+  let first = reader.search(&req).unwrap();
+  assert_eq!(first.hits.len(), 2);
+  assert_eq!(first.total_hits_estimate, 3);
+  let cursor = first.next_cursor.clone().expect("cursor for second page");
+
+  req.cursor = Some(cursor);
+  let second = reader.search(&req).unwrap();
+  assert_eq!(second.hits.len(), 1);
+  assert_eq!(second.total_hits_estimate, 3);
+  assert!(second.next_cursor.is_none());
+}
+
+#[test]
 fn cursor_rejects_invalid_hex() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
