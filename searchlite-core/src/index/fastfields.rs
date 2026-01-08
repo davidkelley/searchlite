@@ -472,6 +472,14 @@ pub struct FastFieldsReader {
   fields: HashMap<String, Column>,
 }
 
+pub(crate) fn case_insensitive_equals(a: &str, b: &str) -> bool {
+  if a.is_ascii() && b.is_ascii() {
+    a.eq_ignore_ascii_case(b)
+  } else {
+    a.to_lowercase() == b.to_lowercase()
+  }
+}
+
 impl FastFieldsReader {
   pub fn open(storage: &dyn Storage, path: &Path) -> Result<Self> {
     let data = storage.read_to_end(path)?;
@@ -484,7 +492,7 @@ impl FastFieldsReader {
       Some(Column::Str { dict, values }) => values
         .get(doc_id as usize)
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
-        .map(|s| s == value)
+        .map(|s| case_insensitive_equals(s, value))
         .unwrap_or(false),
       Some(Column::StrList {
         dict,
@@ -492,9 +500,12 @@ impl FastFieldsReader {
         values,
       }) => {
         if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
-          values[start..end]
-            .iter()
-            .any(|idx| dict.get(*idx as usize).map(|s| s == value).unwrap_or(false))
+          values[start..end].iter().any(|idx| {
+            dict
+              .get(*idx as usize)
+              .map(|s| case_insensitive_equals(s, value))
+              .unwrap_or(false)
+          })
         } else {
           false
         }
@@ -508,10 +519,12 @@ impl FastFieldsReader {
         if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
           for obj_idx in obj_start..obj_end {
             if let Some((start, end)) = object_range(object_offsets, obj_idx) {
-              if values[start..end]
-                .iter()
-                .any(|idx| dict.get(*idx as usize).map(|s| s == value).unwrap_or(false))
-              {
+              if values[start..end].iter().any(|idx| {
+                dict
+                  .get(*idx as usize)
+                  .map(|s| case_insensitive_equals(s, value))
+                  .unwrap_or(false)
+              }) {
                 return true;
               }
             }
@@ -531,7 +544,7 @@ impl FastFieldsReader {
       }) => lookup
         .get(doc_id as usize)
         .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
-        .map(|s| values.iter().any(|v| v == s))
+        .map(|s| values.iter().any(|v| case_insensitive_equals(s, v)))
         .unwrap_or(false),
       Some(Column::StrList {
         dict,
@@ -542,7 +555,7 @@ impl FastFieldsReader {
           lookup[start..end].iter().any(|idx| {
             dict
               .get(*idx as usize)
-              .map(|s| values.iter().any(|v| v == s))
+              .map(|s| values.iter().any(|v| case_insensitive_equals(s, v)))
               .unwrap_or(false)
           })
         } else {
@@ -561,7 +574,7 @@ impl FastFieldsReader {
               if lookup[start..end].iter().any(|idx| {
                 dict
                   .get(*idx as usize)
-                  .map(|s| values.iter().any(|v| v == s))
+                  .map(|s| values.iter().any(|v| case_insensitive_equals(s, v)))
                   .unwrap_or(false)
               }) {
                 return true;

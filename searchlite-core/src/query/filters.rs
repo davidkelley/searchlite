@@ -1,5 +1,5 @@
 use crate::api::types::Filter;
-use crate::index::fastfields::FastFieldsReader;
+use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
 
 pub fn passes_filters(reader: &FastFieldsReader, doc_id: DocId, filters: &[Filter]) -> bool {
@@ -95,7 +95,7 @@ fn filter_matches(
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
           .get(idx)
-          .map(|vals| vals.iter().any(|v| v == value))
+          .map(|vals| vals.iter().any(|v| case_insensitive_equals(v, value)))
           .unwrap_or(false),
         None => reader.matches_keyword(&full, doc_id, value),
       }
@@ -106,7 +106,11 @@ fn filter_matches(
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
           .get(idx)
-          .map(|vals| vals.iter().any(|v| values.iter().any(|t| t == v)))
+          .map(|vals| {
+            vals
+              .iter()
+              .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
+          })
           .unwrap_or(false),
         None => reader.matches_keyword_in(&full, doc_id, values),
       }
@@ -190,6 +194,76 @@ mod tests {
     nested_count_key, nested_parent_key, FastFieldsWriter, FastValue,
   };
   use tempfile::tempdir;
+
+  #[test]
+  fn keyword_filters_are_case_insensitive() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set("cat", 0, FastValue::Str("News".into()));
+    writer.set("topic", 0, FastValue::Str("ÜMLAUT".into()));
+    writer.set(
+      "tags",
+      0,
+      FastValue::StrList(vec!["Ümlaut".into(), "NEWS".into()]),
+    );
+    writer.set(
+      &nested_count_key("comment"),
+      0,
+      FastValue::NestedCount { objects: 1 },
+    );
+    writer.set(
+      "comment.author",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["Alice".into(), "Δelta".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    let filters = vec![
+      Filter::KeywordEq {
+        field: "cat".into(),
+        value: "news".into(),
+      },
+      Filter::KeywordEq {
+        field: "topic".into(),
+        value: "ümlaut".into(),
+      },
+      Filter::KeywordIn {
+        field: "tags".into(),
+        values: vec!["ümlaut".into(), "news".into()],
+      },
+      Filter::KeywordIn {
+        field: "cat".into(),
+        values: vec!["sports".into(), "NEWS".into()],
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "alice".into(),
+        }),
+      },
+      Filter::Nested {
+        path: "comment".into(),
+        filter: Box::new(Filter::KeywordEq {
+          field: "author".into(),
+          value: "δELTA".into(),
+        }),
+      },
+    ];
+    assert!(passes_filters(&reader, 0, &filters));
+
+    let rejecting = vec![Filter::KeywordEq {
+      field: "cat".into(),
+      value: "other".into(),
+    }];
+    assert!(!passes_filters(&reader, 0, &rejecting));
+  }
 
   #[test]
   fn evaluates_all_filter_types() {
