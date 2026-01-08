@@ -69,21 +69,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$DIST_DIR"
+          repo_root="$PWD"
           bin="target/${{ matrix.target }}/release/searchlite-cli${{ matrix.ext }}"
           name="searchlite-cli-${{ matrix.target }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            python - <<'PY'
-import os, sys, zipfile
-dist = os.environ["DIST_DIR"]
-target = os.environ["name"]
-bin_path = os.path.join("target", "${{ matrix.target }}", "release", f"searchlite-cli${{ matrix.ext }}")
-with zipfile.ZipFile(os.path.join(dist, f"{target}.zip"), "w", compression=zipfile.ZIP_DEFLATED) as z:
-    z.write(bin_path, arcname=os.path.basename(bin_path))
-    z.write("LICENSE", arcname="LICENSE")
-    z.write("README.md", arcname="README.md")
-PY
+            export NAME="$name"
+            python -c "import os, zipfile; dist=os.environ['DIST_DIR']; target=os.environ['NAME']; bin_path=os.path.join('target','${{ matrix.target }}','release','searchlite-cli${{ matrix.ext }}'); z=zipfile.ZipFile(os.path.join(dist,f'{target}.zip'),'w',compression=zipfile.ZIP_DEFLATED); z.write(bin_path, arcname=os.path.basename(bin_path)); z.write('LICENSE', arcname='LICENSE'); z.write('README.md', arcname='README.md'); z.close()"
           else
-            tar -C "$(dirname "$bin")" -czf "$DIST_DIR/${name}.tar.gz" "$(basename "$bin")" LICENSE README.md
+            tar -czf "$DIST_DIR/${name}.tar.gz" \
+              -C "$(dirname "$bin")" "$(basename "$bin")" \
+              -C "$repo_root" LICENSE README.md
           fi
 
       - name: Upload CLI asset
