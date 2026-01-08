@@ -303,7 +303,7 @@ curl -XPOST http://localhost:8080/search \
   -d '{"query":{"type":"bool","should":[{"type":"vector","field":"vec_a","vector":[1,0,0],"alpha":0.0,"k":20},{"type":"vector","field":"vec_b","vector":[0,1,0],"alpha":0.0,"k":20}]},"candidate_size":100,"limit":20,"return_stored":true}'
 ```
 
-- Numeric boosts: `{"type":"rank_feature","field":"popularity","modifier":"sqrt"}` and a guarded script score: `{"type":"script_score","query":{"type":"match_all"},"script":"_score + popularity * 0.1","params":{"weight":0.1}}`.
+- Numeric boosts: `{"type":"rank_feature","field":"popularity","modifier":"sqrt"}` and a guarded script score: `{"type":"script_score","query":{"type":"match_all"},"script":"_score + popularity * weight","params":{"weight":0.1}}`.
 
 - Maintenance endpoints:
 

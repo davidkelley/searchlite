@@ -40,6 +40,7 @@ use crate::query::score_functions::{
 };
 use crate::query::script::{compile_script, CompiledScript};
 use crate::query::sort::{SortKey, SortKeyPart, SortPlan, SortValue};
+use crate::query::util::ensure_numeric_fast as ensure_numeric_fast_field;
 use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
   ScoredTerm,
@@ -172,21 +173,6 @@ fn score_sort_key(score: f32, segment_ord: u32, doc_id: DocId, order: SortOrder)
   }
 }
 
-fn ensure_numeric_fast_field(schema: &Schema, field: &str, ctx: &str) -> Result<()> {
-  let Some(meta) = schema.field_meta(field) else {
-    bail!("{ctx} field `{field}` is not present in schema");
-  };
-  match meta.kind {
-    FieldKind::Numeric => {
-      if !meta.fast {
-        bail!("{ctx} field `{field}` must be fast");
-      }
-      Ok(())
-    }
-    _ => bail!("{ctx} field `{field}` must be a numeric fast field"),
-  }
-}
-
 fn rank_numeric_value(reader: &FastFieldsReader, field: &str, doc_id: DocId, missing: f32) -> f64 {
   reader
     .f64_value(field, doc_id)
@@ -259,7 +245,7 @@ fn compute_hybrid_score(
       vec_score
     } else {
       blend_scores(bm25_score, vec_score, clause.alpha, true)
-    } * clause.boost;
+    };
     blended_sum += blended;
   }
   let denom = plan.clauses.len().max(1) as f32;

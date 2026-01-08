@@ -1,12 +1,13 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use crate::api::types::Filter;
 use crate::api::types::{
   DecayFunction, FieldValueModifier, FunctionBoostMode, FunctionScoreMode, FunctionSpec,
 };
 use crate::index::fastfields::FastFieldsReader;
-use crate::index::manifest::{FieldKind, Schema};
+use crate::index::manifest::Schema;
 use crate::query::filters::passes_filter;
+use crate::query::util::ensure_numeric_fast;
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -59,7 +60,7 @@ pub(crate) fn compile_functions(
         if !factor.is_finite() {
           bail!("field_value_factor `factor` must be finite");
         }
-        ensure_numeric_fast(schema, field)?;
+        ensure_numeric_fast(schema, field, "function_score")?;
         compiled.push(CompiledFunction::FieldValueFactor {
           field: field.clone(),
           factor: *factor,
@@ -80,7 +81,7 @@ pub(crate) fn compile_functions(
         if !scale.is_finite() {
           bail!("decay scale must be finite");
         }
-        ensure_numeric_fast(schema, field)?;
+        ensure_numeric_fast(schema, field, "function_score")?;
         if *scale <= 0.0 {
           bail!("decay scale must be > 0");
         }
@@ -235,23 +236,6 @@ fn numeric_value(reader: &FastFieldsReader, field: &str, doc_id: DocId) -> Optio
   reader
     .f64_value(field, doc_id)
     .or_else(|| reader.i64_value(field, doc_id).map(|v| v as f64))
-}
-
-fn ensure_numeric_fast(schema: &Schema, field: &str) -> Result<()> {
-  let Some(meta) = schema.field_meta(field) else {
-    bail!("function_score field `{field}` is not present in schema");
-  };
-  match meta.kind {
-    FieldKind::Numeric => {
-      if !meta.fast {
-        bail!("function_score field `{field}` must be fast");
-      }
-      Ok(())
-    }
-    _ => Err(anyhow!(
-      "function_score field `{field}` must be a numeric fast field"
-    )),
-  }
 }
 
 fn filter_passes(filter: &Option<Filter>, reader: &FastFieldsReader, doc_id: DocId) -> bool {

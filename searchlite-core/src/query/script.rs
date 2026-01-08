@@ -4,7 +4,8 @@ use anyhow::{anyhow, bail, Result};
 use smallvec::SmallVec;
 
 use crate::index::fastfields::FastFieldsReader;
-use crate::index::manifest::{FieldKind, Schema};
+use crate::index::manifest::Schema;
+use crate::query::util::ensure_numeric_fast;
 use crate::DocId;
 
 const MAX_SCRIPT_LENGTH: usize = 512;
@@ -372,19 +373,4 @@ fn is_ident_start(ch: char) -> bool {
 
 fn is_ident_continue(ch: char) -> bool {
   ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
-}
-
-fn ensure_numeric_fast(schema: &Schema, field: &str, ctx: &str) -> Result<()> {
-  let Some(meta) = schema.field_meta(field) else {
-    bail!("{ctx} field `{field}` is not present in schema");
-  };
-  match meta.kind {
-    FieldKind::Numeric => {
-      if !meta.fast {
-        bail!("{ctx} field `{field}` must be fast");
-      }
-      Ok(())
-    }
-    _ => bail!("{ctx} field `{field}` must be a numeric fast field"),
-  }
 }
