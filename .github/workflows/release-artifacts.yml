@@ -27,11 +27,11 @@ jobs:
             archive: tar.gz
             ext: ""
             install: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
             ext: ""
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             ext: ""
@@ -51,8 +51,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.92.0
           targets: ${{ matrix.target }}
 
       - name: Install target dependencies
@@ -98,7 +99,10 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: cargo install wasm-pack
