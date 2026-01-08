@@ -17,4 +17,4 @@ pub mod vectors;
 pub type DocId = u32;
 
 pub use index::wal;
-pub use index::{manifest::Schema, Index};
+pub use index::{manifest::Manifest, manifest::Schema, Index};

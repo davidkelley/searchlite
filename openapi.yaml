@@ -1,0 +1,462 @@
+openapi: 3.0.3
+info:
+  title: Searchlite HTTP API
+  version: "0.1.0"
+  description: >
+    HTTP surface for a single Searchlite index. The request schema for `/search`
+    matches `search-request.schema.json`; the `/init` schema matches `index-schema.json`.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Server is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /init:
+    post:
+      summary: Create a new index if missing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./index-schema.json"
+      responses:
+        "200":
+          description: Index created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitResponse"
+        "400":
+          description: Invalid schema
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Index already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /add:
+    post:
+      summary: Upsert documents via streaming NDJSON
+      description: >
+        The request body must be newline-delimited JSON documents. Each line is parsed
+        as a document object whose keys map to schema fields (including `_id`).
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              $ref: "#/components/schemas/Document"
+      responses:
+        "200":
+          description: Documents queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /bulk:
+    post:
+      summary: Upsert documents with a JSON payload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkRequest"
+      responses:
+        "200":
+          description: Documents queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /delete:
+    post:
+      summary: Queue document deletions by id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteRequest"
+      responses:
+        "200":
+          description: Deletes queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /commit:
+    post:
+      summary: Flush WAL to immutable segments
+      responses:
+        "200":
+          description: Commit complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommitResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /refresh:
+    post:
+      summary: Refresh readers (lightweight)
+      description: In the current implementation this is a no-op that reloads readers.
+      responses:
+        "200":
+          description: Refresh acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefreshResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /compact:
+    post:
+      summary: Merge segments to reduce fragmentation
+      responses:
+        "200":
+          description: Compaction completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /search:
+    post:
+      summary: Execute a search, aggregation, suggest, or vector query
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./search-request.schema.json"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResult"
+        "400":
+          description: Invalid search request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /inspect:
+    post:
+      summary: Inspect manifest and segment metadata
+      responses:
+        "200":
+          description: Current manifest snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InspectResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /stats:
+    get:
+      summary: Lightweight index stats
+      responses:
+        "200":
+          description: Stats payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "404":
+          description: Index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+            reason:
+              type: string
+          required: [type, reason]
+      required: [error]
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+      required: [status]
+    InitResponse:
+      type: object
+      properties:
+        created:
+          type: boolean
+      required: [created]
+    IngestResponse:
+      type: object
+      properties:
+        queued:
+          type: integer
+          format: int64
+      required: [queued]
+    DeleteRequest:
+      type: object
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+      required: [ids]
+    DeleteResponse:
+      type: object
+      properties:
+        deleted:
+          type: integer
+          format: int64
+      required: [deleted]
+    CommitResponse:
+      type: object
+      properties:
+        committed:
+          type: boolean
+      required: [committed]
+    RefreshResponse:
+      type: object
+      properties:
+        refreshed:
+          type: boolean
+      required: [refreshed]
+    CompactResponse:
+      type: object
+      properties:
+        compacted:
+          type: boolean
+      required: [compacted]
+    BulkRequest:
+      type: object
+      properties:
+        docs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Document"
+      required: [docs]
+    Document:
+      type: object
+      description: |
+        Arbitrary JSON object keyed by schema field names. `_id` (or `doc_id_field`)
+        is required for upsert/delete semantics.
+      additionalProperties: true
+    InspectResponse:
+      type: object
+      properties:
+        manifest:
+          $ref: "#/components/schemas/Manifest"
+      required: [manifest]
+    Manifest:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        uuid:
+          type: string
+          format: uuid
+        committed_at:
+          type: string
+          description: RFC 3339 timestamp
+        schema:
+          $ref: "./index-schema.json"
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/SegmentMeta"
+      required: [version, uuid, committed_at, schema, segments]
+    SegmentMeta:
+      type: object
+      properties:
+        id:
+          type: string
+        generation:
+          type: integer
+          format: int32
+        doc_count:
+          type: integer
+          format: int64
+        max_doc_id:
+          type: integer
+          format: int64
+        blockmax:
+          type: boolean
+        deleted_docs:
+          type: array
+          items:
+            type: integer
+            format: int64
+        paths:
+          $ref: "#/components/schemas/SegmentPaths"
+      required: [id, generation, doc_count, max_doc_id, blockmax, deleted_docs, paths]
+    SegmentPaths:
+      type: object
+      properties:
+        terms:
+          type: string
+        postings:
+          type: string
+        docstore:
+          type: string
+        fast:
+          type: string
+        meta:
+          type: string
+        vector_dir:
+          type: string
+          nullable: true
+      required: [terms, postings, docstore, fast, meta]
+    StatsResponse:
+      type: object
+      properties:
+        documents:
+          type: integer
+          format: int64
+        deleted_documents:
+          type: integer
+          format: int64
+        segments:
+          type: integer
+          format: int32
+        committed_at:
+          type: string
+        index_uuid:
+          type: string
+        index_path:
+          type: string
+      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_path]
+    SearchResult:
+      type: object
+      properties:
+        total_hits_estimate:
+          type: integer
+          format: int64
+        total_groups:
+          type: integer
+          format: int64
+          nullable: true
+        hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hit"
+        next_cursor:
+          type: string
+          nullable: true
+        aggregations:
+          type: object
+          additionalProperties: true
+        suggest:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/SuggestResult"
+        profile:
+          type: object
+          nullable: true
+      required: [total_hits_estimate, hits]
+    Hit:
+      type: object
+      properties:
+        doc_id:
+          type: string
+        score:
+          type: number
+        vector_score:
+          type: number
+          nullable: true
+        fields:
+          type: object
+          nullable: true
+        snippet:
+          type: string
+          nullable: true
+        highlights:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: array
+            items:
+              type: string
+      required: [doc_id, score]
+    SuggestResult:
+      type: object
+      properties:
+        options:
+          type: array
+          items:
+            $ref: "#/components/schemas/SuggestOption"
+      required: [options]
+    SuggestOption:
+      type: object
+      properties:
+        text:
+          type: string
+        score:
+          type: number
+        doc_freq:
+          type: integer
+          format: int64
+      required: [text, score, doc_freq]
