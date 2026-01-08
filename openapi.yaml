@@ -51,7 +51,9 @@ paths:
       summary: Upsert documents via streaming NDJSON
       description: >
         The request body must be newline-delimited JSON documents. Each line is parsed
-        as a document object whose keys map to schema fields (including `_id`).
+        as a document object whose keys map to schema fields (including `_id`). Writes are
+        queued in the index writer; call `/commit` (and optionally `/refresh`) to make them
+        durable and visible to searches.
       requestBody:
         required: true
         content:
@@ -74,6 +76,9 @@ paths:
   /bulk:
     post:
       summary: Upsert documents with a JSON payload
+      description: >
+        Upsert a JSON array of documents; writes are queued in the index writer and require
+        `/commit` (and optionally `/refresh`) before they become visible to searches.
       requestBody:
         required: true
         content:
@@ -96,6 +101,9 @@ paths:
   /delete:
     post:
       summary: Queue document deletions by id
+      description: >
+        Deletes are queued in the index writer and require a subsequent `/commit`
+        (and optional `/refresh`) to take effect.
       requestBody:
         required: true
         content:
@@ -118,6 +126,7 @@ paths:
   /commit:
     post:
       summary: Flush WAL to immutable segments
+      description: Persist queued writes/deletes; combine with `/refresh` if you want readers reloaded.
       responses:
         "200":
           description: Commit complete
@@ -134,7 +143,7 @@ paths:
   /refresh:
     post:
       summary: Refresh readers (lightweight)
-      description: In the current implementation this is a no-op that reloads readers.
+      description: Trigger a lightweight reload of index readers without modifying index contents.
       responses:
         "200":
           description: Refresh acknowledged

@@ -47,6 +47,8 @@ struct ServeArgs {
   index: PathBuf,
 
   /// Bind address for the HTTP server.
+  /// WARNING: Binding to 0.0.0.0 or any non-localhost address exposes this
+  /// unauthenticated service to the network; front it with a proxy or firewall.
   #[arg(long, env = "SEARCHLITE_BIND_ADDR", default_value = "127.0.0.1:8080")]
   bind: SocketAddr,
 
@@ -85,6 +87,8 @@ struct AppState {
   require_existing_index: bool,
   refresh_on_commit: bool,
   index: Arc<tokio::sync::RwLock<Option<Arc<Index>>>>,
+  // Serialize writer access across handlers to avoid concurrent writers.
+  writer_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +109,7 @@ fn parse_json<T>(payload: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ErrorResponseBody {
+  // `r#type` is a Rust raw identifier; the serialized JSON field name is "type".
   r#type: String,
   reason: String,
 }
@@ -161,7 +166,7 @@ struct StatsResponse {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct HealthResponse {
-  status: &'static str,
+  status: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -227,6 +232,7 @@ impl AppState {
       require_existing_index: args.require_existing_index,
       refresh_on_commit: args.refresh_on_commit,
       index: Arc::new(tokio::sync::RwLock::new(None)),
+      writer_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
   }
 
@@ -343,16 +349,21 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/stats", get(stats))
     .with_state(state)
     .layer(middleware)
-    .layer(middleware::from_fn(map_413))
+    .layer(middleware::from_fn(move |req, next| {
+      map_413(max_body, req, next)
+    }))
 }
 
-async fn map_413(req: Request, next: Next) -> Response {
+async fn map_413(max_body: usize, req: Request, next: Next) -> Response {
   let mut res = next.run(req).await;
   if res.status() == StatusCode::PAYLOAD_TOO_LARGE {
     res = HttpError::from_anyhow(
       "body_too_large",
       StatusCode::PAYLOAD_TOO_LARGE,
-      anyhow::anyhow!("request body exceeded configured limit"),
+      anyhow::anyhow!(format!(
+        "request body exceeded configured limit of {} bytes",
+        max_body
+      )),
     )
     .into_response();
   }
@@ -368,16 +379,22 @@ async fn handle_middleware_error(err: BoxError) -> Response {
     )
     .into_response();
   }
+  error!(error = ?err, "middleware error");
   HttpError::from_anyhow(
     "middleware_error",
     StatusCode::INTERNAL_SERVER_ERROR,
-    anyhow::anyhow!(err.to_string()),
+    anyhow::anyhow!(format!("{err:?}")),
   )
   .into_response()
 }
 
 async fn health() -> impl IntoResponse {
-  (StatusCode::OK, Json(HealthResponse { status: "ok" }))
+  (
+    StatusCode::OK,
+    Json(HealthResponse {
+      status: "ok".into(),
+    }),
+  )
 }
 
 async fn init_index(
@@ -403,6 +420,9 @@ async fn init_index(
       )
     })?
     .map_err(|err| HttpError::from_anyhow("init_failed", StatusCode::BAD_REQUEST, err))?;
+  // IndexBuilder::create must either return a fully initialized, ready-to-use index
+  // or fail with an error. At this point the index is safe for subsequent writer/reader
+  // creation, otherwise the call above would have erred.
   state.set_index(created).await;
   Ok(Json(InitResponse { created: true }))
 }
@@ -445,12 +465,18 @@ async fn add_ndjson(
   if docs.is_empty() {
     return Ok(Json(IngestResponse { queued: 0 }));
   }
+  let _writer_guard = state.writer_lock.lock().await;
   let mut writer = index
     .writer()
     .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
   for doc in docs.iter() {
     if let Err(err) = writer.add_document(doc) {
-      let _ = writer.rollback();
+      if let Err(rollback_err) = writer.rollback() {
+        error!(
+          error = ?rollback_err,
+          "failed to rollback writer after NDJSON add failure"
+        );
+      }
       return Err(HttpError::bad_request("add_failed", err.to_string()));
     }
   }
@@ -474,12 +500,18 @@ async fn bulk_ingest(
     .map(value_to_document)
     .collect::<ApiResult<_>>()?;
   let index = state.require_index().await?;
+  let _writer_guard = state.writer_lock.lock().await;
   let mut writer = index
     .writer()
     .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
   for doc in docs.iter() {
     if let Err(err) = writer.add_document(doc) {
-      let _ = writer.rollback();
+      if let Err(rollback_err) = writer.rollback() {
+        error!(
+          error = ?rollback_err,
+          "failed to rollback writer after bulk add failure"
+        );
+      }
       return Err(HttpError::bad_request("add_failed", err.to_string()));
     }
   }
@@ -499,6 +531,7 @@ async fn delete_documents(
   }
   validate_ids(&body.ids)?;
   let index = state.require_index().await?;
+  let _writer_guard = state.writer_lock.lock().await;
   let mut writer = index
     .writer()
     .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -510,14 +543,22 @@ async fn delete_documents(
   }))
 }
 
+fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
+  // Opening a reader reloads searchers; the returned reader can be dropped
+  // immediately when only a refresh side effect is desired.
+  index.reader().map(|_| ())
+}
+
 async fn commit(State(state): State<Arc<AppState>>) -> ApiResult<Json<CommitResponse>> {
   let index = state.require_index().await?;
   let refresh = state.refresh_on_commit;
+  let writer_lock = state.writer_lock.clone();
   tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let _guard = writer_lock.blocking_lock();
     let mut writer = index.writer()?;
     writer.commit()?;
     if refresh {
-      index.reader()?;
+      trigger_reader_refresh(&index)?;
     }
     Ok(())
   })
@@ -535,38 +576,39 @@ async fn commit(State(state): State<Arc<AppState>>) -> ApiResult<Json<CommitResp
 
 async fn refresh(State(state): State<Arc<AppState>>) -> ApiResult<Json<RefreshResponse>> {
   let index = state.require_index().await?;
-  tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-    let _ = index.reader()?;
-    Ok(())
-  })
-  .await
-  .map_err(|err| {
-    HttpError::from_anyhow(
-      "refresh_join",
-      StatusCode::INTERNAL_SERVER_ERROR,
-      anyhow::anyhow!(err.to_string()),
-    )
-  })?
-  .map_err(|err| {
-    HttpError::from_anyhow("refresh_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
-  })?;
-  Ok(Json(RefreshResponse { refreshed: true }))
-}
-
-async fn compact(State(state): State<Arc<AppState>>) -> ApiResult<Json<CompactResponse>> {
-  let index = state.require_index().await?;
-  tokio::task::spawn_blocking(move || index.compact())
+  tokio::task::spawn_blocking(move || trigger_reader_refresh(&index))
     .await
     .map_err(|err| {
       HttpError::from_anyhow(
-        "compact_join",
+        "refresh_join",
         StatusCode::INTERNAL_SERVER_ERROR,
         anyhow::anyhow!(err.to_string()),
       )
     })?
     .map_err(|err| {
-      HttpError::from_anyhow("compact_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
+      HttpError::from_anyhow("refresh_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
     })?;
+  Ok(Json(RefreshResponse { refreshed: true }))
+}
+
+async fn compact(State(state): State<Arc<AppState>>) -> ApiResult<Json<CompactResponse>> {
+  let index = state.require_index().await?;
+  let writer_lock = state.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _guard = writer_lock.blocking_lock();
+    index.compact()
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "compact_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
+  .map_err(|err| {
+    HttpError::from_anyhow("compact_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
+  })?;
   Ok(Json(CompactResponse { compacted: true }))
 }
 
@@ -611,7 +653,18 @@ async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectRe
 
 async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<StatsResponse>> {
   let index = state.require_index().await?;
-  let manifest = index.manifest();
+  let manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
+    .await
+    .map_err(|err| {
+      HttpError::from_anyhow(
+        "stats_join",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!(err.to_string()),
+      )
+    })?
+    .map_err(|err| {
+      HttpError::from_anyhow("stats_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
+    })?;
   let mut total_docs = 0u64;
   let mut deleted_docs = 0u64;
   for seg in manifest.segments.iter() {
@@ -645,10 +698,17 @@ fn value_to_document(value: serde_json::Value) -> ApiResult<Document> {
 fn validate_ids(ids: &[String]) -> ApiResult<()> {
   // Avoid control characters to prevent invisible ids or log injection.
   for (idx, id) in ids.iter().enumerate() {
-    if id.trim().is_empty() {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
       return Err(HttpError::bad_request(
         "invalid_id",
         format!("id at position {} is empty", idx),
+      ));
+    }
+    if trimmed.len() != id.len() {
+      return Err(HttpError::bad_request(
+        "invalid_id",
+        format!("id at position {} has leading or trailing whitespace", idx),
       ));
     }
     if id.chars().any(|c| c.is_control()) {
@@ -1324,6 +1384,67 @@ mod tests {
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let err: ErrorResponse = res.json().await.unwrap();
     assert_eq!(err.error.r#type, "invalid_id");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn delete_rejects_whitespace_only_ids() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-whitespace-ids")).await;
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let res = client
+      .post(format!("{base}/delete"))
+      .json(&serde_json::json!({ "ids": ["  ", "ok"] }))
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "invalid_id");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn health_endpoint_returns_ok() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-healthz")).await;
+    let res = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: HealthResponse = res.json().await.unwrap();
+    assert_eq!(body.status, "ok");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn refresh_endpoint_returns_ok() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-refresh")).await;
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let res = client.post(format!("{base}/refresh")).send().await.unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: RefreshResponse = res.json().await.unwrap();
+    assert!(body.refreshed);
 
     handle.abort();
     let _ = handle.await;

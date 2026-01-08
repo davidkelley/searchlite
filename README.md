@@ -17,6 +17,18 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
 - Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
 
+## Install the CLI
+
+Prebuilt binaries are published on every GitHub release:
+
+```bash
+curl -fsSL https://searchlite.dev/install | sh
+```
+
+- Set `SEARCHLITE_VERSION` to pin a tag (e.g., `v0.4.0`), `SEARCHLITE_INSTALL_DIR` to override the destination, and `SEARCHLITE_BIN_NAME` to change the installed name (defaults to `searchlite`).
+- Supported targets match release artifacts: `x86_64`/`aarch64` for Linux/macOS, and Windows via Git Bash/WSL (downloads the `.zip` and installs `searchlite.exe`).
+- The script downloads from GitHub releases (`searchlite-cli-<target>.{tar.gz,zip}`) and falls back to `~/.local/bin` if `/usr/local/bin` is not writable.
+
 ## Development setup
 
 - Rust toolchain is pinned to `1.78.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
@@ -203,6 +215,10 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 ## HTTP Service
 
+#### WARNING
+
+This HTTP service provides no authentication, authorization, or rate limiting. Do not expose it directly to untrusted networks; front it with your own proxy or API gateway that enforces access control and rate limits.
+
 Run the bundled HTTP server for a single index:
 
 ```bash
@@ -221,7 +237,7 @@ Flags/env:
 - `--require-existing-index`: fail fast at startup if the manifest is missing.
 - `--max-body-bytes`, `--max-concurrency`, `--request-timeout-secs`, `--shutdown-grace-secs`, `--refresh-on-commit`: resource limits and shutdown behavior.
 
-All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. The full API surface is documented in `openapi.yaml`.
+All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/add`, `/bulk`, or `/delete` are queued in the writer and become durable/searchable only after calling `/commit` (optionally followed by `/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
 
 ### Example requests
 
