@@ -126,7 +126,7 @@ struct IngestResponse {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DeleteResponse {
-  deleted: usize,
+  queued: usize,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -241,7 +241,7 @@ impl AppState {
       return Ok(());
     }
     let idx = Index::open(self.index_options(false))
-      .with_context(|| "opening existing index during startup".to_string())?;
+      .with_context(|| "failed to open existing index during startup".to_string())?;
     let arc = Arc::new(idx);
     let mut guard = self.index.write().await;
     *guard = Some(arc);
@@ -317,7 +317,10 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
 }
 
 fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
-  let max_body = args.max_body_bytes.try_into().unwrap_or(usize::MAX);
+  let max_body = args
+    .max_body_bytes
+    .try_into()
+    .expect("configured max_body_bytes does not fit into usize");
   let middleware = ServiceBuilder::new()
     .layer(HandleErrorLayer::new(handle_middleware_error))
     .layer(TimeoutLayer::new(Duration::from_secs(
@@ -336,7 +339,7 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/refresh", post(refresh))
     .route("/compact", post(compact))
     .route("/search", post(search))
-    .route("/inspect", post(inspect))
+    .route("/inspect", get(inspect))
     .route("/stats", get(stats))
     .with_state(state)
     .layer(middleware)
@@ -409,15 +412,13 @@ async fn add_ndjson(
   body: Body,
 ) -> ApiResult<Json<IngestResponse>> {
   let index = state.require_index().await?;
-  let mut writer = index
-    .writer()
-    .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
   let mapped_stream = body
     .into_data_stream()
     .map(|chunk| chunk.map_err(io::Error::other));
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
-  let mut count = 0usize;
+  let mut docs = Vec::new();
+  let mut line_number = 0usize;
   loop {
     buf.clear();
     let read = reader
@@ -427,6 +428,7 @@ async fn add_ndjson(
     if read == 0 {
       break;
     }
+    line_number += 1;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
       continue;
@@ -434,16 +436,25 @@ async fn add_ndjson(
     let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
       HttpError::bad_request(
         "invalid_document",
-        format!("invalid JSON document on NDJSON line {}: {e}", count + 1),
+        format!("invalid JSON document on NDJSON line {}: {e}", line_number),
       )
     })?;
     let doc = value_to_document(value)?;
-    writer
-      .add_document(&doc)
-      .map_err(|e| HttpError::bad_request("add_failed", e.to_string()))?;
-    count += 1;
+    docs.push(doc);
   }
-  Ok(Json(IngestResponse { queued: count }))
+  if docs.is_empty() {
+    return Ok(Json(IngestResponse { queued: 0 }));
+  }
+  let mut writer = index
+    .writer()
+    .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  for doc in docs.iter() {
+    if let Err(err) = writer.add_document(doc) {
+      let _ = writer.rollback();
+      return Err(HttpError::bad_request("add_failed", err.to_string()));
+    }
+  }
+  Ok(Json(IngestResponse { queued: docs.len() }))
 }
 
 async fn bulk_ingest(
@@ -467,9 +478,10 @@ async fn bulk_ingest(
     .writer()
     .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
   for doc in docs.iter() {
-    writer
-      .add_document(doc)
-      .map_err(|e| HttpError::bad_request("add_failed", e.to_string()))?;
+    if let Err(err) = writer.add_document(doc) {
+      let _ = writer.rollback();
+      return Err(HttpError::bad_request("add_failed", err.to_string()));
+    }
   }
   Ok(Json(IngestResponse { queued: docs.len() }))
 }
@@ -494,7 +506,7 @@ async fn delete_documents(
     .delete_documents(&body.ids)
     .map_err(|e| HttpError::bad_request("delete_failed", e.to_string()))?;
   Ok(Json(DeleteResponse {
-    deleted: body.ids.len(),
+    queued: body.ids.len(),
   }))
 }
 
@@ -505,7 +517,7 @@ async fn commit(State(state): State<Arc<AppState>>) -> ApiResult<Json<CommitResp
     let mut writer = index.writer()?;
     writer.commit()?;
     if refresh {
-      let _ = index.reader()?;
+      index.reader()?;
     }
     Ok(())
   })
@@ -631,6 +643,7 @@ fn value_to_document(value: serde_json::Value) -> ApiResult<Document> {
 }
 
 fn validate_ids(ids: &[String]) -> ApiResult<()> {
+  // Avoid control characters to prevent invisible ids or log injection.
   for (idx, id) in ids.iter().enumerate() {
     if id.trim().is_empty() {
       return Err(HttpError::bad_request(
@@ -823,7 +836,7 @@ mod tests {
 
     // inspect
     let res = client
-      .post(format!("{base}/inspect"))
+      .get(format!("{base}/inspect"))
       .send()
       .await
       .unwrap()
@@ -1285,6 +1298,32 @@ mod tests {
     assert_eq!(delete_res.status(), HttpStatus::BAD_REQUEST);
     let delete_err: ErrorResponse = delete_res.json().await.unwrap();
     assert_eq!(delete_err.error.r#type, "missing_ids");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn delete_rejects_control_character_ids() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-control-ids")).await;
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let res = client
+      .post(format!("{base}/delete"))
+      .json(&serde_json::json!({ "ids": ["ok", "bad\tid"] }))
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "invalid_id");
 
     handle.abort();
     let _ = handle.await;

@@ -193,7 +193,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
   /inspect:
-    post:
+    get:
       summary: Inspect manifest and segment metadata
       responses:
         "200":
@@ -268,10 +268,10 @@ components:
     DeleteResponse:
       type: object
       properties:
-        deleted:
+        queued:
           type: integer
           format: int64
-      required: [deleted]
+      required: [queued]
     CommitResponse:
       type: object
       properties:

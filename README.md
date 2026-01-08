@@ -198,6 +198,8 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 - Provide a `sort` array in the search request (or via `--sort "field:order,other_field:asc"` in the CLI). Each entry looks like `{"field":"year","order":"desc"}`; `_score` is also allowed.
 - Sort targets must be fast keyword or numeric fields; the default order is ascending (descending for `_score`).
+- Multi-valued fields use the minimum value for ascending sorts and the maximum for descending sorts; documents missing the field are placed last.
+- Ordering is stable and tiebroken by segment/doc id so cursor pagination works reliably.
 
 ## HTTP Service
 
@@ -282,11 +284,9 @@ curl -XPOST http://localhost:8080/search \
 ```bash
 curl -XPOST http://localhost:8080/refresh   # lightweight reader reload
 curl -XPOST http://localhost:8080/compact   # merge segments
-curl -XPOST http://localhost:8080/inspect   # manifest + segments
+curl -XGET  http://localhost:8080/inspect   # manifest + segments
 curl -XGET  http://localhost:8080/stats     # doc/segment counts
 ```
-- Multi-valued fields use the minimum value for ascending sorts and the maximum for descending sorts; documents missing the field are placed last.
-- Ordering is stable and tiebroken by segment/doc id so cursor pagination works reliably.
 
 ### Aggregations quick reference
 
