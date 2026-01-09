@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.0...searchlite-cli-v0.1.1) - 2026-01-09
+
+### Added
+
+- supporting http server via cli
+
+### Other
+
+- Merge branch 'main' into feat/p8-ranking-controls
+
 ## [0.1.0](https://github.com/davidkelley/searchlite/releases/tag/searchlite-cli-v0.1.0) - 2026-01-08
 
 ### Added
