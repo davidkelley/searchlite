@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{
   btree_map::Entry as BTreeEntry, hash_map::DefaultHasher, hash_map::Entry as HashEntry, BTreeMap,
-  BinaryHeap, HashMap, HashSet,
+  BinaryHeap, HashMap, HashSet, VecDeque,
 };
 use std::hash::{Hash, Hasher};
 
@@ -34,6 +34,12 @@ pub struct AggregationContext<'a> {
   pub segment_ord: u32,
 }
 
+/// Upper bound on the number of aggregation buckets we will materialize for a single request.
+///
+/// This protects against excessive memory/CPU usage in high-cardinality aggregations. The value
+/// `10_000` is a pragmatic default that keeps memory bounded for typical analytics workloads while
+/// still allowing thousands of buckets. Deployments that need a different limit can adjust this
+/// constant at compile time.
 const MAX_BUCKETS: usize = 10_000;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
@@ -98,8 +104,8 @@ impl Sampler {
         hasher.write_u64(self.seed);
         hasher.write_u64(doc_id as u64);
         let value = hasher.finish();
-        let scaled = (value as f64) / (u64::MAX as f64);
-        scaled < p
+        let threshold = (p * (u64::MAX as f64)) as u64;
+        value < threshold
       }
       SamplingMode::TopN(limit) => {
         if self.accepted < limit {
@@ -454,16 +460,17 @@ impl QuantileState {
   }
 
   fn ensure_digest(&mut self) {
+    let vals = std::mem::take(&mut self.values);
     if self.digest.is_none() {
       let base = TDigest::new_with_size(TDIGEST_MAX_SIZE);
-      let vals = std::mem::take(&mut self.values);
       self.digest = Some(base.merge_unsorted(vals));
-    } else if !self.values.is_empty() {
-      let vals = std::mem::take(&mut self.values);
-      let mut digest = self.digest.take().unwrap();
-      let extra = TDigest::new_with_size(TDIGEST_MAX_SIZE).merge_unsorted(vals);
-      digest = TDigest::merge_digests(vec![digest, extra]);
-      self.digest = Some(digest);
+      return;
+    }
+    if vals.is_empty() {
+      return;
+    }
+    if let Some(digest) = self.digest.take() {
+      self.digest = Some(digest.merge_unsorted(vals));
     }
   }
 
@@ -528,13 +535,16 @@ impl QuantileState {
     };
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
-    for _ in 0..30 {
+    for _ in 0..60 {
       let mid = (lo + hi) / 2.0;
       let value = digest.estimate_quantile(mid);
       if value <= target {
         lo = mid;
       } else {
         hi = mid;
+      }
+      if (hi - lo) < 1e-6 {
+        break;
       }
     }
     lo * 100.0
@@ -2512,26 +2522,18 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
         sig_buckets.truncate(limit);
       }
       let mut temp_buckets: Vec<BucketResponse> = sig_buckets
-        .iter()
+        .iter_mut()
         .map(|b| BucketResponse {
           key: b.key.clone(),
           doc_count: b.doc_count,
-          aggregations: b.aggregations.clone(),
+          aggregations: std::mem::take(&mut b.aggregations),
         })
         .collect();
       let aggregations = apply_pipeline_aggs(&pipeline, &mut temp_buckets);
-      let mut by_key: HashMap<String, SignificantBucketResponse> = sig_buckets
-        .into_iter()
-        .map(|b| (bucket_key_string(&b.key), b))
-        .collect();
-      let mut buckets = Vec::new();
-      for bucket in temp_buckets.into_iter() {
-        let key = bucket_key_string(&bucket.key);
-        if let Some(mut sig) = by_key.remove(&key) {
-          sig.aggregations = bucket.aggregations;
-          buckets.push(sig);
-        }
+      for (sig_bucket, bucket) in sig_buckets.iter_mut().zip(temp_buckets.into_iter()) {
+        sig_bucket.aggregations = bucket.aggregations;
       }
+      let buckets = sig_buckets;
       AggregationResponse::SignificantTerms {
         buckets,
         aggregations,
@@ -2828,7 +2830,7 @@ fn apply_moving_avg_pipeline(
 ) {
   let series = bucket_metric_series(buckets, &cfg.buckets_path);
   let policy = cfg.gap_policy.unwrap_or(GapPolicy::Skip);
-  let mut window_values: Vec<f64> = Vec::new();
+  let mut window_values: VecDeque<f64> = VecDeque::new();
   let window = cfg.window.max(1);
   let mut avgs = Vec::with_capacity(buckets.len());
   for (idx, bucket) in buckets.iter_mut().enumerate() {
@@ -2838,10 +2840,10 @@ fn apply_moving_avg_pipeline(
       (None, GapPolicy::Skip) => None,
     };
     if let Some(val) = current {
-      window_values.push(val);
-      if window_values.len() > window {
-        window_values.remove(0);
+      if window_values.len() == window {
+        window_values.pop_front();
       }
+      window_values.push_back(val);
     }
     let avg = if window_values.is_empty() {
       None
@@ -2859,20 +2861,9 @@ fn apply_moving_avg_pipeline(
   }
   let mut predictions = Vec::new();
   if let Some(predict) = cfg.predict {
-    let mut forecast_window = window_values.clone();
-    let mut last_val = avgs.last().and_then(|v| *v);
-    for _ in 0..predict {
-      if let Some(val) = last_val {
-        forecast_window.push(val);
-        if forecast_window.len() > window {
-          forecast_window.remove(0);
-        }
-        let next = forecast_window.iter().copied().sum::<f64>() / forecast_window.len() as f64;
-        predictions.push(next);
-        last_val = Some(next);
-      } else {
-        break;
-      }
+    if let Some(last_avg) = avgs.last().and_then(|v| *v) {
+      // Simple forecast that repeats the last observed average to avoid feedback loops.
+      predictions = vec![last_avg; predict];
     }
   }
   responses.insert(
@@ -2947,22 +2938,27 @@ fn eval_bucket_script(script: &str, vars: &BTreeMap<String, f64>) -> Option<f64>
 fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
   let mut chars = script.chars().peekable();
   let mut tokens = Vec::new();
+  let mut expect_unary = true;
   while let Some(ch) = chars.peek().copied() {
     if ch.is_whitespace() {
       chars.next();
       continue;
     }
-    if ch.is_ascii_digit()
+    let looks_numeric = ch.is_ascii_digit()
       || ch == '.'
-      || (ch == '-'
+      || (expect_unary
+        && ch == '-'
         && chars
           .clone()
           .nth(1)
           .map(|next| next.is_ascii_digit() || next == '.')
-          .unwrap_or(false))
-    {
+          .unwrap_or(false));
+    if looks_numeric {
       let mut num = String::new();
-      num.push(chars.next().unwrap());
+      if ch == '-' {
+        num.push('-');
+        chars.next();
+      }
       while let Some(next) = chars.peek() {
         if next.is_ascii_digit() || *next == '.' {
           num.push(*next);
@@ -2971,8 +2967,12 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
           break;
         }
       }
+      if num == "-" || num == "." || num == "-." {
+        return None;
+      }
       let value: f64 = num.parse().ok()?;
       tokens.push(ScriptToken::Number(value));
+      expect_unary = false;
       continue;
     }
     if ch.is_ascii_alphabetic() || ch == '_' {
@@ -2986,20 +2986,24 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
         }
       }
       tokens.push(ScriptToken::Var(name));
+      expect_unary = false;
       continue;
     }
     match ch {
       '+' | '-' | '*' | '/' => {
         tokens.push(ScriptToken::Op(ch));
         chars.next();
+        expect_unary = true;
       }
       '(' => {
         tokens.push(ScriptToken::LParen);
         chars.next();
+        expect_unary = true;
       }
       ')' => {
         tokens.push(ScriptToken::RParen);
         chars.next();
+        expect_unary = false;
       }
       _ => return None,
     }
@@ -3060,7 +3064,7 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
           '-' => a - b,
           '*' => a * b,
           '/' => {
-            if b == 0.0 {
+            if b.abs() < 1e-12 {
               return None;
             }
             a / b
@@ -3489,16 +3493,32 @@ mod tests {
       q.push(v);
     }
     assert!((q.percentile(50.0) - 2.5).abs() < 1e-6);
-    assert!((q.percentile_rank(2.0) - 50.0).abs() < 1e-3);
+    assert!((q.percentile_rank(2.0) - 50.0).abs() < 1e-6);
   }
 
   #[test]
-  fn bucket_script_evalutes_basic_expression() {
+  fn bucket_script_evaluates_basic_expression() {
     let mut vars = BTreeMap::new();
     vars.insert("a".to_string(), 2.0);
     vars.insert("b".to_string(), 4.0);
     let value = eval_bucket_script("a + b * 2", &vars).unwrap();
     assert!((value - 10.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_handles_binary_subtraction_without_whitespace() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 5.0);
+    let value = eval_bucket_script("a-2", &vars).unwrap();
+    assert!((value - 3.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_rejects_near_zero_division() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    vars.insert("b".to_string(), 1e-14);
+    assert!(eval_bucket_script("a / b", &vars).is_none());
   }
 
   #[test]

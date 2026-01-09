@@ -3741,6 +3741,16 @@ fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Resu
         );
       }
     }
+    if s.seed.is_some() && s.size.is_none() && s.probability.is_none() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "aggregation `{name}` sampling seed requires size or probability to be set"
+          ),
+        }
+        .into(),
+      );
+    }
   }
   Ok(())
 }

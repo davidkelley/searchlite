@@ -1778,7 +1778,12 @@ fn derivative_and_moving_avg_pipeline() {
   };
   let resp = idx.reader().unwrap().search(&req).unwrap();
   let hist = resp.aggregations.get("hist").expect("hist agg");
-  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
+  if let searchlite_core::api::types::AggregationResponse::Histogram {
+    buckets,
+    aggregations,
+    ..
+  } = hist
+  {
     assert!(buckets.len() >= 3);
     let delta = buckets[1]
       .aggregations
@@ -1789,7 +1794,7 @@ fn derivative_and_moving_avg_pipeline() {
       })
       .unwrap();
     assert!((delta - 1.0).abs() < 1e-6);
-    let smooth = buckets[2]
+    let smooth_val = buckets[2]
       .aggregations
       .get("smooth")
       .and_then(|agg| match agg {
@@ -1797,7 +1802,123 @@ fn derivative_and_moving_avg_pipeline() {
         _ => None,
       })
       .unwrap();
-    assert!(smooth > 0.0);
+    assert!(smooth_val > 0.0);
+    if let Some(searchlite_core::api::types::AggregationResponse::MovingAvg(resp)) =
+      aggregations.get("smooth")
+    {
+      assert_eq!(resp.predictions, vec![smooth_val]);
+    } else {
+      panic!("missing moving_avg pipeline response");
+    }
+  } else {
+    panic!("expected histogram agg");
+  }
+}
+
+#[test]
+fn pipeline_missing_metric_path_with_gap_policy_inserts_zeros() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "views".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("m1", vec![("body", json!("x")), ("views", json!(1))]))
+      .unwrap();
+    writer
+      .add_document(&doc("m2", vec![("body", json!("y")), ("views", json!(3))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let mut hist_aggs = BTreeMap::new();
+  hist_aggs.insert(
+    "deriv".into(),
+    Aggregation::Derivative(DerivativeAggregation {
+      buckets_path: "missing.metric".into(),
+      gap_policy: Some(GapPolicy::InsertZeros),
+      unit: Some(1.0),
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "views".into(),
+      interval: 1.0,
+      offset: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: hist_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "x y".into(),
+      fields: None,
+      filter: None,
+      filters: Vec::new(),
+      limit: 0,
+      candidate_size: None,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } =
+    resp.aggregations.get("hist").expect("hist agg")
+  {
+    assert!(buckets.len() >= 2);
+    let deriv_second = buckets[1]
+      .aggregations
+      .get("deriv")
+      .and_then(|agg| match agg {
+        searchlite_core::api::types::AggregationResponse::Derivative(val) => val.value,
+        _ => None,
+      });
+    assert_eq!(deriv_second, Some(0.0));
   } else {
     panic!("expected histogram agg");
   }
