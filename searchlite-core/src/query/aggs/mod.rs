@@ -237,6 +237,25 @@ fn compute_background_counts(
   field: &str,
   filter: Option<&Filter>,
 ) -> (HashMap<String, u64>, u64) {
+  if filter.is_none() {
+    // Fast path: use the term dictionary to pull doc frequencies without scanning every doc.
+    let prefix = format!("{field}:");
+    let field_prefix_len = prefix.len();
+    let mut counts = HashMap::new();
+    for key in ctx.segment.terms_with_prefix(&prefix) {
+      if key.len() <= field_prefix_len {
+        continue;
+      }
+      if let Some(postings) = ctx.segment.postings(key) {
+        let df = postings.len() as u64;
+        if df > 0 {
+          counts.insert(key[field_prefix_len..].to_string(), df);
+        }
+      }
+    }
+    let total = ctx.segment.live_docs() as u64;
+    return (counts, total);
+  }
   let mut counts = HashMap::new();
   let mut total = 0_u64;
   for doc_id in 0..ctx.segment.meta.doc_count {
@@ -533,6 +552,14 @@ impl QuantileState {
     let Some(digest) = self.digest.as_ref() else {
       return 0.0;
     };
+    let min_val = digest.estimate_quantile(0.0);
+    if target <= min_val {
+      return 0.0;
+    }
+    let max_val = digest.estimate_quantile(1.0);
+    if target >= max_val {
+      return 100.0;
+    }
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
     for _ in 0..60 {
@@ -543,7 +570,7 @@ impl QuantileState {
       } else {
         hi = mid;
       }
-      if (hi - lo) < 1e-6 {
+      if (hi - lo) < 1e-9 {
         break;
       }
     }
