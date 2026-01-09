@@ -219,16 +219,20 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 This HTTP service provides no authentication, authorization, or rate limiting. Do not expose it directly to untrusted networks; front it with your own proxy or API gateway that enforces access control and rate limits.
 
-Run the bundled HTTP server for a single index:
+Run the bundled HTTP server for a single index (available directly from the CLI):
 
 ```bash
-cargo run -p searchlite-http -- --index /tmp/searchlite_idx --bind 0.0.0.0:8080
+searchlite http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
+# Or via cargo without installing first:
+cargo run -p searchlite-cli -- http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
 # Env-style config is supported too:
 SEARCHLITE_INDEX_PATH=/tmp/searchlite_idx \
 SEARCHLITE_BIND_ADDR=0.0.0.0:8080 \
 SEARCHLITE_MAX_BODY_BYTES=$((50*1024*1024)) \
-cargo run -p searchlite-http -- --refresh-on-commit
+cargo run -p searchlite-cli -- http --refresh-on-commit
 ```
+
+The standalone `searchlite-http` binary remains available; both entrypoints share the same flags.
 
 Flags/env:
 

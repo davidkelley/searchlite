@@ -15,6 +15,11 @@ use searchlite_core::api::types::{
 #[cfg(feature = "vectors")]
 use searchlite_core::api::types::{VectorQuery, VectorQuerySpec};
 use searchlite_core::api::Index;
+use searchlite_http::{
+  init_tracing as init_http_tracing, run as http_run, ServeArgs as HttpServeArgs,
+};
+use tokio::runtime::Runtime;
+use tracing::error;
 
 #[derive(Parser)]
 #[command(name = "searchlite", version, about = "Embedded search engine CLI")]
@@ -85,6 +90,11 @@ enum Commands {
     /// Aggregations JSON file path
     #[arg(long)]
     aggs_file: Option<PathBuf>,
+  },
+  /// Start the HTTP server for a single index
+  Http {
+    #[command(flatten)]
+    args: HttpServeArgs,
   },
   /// Inspect manifest and segments
   Inspect { index: PathBuf },
@@ -159,6 +169,15 @@ fn main() -> Result<()> {
         })?
       };
       cmd_search(index, request)
+    }
+    Commands::Http { args } => {
+      init_http_tracing();
+      let rt = Runtime::new()?;
+      if let Err(err) = rt.block_on(http_run(args)) {
+        error!("{err:?}");
+        std::process::exit(1);
+      }
+      Ok(())
     }
     Commands::Inspect { index } => cmd_inspect(index.as_path()),
     Commands::Compact { index } => cmd_compact(index.as_path()),
