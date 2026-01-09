@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "searchlite-core",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "futures",
