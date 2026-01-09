@@ -48,14 +48,12 @@ jobs:
       - name: Run release-plz
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          REGISTRY_MANIFEST_PATH: ${{ steps.previous-release.outputs.manifest_path }}
         run: |
           set -euo pipefail
-          args=(--git-token "${GITHUB_TOKEN}" --repo-url "https://github.com/${GITHUB_REPOSITORY}")
-          if [ -n "${REGISTRY_MANIFEST_PATH}" ]; then
-            args+=(--registry-manifest-path "${REGISTRY_MANIFEST_PATH}")
-          fi
-          release-plz release "${args[@]}" -o json
+          release-plz release \
+            --git-token "${GITHUB_TOKEN}" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            -o json
 
   # Create a PR with the new versions and changelog, preparing the next release.
   release-plz-pr:
