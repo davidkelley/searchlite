@@ -73,6 +73,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       }),
       hard_bounds: None,
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );
@@ -150,6 +151,7 @@ fn histogram_requires_positive_interval() {
       extended_bounds: None,
       hard_bounds: None,
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );
@@ -242,6 +244,7 @@ fn nested_terms_stats_aggregation() {
       shard_size: None,
       min_doc_count: None,
       missing: None,
+      sampling: None,
       aggs: sub_aggs,
     })),
   );
@@ -331,6 +334,7 @@ fn date_histogram_rejects_invalid_config() {
       extended_bounds: None,
       hard_bounds: None,
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );
@@ -385,6 +389,7 @@ fn date_histogram_rejects_invalid_config() {
         max: "2024-01-01T00:00:00Z".into(),
       }),
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );
@@ -660,6 +665,7 @@ fn date_histogram_calendar_month_interval() {
       }),
       hard_bounds: None,
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );

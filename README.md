@@ -320,12 +320,12 @@ curl -XGET  http://localhost:8080/stats     # doc/segment counts
 
 ### Aggregations quick reference
 
-- Field requirements: `terms` needs a fast keyword field; `range`/`date_range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
-- Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided; `percentile_ranks` report the percent of values at or below each supplied `values` entry.
-- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page.
-- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree.
+- Field requirements: `terms`/`significant_terms`/`rare_terms` need a fast keyword field; `range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
+- Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided and use a bounded t-digest estimator (exact mode for small buckets); `percentile_ranks` report the percent of values at or below each supplied `values` entry.
+- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `significant_terms` adds `background_filter` + `size`/`min_doc_count`; `rare_terms` favors low-frequency keys with `max_doc_count`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page. Bucket aggs accept optional `sampling` with either `size` or `probability` plus a deterministic `seed`.
+- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree; `derivative` and `moving_avg` operate on histogram/date_histogram buckets with `gap_policy` (`skip`/`insert_zeros`) and optional `unit`/`predict`; `bucket_script` evaluates a lightweight arithmetic expression over one or more `buckets_path` values (including `_count` for bucket doc counts).
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
-- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`).
+- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`). Aggregations with `sampling` return approximate counts and mark responses with `sampled: true`.
 
 #### Filter, composite, and pipeline aggregation examples
 
@@ -367,6 +367,47 @@ cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file 
 ```
 
 `composite` returns an `after_key` so you can page deterministically across buckets by sending that object back as `after` in the next request. Pipeline aggregations operate on the current bucket tree: `bucket_sort` reorders/truncates buckets, while `avg_bucket`/`sum_bucket` read metrics via dot-separated `buckets_path` selectors.
+
+#### Significance, smoothing, and sampling examples
+
+```bash
+cat > /tmp/aggs-sampling.json <<'EOF'
+{
+  "sig_tags": {
+    "type": "significant_terms",
+    "field": "tag",
+    "size": 5,
+    "background_filter": { "KeywordEq": { "field": "lang", "value": "en" } }
+  },
+  "rare_langs": {
+    "type": "rare_terms",
+    "field": "lang",
+    "max_doc_count": 1,
+    "sampling": { "probability": 0.35, "seed": 42 }
+  },
+  "by_day": {
+    "type": "date_histogram",
+    "field": "timestamp_ms",
+    "fixed_interval": "1d",
+    "sampling": { "size": 5000, "seed": 7 },
+    "aggs": {
+      "latency": { "type": "stats", "field": "latency_ms" },
+      "trend": { "type": "derivative", "buckets_path": "latency.avg", "gap_policy": "skip", "unit": 86400000 },
+      "smooth": { "type": "moving_avg", "buckets_path": "latency.avg", "window": 3, "predict": 1 },
+      "efficiency": {
+        "type": "bucket_script",
+        "buckets_path": { "avg": "latency.avg", "trend": "trend.value" },
+        "script": "avg / (trend + 1)"
+      }
+    }
+  }
+}
+EOF
+
+cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file /tmp/aggs-sampling.json
+```
+
+Responses include `sampled: true` when sampling is active; counts/percentiles become approximate while ordering remains deterministic for a fixed seed. Percentiles and percentile_ranks use a bounded t-digest estimator and switch to exact calculations for small buckets.
 
 ### Field collapsing and inner hits
 
