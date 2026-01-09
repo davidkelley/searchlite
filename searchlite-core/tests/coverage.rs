@@ -103,6 +103,7 @@ fn search_with_phrase_filters_and_compaction() {
         },
       ],
       limit: 10,
+      candidate_size: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

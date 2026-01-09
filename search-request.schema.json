@@ -8,7 +8,7 @@
   "required": ["query"],
   "properties": {
     "query": {
-      "description": "Query string or structured query AST node.",
+      "description": "Query string or structured query AST node (supports multiple vector clauses, rank_feature, and script_score).",
       "anyOf": [{ "type": "string" }, { "type": "object" }]
     },
     "fields": {
@@ -27,6 +27,11 @@
       "default": []
     },
     "limit": { "type": "integer", "minimum": 0, "default": 10 },
+    "candidate_size": {
+      "description": "Optional global candidate pool size (before final top-N) capped to 20000.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
     "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
     "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },
     "execution": { "type": "string", "enum": ["bm25", "wand", "bmw"], "default": "wand" },

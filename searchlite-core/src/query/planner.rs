@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use crate::util::regex::anchored_regex;
 use anyhow::{bail, Result};
 
 use crate::api::query::{parse_query, ParsedQuery};
 use crate::api::types::{
   FieldSpec, Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, MatchOperator,
-  MinimumShouldMatch, MultiMatchType, Query, QueryNode,
+  MinimumShouldMatch, MultiMatchType, Query, QueryNode, RankFeatureModifier,
 };
 
 const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
@@ -183,6 +185,20 @@ pub(crate) enum ScoreNode {
     boost_mode: FunctionBoostMode,
     max_boost: Option<f32>,
     min_score: Option<f32>,
+    boost: f32,
+  },
+  RankFeature {
+    matcher: QueryMatcher,
+    field: String,
+    modifier: Option<RankFeatureModifier>,
+    missing: Option<f32>,
+    boost: f32,
+  },
+  ScriptScore {
+    matcher: QueryMatcher,
+    base: Box<ScoreNode>,
+    script: String,
+    params: Option<BTreeMap<String, f64>>,
     boost: f32,
   },
 }
@@ -740,6 +756,40 @@ impl<'a> QueryPlanBuilder<'a> {
         };
         Ok((matcher, scorer, score_node))
       }
+      QueryNode::RankFeature {
+        field,
+        boost: node_boost,
+        modifier,
+        missing,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let matcher = QueryMatcher::MatchAll;
+        let score_node = ScoreNode::RankFeature {
+          matcher: matcher.clone(),
+          field: field.clone(),
+          modifier: *modifier,
+          missing: *missing,
+          boost: boost * node_boost,
+        };
+        Ok((matcher, None, score_node))
+      }
+      QueryNode::ScriptScore {
+        query,
+        script,
+        params,
+        boost: node_boost,
+      } => {
+        let node_boost = validate_boost(node_boost)?;
+        let (matcher, scorer, base_score_node) = self.build_node(query, score, boost)?;
+        let score_node = ScoreNode::ScriptScore {
+          matcher: matcher.clone(),
+          base: Box::new(base_score_node),
+          script: script.clone(),
+          params: params.clone(),
+          boost: boost * node_boost,
+        };
+        Ok((matcher, scorer, score_node))
+      }
       #[cfg(feature = "vectors")]
       QueryNode::Vector(_) => {
         // Vector clauses are handled by the vector search path; treat as MatchAll
@@ -791,8 +841,8 @@ impl<'a> QueryPlanBuilder<'a> {
 /// - A boost of `0.0` disables scoring contribution while still matching.
 fn validate_boost(boost: &Option<f32>) -> Result<f32> {
   let value = boost.unwrap_or(1.0);
-  if value.is_sign_negative() {
-    bail!("query boost must be non-negative (>= 0)");
+  if !value.is_finite() || value.is_sign_negative() {
+    bail!("query boost must be finite and non-negative (>= 0)");
   }
   Ok(value)
 }
