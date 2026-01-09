@@ -228,7 +228,7 @@ fn compute_hybrid_score(
   bm25_score: f32,
   plan: &VectorPlan,
   vector_scores: &[HashMap<(u32, DocId), f32>],
-) -> (f32, Option<f32>) {
+) -> (f32, Option<f32>, bool) {
   let mut blended_sum = 0.0_f32;
   let mut vector_sum = 0.0_f32;
   let mut has_vector = false;
@@ -250,7 +250,7 @@ fn compute_hybrid_score(
   }
   let denom = plan.clauses.len().max(1) as f32;
   let final_score = blended_sum / denom;
-  (final_score, has_vector.then_some(vector_sum))
+  (final_score, has_vector.then_some(vector_sum), has_vector)
 }
 
 #[derive(Clone, Debug)]
@@ -2238,7 +2238,7 @@ impl IndexReader {
       }
       for doc_id in seg_docs.into_iter() {
         let key_tuple = (segment_ord as u32, doc_id);
-        let (final_score, vector_score) =
+        let (final_score, vector_score, _) =
           compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores);
         let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
         if let Some(cur) = &cursor_key {
@@ -2472,6 +2472,7 @@ impl IndexReader {
     for map in vector_scores.iter() {
       candidate_keys.extend(map.keys().copied());
     }
+    let all_vector_only = plan.clauses.iter().all(|c| c.alpha <= 0.0);
     for (seg_ord, doc_id) in candidate_keys.into_iter() {
       let mut bm25_score = 0.0_f32;
       let mut explanation = None;
@@ -2479,8 +2480,11 @@ impl IndexReader {
         bm25_score = existing.score;
         explanation = existing.explanation;
       }
-      let (final_score, vector_score) =
+      let (final_score, vector_score, has_vector) =
         compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores);
+      if all_vector_only && !has_vector {
+        continue;
+      }
       if let Some(expl) = explanation.as_mut() {
         expl.final_score = final_score;
       }

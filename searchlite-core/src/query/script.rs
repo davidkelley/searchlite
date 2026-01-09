@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::iter::Peekable;
+use std::str::Chars;
 
 use anyhow::{anyhow, bail, Result};
 use smallvec::SmallVec;
@@ -219,6 +221,41 @@ pub(crate) fn compile_script(
   })
 }
 
+fn read_number_literal(first: char, chars: &mut Peekable<Chars<'_>>) -> Result<f64> {
+  let mut num = String::new();
+  let mut dot_count = 0usize;
+  let mut digit_count = 0usize;
+  let push_char = |c: char, dot_count: &mut usize, digit_count: &mut usize, buf: &mut String| {
+    if c == '.' {
+      *dot_count += 1;
+    } else if c.is_ascii_digit() {
+      *digit_count += 1;
+    }
+    buf.push(c);
+  };
+  push_char(first, &mut dot_count, &mut digit_count, &mut num);
+  if dot_count > 1 {
+    bail!("invalid number literal `{num}`");
+  }
+  while let Some(&c) = chars.peek() {
+    if c.is_ascii_digit() || c == '.' {
+      chars.next();
+      push_char(c, &mut dot_count, &mut digit_count, &mut num);
+      if dot_count > 1 {
+        bail!("invalid number literal `{num}`");
+      }
+    } else {
+      break;
+    }
+  }
+  if digit_count == 0 {
+    bail!("invalid number literal `{num}`");
+  }
+  num
+    .parse::<f64>()
+    .map_err(|_| anyhow!("invalid number literal `{num}`"))
+}
+
 fn tokenize(input: &str) -> Result<Vec<Token>> {
   let mut tokens = Vec::new();
   let mut chars = input.chars().peekable();
@@ -248,19 +285,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
         if expect_operand {
           if let Some(next) = chars.peek() {
             if next.is_ascii_digit() || *next == '.' {
-              let mut num = String::from("-");
-              while let Some(d) = chars.peek() {
-                if d.is_ascii_digit() || *d == '.' {
-                  num.push(*d);
-                  chars.next();
-                } else {
-                  break;
-                }
-              }
-              let value: f64 = num
-                .parse()
-                .map_err(|_| anyhow!("invalid number literal `{num}`"))?;
-              tokens.push(Token::Number(value));
+              let first = chars.next().unwrap();
+              let value = read_number_literal(first, &mut chars)?;
+              tokens.push(Token::Number(-value));
               expect_operand = false;
               continue;
             }
@@ -282,18 +309,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
         expect_operand = true;
       }
       ch if ch.is_ascii_digit() || ch == '.' => {
-        let mut num = String::new();
-        while let Some(d) = chars.peek() {
-          if d.is_ascii_digit() || *d == '.' {
-            num.push(*d);
-            chars.next();
-          } else {
-            break;
-          }
-        }
-        let value: f64 = num
-          .parse()
-          .map_err(|_| anyhow!("invalid number literal `{num}`"))?;
+        let first = chars.next().unwrap();
+        let value = read_number_literal(first, &mut chars)?;
         tokens.push(Token::Number(value));
         expect_operand = false;
       }
@@ -368,9 +385,9 @@ fn shunting_yard(tokens: &[Token]) -> Result<Vec<Token>> {
 }
 
 fn is_ident_start(ch: char) -> bool {
-  ch.is_ascii_alphabetic() || ch == '_' || ch == '.'
+  ch.is_ascii_alphabetic() || ch == '_'
 }
 
 fn is_ident_continue(ch: char) -> bool {
-  ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
+  ch.is_ascii_alphanumeric() || ch == '_'
 }
