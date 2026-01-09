@@ -12,10 +12,10 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
-  Aggregation, AggregationResponse, CollapseRequest, DateHistogramAggregation, DecayFunction,
-  Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation, IndexOptions,
-  Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestOption,
-  SuggestRequest, SuggestResult,
+  Aggregation, AggregationResponse, AggregationSampling, CollapseRequest, DateHistogramAggregation,
+  DecayFunction, Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation,
+  IndexOptions, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder,
+  SuggestOption, SuggestRequest, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -3566,24 +3566,39 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
     match agg {
       Aggregation::Terms(t) => {
         ensure_keyword_fast(schema, &t.field, name)?;
+        validate_sampling(name, &t.sampling)?;
         validate_aggregations(schema, &t.aggs)?;
+      }
+      Aggregation::SignificantTerms(t) => {
+        ensure_keyword_fast(schema, &t.field, name)?;
+        validate_sampling(name, &t.sampling)?;
+        validate_aggregations(schema, &t.aggs)?;
+      }
+      Aggregation::RareTerms(r) => {
+        ensure_keyword_fast(schema, &r.field, name)?;
+        validate_sampling(name, &r.sampling)?;
+        validate_aggregations(schema, &r.aggs)?;
       }
       Aggregation::Range(r) => {
         ensure_numeric_fast(schema, &r.field, name)?;
+        validate_sampling(name, &r.sampling)?;
         validate_aggregations(schema, &r.aggs)?;
       }
       Aggregation::DateRange(r) => {
         ensure_numeric_fast(schema, &r.field, name)?;
+        validate_sampling(name, &r.sampling)?;
         validate_aggregations(schema, &r.aggs)?;
       }
       Aggregation::Histogram(h) => {
         ensure_numeric_fast(schema, &h.field, name)?;
         validate_histogram_config(name, h)?;
+        validate_sampling(name, &h.sampling)?;
         validate_aggregations(schema, &h.aggs)?;
       }
       Aggregation::DateHistogram(h) => {
         ensure_numeric_fast(schema, &h.field, name)?;
         validate_date_histogram_config(name, h)?;
+        validate_sampling(name, &h.sampling)?;
         validate_aggregations(schema, &h.aggs)?;
       }
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
@@ -3593,6 +3608,7 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
       Aggregation::PercentileRanks(p) => ensure_numeric_fast(schema, &p.field, name)?,
       Aggregation::Cardinality(c) => ensure_keyword_or_numeric_fast(schema, &c.field, name)?,
       Aggregation::Filter(f) => {
+        validate_sampling(name, &f.sampling)?;
         validate_aggregations(schema, &f.aggs)?;
       }
       Aggregation::Composite(c) => {
@@ -3606,9 +3622,15 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
             }
           }
         }
+        validate_sampling(name, &c.sampling)?;
         validate_aggregations(schema, &c.aggs)?;
       }
-      Aggregation::BucketSort(_) | Aggregation::AvgBucket(_) | Aggregation::SumBucket(_) => {}
+      Aggregation::BucketSort(_)
+      | Aggregation::AvgBucket(_)
+      | Aggregation::SumBucket(_)
+      | Aggregation::Derivative(_)
+      | Aggregation::MovingAvg(_)
+      | Aggregation::BucketScript(_) => {}
       Aggregation::TopHits(t) => {
         SortPlan::from_request(schema, &t.sort)
           .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
@@ -3687,6 +3709,40 @@ fn ensure_keyword_or_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Re
     }
     .into(),
   )
+}
+
+fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Result<()> {
+  if let Some(s) = sampling {
+    if s.size.is_some() && s.probability.is_some() {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!("aggregation `{name}` sampling cannot set both size and probability"),
+        }
+        .into(),
+      );
+    }
+    if let Some(prob) = s.probability {
+      if !(0.0..=1.0).contains(&prob) {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("aggregation `{name}` sampling probability must be between 0 and 1"),
+          }
+          .into(),
+        );
+      }
+    }
+    if let Some(size) = s.size {
+      if size == 0 {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("aggregation `{name}` sampling size must be greater than 0"),
+          }
+          .into(),
+        );
+      }
+    }
+  }
+  Ok(())
 }
 
 fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<()> {

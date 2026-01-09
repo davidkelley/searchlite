@@ -32,30 +32,15 @@ jobs:
         uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - &determine-previous
-        name: Determine previous release manifest
-        id: previous-release
-        run: |
-          set -euo pipefail
-          latest_tag=$(git tag --list 'searchlite-core-v*' --sort=-v:refname | head -n 1)
-          if [ -n "$latest_tag" ]; then
-            worktree_dir=$(mktemp -d)
-            git worktree add "$worktree_dir" "$latest_tag"
-            echo "manifest_path=$worktree_dir/Cargo.toml" >> "$GITHUB_OUTPUT"
-          else
-            echo "manifest_path=" >> "$GITHUB_OUTPUT"
-          fi
       - name: Run release-plz
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          REGISTRY_MANIFEST_PATH: ${{ steps.previous-release.outputs.manifest_path }}
         run: |
           set -euo pipefail
-          args=(--git-token "${GITHUB_TOKEN}" --repo-url "https://github.com/${GITHUB_REPOSITORY}")
-          if [ -n "${REGISTRY_MANIFEST_PATH}" ]; then
-            args+=(--registry-manifest-path "${REGISTRY_MANIFEST_PATH}")
-          fi
-          release-plz release "${args[@]}" -o json
+          release-plz release \
+            --git-token "${GITHUB_TOKEN}" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            -o json
 
   # Create a PR with the new versions and changelog, preparing the next release.
   release-plz-pr:
@@ -75,15 +60,12 @@ jobs:
         uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - *determine-previous
       - name: Run release-plz
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          REGISTRY_MANIFEST_PATH: ${{ steps.previous-release.outputs.manifest_path }}
         run: |
           set -euo pipefail
-          args=(--git-token "${GITHUB_TOKEN}" --repo-url "https://github.com/${GITHUB_REPOSITORY}")
-          if [ -n "${REGISTRY_MANIFEST_PATH}" ]; then
-            args+=(--registry-manifest-path "${REGISTRY_MANIFEST_PATH}")
-          fi
-          release-plz release-pr "${args[@]}" -o json
+          release-plz release-pr \
+            --git-token "${GITHUB_TOKEN}" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            -o json

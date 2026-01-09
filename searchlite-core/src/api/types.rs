@@ -690,6 +690,8 @@ pub struct Aggregations(pub BTreeMap<String, Aggregation>);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FilterAggregation {
   pub filter: Filter,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -700,6 +702,8 @@ pub struct CompositeAggregation {
   pub size: usize,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub after: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -742,6 +746,31 @@ pub struct PercentileRanksAggregation {
   pub values: Vec<f64>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub missing: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DerivativeAggregation {
+  pub buckets_path: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub gap_policy: Option<GapPolicy>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub unit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MovingAvgAggregation {
+  pub buckets_path: String,
+  pub window: usize,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub predict: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub gap_policy: Option<GapPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BucketScriptAggregation {
+  pub buckets_path: BTreeMap<String, String>,
+  pub script: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -792,9 +821,28 @@ pub struct BucketMetricAggregation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AggregationSampling {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub probability: Option<f64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GapPolicy {
+  Skip,
+  InsertZeros,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Aggregation {
   Terms(Box<TermsAggregation>),
+  SignificantTerms(Box<SignificantTermsAggregation>),
+  RareTerms(Box<RareTermsAggregation>),
   Range(Box<RangeAggregation>),
   DateRange(Box<DateRangeAggregation>),
   Histogram(Box<HistogramAggregation>),
@@ -811,6 +859,9 @@ pub enum Aggregation {
   BucketSort(BucketSortAggregation),
   AvgBucket(BucketMetricAggregation),
   SumBucket(BucketMetricAggregation),
+  Derivative(DerivativeAggregation),
+  MovingAvg(MovingAvgAggregation),
+  BucketScript(BucketScriptAggregation),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -820,6 +871,36 @@ pub struct TermsAggregation {
   pub shard_size: Option<usize>,
   pub min_doc_count: Option<u64>,
   pub missing: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignificantTermsAggregation {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub min_doc_count: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub background_filter: Option<Filter>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RareTermsAggregation {
+  pub field: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub max_doc_count: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub size: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -830,6 +911,8 @@ pub struct RangeAggregation {
   pub keyed: bool,
   pub ranges: Vec<RangeBound>,
   pub missing: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -841,6 +924,8 @@ pub struct DateRangeAggregation {
   pub format: Option<String>,
   pub ranges: Vec<DateRangeBound>,
   pub missing: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -854,6 +939,8 @@ pub struct HistogramAggregation {
   pub extended_bounds: Option<HistogramBounds>,
   pub hard_bounds: Option<HistogramBounds>,
   pub missing: Option<f64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -869,6 +956,8 @@ pub struct DateHistogramAggregation {
   pub extended_bounds: Option<DateHistogramBounds>,
   pub hard_bounds: Option<DateHistogramBounds>,
   pub missing: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggs: BTreeMap<String, Aggregation>,
 }
@@ -944,39 +1033,97 @@ pub struct BucketResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignificantBucketResponse {
+  pub key: serde_json::Value,
+  pub doc_count: u64,
+  pub bg_count: u64,
+  pub score: f64,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggregations: BTreeMap<String, AggregationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OptionalBucketMetricResponse {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MovingAvgResponse {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub value: Option<f64>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub predictions: Vec<f64>,
+}
+
+fn is_false(val: &bool) -> bool {
+  !*val
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AggregationResponse {
   Terms {
     buckets: Vec<BucketResponse>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
+  },
+  SignificantTerms {
+    buckets: Vec<SignificantBucketResponse>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default)]
+    doc_count: u64,
+    #[serde(default)]
+    bg_count: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
+  },
+  RareTerms {
+    buckets: Vec<BucketResponse>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   Range {
     buckets: Vec<BucketResponse>,
     keyed: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   DateRange {
     buckets: Vec<BucketResponse>,
     keyed: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   Histogram {
     buckets: Vec<BucketResponse>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   DateHistogram {
     buckets: Vec<BucketResponse>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   Filter {
     doc_count: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   Composite {
     buckets: Vec<BucketResponse>,
@@ -984,6 +1131,8 @@ pub enum AggregationResponse {
     after_key: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
   },
   Stats(StatsResponse),
   ExtendedStats(ExtendedStatsResponse),
@@ -1000,6 +1149,9 @@ pub enum AggregationResponse {
   },
   AvgBucket(BucketMetricResponse),
   SumBucket(BucketMetricResponse),
+  Derivative(OptionalBucketMetricResponse),
+  MovingAvg(MovingAvgResponse),
+  BucketScript(OptionalBucketMetricResponse),
 }
 
 /// Aggregate statistics over the numeric field values contributing to the bucket.

@@ -86,6 +86,7 @@ fn bench_terms_aggregation(c: &mut Criterion) {
       shard_size: Some(200),
       min_doc_count: Some(1),
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );
@@ -143,6 +144,7 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
       extended_bounds: None,
       hard_bounds: None,
       missing: None,
+      sampling: None,
       aggs: BTreeMap::new(),
     })),
   );

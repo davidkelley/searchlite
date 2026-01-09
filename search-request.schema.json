@@ -117,6 +117,8 @@
         {
           "oneOf": [
             { "$ref": "#/$defs/terms_agg" },
+            { "$ref": "#/$defs/significant_terms_agg" },
+            { "$ref": "#/$defs/rare_terms_agg" },
             { "$ref": "#/$defs/range_agg" },
             { "$ref": "#/$defs/histogram_agg" },
             { "$ref": "#/$defs/date_histogram_agg" },
@@ -130,7 +132,10 @@
             { "$ref": "#/$defs/percentile_ranks_agg" },
             { "$ref": "#/$defs/bucket_sort_agg" },
             { "$ref": "#/$defs/avg_bucket_agg" },
-            { "$ref": "#/$defs/sum_bucket_agg" }
+            { "$ref": "#/$defs/sum_bucket_agg" },
+            { "$ref": "#/$defs/derivative_agg" },
+            { "$ref": "#/$defs/moving_avg_agg" },
+            { "$ref": "#/$defs/bucket_script_agg" }
           ]
         }
       ]
@@ -143,6 +148,32 @@
         "field": { "type": "string" },
         "size": { "type": "integer", "minimum": 0 },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "sampling": { "$ref": "#/$defs/sampling" },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "significant_terms_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "significant_terms" },
+        "field": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "min_doc_count": { "type": "integer", "minimum": 0 },
+        "background_filter": { "type": "object" },
+        "sampling": { "$ref": "#/$defs/sampling" },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "rare_terms_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "rare_terms" },
+        "field": { "type": "string" },
+        "max_doc_count": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0 },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -153,6 +184,7 @@
         "type": { "const": "range" },
         "field": { "type": "string" },
         "ranges": { "type": "array", "items": { "type": "object" } },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -165,6 +197,7 @@
         "interval": { "type": "number" },
         "offset": { "type": "number" },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -178,6 +211,7 @@
         "fixed_interval": { "type": "string" },
         "offset": { "type": "string" },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -187,6 +221,7 @@
       "properties": {
         "type": { "const": "filter" },
         "filter": { "type": "object", "description": "Any filter AST node." },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -210,6 +245,7 @@
         },
         "size": { "type": "integer", "minimum": 1 },
         "after": { "type": "object", "description": "Pagination key from the previous page." },
+        "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
     },
@@ -301,6 +337,46 @@
         "type": { "const": "sum_bucket" },
         "buckets_path": { "type": "string", "description": "Dot-separated metric path (e.g., `by_tag.score`)." }
       }
+    },
+    "derivative_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "derivative" },
+        "buckets_path": { "type": "string", "description": "Metric path to differentiate." },
+        "gap_policy": { "type": "string", "enum": ["skip", "insert_zeros"] },
+        "unit": { "type": "number", "description": "Optional normalization divisor (e.g., bucket interval)." }
+      }
+    },
+    "moving_avg_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "moving_avg" },
+        "buckets_path": { "type": "string", "description": "Metric path to average." },
+        "window": { "type": "integer", "minimum": 1 },
+        "predict": { "type": "integer", "minimum": 0 },
+        "gap_policy": { "type": "string", "enum": ["skip", "insert_zeros"] }
+      }
+    },
+    "bucket_script_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "bucket_script" },
+        "buckets_path": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Variable map of metric paths." },
+        "script": { "type": "string", "description": "Lightweight arithmetic expression using variables." }
+      }
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": { "type": "integer", "minimum": 1 },
+        "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seed": { "type": "integer", "minimum": 0 }
+      },
+      "description": "Per-aggregation sampling (specify either size or probability)."
     },
     "sort_direction": { "type": "string", "enum": ["asc", "desc"] }
   }
