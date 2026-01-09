@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.1.0...searchlite-core-v0.2.0) - 2026-01-09
+
+### Added
+
+- add multi-vector ranking and scoring hooks
+- implemented http service
+
+### Fixed
+
+- address additional review feedback
+- address review feedback
+- return estimate counts regardless of limit value
+
 ## [0.1.0](https://github.com/davidkelley/searchlite/releases/tag/searchlite-core-v0.1.0) - 2026-01-08
 
 ### Added
