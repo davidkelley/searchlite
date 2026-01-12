@@ -1,0 +1,33 @@
+[changelog]
+header = ""
+body = """
+{% if version %}## {{ version }} - {{ date | date(format="%Y-%m-%d") }}{% endif %}
+{% for group in groups %}### {{ group.name }}
+{% for commit in group.commits %}- {{ commit.message }}{% endfor %}
+
+{% endfor %}"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+skip_tags = false
+skip_merge_commits = false
+
+# Rewrite merge commits so the PR title (second paragraph) becomes the parsed message.
+commit_preprocessors = [
+  { pattern = "(?s)^Merge pull request #[0-9]+ from .*\\n\\n(.*)", replace = "${1}" },
+  { pattern = "(?s)^Merge branch '.*' into .*\\n\\n(.*)", replace = "${1}" },
+]
+
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^refactor", group = "Refactors" },
+  { message = "^test", group = "Tests" },
+  { message = "^ci", group = "CI", skip = true },
+  { message = "^chore", group = "Chores", skip = true },
+  { message = ".*", group = "Other", skip = true },
+]
