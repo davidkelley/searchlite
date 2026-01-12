@@ -2444,14 +2444,13 @@ impl IndexReader {
     for (idx, mut candidates) in per_clause.into_iter().enumerate() {
       candidates.sort_by(|a, b| {
         b.score
-          .to_bits()
-          .cmp(&a.score.to_bits())
+          .total_cmp(&a.score)
           .then_with(|| a.segment_ord.cmp(&b.segment_ord))
           .then_with(|| a.doc_id.cmp(&b.doc_id))
       });
-      let k = plan.clauses.get(idx).map(|c| c.k).unwrap_or(0);
-      if k > 0 && candidates.len() > k {
-        candidates.truncate(k);
+      let max_candidates = plan.clauses.get(idx).map(|c| c.candidate_size).unwrap_or(0);
+      if max_candidates > 0 && candidates.len() > max_candidates {
+        candidates.truncate(max_candidates);
       }
       let mut map = HashMap::with_capacity(candidates.len());
       for cand in candidates.into_iter() {
