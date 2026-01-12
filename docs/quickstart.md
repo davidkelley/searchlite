@@ -144,4 +144,4 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
 
 - Explore analyzers, nested filters, aggregations, and vectors in the feature docs.
 - Embed Searchlite via the Rust API or FFI if you want to integrate directly into your app.
-- See [Quickstart](quickstart.md) for updates and cross-links to deeper guides once they land.
+- Check the Searchlite documentation site for updates and cross-links to deeper guides once they land.

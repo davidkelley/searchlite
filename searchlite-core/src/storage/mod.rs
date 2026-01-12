@@ -115,14 +115,16 @@ impl Storage for FsStorage {
           return Ok(());
         }
       }
-      let _ = fs::remove_file(path);
+      fs::remove_file(path)
+        .map_err(|e| anyhow!("failed to remove file {}: {e}", path.display()))?;
     }
     Ok(())
   }
 
   fn remove_dir_all(&self, path: &Path) -> Result<()> {
     if path.exists() {
-      let _ = fs::remove_dir_all(path);
+      fs::remove_dir_all(path)
+        .map_err(|e| anyhow!("failed to remove directory {}: {e}", path.display()))?;
     }
     Ok(())
   }

@@ -609,7 +609,7 @@ async fn search(
   if request.limit == 0 {
     return Err(HttpError::bad_request(
       "invalid_limit",
-      "search limit must be greater than zero (set limit to a positive integer)",
+      "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
   }
   let index = state.require_index().await?;

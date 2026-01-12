@@ -2530,9 +2530,6 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
-    if req.limit == 0 && req.cursor.is_some() {
-      bail!("cursor is not supported when limit is 0; set a positive limit to page results");
-    }
     if req.limit == 0 {
       bail!("search request must set limit > 0");
     }
