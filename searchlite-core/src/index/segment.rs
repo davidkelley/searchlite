@@ -817,6 +817,7 @@ impl<'a> SegmentWriter<'a> {
     }
     let doc_offsets = doc_writer.offsets().to_vec();
     drop(doc_writer);
+    docstore_file.sync_all()?;
     drop(docstore_file);
 
     let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
