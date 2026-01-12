@@ -323,6 +323,14 @@ mod tests {
       }
       self.inner.atomic_write(path, data)
     }
+
+    fn remove(&self, path: &std::path::Path) -> anyhow::Result<()> {
+      self.inner.remove(path)
+    }
+
+    fn remove_dir_all(&self, path: &std::path::Path) -> anyhow::Result<()> {
+      self.inner.remove_dir_all(path)
+    }
   }
 
   #[test]

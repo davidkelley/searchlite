@@ -1159,6 +1159,10 @@ pub fn nested_parent_key(path: &str) -> String {
   format!("_nested_parent:{path}")
 }
 
+pub fn doc_length_key(field: &str) -> String {
+  format!("_len:{field}")
+}
+
 fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
   if data.len() < 8 {
     return Ok(HashMap::new());

@@ -1,5 +1,6 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use crate::api::types::ExecutionStrategy;
 use crate::index::postings::{PostingsReader, DEFAULT_BLOCK_SIZE};
@@ -69,6 +70,18 @@ pub struct ScoredTerm {
   pub k1: f32,
   pub b: f32,
   pub leaf: usize,
+  pub doc_lengths: Option<Arc<Vec<f32>>>,
+}
+
+impl ScoredTerm {
+  pub(crate) fn doc_len(&self, doc_id: DocId) -> f32 {
+    self
+      .doc_lengths
+      .as_ref()
+      .and_then(|lens| lens.get(doc_id as usize).copied())
+      .filter(|v| *v > 0.0)
+      .unwrap_or_else(|| self.avgdl.max(1.0))
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +96,8 @@ struct TermState {
   b: f32,
   leaf: usize,
   ub: f32,
+  min_doc_len: f32,
+  doc_lengths: Option<Arc<Vec<f32>>>,
   block_max_doc_ids: Vec<DocId>,
   block_max_tfs: Vec<f32>,
   block_size: usize,
@@ -93,9 +108,25 @@ impl TermState {
     let df = term.postings.len() as f32;
     let clamped_block = block_size.max(1);
     let (block_max_doc_ids, block_max_tfs) = build_block_meta(&term.postings, clamped_block);
+    let (doc_lengths, min_doc_len) = if let Some(lengths) = term.doc_lengths.as_ref() {
+      let min = lengths
+        .iter()
+        .copied()
+        .filter(|l| *l > 0.0)
+        .fold(f32::INFINITY, f32::min);
+      let hint = if min.is_finite() {
+        min
+      } else {
+        term.avgdl.max(1.0)
+      };
+      (Some(lengths.clone()), hint)
+    } else {
+      (None, term.avgdl.max(1.0))
+    };
     let ub = upper_bound_tf(
       term.postings.max_tf,
       df,
+      min_doc_len,
       term.avgdl,
       term.docs,
       term.k1,
@@ -113,6 +144,8 @@ impl TermState {
       b: term.b,
       leaf: term.leaf,
       ub,
+      min_doc_len,
+      doc_lengths,
       block_max_doc_ids,
       block_max_tfs,
       block_size: clamped_block,
@@ -131,6 +164,15 @@ impl TermState {
     }
   }
 
+  fn doc_len(&self, doc_id: DocId) -> f32 {
+    self
+      .doc_lengths
+      .as_ref()
+      .and_then(|lens| lens.get(doc_id as usize).copied())
+      .filter(|v| *v > 0.0)
+      .unwrap_or_else(|| self.avgdl.max(1.0))
+  }
+
   fn tf(&self) -> f32 {
     self
       .postings
@@ -143,6 +185,7 @@ impl TermState {
     score_tf(
       self.tf(),
       self.df,
+      self.doc_len(self.doc_id()),
       self.avgdl,
       self.docs,
       self.k1,
@@ -198,6 +241,7 @@ impl TermState {
     score_tf(
       tf,
       self.df,
+      self.min_doc_len,
       self.avgdl,
       self.docs,
       self.k1,
@@ -221,25 +265,41 @@ impl TermState {
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn score_tf(
   tf: f32,
   df: f32,
+  doc_len: f32,
   avgdl: f32,
   docs: f32,
   k1: f32,
   b: f32,
   weight: f32,
 ) -> f32 {
-  let doc_len = if avgdl > 0.0 { avgdl } else { tf };
-  let base = bm25(tf, df, doc_len, avgdl, docs, k1, b);
+  let norm_len = if doc_len > 0.0 {
+    doc_len
+  } else {
+    avgdl.max(tf)
+  };
+  let base = bm25(tf, df, norm_len, avgdl, docs, k1, b);
   base * weight
 }
 
-fn upper_bound_tf(tf: f32, df: f32, avgdl: f32, docs: f32, k1: f32, b: f32, weight: f32) -> f32 {
+#[allow(clippy::too_many_arguments)]
+fn upper_bound_tf(
+  tf: f32,
+  df: f32,
+  doc_len: f32,
+  avgdl: f32,
+  docs: f32,
+  k1: f32,
+  b: f32,
+  weight: f32,
+) -> f32 {
   if tf <= 0.0 {
     return 0.0;
   }
-  score_tf(tf, df, avgdl, docs, k1, b, weight)
+  score_tf(tf, df, doc_len, avgdl, docs, k1, b, weight)
 }
 
 fn build_block_meta(postings: &PostingsReader, block_size: usize) -> (Vec<DocId>, Vec<f32>) {
@@ -415,6 +475,7 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         let score = score_tf(
           entry.term_freq as f32,
           df,
+          term.doc_len(entry.doc_id),
           term.avgdl,
           term.docs,
           term.k1,
@@ -468,6 +529,7 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       let score = score_tf(
         entry.term_freq as f32,
         df,
+        term.doc_len(entry.doc_id),
         term.avgdl,
         term.docs,
         term.k1,
@@ -737,9 +799,12 @@ mod tests {
   use super::*;
   use crate::index::postings::PostingEntry;
   use smallvec::smallvec;
+  use std::sync::Arc;
 
   fn term_from_entries(entries: &[PostingEntry]) -> ScoredTerm {
     let reader = PostingsReader::from_entries_for_test(entries.to_vec(), DEFAULT_BLOCK_SIZE);
+    let max_doc = entries.iter().map(|e| e.doc_id).max().unwrap_or(0) as usize;
+    let doc_lengths = Arc::new(vec![10.0; max_doc.saturating_add(1)]);
     ScoredTerm {
       postings: reader,
       weight: 1.0,
@@ -748,6 +813,7 @@ mod tests {
       k1: 1.2,
       b: 0.75,
       leaf: 0,
+      doc_lengths: Some(doc_lengths),
     }
   }
 
@@ -811,6 +877,16 @@ mod tests {
       assert_eq!(a.doc_id, b.doc_id);
       assert!((a.score - b.score).abs() < 1e-6);
     }
+  }
+
+  #[test]
+  fn bm25_penalizes_long_documents() {
+    let short = score_tf(2.0, 1.0, 5.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+    let long = score_tf(2.0, 1.0, 100.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+    assert!(
+      short > long,
+      "short doc score {short} should exceed long doc score {long}"
+    );
   }
 
   #[test]

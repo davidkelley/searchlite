@@ -106,6 +106,7 @@ impl Index {
     if manifest_snapshot.segments.len() <= 1 {
       return Ok(());
     }
+    let old_segments = manifest_snapshot.segments.clone();
     let inner = &self.inner;
     let schema = manifest_snapshot.schema.clone();
     let generation = manifest_snapshot
@@ -147,6 +148,8 @@ impl Index {
       inner.storage.as_ref(),
       &Manifest::manifest_path(&inner.path),
     )?;
+    drop(manifest_guard);
+    cleanup_segments(inner.storage.as_ref(), &old_segments)?;
     Ok(())
   }
 
@@ -171,4 +174,26 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
     StorageType::Filesystem => Arc::new(FsStorage::new(opts.path.clone())),
     StorageType::InMemory => Arc::new(InMemoryStorage::new(opts.path.clone())),
   }
+}
+
+fn cleanup_segments(
+  storage: &dyn Storage,
+  segments: &[crate::index::manifest::SegmentMeta],
+) -> Result<()> {
+  for seg in segments {
+    for path in [
+      &seg.paths.terms,
+      &seg.paths.postings,
+      &seg.paths.docstore,
+      &seg.paths.fast,
+      &seg.paths.meta,
+    ] {
+      let _ = storage.remove(Path::new(path));
+    }
+    #[cfg(feature = "vectors")]
+    if let Some(dir) = seg.paths.vector_dir.as_ref() {
+      let _ = storage.remove_dir_all(Path::new(dir));
+    }
+  }
+  Ok(())
 }

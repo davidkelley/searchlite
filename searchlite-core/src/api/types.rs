@@ -402,6 +402,8 @@ pub struct SearchRequest {
   #[serde(default)]
   pub filters: Vec<Filter>,
   pub limit: usize,
+  #[serde(default = "default_return_hits")]
+  pub return_hits: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub candidate_size: Option<usize>,
   #[serde(default)]
@@ -448,6 +450,8 @@ struct SearchRequestHelper {
   #[serde(default)]
   pub filters: Vec<Filter>,
   pub limit: usize,
+  #[serde(default = "default_return_hits")]
+  pub return_hits: bool,
   #[serde(default)]
   pub candidate_size: Option<usize>,
   #[serde(default)]
@@ -501,6 +505,7 @@ impl<'de> Deserialize<'de> for SearchRequest {
       filter: helper.filter,
       filters: helper.filters,
       limit: helper.limit,
+      return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,
       sort: helper.sort,
       cursor: helper.cursor,
@@ -1221,3 +1226,6 @@ pub struct BucketMetricResponse {
 pub use crate::index::manifest::{
   KeywordField, NestedField, NestedProperty, NumericField, Schema, SearchAsYouType, TextField,
 };
+fn default_return_hits() -> bool {
+  true
+}

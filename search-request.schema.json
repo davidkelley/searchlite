@@ -26,7 +26,8 @@
       "items": { "type": "object" },
       "default": []
     },
-    "limit": { "type": "integer", "minimum": 0, "default": 10 },
+    "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "Number of hits to return; must be >= 1 when hits are enabled." },
+    "return_hits": { "type": "boolean", "default": true, "description": "When false, skip hit collection/materialization and return only counts/aggregations/suggest/profile." },
     "candidate_size": {
       "description": "Optional global candidate pool size (before final top-N) capped to 20000.",
       "type": ["integer", "null"],

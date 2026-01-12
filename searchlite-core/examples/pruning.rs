@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -142,9 +143,24 @@ fn run_strategy(
         entry.1 += 1.0;
       }
       let docs = seg.meta.doc_count as f32;
+      let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
       let mut terms = Vec::new();
       for (key, (field, weight)) in term_weights.into_iter() {
         if let Some(postings) = seg.postings(&key) {
+          let doc_lengths = field_lengths_cache.get(&field).cloned().or_else(|| {
+            let mut lengths = Vec::with_capacity(seg.meta.doc_count as usize);
+            let len_key = format!("_len:{field}");
+            for doc_id in 0..seg.meta.doc_count {
+              let len = seg
+                .fast_fields()
+                .i64_value(&len_key, doc_id as searchlite_core::DocId)
+                .unwrap_or(0) as f32;
+              lengths.push(len);
+            }
+            let arc = Arc::new(lengths);
+            field_lengths_cache.insert(field.clone(), arc.clone());
+            Some(arc)
+          });
           terms.push(ScoredTerm {
             postings,
             weight,
@@ -153,6 +169,7 @@ fn run_strategy(
             k1: opts.bm25_k1,
             b: opts.bm25_b,
             leaf: 0,
+            doc_lengths,
           });
         }
       }

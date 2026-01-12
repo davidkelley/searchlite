@@ -67,6 +67,7 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     filter: None,
     filters: vec![],
     limit: 10,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,

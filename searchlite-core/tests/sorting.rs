@@ -77,6 +77,7 @@ fn sorts_numeric_and_missing_last() {
       filter: None,
       filters: vec![],
       limit: 10,
+      return_hits: true,
       candidate_size: None,
       sort: vec![SortSpec {
         field: "rating".into(),
@@ -167,6 +168,7 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       filter: None,
       filters: vec![],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: vec![SortSpec {
         field: "tag".into(),
@@ -268,6 +270,7 @@ fn paginates_with_sorted_cursor_across_segments() {
     filter: None,
     filters: vec![],
     limit: 2,
+    return_hits: true,
     candidate_size: None,
     sort: vec![SortSpec {
       field: "rank".into(),

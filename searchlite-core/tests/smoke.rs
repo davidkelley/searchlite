@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  CollapseRequest, Document, ExecutionStrategy, FuzzyOptions, HighlightField, HighlightRequest,
-  IndexOptions, InnerHitsRequest, KeywordField, NestedField, NestedProperty, NumericField, Schema,
-  SearchRequest, StorageType, TextField,
+  Aggregation, CollapseRequest, Document, ExecutionStrategy, FuzzyOptions, HighlightField,
+  HighlightRequest, IndexOptions, InnerHitsRequest, KeywordField, NestedField, NestedProperty,
+  NumericField, Schema, SearchRequest, StorageType, TextField, TopHitsAggregation,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -26,6 +27,7 @@ fn base_search_request(query: &str) -> SearchRequest {
     filter: None,
     filters: vec![],
     limit: 10,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,
@@ -129,6 +131,7 @@ fn index_and_search() {
         max: 2024,
       }],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -323,6 +326,99 @@ fn fuzzy_allows_two_edits() {
 }
 
 #[test]
+fn search_with_zero_limit_errors() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  let err = reader.search(&req).unwrap_err();
+  assert!(err.to_string().to_lowercase().contains("limit"));
+}
+
+#[test]
+fn search_without_hits_returns_agg_only() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("hello rust"))]),
+    doc("doc-2", vec![("body", json!("rust search"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("rust");
+  req.return_hits = false;
+  req.aggs.insert(
+    "top_body".into(),
+    Aggregation::TopHits(TopHitsAggregation {
+      size: 1,
+      from: 0,
+      fields: None,
+      sort: Vec::new(),
+      highlight_field: None,
+    }),
+  );
+  let resp = reader.search(&req).unwrap();
+  assert!(resp.hits.is_empty());
+  assert!(resp.next_cursor.is_none());
+  assert!(!resp.aggregations.is_empty());
+  assert!(resp.total_hits_estimate > 0);
+}
+
+#[test]
+fn compact_removes_old_segments() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, Schema::default_text_body(), opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("doc-1", vec![("body", json!("first"))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc("doc-2", vec![("body", json!("second"))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let manifest_before = idx.manifest();
+  assert_eq!(manifest_before.segments.len(), 2);
+  let old_paths: Vec<PathBuf> = manifest_before
+    .segments
+    .iter()
+    .flat_map(|seg| {
+      [
+        seg.paths.terms.clone(),
+        seg.paths.postings.clone(),
+        seg.paths.docstore.clone(),
+        seg.paths.fast.clone(),
+        seg.paths.meta.clone(),
+      ]
+    })
+    .map(PathBuf::from)
+    .collect();
+  idx.compact().unwrap();
+  let manifest_after = idx.manifest();
+  assert_eq!(manifest_after.segments.len(), 1);
+  for p in old_paths {
+    assert!(
+      !p.exists(),
+      "expected old segment file {:?} to be removed after compaction",
+      p
+    );
+  }
+}
+
+#[test]
 fn upsert_and_delete_by_id() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
@@ -358,6 +454,7 @@ fn upsert_and_delete_by_id() {
     filter: None,
     filters: vec![],
     limit: 5,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,
@@ -451,6 +548,7 @@ fn cursor_paginates_ordered_hits() {
     filter: None,
     filters: vec![],
     limit: 2,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,
@@ -550,6 +648,7 @@ fn cursor_rejects_invalid_hex() {
     filter: None,
     filters: vec![],
     limit: 1,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: Some("not-a-valid-cursor".to_string()),
@@ -606,6 +705,7 @@ fn cursor_rejects_when_limit_zero() {
       filter: None,
       filters: vec![],
       limit: 0,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: Some("00000000000000000000000000000000".to_string()),
@@ -629,9 +729,7 @@ fn cursor_rejects_when_limit_zero() {
     })
     .unwrap_err();
 
-  assert!(err
-    .to_string()
-    .contains("cursor is not supported when limit is 0"));
+  assert!(err.to_string().to_lowercase().contains("limit"));
 }
 
 #[test]
@@ -671,6 +769,7 @@ fn cursor_rejects_excessive_advance() {
     filter: None,
     filters: vec![],
     limit: 1,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
@@ -728,6 +827,7 @@ fn cursor_rejects_mismatched_position() {
     filter: None,
     filters: vec![],
     limit: 2,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,
@@ -812,6 +912,7 @@ fn cursor_orders_stably_across_segments() {
     filter: None,
     filters: vec![],
     limit: 2,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::new(),
     cursor: None,
@@ -927,6 +1028,7 @@ fn in_memory_storage_keeps_disk_clean() {
       filter: None,
       filters: vec![],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -1061,6 +1163,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       filter: None,
       filters,
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -1227,6 +1330,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       filter: None,
       filters,
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -1320,6 +1424,7 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
       filter: None,
       filters: vec![],
       limit: 10,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -1430,6 +1535,7 @@ fn highlight_configuration_applies_tags() {
       filter: None,
       filters: vec![],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
