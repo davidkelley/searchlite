@@ -58,8 +58,12 @@ impl Wal {
     buf.extend_from_slice(&checksum.to_le_bytes());
     self.file.write_all(&buf)?;
     self.file.flush()?;
-    self.file.sync_all()?;
     Ok(())
+  }
+
+  pub fn sync(&mut self) -> Result<()> {
+    self.file.flush()?;
+    self.file.sync_all()
   }
 
   pub fn truncate(&mut self) -> Result<()> {

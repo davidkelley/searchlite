@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::storage::Storage;
 use crate::util::checksum::checksum;
@@ -26,7 +26,7 @@ pub fn write_terms(storage: &dyn Storage, path: &Path, terms: &[(String, u64)]) 
 pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   let buf = storage.read_to_end(path)?;
   if buf.len() < 12 {
-    return Ok(TinyFst::default());
+    bail!("terms file at {:?} is truncated", path);
   }
   let term_count = u64::from_le_bytes([
     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -36,7 +36,7 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   let expected = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
   let actual = checksum(data);
   if expected != actual {
-    return Ok(TinyFst::default());
+    bail!("terms file at {:?} failed checksum validation", path);
   }
   let mut cursor = 0usize;
   let mut pairs = Vec::with_capacity(term_count as usize);
@@ -45,12 +45,18 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
     cursor += consumed;
     let end = cursor + len as usize;
     if end > data.len() {
-      break;
+      bail!(
+        "terms file at {:?} ended unexpectedly while reading term",
+        path
+      );
     }
     let term = String::from_utf8_lossy(&data[cursor..end]).into_owned();
     cursor = end;
     if cursor + 8 > data.len() {
-      break;
+      bail!(
+        "terms file at {:?} ended unexpectedly while reading offset",
+        path
+      );
     }
     let offset = u64::from_le_bytes([
       data[cursor],
@@ -90,7 +96,7 @@ mod tests {
   }
 
   #[test]
-  fn invalid_checksum_returns_empty() {
+  fn invalid_checksum_errors() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("terms");
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
@@ -99,7 +105,7 @@ mod tests {
     let last = data.last_mut().unwrap();
     *last = last.wrapping_add(1);
     std::fs::write(&path, data).unwrap();
-    let fst = read_terms(&storage, &path).unwrap();
-    assert!(fst.get("term").is_none());
+    let err = read_terms(&storage, &path).unwrap_err();
+    assert!(err.to_string().contains("failed checksum"));
   }
 }
