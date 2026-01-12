@@ -188,7 +188,12 @@ impl IndexWriter {
 impl Drop for IndexWriter {
   fn drop(&mut self) {
     if !self.pending_ops.is_empty() {
-      let _ = self.wal.sync();
+      if let Err(e) = self.wal.sync() {
+        eprintln!(
+          "IndexWriter: failed to sync WAL on drop ({} pending ops): {e}",
+          self.pending_ops.len()
+        );
+      }
     }
   }
 }
