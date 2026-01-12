@@ -101,6 +101,7 @@ impl IndexWriter {
     if self.pending_ops.is_empty() {
       return Ok(());
     }
+    self.wal.sync()?;
     let mut live_docs = self.live_docs.clone();
     let mut pending_new: BTreeMap<String, Document> = BTreeMap::new();
     let mut tombstones: HashMap<String, Vec<DocId>> = HashMap::new();
@@ -169,6 +170,7 @@ impl IndexWriter {
     drop(manifest);
     store_result?;
     self.wal.append_commit()?;
+    self.wal.sync()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
     self.live_docs = live_docs;
@@ -180,6 +182,19 @@ impl IndexWriter {
     self.pending_ops.clear();
     self.wal.truncate()?;
     Ok(())
+  }
+}
+
+impl Drop for IndexWriter {
+  fn drop(&mut self) {
+    if !self.pending_ops.is_empty() {
+      if let Err(e) = self.wal.sync() {
+        eprintln!(
+          "IndexWriter: failed to sync WAL on drop ({} pending ops): {e}",
+          self.pending_ops.len()
+        );
+      }
+    }
   }
 }
 

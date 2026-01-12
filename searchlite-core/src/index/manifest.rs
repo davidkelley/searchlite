@@ -287,6 +287,7 @@ impl Schema {
         stored: f.stored,
         fast: false,
         numeric_i64: None,
+        nullable: f.nullable,
       });
     }
     for f in self.keyword_fields.iter() {
@@ -297,6 +298,7 @@ impl Schema {
         stored: f.stored,
         fast: f.fast,
         numeric_i64: None,
+        nullable: f.nullable,
       });
     }
     for f in self.numeric_fields.iter() {
@@ -307,6 +309,7 @@ impl Schema {
         stored: f.stored,
         fast: f.fast,
         numeric_i64: Some(f.i64),
+        nullable: f.nullable,
       });
     }
     for nested in self.nested_fields.iter() {
@@ -338,6 +341,10 @@ impl Schema {
         nested
           .validate(value)
           .with_context(|| format!("validating nested field {name}"))?;
+        continue;
+      }
+      if let Some(meta) = self.field_meta(name) {
+        validate_field_value(&meta, value)?;
       }
     }
     Ok(())
@@ -346,6 +353,57 @@ impl Schema {
   #[cfg(feature = "vectors")]
   pub fn vector_field(&self, field: &str) -> Option<VectorField> {
     self.vector_fields.iter().find(|f| f.name == field).cloned()
+  }
+}
+
+fn validate_field_value(meta: &ResolvedField, value: &serde_json::Value) -> anyhow::Result<()> {
+  if value.is_null() {
+    if meta.nullable {
+      return Ok(());
+    }
+    anyhow::bail!("field `{}` cannot be null", meta.path);
+  }
+  match meta.kind {
+    FieldKind::Text | FieldKind::Keyword => {
+      if !is_string_or_string_array(value) {
+        anyhow::bail!("field `{}` must be a string or array of strings", meta.path);
+      }
+    }
+    FieldKind::Numeric => {
+      if meta.numeric_i64.unwrap_or(false) {
+        if !is_i64_or_array(value) {
+          anyhow::bail!("field `{}` must be a number or array of numbers", meta.path);
+        }
+      } else if !is_f64_or_array(value) {
+        anyhow::bail!("field `{}` must be a number or array of numbers", meta.path);
+      }
+    }
+    FieldKind::Unknown => {}
+  }
+  Ok(())
+}
+
+fn is_string_or_string_array(value: &serde_json::Value) -> bool {
+  match value {
+    serde_json::Value::String(_) => true,
+    serde_json::Value::Array(arr) => arr.iter().all(|v| v.as_str().is_some()),
+    _ => false,
+  }
+}
+
+fn is_i64_or_array(value: &serde_json::Value) -> bool {
+  match value {
+    serde_json::Value::Number(n) => n.as_i64().is_some(),
+    serde_json::Value::Array(arr) => arr.iter().all(|v| v.as_i64().is_some()),
+    _ => false,
+  }
+}
+
+fn is_f64_or_array(value: &serde_json::Value) -> bool {
+  match value {
+    serde_json::Value::Number(n) => n.as_f64().is_some(),
+    serde_json::Value::Array(arr) => arr.iter().all(|v| v.as_f64().is_some()),
+    _ => false,
   }
 }
 
@@ -529,6 +587,56 @@ mod tests {
       .validate_document(&null_game)
       .expect("nullable container ok");
   }
+
+  #[test]
+  fn top_level_fields_enforce_nullability_and_type() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: Vec::new(),
+      numeric_fields: vec![NumericField {
+        name: "score".into(),
+        i64: false,
+        fast: false,
+        stored: false,
+        nullable: false,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let null_doc = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("1")),
+        ("body".into(), serde_json::Value::Null),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&null_doc).unwrap_err();
+    assert!(err.to_string().contains("cannot be null"));
+
+    let bad_type = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("2")),
+        ("body".into(), serde_json::json!("ok")),
+        ("score".into(), serde_json::json!("not a number")),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&bad_type).unwrap_err();
+    assert!(err.to_string().contains("must be a number"));
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +655,7 @@ pub struct ResolvedField {
   pub stored: bool,
   pub fast: bool,
   pub numeric_i64: Option<bool>,
+  pub nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -904,6 +1013,7 @@ impl NestedProperty {
         stored: f.stored,
         fast: false,
         numeric_i64: None,
+        nullable: f.nullable,
       }),
       NestedProperty::Keyword(f) => out.push(ResolvedField {
         path: format!("{prefix}.{}", f.name),
@@ -912,6 +1022,7 @@ impl NestedProperty {
         stored: f.stored,
         fast: f.fast,
         numeric_i64: None,
+        nullable: f.nullable,
       }),
       NestedProperty::Numeric(f) => out.push(ResolvedField {
         path: format!("{prefix}.{}", f.name),
@@ -920,6 +1031,7 @@ impl NestedProperty {
         stored: f.stored,
         fast: f.fast,
         numeric_i64: Some(f.i64),
+        nullable: f.nullable,
       }),
       NestedProperty::Object(obj) => obj.collect_fields(Some(prefix), out),
     }

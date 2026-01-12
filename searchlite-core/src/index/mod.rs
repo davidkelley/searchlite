@@ -106,6 +106,7 @@ impl Index {
     if manifest_snapshot.segments.len() <= 1 {
       return Ok(());
     }
+    ensure_compact_safe(&manifest_snapshot.schema)?;
     let old_segments = manifest_snapshot.segments.clone();
     let inner = &self.inner;
     let schema = manifest_snapshot.schema.clone();
@@ -196,4 +197,94 @@ fn cleanup_segments(
     }
   }
   Ok(())
+}
+
+fn ensure_compact_safe(schema: &Schema) -> Result<()> {
+  for field in schema.resolved_fields().into_iter() {
+    if field.indexed && !field.stored {
+      bail!(
+        "cannot compact index: field `{}` is indexed but not stored; compaction would drop its data",
+        field.path
+      );
+    }
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::api::types::{Document, IndexOptions, StorageType};
+  use crate::index::manifest::{default_doc_id_field, TextField};
+  use tempfile::tempdir;
+
+  fn opts(path: &Path) -> IndexOptions {
+    IndexOptions {
+      path: path.to_path_buf(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 1.2,
+      bm25_b: 0.75,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    }
+  }
+
+  #[test]
+  fn compact_rejects_non_stored_indexed_fields() {
+    let dir = tempdir().unwrap();
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: false,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("hello")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("2")),
+            ("body".into(), serde_json::json!("world")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let err = idx.compact().unwrap_err();
+    assert!(
+      err.to_string().contains("indexed but not stored"),
+      "unexpected error: {err}"
+    );
+  }
 }
