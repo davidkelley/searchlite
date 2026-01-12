@@ -60,6 +60,8 @@ enum Commands {
     highlight: Option<String>,
     #[arg(long)]
     cursor: Option<String>,
+    #[arg(long, default_value_t = true)]
+    return_hits: bool,
     #[arg(long)]
     sort: Option<String>,
     #[arg(long)]
@@ -121,6 +123,7 @@ fn main() -> Result<()> {
       return_stored,
       highlight,
       cursor,
+      return_hits,
       sort,
       request,
       request_stdin,
@@ -151,6 +154,7 @@ fn main() -> Result<()> {
           return_stored,
           highlight,
           cursor,
+          return_hits,
           sort,
           #[cfg(feature = "vectors")]
           vector_field,
@@ -206,6 +210,7 @@ struct SearchCliArgs {
   return_stored: bool,
   highlight: Option<String>,
   cursor: Option<String>,
+  return_hits: bool,
   sort: Option<String>,
   #[cfg(feature = "vectors")]
   vector_field: Option<String>,
@@ -309,6 +314,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     return_stored,
     highlight,
     cursor,
+    return_hits,
     sort,
     #[cfg(feature = "vectors")]
     vector_field,
@@ -368,12 +374,16 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     Query::Node(QueryNode::Vector(_)) => None,
     _ => vector_opts.clone().map(VectorQuerySpec::Structured),
   };
+  if limit == 0 {
+    bail!("search limit must be greater than zero (set --limit to a positive number)");
+  }
   Ok(SearchRequest {
     query,
     fields: fields.map(|f| f.split(',').map(|s| s.trim().to_string()).collect()),
     filter: None,
     filters: Vec::new(),
     limit,
+    return_hits,
     candidate_size,
     sort: parse_sort(sort)?,
     execution: parse_execution(&execution),
@@ -402,6 +412,9 @@ fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<Sea
       fs::read_to_string(&p).with_context(|| format!("reading search request from {:?}", p))?;
     let request = serde_json::from_str::<SearchRequest>(&contents)
       .with_context(|| format!("parsing search request JSON from {:?}", p))?;
+    if request.limit == 0 {
+      bail!("search request must set limit > 0");
+    }
     return Ok(Some(request));
   }
   if request_stdin {
@@ -411,6 +424,9 @@ fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<Sea
       .context("reading search request from stdin")?;
     let request = serde_json::from_str::<SearchRequest>(&buf)
       .context("parsing search request JSON from stdin")?;
+    if request.limit == 0 {
+      bail!("search request must set limit > 0");
+    }
     return Ok(Some(request));
   }
   Ok(None)
@@ -549,6 +565,7 @@ mod tests {
       query: Some("rust".into()),
       limit: 5,
       cursor: None,
+      return_hits: true,
       execution: "wand".to_string(),
       bmw_block_size: None,
       fields: None,
@@ -596,6 +613,7 @@ mod tests {
       filter: None,
       filters: vec![],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -634,6 +652,7 @@ mod tests {
       filter: None,
       filters: vec![],
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,

@@ -606,6 +606,12 @@ async fn search(
   payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<SearchResult>> {
   let request = parse_json(payload)?;
+  if request.limit == 0 {
+    return Err(HttpError::bad_request(
+      "invalid_limit",
+      "invalid limit: must be greater than zero (set limit to a positive integer)",
+    ));
+  }
   let index = state.require_index().await?;
   let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
     let reader = index.reader()?;
@@ -756,8 +762,10 @@ mod tests {
   use searchlite_core::api::types::VectorQuery;
   use searchlite_core::api::types::{
     Aggregation, AggregationResponse, CollapseRequest, ExecutionStrategy, HighlightField,
-    HighlightRequest, Query, QueryNode, SuggestRequest,
+    HighlightRequest, Query, SuggestRequest,
   };
+  #[cfg(feature = "vectors")]
+  use searchlite_core::api::QueryNode;
   use serde_json::json;
   use std::collections::BTreeMap;
   use std::path::PathBuf;
@@ -853,6 +861,7 @@ mod tests {
       filter: None,
       filters: Vec::new(),
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -978,6 +987,7 @@ mod tests {
       filter: None,
       filters: Vec::new(),
       limit: 5,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,
@@ -1091,6 +1101,7 @@ mod tests {
       filter: None,
       filters: Vec::new(),
       limit: 2,
+      return_hits: true,
       candidate_size: None,
       sort: Vec::new(),
       cursor: None,

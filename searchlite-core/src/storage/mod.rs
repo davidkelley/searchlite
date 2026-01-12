@@ -35,6 +35,8 @@ pub trait Storage: Send + Sync {
   fn read_to_end(&self, path: &Path) -> Result<Vec<u8>>;
   fn write_all(&self, path: &Path, data: &[u8]) -> Result<()>;
   fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()>;
+  fn remove(&self, path: &Path) -> Result<()>;
+  fn remove_dir_all(&self, path: &Path) -> Result<()>;
 }
 
 pub struct FsStorage {
@@ -103,6 +105,27 @@ impl Storage for FsStorage {
     }
     fs::write(&tmp, data)?;
     fs::rename(&tmp, path)?;
+    Ok(())
+  }
+
+  fn remove(&self, path: &Path) -> Result<()> {
+    if path.exists() {
+      if let Some(parent) = path.parent() {
+        if !parent.exists() {
+          return Ok(());
+        }
+      }
+      fs::remove_file(path)
+        .map_err(|e| anyhow!("failed to remove file {}: {e}", path.display()))?;
+    }
+    Ok(())
+  }
+
+  fn remove_dir_all(&self, path: &Path) -> Result<()> {
+    if path.exists() {
+      fs::remove_dir_all(path)
+        .map_err(|e| anyhow!("failed to remove directory {}: {e}", path.display()))?;
+    }
     Ok(())
   }
 }
@@ -183,6 +206,18 @@ impl Storage for InMemoryStorage {
 
   fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
     self.write_all(path, data)
+  }
+
+  fn remove(&self, path: &Path) -> Result<()> {
+    let mut map = self.files.write();
+    map.remove(path);
+    Ok(())
+  }
+
+  fn remove_dir_all(&self, path: &Path) -> Result<()> {
+    let mut map = self.files.write();
+    map.retain(|p, _| !p.starts_with(path));
+    Ok(())
   }
 }
 

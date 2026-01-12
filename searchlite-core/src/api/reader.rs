@@ -20,7 +20,7 @@ use crate::api::types::{
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
 use crate::api::AggregationError;
-use crate::index::fastfields::FastFieldsReader;
+use crate::index::fastfields::{doc_length_key, FastFieldsReader};
 use crate::index::highlight::{highlight_fragments, make_snippet, HighlightOptions};
 use crate::index::manifest::{FieldKind, Manifest, Schema, SchemaAnalyzers};
 use crate::index::postings::{PostingEntry, PostingsReader};
@@ -2190,10 +2190,11 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
-    let heap_limit = if req.limit == 0 {
-      0
-    } else {
+    let collect_hits = req.return_hits && req.limit > 0;
+    let heap_limit = if collect_hits {
       plan.candidate_size.max(req.limit).saturating_add(1)
+    } else {
+      0
     };
     let root_filter = if let Some(filter) = req.filter.as_ref() {
       RootFilter::Node(filter)
@@ -2203,14 +2204,14 @@ impl IndexReader {
       RootFilter::None
     };
     let vector_filter = req.vector_filter.as_ref();
-    let mut heap = if req.limit == 0 {
-      None
-    } else {
+    let mut heap = if collect_hits {
       Some(BinaryHeap::<RankedHit>::new())
+    } else {
+      None
     };
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
-    let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
+    let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
     let agg_pipeline = AggregationPipeline::from_request(&req.aggs, &[], &self.manifest.schema);
@@ -2240,16 +2241,21 @@ impl IndexReader {
         let key_tuple = (segment_ord as u32, doc_id);
         let (final_score, vector_score, _) =
           compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores);
-        let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
-        if let Some(cur) = &cursor_key {
-          let ord = key.cmp(cur);
-          if ord.is_lt() || ord.is_eq() {
-            if ord.is_eq() {
-              saw_cursor = true;
+        let key = if req.return_hits {
+          let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
+          if let Some(cur) = &cursor_key {
+            let ord = key.cmp(cur);
+            if ord.is_lt() || ord.is_eq() {
+              if ord.is_eq() {
+                saw_cursor = true;
+              }
+              continue;
             }
-            continue;
           }
-        }
+          Some(key)
+        } else {
+          None
+        };
         total_matches += 1;
         if let Some(col) = agg_collector.as_mut() {
           col.collect(doc_id, final_score);
@@ -2258,7 +2264,7 @@ impl IndexReader {
           search_stats.candidates_examined += 1;
           search_stats.scored_docs += 1;
         }
-        if let Some(heap_ref) = heap.as_mut() {
+        if let (Some(heap_ref), Some(key)) = (heap.as_mut(), key) {
           let hit = RankedHit {
             key,
             score: final_score,
@@ -2282,22 +2288,24 @@ impl IndexReader {
     let mut hits: Vec<RankedHit> = heap
       .map(|h| h.into_iter().collect())
       .unwrap_or_else(Vec::new);
-    if req.limit == 0 {
-      hits.clear();
-    } else {
+    if req.return_hits {
       hits.sort_by(|a, b| a.key.cmp(&b.key));
+    } else {
+      hits.clear();
     }
     let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
-    if let Some(collapse) = req.collapse.as_ref() {
-      let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
-      total_groups = Some(groups.len() as u64);
-      group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
-      hits = groups.into_iter().map(|(top, _)| top).collect();
+    if req.return_hits {
+      if let Some(collapse) = req.collapse.as_ref() {
+        let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
+        total_groups = Some(groups.len() as u64);
+        group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
+        hits = groups.into_iter().map(|(top, _)| top).collect();
+      }
     }
     let mut next_cursor = None;
-    if req.limit > 0 && hits.len() > req.limit {
+    if req.return_hits && req.limit > 0 && hits.len() > req.limit {
       let key = hits[req.limit - 1].key.clone();
       next_cursor = Some(encode_cursor(
         manifest_generation,
@@ -2309,23 +2317,27 @@ impl IndexReader {
       hits.truncate(req.limit);
     }
     let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
-    let hits: Vec<Hit> = hits
-      .into_iter()
-      .enumerate()
-      .filter_map(|(idx, h)| {
-        let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
-        if let Some(inner) = group_inner_hits.get(idx) {
-          let inner_hits: Vec<Hit> = inner
-            .iter()
-            .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
-            .collect();
-          if !inner_hits.is_empty() {
-            hit.inner_hits = Some(inner_hits);
+    let hits: Vec<Hit> = if req.return_hits {
+      hits
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, h)| {
+          let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
+          if let Some(inner) = group_inner_hits.get(idx) {
+            let inner_hits: Vec<Hit> = inner
+              .iter()
+              .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
+              .collect();
+            if !inner_hits.is_empty() {
+              hit.inner_hits = Some(inner_hits);
+            }
           }
-        }
-        Some(hit)
-      })
-      .collect();
+          Some(hit)
+        })
+        .collect()
+    } else {
+      Vec::new()
+    };
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
     } else {
@@ -2518,8 +2530,11 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
-    if req.limit == 0 && req.cursor.is_some() {
-      bail!("cursor is not supported when limit is 0; set a positive limit to page results");
+    if req.limit == 0 {
+      bail!("search request must set limit > 0");
+    }
+    if !req.return_hits && req.cursor.is_some() {
+      bail!("cursor is not supported when return_hits is false");
     }
     if req.filter.is_some() && !req.filters.is_empty() {
       bail!("search request cannot set both `filter` and `filters`");
@@ -2593,7 +2608,7 @@ impl IndexReader {
     };
     #[cfg(not(feature = "vectors"))]
     let effective_limit = base_candidate;
-    let top_k = if effective_limit == 0 {
+    let top_k = if !req.return_hits || effective_limit == 0 {
       0
     } else {
       effective_limit.saturating_add(1)
@@ -2643,7 +2658,7 @@ impl IndexReader {
     let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
-    let mut saw_cursor = cursor_state.is_none() || req.limit == 0;
+    let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let search_start = Instant::now();
     let mut timings: BTreeMap<String, f64> = BTreeMap::new();
     let mut search_stats = QueryStats::default();
@@ -2657,7 +2672,7 @@ impl IndexReader {
         .transpose()?;
       let mut noop_collector = NoopCollector;
       let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
-      if !score_fast_path && req.limit > 0 && !req.explain {
+      if req.return_hits && !score_fast_path && req.limit > 0 && !req.explain {
         let heap_limit = top_k;
         let heap_ref = &mut heap;
         collect_hits = Some(Box::new(move |key: SortKey, score: f32| {
@@ -2677,10 +2692,12 @@ impl IndexReader {
         let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
-        if !score_fast_path && agg_ref.is_none() && req.limit > 0 {
+        if agg_ref.is_none() && (!req.return_hits || (!score_fast_path && req.limit > 0)) {
           agg_ref = Some(&mut noop_collector);
         }
-        let segment_rank_limit = if score_fast_path {
+        let segment_rank_limit = if !req.return_hits {
+          0
+        } else if score_fast_path {
           top_k
         } else if req.explain {
           seg.live_docs() as usize
@@ -2720,14 +2737,16 @@ impl IndexReader {
       if let Some(collector) = agg_collector {
         agg_results.push(collector.finish());
       }
-      hits.append(&mut seg_hits);
+      if req.return_hits {
+        hits.append(&mut seg_hits);
+      }
     }
 
     if !saw_cursor {
       bail!("stale or invalid cursor for this result set");
     }
 
-    if !score_fast_path {
+    if req.return_hits && !score_fast_path {
       hits.extend(heap);
     }
     #[cfg(feature = "vectors")]
@@ -2752,41 +2771,45 @@ impl IndexReader {
         top_k,
       )?;
     }
-    hits.sort_by(|a, b| a.key.cmp(&b.key));
+    if req.return_hits {
+      hits.sort_by(|a, b| a.key.cmp(&b.key));
+    }
     let search_phase_end = if req.profile {
       Some(Instant::now())
     } else {
       None
     };
     let mut rescore_stats = QueryStats::default();
-    if let Some(rescore_req) = req.rescore.as_ref() {
-      let rescore_start = Instant::now();
-      self.rescore_hits(
-        &mut hits,
-        rescore_req,
-        &default_fields,
-        &sort_plan,
-        req,
-        &mut rescore_stats,
-      )?;
-      if req.profile {
-        timings.insert(
-          "rescore_ms".to_string(),
-          rescore_start.elapsed().as_secs_f64() * 1000.0,
-        );
+    if req.return_hits {
+      if let Some(rescore_req) = req.rescore.as_ref() {
+        let rescore_start = Instant::now();
+        self.rescore_hits(
+          &mut hits,
+          rescore_req,
+          &default_fields,
+          &sort_plan,
+          req,
+          &mut rescore_stats,
+        )?;
+        if req.profile {
+          timings.insert(
+            "rescore_ms".to_string(),
+            rescore_start.elapsed().as_secs_f64() * 1000.0,
+          );
+        }
       }
-    }
-    if req.explain {
-      for hit in hits.iter_mut() {
-        if let Some(expl) = hit.explanation.as_mut() {
-          expl.final_score = hit.score;
-        } else {
-          hit.explanation = Some(HitExplanation {
-            base_score: hit.score,
-            functions: Vec::new(),
-            rescore: None,
-            final_score: hit.score,
-          });
+      if req.explain {
+        for hit in hits.iter_mut() {
+          if let Some(expl) = hit.explanation.as_mut() {
+            expl.final_score = hit.score;
+          } else {
+            hit.explanation = Some(HitExplanation {
+              base_score: hit.score,
+              functions: Vec::new(),
+              rescore: None,
+              final_score: hit.score,
+            });
+          }
         }
       }
     }
@@ -2800,47 +2823,53 @@ impl IndexReader {
     let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
-    if let Some(collapse) = req.collapse.as_ref() {
-      let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
-      total_groups = Some(groups.len() as u64);
-      group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
-      hits = groups.into_iter().map(|(top, _)| top).collect();
+    if req.return_hits {
+      if let Some(collapse) = req.collapse.as_ref() {
+        let groups = self.collapse_hits(hits, collapse, &sort_plan)?;
+        total_groups = Some(groups.len() as u64);
+        group_inner_hits = groups.iter().map(|(_, inner)| inner.clone()).collect();
+        hits = groups.into_iter().map(|(top, _)| top).collect();
+      }
     }
     let mut next_cursor = None;
-    if req.limit > 0 && hits.len() > req.limit {
-      let last = &hits[req.limit - 1];
-      let returned = cursor_returned
-        .saturating_add(req.limit)
-        .try_into()
-        .unwrap_or(u32::MAX);
-      next_cursor = Some(encode_cursor(
-        manifest_generation,
-        returned,
-        &last.key,
-        &sort_plan,
-        score_fast_path,
-      )?);
-      hits.truncate(req.limit);
-    }
-    let hits: Vec<Hit> = hits
-      .into_iter()
-      .enumerate()
-      .filter_map(|(idx, h)| {
-        let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
-        if let Some(inner) = group_inner_hits.get(idx) {
-          let inner_hits: Vec<Hit> = inner
-            .iter()
-            .filter_map(|ih| {
-              self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
-            })
-            .collect();
-          if !inner_hits.is_empty() {
-            hit.inner_hits = Some(inner_hits);
+    let hits: Vec<Hit> = if req.return_hits {
+      if req.limit > 0 && hits.len() > req.limit {
+        let last = &hits[req.limit - 1];
+        let returned = cursor_returned
+          .saturating_add(req.limit)
+          .try_into()
+          .unwrap_or(u32::MAX);
+        next_cursor = Some(encode_cursor(
+          manifest_generation,
+          returned,
+          &last.key,
+          &sort_plan,
+          score_fast_path,
+        )?);
+        hits.truncate(req.limit);
+      }
+      hits
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, h)| {
+          let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
+          if let Some(inner) = group_inner_hits.get(idx) {
+            let inner_hits: Vec<Hit> = inner
+              .iter()
+              .filter_map(|ih| {
+                self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
+              })
+              .collect();
+            if !inner_hits.is_empty() {
+              hit.inner_hits = Some(inner_hits);
+            }
           }
-        }
-        Some(hit)
-      })
-      .collect();
+          Some(hit)
+        })
+        .collect()
+    } else {
+      Vec::new()
+    };
     let aggregations = if let Some(pipeline) = agg_pipeline {
       pipeline.merge(agg_results)?
     } else {
@@ -2952,9 +2981,11 @@ impl IndexReader {
     }
 
     let docs = seg.live_docs() as f32;
+    let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf)) in term_weights.into_iter() {
       if let Some(postings) = seg.postings(&key) {
+        let doc_lengths = field_lengths_for(&mut field_lengths_cache, &field, seg);
         terms.push(ScoredTerm {
           postings,
           weight,
@@ -2963,6 +2994,7 @@ impl IndexReader {
           k1: self.options.bm25_k1,
           b: self.options.bm25_b,
           leaf,
+          doc_lengths,
         });
       }
     }
@@ -3252,6 +3284,7 @@ impl IndexReader {
         phrase_postings: &phrase_postings,
         fast_fields: seg.fast_fields(),
       };
+      let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
       let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
       for term in qualified_terms.iter() {
         let entry =
@@ -3264,6 +3297,7 @@ impl IndexReader {
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
         if let Some(postings) = seg.postings(&key) {
+          let doc_lengths = field_lengths_for(&mut field_lengths_cache, &field, seg);
           terms.push(ScoredTerm {
             postings,
             weight,
@@ -3272,6 +3306,7 @@ impl IndexReader {
             k1: self.options.bm25_k1,
             b: self.options.bm25_b,
             leaf,
+            doc_lengths,
           });
         }
       }
@@ -3291,8 +3326,16 @@ impl IndexReader {
         for term in terms.iter() {
           if let Some(tf) = term_freq_for_doc(&term.postings, doc_id) {
             let df = term.postings.len() as f32;
-            let contribution =
-              score_tf(tf, df, term.avgdl, term.docs, term.k1, term.b, term.weight);
+            let contribution = score_tf(
+              tf,
+              df,
+              term.doc_len(doc_id),
+              term.avgdl,
+              term.docs,
+              term.k1,
+              term.b,
+              term.weight,
+            );
             if let Some(buf) = leaf_scores.get_mut(term.leaf) {
               *buf += contribution;
             }
@@ -3541,6 +3584,25 @@ fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
   let entries = postings.entries();
   let idx = entries.binary_search_by_key(&doc_id, |e| e.doc_id).ok()?;
   Some(entries.get(idx)?.term_freq as f32)
+}
+
+fn field_lengths_for(
+  cache: &mut HashMap<String, Arc<Vec<f32>>>,
+  field: &str,
+  seg: &SegmentReader,
+) -> Option<Arc<Vec<f32>>> {
+  if let Some(existing) = cache.get(field) {
+    return Some(existing.clone());
+  }
+  let key = doc_length_key(field);
+  let mut lengths = Vec::with_capacity(seg.meta.doc_count as usize);
+  for doc_id in 0..seg.meta.doc_count {
+    let len = seg.fast_fields().i64_value(&key, doc_id).unwrap_or(0) as f32;
+    lengths.push(len);
+  }
+  let arc = Arc::new(lengths);
+  cache.insert(field.to_string(), arc.clone());
+  Some(arc)
 }
 
 fn combine_rescore_scores(mode: RescoreMode, original: f32, rescore: f32) -> f32 {
@@ -4111,6 +4173,7 @@ mod tests {
           k1: reader.options.bm25_k1,
           b: reader.options.bm25_b,
           leaf,
+          doc_lengths: None,
         });
       }
     }
@@ -4175,6 +4238,7 @@ mod tests {
         filter: None,
         filters: vec![],
         limit: 5,
+        return_hits: true,
         candidate_size: None,
         sort: Vec::new(),
         cursor: None,

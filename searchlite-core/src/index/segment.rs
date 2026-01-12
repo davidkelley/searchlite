@@ -20,7 +20,8 @@ use crate::api::types::VectorMetric as ApiVectorMetric;
 use crate::index::directory;
 use crate::index::docstore::{DocStoreReader, DocStoreWriter};
 use crate::index::fastfields::{
-  nested_count_key, nested_parent_key, FastFieldsReader, FastFieldsWriter, FastValue,
+  doc_length_key, nested_count_key, nested_parent_key, FastFieldsReader, FastFieldsWriter,
+  FastValue,
 };
 use crate::index::manifest::{
   FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
@@ -599,7 +600,7 @@ impl<'a> SegmentWriter<'a> {
     let analyzers = self.schema.build_analyzers()?;
 
     let mut postings_builder = InvertedIndexBuilder::new();
-    let mut doc_lengths: HashMap<String, u64> = HashMap::new();
+    let mut total_doc_lengths: HashMap<String, u64> = HashMap::new();
     let mut fast_writer = FastFieldsWriter::new();
     let resolved: FastHashMap<String, ResolvedField> = self
       .schema
@@ -652,13 +653,15 @@ impl<'a> SegmentWriter<'a> {
           bail!("no analyzer configured for field `{field}`");
         };
         let mut position_offset: u32 = 0;
+        let mut doc_len: u32 = 0;
         for text in values.iter() {
           let tokens = analyzer.analyze(text);
-          let token_count = tokens.len() as u64;
-          doc_lengths
+          let token_count = tokens.len() as u32;
+          doc_len = doc_len.saturating_add(token_count);
+          total_doc_lengths
             .entry(field.clone())
-            .and_modify(|v| *v += token_count)
-            .or_insert(token_count);
+            .and_modify(|v| *v += token_count as u64)
+            .or_insert(token_count as u64);
           for tok in tokens.iter() {
             let mut term_key = String::with_capacity(field.len() + tok.text.len() + 1);
             term_key.push_str(field);
@@ -678,6 +681,11 @@ impl<'a> SegmentWriter<'a> {
             position_offset += 1;
           }
         }
+        fast_writer.set(
+          &doc_length_key(field),
+          doc_ord,
+          FastValue::I64(doc_len as i64),
+        );
       }
 
       for (field, values) in collected.keywords.iter() {
@@ -827,7 +835,7 @@ impl<'a> SegmentWriter<'a> {
     )?;
 
     let total_docs = doc_ids.len();
-    let avg_field_lengths = compute_avg_lengths(&doc_lengths, total_docs as u64);
+    let avg_field_lengths = compute_avg_lengths(&total_doc_lengths, total_docs as u64);
 
     fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
 
@@ -1117,6 +1125,87 @@ fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<Hash
   Ok(map)
 }
 
+fn verify_checksums(
+  storage: &dyn Storage,
+  meta: &SegmentMeta,
+  _seg_meta: &SegmentFileMeta,
+  seg_meta_bytes: &[u8],
+) -> Result<()> {
+  let verify = |label: &str, path: &Path, expected: Option<&u32>, data: Option<&[u8]>| {
+    if let Some(expected) = expected {
+      let actual = if let Some(bytes) = data {
+        checksum(bytes)
+      } else {
+        checksum(&storage.read_to_end(path)?)
+      };
+      if actual != *expected {
+        bail!(
+          "segment {} failed checksum for {} (expected {}, found {})",
+          meta.id,
+          label,
+          expected,
+          actual
+        );
+      }
+    }
+    Ok(())
+  };
+  verify(
+    "meta",
+    Path::new(&meta.paths.meta),
+    meta.checksums.get("meta"),
+    Some(seg_meta_bytes),
+  )?;
+  verify(
+    "terms",
+    Path::new(&meta.paths.terms),
+    meta.checksums.get("terms"),
+    None,
+  )?;
+  verify(
+    "postings",
+    Path::new(&meta.paths.postings),
+    meta.checksums.get("postings"),
+    None,
+  )?;
+  verify(
+    "docstore",
+    Path::new(&meta.paths.docstore),
+    meta.checksums.get("docstore"),
+    None,
+  )?;
+  verify(
+    "fast fields",
+    Path::new(&meta.paths.fast),
+    meta.checksums.get("fast"),
+    None,
+  )?;
+  #[cfg(feature = "vectors")]
+  {
+    let seg_meta = _seg_meta;
+    if let Some(dir) = meta.paths.vector_dir.as_deref() {
+      if !dir.is_empty() {
+        for field in seg_meta.vector_fields.keys() {
+          let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
+          verify(
+            &format!("vector {} bin", field),
+            &vec_path,
+            meta.checksums.get(&format!("vector_{}_bin", field)),
+            None,
+          )?;
+          verify(
+            &format!("vector {} hnsw", field),
+            &hnsw_path,
+            meta.checksums.get(&format!("vector_{}_hnsw", field)),
+            None,
+          )?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
 #[cfg(feature = "vectors")]
 struct VectorFieldReader {
   store: Arc<VectorStore>,
@@ -1139,11 +1228,12 @@ pub struct SegmentReader {
 
 impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
+    let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
+    let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes)?;
     let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
     let postings = storage.open_read(Path::new(&meta.paths.postings))?;
     let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
-    let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
-    let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
       bail!(
         "segment {} is missing document ids; reindex or re-commit documents with doc_id support",

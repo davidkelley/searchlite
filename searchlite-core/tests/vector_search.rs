@@ -75,6 +75,7 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     filter: None,
     filters: Vec::new(),
     limit,
+    return_hits: true,
     candidate_size: None,
     sort: Vec::<SortSpec>::new(),
     cursor: None,
@@ -159,7 +160,7 @@ fn vector_only_search_skips_missing_vectors() {
 }
 
 #[test]
-fn vector_query_with_limit_zero_returns_no_hits() {
+fn vector_query_with_limit_zero_errors() {
   let dir = tempdir().unwrap();
   let schema = schema();
   IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
@@ -193,8 +194,8 @@ fn vector_query_with_limit_zero_returns_no_hits() {
     vector_filter: None,
     ..base_request(Query::String("".into()), 0)
   };
-  let res = reader.search(&req).unwrap();
-  assert_eq!(res.hits.len(), 0);
+  let err = reader.search(&req).unwrap_err();
+  assert!(err.to_string().to_lowercase().contains("limit"));
 }
 
 #[test]
@@ -579,6 +580,7 @@ fn multiple_vector_clauses_merge_candidates() {
   let req = SearchRequest {
     query: Query::Node(query),
     limit: 3,
+    return_hits: true,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]
