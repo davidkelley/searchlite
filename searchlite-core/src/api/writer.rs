@@ -30,6 +30,7 @@ pub struct IndexWriter {
   pending_ops: Vec<PendingOp>,
   schema: Schema,
   live_docs: HashMap<String, DocAddress>,
+  live_generation: u32,
 }
 
 impl IndexWriter {
@@ -41,6 +42,12 @@ impl IndexWriter {
     let wal = inner.wal()?;
     let manifest = inner.manifest.read().clone();
     let schema = manifest.schema.clone();
+    let live_generation = manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
     let mut pending_ops = Vec::new();
     for entry in pending_entries {
@@ -60,6 +67,7 @@ impl IndexWriter {
       pending_ops,
       schema,
       live_docs,
+      live_generation,
     })
   }
 
@@ -104,7 +112,17 @@ impl IndexWriter {
     self.wal.sync()?;
     let manifest_snapshot = inner.manifest.read().clone();
     self.schema = manifest_snapshot.schema.clone();
-    let mut live_docs = load_live_docs(inner.as_ref(), &manifest_snapshot)?;
+    let manifest_generation = manifest_snapshot
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
+    let mut live_docs = if manifest_generation == self.live_generation {
+      self.live_docs.clone()
+    } else {
+      load_live_docs(inner.as_ref(), &manifest_snapshot)?
+    };
     let mut pending_new: BTreeMap<String, Document> = BTreeMap::new();
     let mut tombstones: HashMap<String, Vec<DocId>> = HashMap::new();
     for op in self.pending_ops.iter() {
@@ -167,17 +185,35 @@ impl IndexWriter {
         );
       }
     }
+    let new_generation = new_manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
     new_manifest.committed_at = Utc::now().to_rfc3339();
-    new_manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
+    let manifest_path = self.inner.manifest_path();
+    new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
+    let wal_len = self.wal.len()?;
+    if let Err(e) = (|| -> Result<()> {
+      self.wal.append_commit()?;
+      self.wal.sync()?;
+      Ok(())
+    })() {
+      // Roll back manifest to the previous snapshot and restore WAL to its
+      // pre-commit length so pending ops can be retried safely.
+      let _ = self.wal.truncate_to(wal_len);
+      let _ = manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path);
+      return Err(e);
+    }
     {
       let mut manifest_guard = self.inner.manifest.write();
       *manifest_guard = new_manifest;
     }
-    self.wal.append_commit()?;
-    self.wal.sync()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
     self.live_docs = live_docs;
+    self.live_generation = new_generation;
     Ok(())
   }
 

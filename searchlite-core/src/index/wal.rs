@@ -61,6 +61,16 @@ impl Wal {
     Ok(())
   }
 
+  pub fn len(&mut self) -> Result<u64> {
+    Ok(self.file.seek(SeekFrom::End(0))?)
+  }
+
+  pub fn truncate_to(&mut self, len: u64) -> Result<()> {
+    self.file.set_len(len)?;
+    self.file.seek(SeekFrom::Start(len))?;
+    self.file.sync_all()
+  }
+
   pub fn sync(&mut self) -> Result<()> {
     self.file.flush()?;
     self.file.sync_all()

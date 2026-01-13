@@ -1,8 +1,11 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::DocId;
+
+/// Hard cap on stored document payload size to avoid OOM or corrupt reads.
+pub const MAX_DOCSTORE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 pub struct DocStoreWriter<'a, W: Write + Seek + ?Sized> {
   file: &'a mut W,
@@ -28,6 +31,13 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
     #[cfg(feature = "zstd")]
     if self.use_zstd {
       data = zstd::stream::encode_all(&data[..], 0)?;
+    }
+    if data.len() > MAX_DOCSTORE_BYTES {
+      bail!(
+        "stored document too large ({} bytes, max {})",
+        data.len(),
+        MAX_DOCSTORE_BYTES
+      );
     }
     let len = data.len() as u32;
     self.file.write_all(&len.to_le_bytes())?;
@@ -65,6 +75,13 @@ impl<R: Read + Seek> DocStoreReader<R> {
     let mut len_bytes = [0u8; 4];
     self.file.read_exact(&mut len_bytes)?;
     let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_DOCSTORE_BYTES {
+      bail!(
+        "stored document length {} exceeds maximum {}",
+        len,
+        MAX_DOCSTORE_BYTES
+      );
+    }
     let mut buf = vec![0u8; len];
     self.file.read_exact(&mut buf)?;
     #[cfg(feature = "zstd")]
@@ -106,5 +123,35 @@ mod tests {
     let first = reader.get(0).unwrap();
     assert_eq!(first["title"], "Rust");
     assert!(reader.get(2).is_err());
+  }
+
+  #[test]
+  fn rejects_oversized_documents() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut file = tmp.reopen().unwrap();
+    let mut writer = DocStoreWriter::new(&mut file, false);
+    let huge = serde_json::json!(String::from_utf8(vec![b'a'; MAX_DOCSTORE_BYTES + 1]).unwrap());
+    let err = writer.add_document(&huge).unwrap_err();
+    assert!(err.to_string().contains("too large"));
+  }
+
+  #[test]
+  fn rejects_corrupt_length_header() {
+    use std::io::Write;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    // Write a bogus length header that exceeds the limit; no body is needed because
+    // the reader should fail before attempting to read the payload.
+    {
+      let mut file = std::fs::File::create(&path).unwrap();
+      let len = (MAX_DOCSTORE_BYTES as u32).saturating_add(1);
+      file.write_all(&len.to_le_bytes()).unwrap();
+    }
+    let mut reader = DocStoreReader::new(std::fs::File::open(&path).unwrap(), vec![0], false);
+    let err = reader.get(0).unwrap_err();
+    assert!(
+      err.to_string().contains("stored document length") && err.to_string().contains("exceeds")
+    );
   }
 }
