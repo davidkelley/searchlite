@@ -62,7 +62,7 @@ impl Wal {
   }
 
   pub fn len(&mut self) -> Result<u64> {
-    let current = self.file.seek(SeekFrom::Current(0))?;
+    let current = self.file.stream_position()?;
     let end = self.file.seek(SeekFrom::End(0))?;
     self.file.seek(SeekFrom::Start(current))?;
     Ok(end)
