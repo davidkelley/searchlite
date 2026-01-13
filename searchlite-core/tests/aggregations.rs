@@ -153,6 +153,110 @@ fn terms_and_stats_aggregations() {
 }
 
 #[test]
+fn significant_terms_respects_deletions() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
+  {
+    let mut writer = idx.writer().expect("writer");
+    writer
+      .add_document(&doc(
+        "1",
+        vec![("body", json!("keep me")), ("tag", json!("foo"))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "2",
+        vec![("body", json!("delete me")), ("tag", json!("foo"))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  {
+    let mut writer = idx.writer().expect("writer");
+    writer.delete_document("2").unwrap();
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "sig".to_string(),
+    Aggregation::SignificantTerms(Box::new(SignificantTermsAggregation {
+      field: "tag".into(),
+      size: Some(5),
+      min_doc_count: None,
+      background_filter: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = reader
+    .search(&SearchRequest {
+      query: "keep".into(),
+      fields: None,
+      filter: None,
+      filters: vec![],
+      limit: 5,
+      return_hits: true,
+      candidate_size: None,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+
+  let sig = resp.aggregations.get("sig").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::SignificantTerms { buckets, .. } = sig {
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].key, json!("foo"));
+    assert_eq!(
+      buckets[0].doc_count, 1,
+      "deleted docs must not contribute to significant_terms doc counts"
+    );
+  } else {
+    panic!("expected significant_terms response");
+  }
+}
+
+#[test]
 fn aggregation_requires_fast_field() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();

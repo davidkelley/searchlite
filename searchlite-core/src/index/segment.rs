@@ -26,7 +26,7 @@ use crate::index::fastfields::{
 use crate::index::manifest::{
   FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
 };
-use crate::index::postings::{InvertedIndexBuilder, PostingsReader, PostingsWriter};
+use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
 use crate::storage::{Storage, StorageFile};
 use crate::util::checksum::checksum;
@@ -1230,6 +1230,13 @@ impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
     let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    #[cfg(not(feature = "zstd"))]
+    if seg_meta.use_zstd {
+      bail!(
+        "segment {} uses zstd-compressed docstore, but this build was compiled without the `zstd` feature; rebuild with `--features zstd` or reindex without compression",
+        meta.id
+      );
+    }
     verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes)?;
     let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
     let postings = storage.open_read(Path::new(&meta.paths.postings))?;
@@ -1313,6 +1320,12 @@ impl SegmentReader {
     let offset = self.terms.0.get(term)?;
     let mut file = self.postings.borrow_mut();
     PostingsReader::read_at(&mut *file, offset, self.keep_positions).ok()
+  }
+
+  pub fn doc_freq(&self, term: &str) -> Option<u32> {
+    let offset = self.terms.0.get(term)?;
+    let mut file = self.postings.borrow_mut();
+    read_doc_freq(&mut *file, offset).ok()
   }
 
   pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> + 'a {
@@ -1497,5 +1510,40 @@ mod tests {
     let avg = compute_avg_lengths(&lengths, 2);
     assert_eq!(avg.get("body"), Some(&2.0));
     assert_eq!(avg.get("title"), Some(&0.0));
+  }
+
+  #[cfg(not(feature = "zstd"))]
+  #[test]
+  fn opening_zstd_segment_without_feature_errors() {
+    let dir = tempdir().unwrap();
+    let paths = directory::segment_paths(dir.path(), "zstd");
+    let seg_file_meta = SegmentFileMeta {
+      doc_offsets: Vec::new(),
+      doc_ids: Vec::new(),
+      avg_field_lengths: HashMap::new(),
+      use_zstd: true,
+      #[cfg(feature = "vectors")]
+      vector_fields: HashMap::new(),
+    };
+    std::fs::write(&paths.meta, serde_json::to_vec(&seg_file_meta).unwrap()).unwrap();
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let meta = crate::index::manifest::SegmentMeta {
+      id: "zstd".into(),
+      generation: 1,
+      paths,
+      doc_count: 0,
+      max_doc_id: 0,
+      blockmax: true,
+      deleted_docs: Vec::new(),
+      avg_field_lengths: HashMap::new(),
+      checksums: HashMap::new(),
+    };
+    let err = SegmentReader::open(storage, meta, true);
+    assert!(err.is_err(), "expected zstd error for missing feature");
+    let err = err.err().unwrap();
+    assert!(
+      err.to_string().contains("zstd"),
+      "expected a clear zstd feature error, got {err}"
+    );
   }
 }

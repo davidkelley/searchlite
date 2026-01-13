@@ -107,14 +107,28 @@ impl Wal {
       }
       let entry_type = data[cursor];
       cursor += 1;
-      let payload_end = cursor.saturating_add(len as usize);
-      if payload_end + 4 > data.len() {
+      let len_usize = if let Ok(v) = usize::try_from(len) {
+        v
+      } else {
+        break;
+      };
+      let payload_end = if let Some(end) = cursor.checked_add(len_usize) {
+        end
+      } else {
+        break;
+      };
+      let checksum_end = if let Some(end) = payload_end.checked_add(4) {
+        end
+      } else {
+        break;
+      };
+      if checksum_end > data.len() {
         break;
       }
       let payload = &data[cursor..payload_end];
       cursor = payload_end;
-      let checksum_bytes = &data[cursor..cursor + 4];
-      cursor += 4;
+      let checksum_bytes = &data[cursor..checksum_end];
+      cursor = checksum_end;
       let mut hasher = Hasher::new();
       hasher.update(&[entry_type]);
       hasher.update(payload);
@@ -187,6 +201,19 @@ mod tests {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     std::fs::write(&path, vec![1u8, 2, 3, 4]).unwrap();
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let entries = Wal::replay(&storage, &path).unwrap();
+    assert!(entries.is_empty());
+  }
+
+  #[test]
+  fn handles_truncated_large_length_without_panic() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let mut buf = Vec::new();
+    // Write an entry length that cannot fit in usize and provide no payload.
+    crate::util::varint::write_u64(u64::MAX, &mut buf);
+    std::fs::write(&path, buf).unwrap();
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let entries = Wal::replay(&storage, &path).unwrap();
     assert!(entries.is_empty());
