@@ -1538,7 +1538,9 @@ mod tests {
       avg_field_lengths: HashMap::new(),
       checksums: HashMap::new(),
     };
-    let err = SegmentReader::open(storage, meta, true).unwrap_err();
+    let err = SegmentReader::open(storage, meta, true);
+    assert!(err.is_err(), "expected zstd error for missing feature");
+    let err = err.err().unwrap();
     assert!(
       err.to_string().contains("zstd"),
       "expected a clear zstd feature error, got {err}"
