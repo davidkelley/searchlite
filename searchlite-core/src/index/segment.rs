@@ -1040,8 +1040,7 @@ fn write_vector_file(storage: &dyn Storage, path: &Path, store: &VectorStore) ->
   for v in values.iter() {
     buf.write_f32::<LittleEndian>(*v)?;
   }
-  storage.write_all(path, &buf)?;
-  Ok(())
+  storage.write_all(path, &buf)
 }
 
 #[cfg(feature = "vectors")]

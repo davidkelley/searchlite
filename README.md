@@ -17,6 +17,12 @@ Embedded, SQLite-flavored search engine with a single on-disk index and an ergon
 - Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
 - Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
 
+**Durability**
+
+- Segment files, docstores, manifests, and vector indexes are fsync’d on write; the WAL is truncated only after those files are flushed and the manifest is synced.
+- Crash window: if the process dies after the manifest is persisted but before the WAL is truncated, WAL replay will reapply the last batch, creating an extra generation for the same docs (no data loss; compaction cleans it up).
+- Manifest writes use atomic rename plus directory fsync; in-memory storage skips fsync as it is meant for ephemeral use.
+
 ## Install the CLI
 
 Prebuilt binaries are published on every GitHub release:

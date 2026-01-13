@@ -94,7 +94,10 @@ impl Storage for FsStorage {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
-    fs::write(path, data)?;
+    let mut file = File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    sync_dir(path)?;
     Ok(())
   }
 
@@ -103,8 +106,13 @@ impl Storage for FsStorage {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
-    fs::write(&tmp, data)?;
+    {
+      let mut file = File::create(&tmp)?;
+      file.write_all(data)?;
+      file.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    sync_dir(path)?;
     Ok(())
   }
 
@@ -128,6 +136,14 @@ impl Storage for FsStorage {
     }
     Ok(())
   }
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+  if let Some(parent) = path.parent() {
+    let dir = File::open(parent)?;
+    dir.sync_all()?;
+  }
+  Ok(())
 }
 
 pub struct InMemoryStorage {
