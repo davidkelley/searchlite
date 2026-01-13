@@ -177,7 +177,7 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
   }
 }
 
-fn cleanup_segments(
+pub(crate) fn cleanup_segments(
   storage: &dyn Storage,
   segments: &[crate::index::manifest::SegmentMeta],
 ) -> Result<()> {

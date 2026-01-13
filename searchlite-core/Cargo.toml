@@ -35,6 +35,7 @@ unicode-segmentation = { workspace = true }
 rust-stemmers = { workspace = true }
 regex = { workspace = true }
 tdigest = { workspace = true }
+log = { workspace = true }
 
 zstd = { version = "0.13.1", optional = true }
 

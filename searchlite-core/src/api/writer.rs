@@ -30,6 +30,7 @@ pub struct IndexWriter {
   pending_ops: Vec<PendingOp>,
   schema: Schema,
   live_docs: HashMap<String, DocAddress>,
+  live_generation: u32,
 }
 
 impl IndexWriter {
@@ -41,6 +42,12 @@ impl IndexWriter {
     let wal = inner.wal()?;
     let manifest = inner.manifest.read().clone();
     let schema = manifest.schema.clone();
+    let live_generation = manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
     let mut pending_ops = Vec::new();
     for entry in pending_entries {
@@ -60,6 +67,7 @@ impl IndexWriter {
       pending_ops,
       schema,
       live_docs,
+      live_generation,
     })
   }
 
@@ -104,7 +112,17 @@ impl IndexWriter {
     self.wal.sync()?;
     let manifest_snapshot = inner.manifest.read().clone();
     self.schema = manifest_snapshot.schema.clone();
-    let mut live_docs = load_live_docs(inner.as_ref(), &manifest_snapshot)?;
+    let manifest_generation = manifest_snapshot
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
+    let mut live_docs = if manifest_generation == self.live_generation {
+      self.live_docs.clone()
+    } else {
+      load_live_docs(inner.as_ref(), &manifest_snapshot)?
+    };
     let mut pending_new: BTreeMap<String, Document> = BTreeMap::new();
     let mut tombstones: HashMap<String, Vec<DocId>> = HashMap::new();
     for op in self.pending_ops.iter() {
@@ -139,6 +157,7 @@ impl IndexWriter {
         seg.deleted_docs = merged;
       }
     }
+    let mut new_segments: Vec<crate::index::manifest::SegmentMeta> = Vec::new();
     if !pending_new.is_empty() {
       let generation = new_manifest
         .segments
@@ -156,6 +175,8 @@ impl IndexWriter {
       );
       let docs: Vec<Document> = pending_new.values().cloned().collect();
       let segment = writer.write_segment(&docs, generation)?;
+      // Keep track of newly written segments so they can be cleaned up on rollback.
+      new_segments.push(segment.clone());
       new_manifest.segments.push(segment.clone());
       for (offset, doc_id) in pending_new.keys().enumerate() {
         live_docs.insert(
@@ -167,17 +188,53 @@ impl IndexWriter {
         );
       }
     }
+    let new_generation = new_manifest
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0);
     new_manifest.committed_at = Utc::now().to_rfc3339();
-    new_manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
+    let manifest_path = self.inner.manifest_path();
+    let wal_len = self.wal.len()?;
+    if let Err(e) = (|| -> Result<()> {
+      new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
+      self.wal.append_commit()?;
+      self.wal.sync()?;
+      Ok(())
+    })() {
+      // Roll back manifest to the previous snapshot and restore WAL to its
+      // pre-commit length so pending ops can be retried safely.
+      if let Err(truncate_err) = self.wal.truncate_to(wal_len) {
+        log::error!(
+          "WAL rollback failed while handling commit error: \
+           unable to truncate WAL back to length {}: {}",
+          wal_len,
+          truncate_err
+        );
+      }
+      if let Err(manifest_err) =
+        manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path)
+      {
+        log::error!(
+          "Manifest rollback failed while handling commit error: {}. \
+           The on-disk manifest and WAL may be inconsistent.",
+          manifest_err
+        );
+      }
+      if !new_segments.is_empty() {
+        let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
+      }
+      return Err(e);
+    }
     {
       let mut manifest_guard = self.inner.manifest.write();
       *manifest_guard = new_manifest;
     }
-    self.wal.append_commit()?;
-    self.wal.sync()?;
     self.wal.truncate()?;
     self.pending_ops.clear();
     self.live_docs = live_docs;
+    self.live_generation = new_generation;
     Ok(())
   }
 

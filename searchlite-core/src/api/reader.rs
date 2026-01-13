@@ -1795,14 +1795,14 @@ fn collect_completion_candidates(
   let max_candidates = size
     .saturating_mul(5)
     .clamp(DEFAULT_SUGGEST_SCAN, MAX_SUGGEST_CANDIDATES);
+  let mut expanded_total: usize = 0;
   match fuzzy {
     None => {
       let prefix_key = build_term_key(field, term);
       let field_prefix_len = field.len() + 1;
       for seg in segments.iter() {
-        let mut expanded = 0usize;
         for key in seg.terms_with_prefix(&prefix_key) {
-          if expanded >= max_candidates {
+          if expanded_total >= max_candidates {
             break;
           }
           if key.len() <= field_prefix_len {
@@ -1816,7 +1816,13 @@ fn collect_completion_candidates(
           let entry = out.entry(term_text).or_default();
           entry.doc_freq = entry.doc_freq.saturating_add(df);
           entry.score += df as f32;
-          expanded += 1;
+          expanded_total += 1;
+          if expanded_total >= max_candidates {
+            break;
+          }
+        }
+        if expanded_total >= max_candidates {
+          break;
         }
       }
     }
@@ -1833,12 +1839,11 @@ fn collect_completion_candidates(
       let prefix = char_prefix(term, prefix_len);
       let prefix_key = build_term_key(field, prefix);
       let field_prefix_len = field.len() + 1;
-      let mut per_segment_cap = fuzzy.max_expansions.min(MAX_SUGGEST_CANDIDATES);
-      per_segment_cap = per_segment_cap.max(size);
+      let mut global_cap = fuzzy.max_expansions.min(MAX_SUGGEST_CANDIDATES);
+      global_cap = global_cap.max(size);
       for seg in segments.iter() {
-        let mut expanded = 0usize;
         for key in seg.terms_with_prefix(&prefix_key) {
-          if expanded >= per_segment_cap {
+          if expanded_total >= global_cap {
             break;
           }
           if key.len() <= field_prefix_len {
@@ -1859,7 +1864,13 @@ fn collect_completion_candidates(
           let entry = out.entry(candidate.to_string()).or_default();
           entry.doc_freq = entry.doc_freq.saturating_add(df);
           entry.score += distance_weight(distance) * df as f32;
-          expanded += 1;
+          expanded_total += 1;
+          if expanded_total >= global_cap {
+            break;
+          }
+        }
+        if expanded_total >= global_cap {
+          break;
         }
       }
     }

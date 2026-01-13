@@ -61,6 +61,23 @@ impl Wal {
     Ok(())
   }
 
+  pub fn len(&mut self) -> Result<u64> {
+    let current = self.file.stream_position()?;
+    let end = self.file.seek(SeekFrom::End(0))?;
+    self.file.seek(SeekFrom::Start(current))?;
+    Ok(end)
+  }
+
+  pub fn is_empty(&mut self) -> Result<bool> {
+    Ok(self.len()? == 0)
+  }
+
+  pub fn truncate_to(&mut self, len: u64) -> Result<()> {
+    self.file.set_len(len)?;
+    self.file.seek(SeekFrom::Start(len))?;
+    self.file.sync_all()
+  }
+
   pub fn sync(&mut self) -> Result<()> {
     self.file.flush()?;
     self.file.sync_all()
@@ -188,5 +205,47 @@ mod tests {
       entries.first(),
       Some(WalEntry::DeleteDocId(id)) if id == "abc"
     ));
+  }
+
+  #[test]
+  fn len_and_is_empty_track_bytes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    assert!(wal.is_empty().unwrap());
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("hello len"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    let len_after = wal.len().unwrap();
+    assert!(len_after > 0);
+    assert!(!wal.is_empty().unwrap());
+    wal.truncate().unwrap();
+    assert!(wal.is_empty().unwrap());
+  }
+
+  #[test]
+  fn truncate_to_restores_previous_length() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("hello truncate"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    let len_after_add = wal.len().unwrap();
+    wal.append_commit().unwrap();
+    wal.sync().unwrap();
+    let len_after_commit = wal.len().unwrap();
+    assert!(len_after_commit > len_after_add);
+    wal.truncate_to(len_after_add).unwrap();
+    let len_restored = wal.len().unwrap();
+    assert_eq!(len_restored, len_after_add);
   }
 }
