@@ -90,7 +90,7 @@ impl Sampler {
     }
   }
 
-  fn accept(&mut self, doc_id: DocId) -> bool {
+  fn accept(&mut self, segment_ord: u32, doc_id: DocId) -> bool {
     match self.mode {
       SamplingMode::None => true,
       SamplingMode::Probability(p) => {
@@ -100,10 +100,7 @@ impl Sampler {
         if p >= 1.0 {
           return true;
         }
-        let mut hasher = DefaultHasher::new();
-        hasher.write_u64(self.seed);
-        hasher.write_u64(doc_id as u64);
-        let value = hasher.finish();
+        let value = self.sample_value(segment_ord, doc_id);
         let threshold = (p * (u64::MAX as f64)) as u64;
         value < threshold
       }
@@ -120,6 +117,14 @@ impl Sampler {
 
   fn sampled(&self) -> bool {
     !matches!(self.mode, SamplingMode::None)
+  }
+
+  fn sample_value(&self, segment_ord: u32, doc_id: DocId) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u64(self.seed);
+    hasher.write_u32(segment_ord);
+    hasher.write_u32(doc_id);
+    hasher.finish()
   }
 }
 
@@ -184,7 +189,7 @@ impl<'a> SignificantTermsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values = self.ctx.fast_fields.str_values(&self.field, doc_id);
@@ -237,7 +242,7 @@ fn compute_background_counts(
   field: &str,
   filter: Option<&Filter>,
 ) -> (HashMap<String, u64>, u64) {
-  if filter.is_none() {
+  if filter.is_none() && ctx.segment.meta.deleted_docs.is_empty() {
     // Fast path: use the term dictionary to pull doc frequencies without scanning every doc.
     let prefix = format!("{field}:");
     let field_prefix_len = prefix.len();
@@ -246,10 +251,9 @@ fn compute_background_counts(
       if key.len() <= field_prefix_len {
         continue;
       }
-      if let Some(postings) = ctx.segment.postings(key) {
-        let df = postings.len() as u64;
+      if let Some(df) = ctx.segment.doc_freq(key) {
         if df > 0 {
-          counts.insert(key[field_prefix_len..].to_string(), df);
+          counts.insert(key[field_prefix_len..].to_string(), df as u64);
         }
       }
     }
@@ -304,7 +308,7 @@ impl<'a> RareTermsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values = self.ctx.fast_fields.str_values(&self.field, doc_id);
@@ -888,7 +892,7 @@ impl<'a> TermsCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values = self.ctx.fast_fields.str_values(&self.field, doc_id);
@@ -1005,7 +1009,7 @@ impl<'a> RangeCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
@@ -1160,7 +1164,7 @@ impl<'a> HistogramCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values = numeric_values(self.ctx.fast_fields, &self.field, doc_id, self.missing);
@@ -1310,7 +1314,7 @@ impl<'a> DateHistogramCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let values: Vec<i64> = numeric_values(
@@ -1658,7 +1662,7 @@ impl<'a> FilterCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     if passes_filter(self.ctx.fast_fields, doc_id, &self.filter) {
@@ -1760,7 +1764,7 @@ impl<'a> CompositeCollector<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(doc_id) {
+    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
       return;
     }
     let mut per_source_values: Vec<Vec<CompositeKeyPart>> = Vec::with_capacity(self.sources.len());
@@ -3546,6 +3550,19 @@ mod tests {
     vars.insert("a".to_string(), 1.0);
     vars.insert("b".to_string(), 1e-14);
     assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  #[test]
+  fn sampler_hash_includes_segment_ord() {
+    let sampling = AggregationSampling {
+      probability: Some(0.5),
+      size: None,
+      seed: Some(7),
+    };
+    let sampler = Sampler::new(Some(&sampling));
+    let a = sampler.sample_value(0, 42);
+    let b = sampler.sample_value(1, 42);
+    assert_ne!(a, b);
   }
 
   #[test]

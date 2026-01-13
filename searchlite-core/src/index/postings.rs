@@ -62,6 +62,11 @@ pub struct PostingsWriter<'a, W: Write + Seek + ?Sized> {
   keep_positions: bool,
 }
 
+pub fn read_doc_freq<R: Read + Seek>(file: &mut R, offset: u64) -> Result<u32> {
+  file.seek(SeekFrom::Start(offset))?;
+  read_u32(file)
+}
+
 impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
   pub fn new(file: &'a mut W, keep_positions: bool) -> Self {
     Self {
