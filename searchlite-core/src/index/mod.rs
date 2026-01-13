@@ -201,9 +201,9 @@ fn cleanup_segments(
 
 fn ensure_compact_safe(schema: &Schema) -> Result<()> {
   for field in schema.resolved_fields().into_iter() {
-    if field.indexed && !field.stored {
+    if (field.indexed || field.fast) && !field.stored {
       bail!(
-        "cannot compact index: field `{}` is indexed but not stored; compaction would drop its data",
+        "cannot compact index: field `{}` is indexed/fast but not stored; compaction would drop its data",
         field.path
       );
     }
@@ -283,7 +283,7 @@ mod tests {
     }
     let err = idx.compact().unwrap_err();
     assert!(
-      err.to_string().contains("indexed but not stored"),
+      err.to_string().contains("indexed/fast but not stored"),
       "unexpected error: {err}"
     );
   }
