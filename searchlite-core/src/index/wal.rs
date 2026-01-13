@@ -65,6 +65,10 @@ impl Wal {
     Ok(self.file.seek(SeekFrom::End(0))?)
   }
 
+  pub fn is_empty(&mut self) -> Result<bool> {
+    Ok(self.len()? == 0)
+  }
+
   pub fn truncate_to(&mut self, len: u64) -> Result<()> {
     self.file.set_len(len)?;
     self.file.seek(SeekFrom::Start(len))?;
