@@ -157,6 +157,7 @@ impl IndexWriter {
         seg.deleted_docs = merged;
       }
     }
+    let mut new_segments: Vec<crate::index::manifest::SegmentMeta> = Vec::new();
     if !pending_new.is_empty() {
       let generation = new_manifest
         .segments
@@ -174,6 +175,8 @@ impl IndexWriter {
       );
       let docs: Vec<Document> = pending_new.values().cloned().collect();
       let segment = writer.write_segment(&docs, generation)?;
+      // Keep track of newly written segments so they can be cleaned up on rollback.
+      new_segments.push(segment.clone());
       new_manifest.segments.push(segment.clone());
       for (offset, doc_id) in pending_new.keys().enumerate() {
         live_docs.insert(
@@ -218,6 +221,9 @@ impl IndexWriter {
            The on-disk manifest and WAL may be inconsistent.",
           manifest_err
         );
+      }
+      if !new_segments.is_empty() {
+        let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
       }
       return Err(e);
     }

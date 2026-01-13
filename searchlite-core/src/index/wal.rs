@@ -206,4 +206,46 @@ mod tests {
       Some(WalEntry::DeleteDocId(id)) if id == "abc"
     ));
   }
+
+  #[test]
+  fn len_and_is_empty_track_bytes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    assert!(wal.is_empty().unwrap());
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("hello len"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    let len_after = wal.len().unwrap();
+    assert!(len_after > 0);
+    assert!(!wal.is_empty().unwrap());
+    wal.truncate().unwrap();
+    assert!(wal.is_empty().unwrap());
+  }
+
+  #[test]
+  fn truncate_to_restores_previous_length() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("hello truncate"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    let len_after_add = wal.len().unwrap();
+    wal.append_commit().unwrap();
+    wal.sync().unwrap();
+    let len_after_commit = wal.len().unwrap();
+    assert!(len_after_commit > len_after_add);
+    wal.truncate_to(len_after_add).unwrap();
+    let len_restored = wal.len().unwrap();
+    assert_eq!(len_restored, len_after_add);
+  }
 }
