@@ -62,7 +62,10 @@ impl Wal {
   }
 
   pub fn len(&mut self) -> Result<u64> {
-    Ok(self.file.seek(SeekFrom::End(0))?)
+    let current = self.file.seek(SeekFrom::Current(0))?;
+    let end = self.file.seek(SeekFrom::End(0))?;
+    self.file.seek(SeekFrom::Start(current))?;
+    Ok(end)
   }
 
   pub fn is_empty(&mut self) -> Result<bool> {

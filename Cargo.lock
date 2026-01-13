@@ -1824,6 +1824,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "hashbrown 0.14.5",
+ "log",
  "memmap2",
  "parking_lot",
  "rand",

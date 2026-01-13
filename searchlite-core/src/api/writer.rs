@@ -202,8 +202,23 @@ impl IndexWriter {
     })() {
       // Roll back manifest to the previous snapshot and restore WAL to its
       // pre-commit length so pending ops can be retried safely.
-      let _ = self.wal.truncate_to(wal_len);
-      let _ = manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path);
+      if let Err(truncate_err) = self.wal.truncate_to(wal_len) {
+        log::error!(
+          "WAL rollback failed while handling commit error: \
+           unable to truncate WAL back to length {}: {}",
+          wal_len,
+          truncate_err
+        );
+      }
+      if let Err(manifest_err) =
+        manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path)
+      {
+        log::error!(
+          "Manifest rollback failed while handling commit error: {}. \
+           The on-disk manifest and WAL may be inconsistent.",
+          manifest_err
+        );
+      }
       return Err(e);
     }
     {

@@ -25,7 +25,6 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
 
   pub fn add_document(&mut self, doc: &serde_json::Value) -> Result<()> {
     let offset = self.file.stream_position()?;
-    self.offsets.push(offset);
     #[allow(unused_mut)]
     let mut data = serde_json::to_vec(doc)?;
     if data.len() > MAX_DOCSTORE_BYTES {
@@ -46,6 +45,7 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
         MAX_DOCSTORE_BYTES
       );
     }
+    self.offsets.push(offset);
     let len = data.len() as u32;
     self.file.write_all(&len.to_le_bytes())?;
     self.file.write_all(&data)?;
