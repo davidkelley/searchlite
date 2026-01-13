@@ -595,4 +595,37 @@ mod tests {
     let manifest = idx.manifest();
     assert!(manifest.segments[0].deleted_docs.is_empty());
   }
+
+  #[test]
+  fn commit_clears_wal_and_pending_entries() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("commit durability")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let wal_path = directory::wal_path(dir.path());
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let pending = Wal::last_pending_ops(&storage, &wal_path).unwrap();
+    assert!(
+      pending.is_empty(),
+      "pending WAL ops should be cleared on commit"
+    );
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    assert_eq!(wal_len, 0, "wal should be truncated after commit");
+    let manifest = idx.manifest();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].doc_count, 1);
+  }
 }

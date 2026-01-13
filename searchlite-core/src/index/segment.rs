@@ -1040,7 +1040,9 @@ fn write_vector_file(storage: &dyn Storage, path: &Path, store: &VectorStore) ->
   for v in values.iter() {
     buf.write_f32::<LittleEndian>(*v)?;
   }
-  storage.write_all(path, &buf)?;
+  let mut handle = storage.open_write(path)?;
+  handle.write_all(&buf)?;
+  handle.sync_all()?;
   Ok(())
 }
 
