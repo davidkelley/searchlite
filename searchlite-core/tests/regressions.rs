@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, KeywordField, Schema, SearchRequest, StorageType,
-  TextField,
+  CollapseRequest, Document, ExecutionStrategy, IndexOptions, KeywordField, Schema, SearchRequest,
+  StorageType, TextField,
 };
 use searchlite_core::api::{Filter, Index};
 use searchlite_core::storage::Storage;
@@ -132,6 +132,54 @@ fn compact_rejects_fast_only_fields() {
     hits_after, 1,
     "compaction attempt must not drop fast-only field data"
   );
+}
+
+#[test]
+fn collapse_rejects_multivalued_fast_field() {
+  let dir = tempdir().unwrap();
+  let schema = Schema {
+    doc_id_field: "_id".into(),
+    analyzers: Vec::new(),
+    text_fields: vec![TextField {
+      name: "body".into(),
+      analyzer: "default".into(),
+      search_analyzer: None,
+      stored: true,
+      indexed: true,
+      nullable: false,
+      search_as_you_type: None,
+    }],
+    keyword_fields: vec![KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    }],
+    numeric_fields: Vec::new(),
+    nested_fields: Vec::new(),
+    #[cfg(feature = "vectors")]
+    vector_fields: Vec::new(),
+  };
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "1",
+        vec![("body", json!("first")), ("tag", json!(["foo", "bar"]))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+  let mut req = base_request("first", None);
+  req.collapse = Some(CollapseRequest {
+    field: "tag".into(),
+    inner_hits: None,
+  });
+  let err = reader.search(&req).unwrap_err();
+  assert!(err.to_string().contains("single-valued"));
 }
 
 struct FailingManifestStorage {

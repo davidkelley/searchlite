@@ -394,6 +394,15 @@ fn collect_nested_object(
       bail!("unknown nested field {prefix}.{k}");
     }
   }
+  for prop in nested.fields.iter() {
+    if map.contains_key(prop.name()) {
+      continue;
+    }
+    if prop.is_nullable() {
+      continue;
+    }
+    bail!("missing required nested field {}.{}", prefix, prop.name());
+  }
   Ok(())
 }
 

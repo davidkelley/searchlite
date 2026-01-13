@@ -589,6 +589,71 @@ mod tests {
   }
 
   #[test]
+  fn nested_fields_require_present_non_nullable_properties() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comment".into(),
+        fields: vec![
+          NestedProperty::Keyword(KeywordField {
+            name: "author".into(),
+            stored: true,
+            indexed: true,
+            fast: false,
+            nullable: false,
+          }),
+          NestedProperty::Numeric(NumericField {
+            name: "score".into(),
+            i64: true,
+            fast: false,
+            stored: false,
+            nullable: true,
+          }),
+        ],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    let missing = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("c1")),
+        ("comment".into(), serde_json::json!({ "score": 10 })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&missing).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages
+        .iter()
+        .any(|m| m.contains("missing required nested field comment.author")),
+      "unexpected error chain: {messages:?}"
+    );
+
+    let complete = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("c2")),
+        (
+          "comment".into(),
+          serde_json::json!({ "author": "Ada", "score": 10 }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema
+      .validate_document(&complete)
+      .expect("complete nested object passes validation");
+  }
+
+  #[test]
   fn top_level_fields_enforce_nullability_and_type() {
     let schema = Schema {
       doc_id_field: default_doc_id_field(),
@@ -913,6 +978,19 @@ impl NestedField {
           };
           prop.validate_value(k, v)?;
         }
+        for prop in self.fields.iter() {
+          if map.contains_key(prop.name()) {
+            continue;
+          }
+          if prop.is_nullable() {
+            continue;
+          }
+          return Err(anyhow!(
+            "missing required nested field {}.{}",
+            self.name,
+            prop.name()
+          ));
+        }
         Ok(())
       }
       _ => Err(anyhow!(
@@ -951,6 +1029,15 @@ impl NestedProperty {
       NestedProperty::Keyword(f) => &f.name,
       NestedProperty::Numeric(f) => &f.name,
       NestedProperty::Object(f) => &f.name,
+    }
+  }
+
+  pub fn is_nullable(&self) -> bool {
+    match self {
+      NestedProperty::Text(f) => f.nullable,
+      NestedProperty::Keyword(f) => f.nullable,
+      NestedProperty::Numeric(f) => f.nullable,
+      NestedProperty::Object(f) => f.nullable,
     }
   }
 

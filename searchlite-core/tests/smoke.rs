@@ -1084,7 +1084,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
         stored: false,
         indexed: true,
         fast: false,
-        nullable: false,
+        nullable: true,
       }),
     ],
     nullable: false,
