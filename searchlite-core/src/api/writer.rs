@@ -193,9 +193,9 @@ impl IndexWriter {
       .unwrap_or(0);
     new_manifest.committed_at = Utc::now().to_rfc3339();
     let manifest_path = self.inner.manifest_path();
-    new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
     let wal_len = self.wal.len()?;
     if let Err(e) = (|| -> Result<()> {
+      new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
       self.wal.append_commit()?;
       self.wal.sync()?;
       Ok(())

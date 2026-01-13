@@ -28,6 +28,13 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
     self.offsets.push(offset);
     #[allow(unused_mut)]
     let mut data = serde_json::to_vec(doc)?;
+    if data.len() > MAX_DOCSTORE_BYTES {
+      bail!(
+        "stored document too large ({} bytes, max {})",
+        data.len(),
+        MAX_DOCSTORE_BYTES
+      );
+    }
     #[cfg(feature = "zstd")]
     if self.use_zstd {
       data = zstd::stream::encode_all(&data[..], 0)?;
@@ -86,7 +93,15 @@ impl<R: Read + Seek> DocStoreReader<R> {
     self.file.read_exact(&mut buf)?;
     #[cfg(feature = "zstd")]
     let buf = if self.use_zstd {
-      zstd::stream::decode_all(&buf[..])?
+      let decoded = zstd::stream::decode_all(&buf[..])?;
+      if decoded.len() > MAX_DOCSTORE_BYTES {
+        bail!(
+          "stored document length {} exceeds maximum {} after decompression",
+          decoded.len(),
+          MAX_DOCSTORE_BYTES
+        );
+      }
+      decoded
     } else {
       buf
     };
@@ -130,7 +145,10 @@ mod tests {
     let tmp = NamedTempFile::new().unwrap();
     let mut file = tmp.reopen().unwrap();
     let mut writer = DocStoreWriter::new(&mut file, false);
-    let huge = serde_json::json!(String::from_utf8(vec![b'a'; MAX_DOCSTORE_BYTES + 1]).unwrap());
+    // Build a string whose serialized JSON length is MAX_DOCSTORE_BYTES + 1 to
+    // exceed the bound regardless of compression.
+    let inner = String::from_utf8(vec![b'a'; MAX_DOCSTORE_BYTES - 1]).unwrap();
+    let huge = serde_json::json!(inner);
     let err = writer.add_document(&huge).unwrap_err();
     assert!(err.to_string().contains("too large"));
   }
