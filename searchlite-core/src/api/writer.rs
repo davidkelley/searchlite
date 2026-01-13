@@ -102,7 +102,9 @@ impl IndexWriter {
       return Ok(());
     }
     self.wal.sync()?;
-    let mut live_docs = self.live_docs.clone();
+    let manifest_snapshot = inner.manifest.read().clone();
+    self.schema = manifest_snapshot.schema.clone();
+    let mut live_docs = load_live_docs(inner.as_ref(), &manifest_snapshot)?;
     let mut pending_new: BTreeMap<String, Document> = BTreeMap::new();
     let mut tombstones: HashMap<String, Vec<DocId>> = HashMap::new();
     for op in self.pending_ops.iter() {
@@ -127,8 +129,8 @@ impl IndexWriter {
         }
       }
     }
-    let mut manifest = self.inner.manifest.write();
-    for seg in manifest.segments.iter_mut() {
+    let mut new_manifest = manifest_snapshot.clone();
+    for seg in new_manifest.segments.iter_mut() {
       if let Some(deleted) = tombstones.remove(&seg.id) {
         let mut set: HashSet<DocId> = seg.deleted_docs.iter().copied().collect();
         set.extend(deleted.into_iter());
@@ -138,7 +140,7 @@ impl IndexWriter {
       }
     }
     if !pending_new.is_empty() {
-      let generation = manifest
+      let generation = new_manifest
         .segments
         .iter()
         .map(|s| s.generation)
@@ -154,7 +156,7 @@ impl IndexWriter {
       );
       let docs: Vec<Document> = pending_new.values().cloned().collect();
       let segment = writer.write_segment(&docs, generation)?;
-      manifest.segments.push(segment.clone());
+      new_manifest.segments.push(segment.clone());
       for (offset, doc_id) in pending_new.keys().enumerate() {
         live_docs.insert(
           doc_id.clone(),
@@ -165,10 +167,12 @@ impl IndexWriter {
         );
       }
     }
-    manifest.committed_at = Utc::now().to_rfc3339();
-    let store_result = manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path());
-    drop(manifest);
-    store_result?;
+    new_manifest.committed_at = Utc::now().to_rfc3339();
+    new_manifest.store(self.inner.storage.as_ref(), &self.inner.manifest_path())?;
+    {
+      let mut manifest_guard = self.inner.manifest.write();
+      *manifest_guard = new_manifest;
+    }
     self.wal.append_commit()?;
     self.wal.sync()?;
     self.wal.truncate()?;
