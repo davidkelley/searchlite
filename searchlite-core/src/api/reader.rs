@@ -2399,22 +2399,7 @@ impl IndexReader {
     let mut per_clause: Vec<Vec<VectorCandidate>> =
       plan.clauses.iter().map(|_| Vec::new()).collect();
     for (segment_ord, seg) in self.segments.iter().enumerate() {
-      let mut _term_doc_holder = None;
-      let mut _phrase_holder = None;
-      let query_eval = if require_text_match {
-        _term_doc_holder = Some(build_term_doc_lists(seg, term_groups));
-        _phrase_holder = Some(build_phrase_runtimes(seg, phrase_fields));
-        let eval = QueryEvaluator {
-          matcher,
-          term_docs: &_term_doc_holder.as_ref().unwrap().lists,
-          term_group_lists: &_term_doc_holder.as_ref().unwrap().group_lists,
-          phrase_postings: _phrase_holder.as_ref().unwrap(),
-          fast_fields: seg.fast_fields(),
-        };
-        Some(eval)
-      } else {
-        None
-      };
+      let mut pending: Vec<(usize, VectorCandidate)> = Vec::new();
       for (idx, clause) in plan.clauses.iter().enumerate() {
         let Some((index, _store)) = seg.vector_components(&clause.field) else {
           continue;
@@ -2437,17 +2422,33 @@ impl IndexReader {
               continue;
             }
           }
-          if let Some(eval) = query_eval.as_ref() {
-            if !eval.matches(doc_id) {
-              continue;
-            }
-          }
           vscore *= clause.boost;
-          per_clause[idx].push(VectorCandidate {
+          let cand = VectorCandidate {
             segment_ord: segment_ord as u32,
             doc_id,
             score: vscore,
-          });
+          };
+          if require_text_match {
+            pending.push((idx, cand));
+          } else {
+            per_clause[idx].push(cand);
+          }
+        }
+      }
+      if require_text_match && !pending.is_empty() {
+        let term_doc_lists = build_term_doc_lists(seg, term_groups);
+        let phrase_postings: Vec<PhraseRuntime> = build_phrase_runtimes(seg, phrase_fields);
+        let query_eval = QueryEvaluator {
+          matcher,
+          term_docs: &term_doc_lists.lists,
+          term_group_lists: &term_doc_lists.group_lists,
+          phrase_postings: &phrase_postings,
+          fast_fields: seg.fast_fields(),
+        };
+        for (idx, cand) in pending.into_iter() {
+          if query_eval.matches(cand.doc_id) {
+            per_clause[idx].push(cand);
+          }
         }
       }
     }
@@ -3513,7 +3514,7 @@ impl IndexReader {
     let mut groups: BTreeMap<String, Vec<RankedHit>> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     for hit in hits.into_iter() {
-      let Some(key) = self.collapse_key(&hit, &collapse.field) else {
+      let Some(key) = self.collapse_value(&hit, &collapse.field)? else {
         continue;
       };
       if !groups.contains_key(&key) {
@@ -3583,10 +3584,23 @@ impl IndexReader {
     Ok(keyed.into_iter().map(|(_, hit)| hit).collect())
   }
 
-  fn collapse_key(&self, hit: &RankedHit, field: &str) -> Option<String> {
-    let seg = self.segments.get(hit.key.segment_ord as usize)?;
+  fn collapse_value(&self, hit: &RankedHit, field: &str) -> Result<Option<String>> {
+    let seg = self
+      .segments
+      .get(hit.key.segment_ord as usize)
+      .ok_or_else(|| anyhow::anyhow!("missing segment {}", hit.key.segment_ord))?;
     let values = seg.fast_fields().str_values(field, hit.key.doc_id);
-    values.first().map(|v| v.to_string())
+    if values.is_empty() {
+      return Ok(None);
+    }
+    if values.len() > 1 {
+      let doc_id = seg.doc_id(hit.key.doc_id).unwrap_or("<unknown>");
+      bail!(
+        "collapse field `{field}` must be single-valued; document `{doc_id}` has {} values",
+        values.len()
+      );
+    }
+    Ok(values.first().map(|v| v.to_string()))
   }
 }
 
