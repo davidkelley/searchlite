@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.1.0...searchlite-http-v0.1.1) - 2026-01-14
+
+### Added
+
+- add return_hits toggle and limit validation
+- supporting http server via cli
+
+### Fixed
+
+- address review feedback on return_hits
+
+### Other
+
+- Merge branch 'main' into feat/p8-ranking-controls
+
 ## [0.1.0](https://github.com/davidkelley/searchlite/releases/tag/searchlite-http-v0.1.0) - 2026-01-08
 
 ### Added

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.2.0...searchlite-core-v0.2.1) - 2026-01-14
+
+### Fixed
+
+- harden nested validation and collapse grouping ([#55](https://github.com/davidkelley/searchlite/pull/55))
+- harden core replay and aggs
+- address review feedback
+- address review feedback
+- harden core durability and bounds
+- fsync vector files via storage helper
+- harden fsync durability and wal cleanup
+- guard compaction and writer consistency
+- harden core validation and durability
+- improve vector recall and durability
+
+### Other
+
+- avoid Debug bound in zstd guard
+- add wal coverage; clean rollback artifacts
+- satisfy clippy seek-from-current
+- add wal is_empty for clippy
+- log WAL sync errors on drop
+
 ## [0.2.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.1.0...searchlite-core-v0.2.0) - 2026-01-09
 
 ### Added
