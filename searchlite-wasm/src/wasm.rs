@@ -310,6 +310,22 @@ async fn persist_file(db_name: &str, path: &Path, data: Vec<u8>) -> Result<()> {
   Ok(())
 }
 
+async fn delete_file(db_name: &str, path: &Path) -> Result<()> {
+  let db = open_db(db_name).await?;
+  let tx = db
+    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
+  let store = tx
+    .object_store(STORE_NAME)
+    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
+  let key = JsValue::from_str(&path_key(path));
+  let req = store
+    .delete(&key)
+    .map_err(|e| anyhow!("delete failed: {:?}", e))?;
+  request_future(&req).await?;
+  Ok(())
+}
+
 #[derive(Clone)]
 struct PendingWrites {
   db_name: String,
@@ -352,6 +368,22 @@ impl PendingWrites {
     let queue = self.queue.clone();
     spawn_local(async move {
       persist_queue(db, path, queue).await;
+    });
+  }
+
+  fn schedule_delete(&self, path: PathBuf) {
+    {
+      let mut guard = self.queue.lock();
+      guard.remove(&path);
+    }
+    let db = self.db_name.clone();
+    spawn_local(async move {
+      if let Err(err) = delete_file(&db, &path).await {
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+          "delete error for {:?}: {}",
+          path, err
+        )));
+      }
     });
   }
 
@@ -519,6 +551,28 @@ impl Storage for JsStorage {
 
   fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
     self.write_all(path, data)
+  }
+
+  fn remove(&self, path: &Path) -> Result<()> {
+    self.files.write().remove(path);
+    self.pending.schedule_delete(path.to_path_buf());
+    Ok(())
+  }
+
+  fn remove_dir_all(&self, path: &Path) -> Result<()> {
+    let to_remove: Vec<PathBuf> = self
+      .files
+      .read()
+      .keys()
+      .filter(|p| p.starts_with(path))
+      .cloned()
+      .collect();
+    let mut guard = self.files.write();
+    for p in to_remove {
+      guard.remove(&p);
+      self.pending.schedule_delete(p);
+    }
+    Ok(())
   }
 }
 
@@ -788,6 +842,8 @@ impl Searchlite {
       filter: None,
       filters: Vec::<Filter>::new(),
       limit,
+      return_hits: true,
+      candidate_size: None,
       sort: Vec::<SortSpec>::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
