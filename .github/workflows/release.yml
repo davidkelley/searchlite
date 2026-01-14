@@ -57,17 +57,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
           set -euo pipefail
-          prev="${{ steps.prev-release.outputs.path }}"
-          args=()
-          if [ -n "$prev" ]; then
-            args+=(--registry-manifest-path "$prev")
-          fi
           # release-plz detects the previous published version from git tags; the registry manifest
           # lookup that used to be here is no longer required with the current release-plz defaults.
           release-plz release \
             --git-token "${GITHUB_TOKEN}" \
             --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
-            "${args[@]}" \
             -o json
 
   # Create a PR with the new versions and changelog, preparing the next release.
