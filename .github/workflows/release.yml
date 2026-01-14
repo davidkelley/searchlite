@@ -28,6 +28,26 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks@0.45, release-plz@0.3.150
+      - name: Prepare previous release checkout (for workspace lockfiles)
+        id: prev-release
+        run: |
+          set -euo pipefail
+          latest_tag="$(git tag --list 'searchlite-core-v*' --sort=-v:refname | head -n1 || true)"
+          if [ -z "$latest_tag" ]; then
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_dir="$(mktemp -d)"
+          git clone --depth 1 --branch "$latest_tag" . "$prev_dir"
+
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-core/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-http/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-cli/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-ffi/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-wasm/Cargo.lock"
+
+          echo "path=$prev_dir/Cargo.toml" >> "$GITHUB_OUTPUT"
       - name: Configure git user
         uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
         env:
@@ -37,11 +57,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
           set -euo pipefail
+          prev="${{ steps.prev-release.outputs.path }}"
+          args=()
+          if [ -n "$prev" ]; then
+            args+=(--registry-manifest-path "$prev")
+          fi
           # release-plz detects the previous published version from git tags; the registry manifest
           # lookup that used to be here is no longer required with the current release-plz defaults.
           release-plz release \
             --git-token "${GITHUB_TOKEN}" \
             --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            "${args[@]}" \
             -o json
 
   # Create a PR with the new versions and changelog, preparing the next release.
@@ -58,6 +84,26 @@ jobs:
       - *checkout
       - *install-rust
       - *install-release-plz
+      - name: Prepare previous release checkout (for workspace lockfiles)
+        id: prev-release
+        run: |
+          set -euo pipefail
+          latest_tag="$(git tag --list 'searchlite-core-v*' --sort=-v:refname | head -n1 || true)"
+          if [ -z "$latest_tag" ]; then
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_dir="$(mktemp -d)"
+          git clone --depth 1 --branch "$latest_tag" . "$prev_dir"
+
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-core/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-http/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-cli/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-ffi/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-wasm/Cargo.lock"
+
+          echo "path=$prev_dir/Cargo.toml" >> "$GITHUB_OUTPUT"
       - name: Configure git user
         uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
         env:
@@ -67,9 +113,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
           set -euo pipefail
+          prev="${{ steps.prev-release.outputs.path }}"
+          args=()
+          if [ -n "$prev" ]; then
+            args+=(--registry-manifest-path "$prev")
+          fi
           # release-plz detects the previous published version from git tags; the registry manifest
           # lookup that used to be here is no longer required with the current release-plz defaults.
           release-plz release-pr \
             --git-token "${GITHUB_TOKEN}" \
             --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            "${args[@]}" \
             -o json
