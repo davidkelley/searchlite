@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "searchlite-core",
