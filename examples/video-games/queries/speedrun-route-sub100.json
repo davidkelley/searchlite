@@ -1,23 +1,54 @@
 {
   "query": "speedrun routing momentum",
-  "fields": ["text", "splits.split", "techniques"],
-  "filter": {
-    "And": [
-      { "KeywordEq": { "field": "doc_type", "value": "speedrun_route" } },
-      { "KeywordEq": { "field": "era", "value": "retro" } },
-      { "KeywordEq": { "field": "category", "value": "Any%" } },
-      { "I64Range": { "field": "target_time_minutes", "min": 0, "max": 100 } },
-      {
-        "Nested": {
-          "path": "splits",
-          "filter": { "I64Range": { "field": "target_time_min", "min": 0, "max": 50 } }
-        }
-      }
-    ]
-  },
+  "fields": [
+    "text",
+    "splits.split",
+    "techniques"
+  ],
   "limit": 5,
   "execution": "wand",
   "bmw_block_size": null,
   "return_stored": true,
-  "highlight_field": "text"
+  "highlight_field": "text",
+  "filter": {
+    "And": [
+      {
+        "KeywordEq": {
+          "field": "doc_type",
+          "value": "speedrun_route"
+        }
+      },
+      {
+        "KeywordEq": {
+          "field": "era",
+          "value": "retro"
+        }
+      },
+      {
+        "KeywordEq": {
+          "field": "category",
+          "value": "Any%"
+        }
+      },
+      {
+        "I64Range": {
+          "field": "target_time_minutes",
+          "min": 0,
+          "max": 100
+        }
+      },
+      {
+        "Nested": {
+          "path": "splits",
+          "filter": {
+            "I64Range": {
+              "field": "target_time_min",
+              "min": 0,
+              "max": 50
+            }
+          }
+        }
+      }
+    ]
+  }
 }

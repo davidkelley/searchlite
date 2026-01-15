@@ -90,8 +90,7 @@ fn search_with_phrase_filters_and_compaction() {
     .search(&SearchRequest {
       query: "\"systems programming\" rust -boring".into(),
       fields: None,
-      filter: None,
-      filters: vec![
+      filter: Some(Filter::And(vec![
         Filter::KeywordEq {
           field: "category".into(),
           value: "search".into(),
@@ -101,7 +100,7 @@ fn search_with_phrase_filters_and_compaction() {
           min: 2010,
           max: 2025,
         },
-      ],
+      ])),
       limit: 10,
       return_hits: true,
       candidate_size: None,

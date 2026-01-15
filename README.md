@@ -486,7 +486,7 @@ cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.jso
 
 Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
 
-Legacy support: `query` may still be a string and the `filters` array is accepted as an AND of entries. Do not send both `filter` and `filters` in the same request.
+Legacy support: `query` may still be a string; structured query nodes remain the preferred shape.
 
 ### Search request JSON shape (extras)
 
@@ -969,7 +969,6 @@ let results = reader.search(&SearchRequest {
     .into(),
     fields: None,
     filter: Some(Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }),
-    filters: vec![],
     limit: 5,
     sort: vec![SortSpec { field: "year".into(), order: Some(SortOrder::Desc) }],
     cursor: None,

@@ -29,7 +29,6 @@ fn base_request(query: &str, filter: Option<Filter>) -> SearchRequest {
     query: query.into(),
     fields: None,
     filter,
-    filters: vec![],
     limit: 10,
     return_hits: true,
     candidate_size: None,

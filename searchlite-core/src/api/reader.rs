@@ -930,7 +930,6 @@ struct PhraseRuntime {
 enum RootFilter<'a> {
   None,
   Node(&'a Filter),
-  AndSlice(&'a [Filter]),
 }
 
 struct SegmentSearchParams<'a> {
@@ -1774,7 +1773,6 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
   match root {
     RootFilter::None => true,
     RootFilter::Node(filter) => passes_filter(reader, doc_id, filter),
-    RootFilter::AndSlice(filters) => passes_filters(reader, doc_id, filters),
   }
 }
 
@@ -2207,13 +2205,11 @@ impl IndexReader {
     } else {
       0
     };
-    let root_filter = if let Some(filter) = req.filter.as_ref() {
-      RootFilter::Node(filter)
-    } else if !req.filters.is_empty() {
-      RootFilter::AndSlice(req.filters.as_slice())
-    } else {
-      RootFilter::None
-    };
+    let root_filter = req
+      .filter
+      .as_ref()
+      .map(RootFilter::Node)
+      .unwrap_or(RootFilter::None);
     let vector_filter = req.vector_filter.as_ref();
     let mut heap = if collect_hits {
       Some(BinaryHeap::<RankedHit>::new())
@@ -2547,9 +2543,6 @@ impl IndexReader {
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
     }
-    if req.filter.is_some() && !req.filters.is_empty() {
-      bail!("search request cannot set both `filter` and `filters`");
-    }
     if let Some(collapse) = req.collapse.as_ref() {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
     }
@@ -2657,13 +2650,11 @@ impl IndexReader {
       &self.manifest.schema,
     );
     let highlight_phrases = build_phrase_term_map(&query_plan.phrase_specs);
-    let root_filter = if let Some(filter) = req.filter.as_ref() {
-      RootFilter::Node(filter)
-    } else if !req.filters.is_empty() {
-      RootFilter::AndSlice(req.filters.as_slice())
-    } else {
-      RootFilter::None
-    };
+    let root_filter = req
+      .filter
+      .as_ref()
+      .map(RootFilter::Node)
+      .unwrap_or(RootFilter::None);
 
     let mut hits: Vec<RankedHit> = Vec::new();
     let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
@@ -4260,7 +4251,6 @@ mod tests {
         }),
         fields: None,
         filter: None,
-        filters: vec![],
         limit: 5,
         return_hits: true,
         candidate_size: None,

@@ -91,7 +91,6 @@ fn bench_search(c: &mut Criterion) {
         query: "rust".into(),
         fields: None,
         filter: None,
-        filters: vec![],
         limit: 5,
         return_hits: true,
         candidate_size: None,
@@ -189,8 +188,7 @@ fn bench_nested_filters(c: &mut Criterion) {
       let req = SearchRequest {
         query: "rust".into(),
         fields: None,
-        filter: None,
-        filters: vec![
+        filter: Some(Filter::And(vec![
           Filter::Nested {
             path: "review".into(),
             filter: Box::new(Filter::KeywordEq {
@@ -206,7 +204,7 @@ fn bench_nested_filters(c: &mut Criterion) {
               max: 6,
             }),
           },
-        ],
+        ])),
         limit: 5,
         return_hits: true,
         candidate_size: None,
@@ -278,7 +276,6 @@ fn bench_cursor_pagination(c: &mut Criterion) {
           query: "rust".into(),
           fields: None,
           filter: None,
-          filters: vec![],
           limit: 20,
           return_hits: true,
           candidate_size: None,

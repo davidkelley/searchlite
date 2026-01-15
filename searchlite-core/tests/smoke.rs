@@ -25,7 +25,6 @@ fn base_search_request(query: &str) -> SearchRequest {
     query: query.into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 10,
     return_hits: true,
     candidate_size: None,
@@ -124,12 +123,11 @@ fn index_and_search() {
     .search(&SearchRequest {
       query: "systems programming".into(),
       fields: Some(vec!["body".to_string(), "title".to_string()]),
-      filter: None,
-      filters: vec![Filter::I64Range {
+      filter: Some(Filter::I64Range {
         field: "year".to_string(),
         min: 2010,
         max: 2024,
-      }],
+      }),
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -452,7 +450,6 @@ fn upsert_and_delete_by_id() {
     query: "second".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 5,
     return_hits: true,
     candidate_size: None,
@@ -546,7 +543,6 @@ fn cursor_paginates_ordered_hits() {
     query: "rust".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 2,
     return_hits: true,
     candidate_size: None,
@@ -646,7 +642,6 @@ fn cursor_rejects_invalid_hex() {
     query: "rust".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 1,
     return_hits: true,
     candidate_size: None,
@@ -703,7 +698,6 @@ fn cursor_rejects_when_limit_zero() {
       query: "rust".into(),
       fields: None,
       filter: None,
-      filters: vec![],
       limit: 0,
       return_hits: true,
       candidate_size: None,
@@ -767,7 +761,6 @@ fn cursor_rejects_excessive_advance() {
     query: "rust".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 1,
     return_hits: true,
     candidate_size: None,
@@ -825,7 +818,6 @@ fn cursor_rejects_mismatched_position() {
     query: "rust".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 2,
     return_hits: true,
     candidate_size: None,
@@ -910,7 +902,6 @@ fn cursor_orders_stably_across_segments() {
     query: "rust".into(),
     fields: None,
     filter: None,
-    filters: vec![],
     limit: 2,
     return_hits: true,
     candidate_size: None,
@@ -1026,7 +1017,6 @@ fn in_memory_storage_keeps_disk_clean() {
       query: "memory".into(),
       fields: None,
       filter: None,
-      filters: vec![],
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -1137,31 +1127,28 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
     writer.commit().unwrap();
   }
 
-  let filters = vec![
-    Filter::Nested {
-      path: "comment".into(),
-      filter: Box::new(Filter::KeywordEq {
-        field: "author".into(),
-        value: "alice".into(),
-      }),
-    },
-    Filter::Nested {
-      path: "comment".into(),
-      filter: Box::new(Filter::KeywordEq {
-        field: "tag".into(),
-        value: "y".into(),
-      }),
-    },
-  ];
-
   let resp = idx
     .reader()
     .unwrap()
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
-      filter: None,
-      filters,
+      filter: Some(Filter::And(vec![
+        Filter::Nested {
+          path: "comment".into(),
+          filter: Box::new(Filter::KeywordEq {
+            field: "author".into(),
+            value: "alice".into(),
+          }),
+        },
+        Filter::Nested {
+          path: "comment".into(),
+          filter: Box::new(Filter::KeywordEq {
+            field: "tag".into(),
+            value: "y".into(),
+          }),
+        },
+      ])),
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -1327,8 +1314,7 @@ fn nested_numeric_filters_bind_to_object_values() {
     .search(&SearchRequest {
       query: "rust".into(),
       fields: None,
-      filter: None,
-      filters,
+      filter: Some(Filter::And(filters)),
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -1422,7 +1408,6 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
       query: "rust".into(),
       fields: None,
       filter: None,
-      filters: vec![],
       limit: 10,
       return_hits: true,
       candidate_size: None,
@@ -1533,7 +1518,6 @@ fn highlight_configuration_applies_tags() {
       query: "rust systems".into(),
       fields: None,
       filter: None,
-      filters: vec![],
       limit: 5,
       return_hits: true,
       candidate_size: None,
