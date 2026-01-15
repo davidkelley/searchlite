@@ -859,7 +859,6 @@ mod tests {
       query: Query::String("rust".into()),
       fields: None,
       filter: None,
-      filters: Vec::new(),
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -985,7 +984,6 @@ mod tests {
       query: Query::String("rust".into()),
       fields: None,
       filter: None,
-      filters: Vec::new(),
       limit: 5,
       return_hits: true,
       candidate_size: None,
@@ -1099,7 +1097,6 @@ mod tests {
       })),
       fields: None,
       filter: None,
-      filters: Vec::new(),
       limit: 2,
       return_hits: true,
       candidate_size: None,
@@ -1191,9 +1188,7 @@ mod tests {
       .unwrap();
     let invalid = json!({
       "query": { "type": "query_string", "query": "rust" },
-      "filter": { "KeywordEq": { "field": "lang", "value": "en" }},
-      "filters": [{ "KeywordEq": { "field": "lang", "value": "en" }}],
-      "limit": 1,
+      "limit": 0,
       "return_stored": true,
       "execution": "wand"
     });
@@ -1205,7 +1200,7 @@ mod tests {
       .unwrap();
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let body: ErrorResponse = res.json().await.unwrap();
-    assert_eq!(body.error.r#type, "invalid_request");
+    assert_eq!(body.error.r#type, "invalid_limit");
     handle.abort();
     let _ = handle.await;
   }

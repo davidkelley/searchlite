@@ -1,21 +1,56 @@
 {
   "query": "no-cook romaine feta lemon vinaigrette",
-  "fields": ["title", "description", "text"],
-  "filters": [
-    { "KeywordEq": { "field": "language", "value": "en" } },
-    { "KeywordEq": { "field": "cuisine", "value": "Mediterranean-inspired" } },
-    { "KeywordIn": { "field": "meal_type", "values": ["lunch", "side"] } },
-    { "I64Range": { "field": "cook_time_minutes", "min": 0, "max": 5 } },
-    {
-      "Nested": {
-        "path": "ingredients",
-        "filter": { "KeywordEq": { "field": "item", "value": "romaine" } }
-      }
-    }
+  "fields": [
+    "title",
+    "description",
+    "text"
   ],
   "limit": 5,
   "execution": "wand",
   "bmw_block_size": null,
   "return_stored": true,
-  "highlight_field": "description"
+  "highlight_field": "description",
+  "filter": {
+    "And": [
+      {
+        "KeywordEq": {
+          "field": "language",
+          "value": "en"
+        }
+      },
+      {
+        "KeywordEq": {
+          "field": "cuisine",
+          "value": "Mediterranean-inspired"
+        }
+      },
+      {
+        "KeywordIn": {
+          "field": "meal_type",
+          "values": [
+            "lunch",
+            "side"
+          ]
+        }
+      },
+      {
+        "I64Range": {
+          "field": "cook_time_minutes",
+          "min": 0,
+          "max": 5
+        }
+      },
+      {
+        "Nested": {
+          "path": "ingredients",
+          "filter": {
+            "KeywordEq": {
+              "field": "item",
+              "value": "romaine"
+            }
+          }
+        }
+      }
+    ]
+  }
 }

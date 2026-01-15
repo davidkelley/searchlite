@@ -73,7 +73,6 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     query,
     fields: None,
     filter: None,
-    filters: Vec::new(),
     limit,
     return_hits: true,
     candidate_size: None,

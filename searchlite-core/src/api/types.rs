@@ -399,8 +399,6 @@ pub struct SearchRequest {
   pub fields: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub filter: Option<Filter>,
-  #[serde(default)]
-  pub filters: Vec<Filter>,
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
@@ -447,8 +445,6 @@ struct SearchRequestHelper {
   pub fields: Option<Vec<String>>,
   #[serde(default)]
   pub filter: Option<Filter>,
-  #[serde(default)]
-  pub filters: Vec<Filter>,
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
@@ -494,16 +490,10 @@ impl<'de> Deserialize<'de> for SearchRequest {
     D: serde::Deserializer<'de>,
   {
     let helper = SearchRequestHelper::deserialize(deserializer)?;
-    if helper.filter.is_some() && !helper.filters.is_empty() {
-      return Err(serde::de::Error::custom(
-        "SearchRequest cannot set both `filter` and `filters`",
-      ));
-    }
     Ok(Self {
       query: helper.query,
       fields: helper.fields,
       filter: helper.filter,
-      filters: helper.filters,
       limit: helper.limit,
       return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,

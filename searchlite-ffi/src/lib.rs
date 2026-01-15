@@ -156,7 +156,6 @@ pub unsafe extern "C" fn searchlite_search(
     query: query_node,
     fields: None,
     filter: None,
-    filters: vec![],
     limit,
     return_hits: true,
     candidate_size: None,
