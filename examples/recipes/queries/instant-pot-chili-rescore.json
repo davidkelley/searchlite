@@ -1,0 +1,26 @@
+{
+  "query": { "type": "query_string", "query": "instant pot chili mushrooms meal prep" },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+      { "KeywordEq": { "field": "dietary_tags", "value": "vegan" } }
+    ]
+  },
+  "execution": "bmw",
+  "bmw_block_size": 24,
+  "candidate_size": 60,
+  "sort": [{ "field": "total_time_minutes", "order": "asc" }],
+  "rescore": {
+    "window_size": 30,
+    "query": { "type": "phrase", "field": "instructions", "terms": ["instant", "pot"], "slop": 2 },
+    "score_mode": "total"
+  },
+  "limit": 5,
+  "return_stored": true,
+  "highlight": {
+    "fields": {
+      "instructions": { "number_of_fragments": 2, "fragment_size": 90 },
+      "text": { "fragment_size": 140, "number_of_fragments": 1 }
+    }
+  }
+}

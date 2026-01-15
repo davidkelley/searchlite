@@ -1,0 +1,21 @@
+{
+  "query": {
+    "type": "multi_match",
+    "query": "quick salad dressing orzo",
+    "match_type": "most_fields",
+    "fields": [
+      { "field": "title", "boost": 1.5 },
+      { "field": "description" },
+      { "field": "ingredients.item", "boost": 1.2 }
+    ]
+  },
+  "filter": { "KeywordIn": { "field": "meal_type", "values": ["lunch", "side", "dinner"] } },
+  "sort": [{ "field": "total_time_minutes", "order": "asc" }],
+  "collapse": {
+    "field": "cuisine",
+    "inner_hits": { "size": 2, "sort": [{ "field": "total_time_minutes", "order": "asc" }] }
+  },
+  "limit": 5,
+  "return_stored": true,
+  "highlight_field": "text"
+}

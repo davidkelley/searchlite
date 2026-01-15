@@ -1,0 +1,14 @@
+{
+  "query": { "type": "wildcard", "field": "codes.input", "value": "up*down*left*right*B*A", "max_expansions": 120 },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "doc_type", "value": "cheat_codes" } },
+      { "KeywordEq": { "field": "era", "value": "retro" } },
+      { "KeywordIn": { "field": "platforms", "values": ["SNES", "Genesis", "Neo Geo", "Arcade"] } }
+    ]
+  },
+  "limit": 5,
+  "execution": "bm25",
+  "return_stored": true,
+  "highlight_field": "codes.input"
+}

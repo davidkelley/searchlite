@@ -1,0 +1,38 @@
+{
+  "query": {
+    "type": "multi_match",
+    "query": "any% speedrun route momentum skip",
+    "match_type": "best_fields",
+    "fields": [
+      { "field": "text", "boost": 1.2 },
+      { "field": "splits.split" },
+      { "field": "techniques" }
+    ],
+    "operator": "and",
+    "minimum_should_match": "70%"
+  },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "doc_type", "value": "speedrun_route" } },
+      { "KeywordEq": { "field": "era", "value": "retro" } },
+      { "KeywordEq": { "field": "category", "value": "Any%" } }
+    ]
+  },
+  "execution": "bmw",
+  "bmw_block_size": 32,
+  "candidate_size": 80,
+  "rescore": {
+    "window_size": 50,
+    "query": { "type": "phrase", "field": "text", "terms": ["any%", "route"], "slop": 2 },
+    "score_mode": "total"
+  },
+  "sort": [{ "field": "_score", "order": "desc" }],
+  "limit": 5,
+  "return_stored": true,
+  "highlight": {
+    "fields": {
+      "text": { "number_of_fragments": 2, "fragment_size": 120 },
+      "splits.split": { "number_of_fragments": 2, "fragment_size": 60 }
+    }
+  }
+}

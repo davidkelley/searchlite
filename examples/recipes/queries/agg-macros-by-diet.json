@@ -1,0 +1,22 @@
+{
+  "query": { "type": "match_all" },
+  "limit": 1,
+  "return_hits": false,
+  "filter": { "KeywordEq": { "field": "language", "value": "en" } },
+  "aggs": {
+    "by_diet": {
+      "type": "terms",
+      "field": "dietary_tags",
+      "size": 8,
+      "aggs": {
+        "protein_stats": { "type": "stats", "field": "nutrition.per_serving.protein_g" },
+        "time_buckets": { "type": "histogram", "field": "total_time_minutes", "interval": 15 }
+      }
+    },
+    "fast_meals": {
+      "type": "range",
+      "field": "total_time_minutes",
+      "ranges": [{ "to": 20 }, { "from": 20, "to": 40 }, { "from": 40 }]
+    }
+  }
+}

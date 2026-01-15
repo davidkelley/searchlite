@@ -1,0 +1,23 @@
+{
+  "query": {
+    "type": "query_string",
+    "query": "accessibility soundtrack performance review"
+  },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "doc_type", "value": "review" } },
+      { "KeywordEq": { "field": "language", "value": "en" } }
+    ]
+  },
+  "sort": [
+    { "field": "review_score_out_of_10", "order": "desc" },
+    { "field": "_score", "order": "desc" }
+  ],
+  "collapse": {
+    "field": "game.game_id",
+    "inner_hits": { "size": 3, "sort": [{ "field": "review_score_out_of_10", "order": "desc" }] }
+  },
+  "limit": 5,
+  "return_stored": true,
+  "highlight_field": "text"
+}

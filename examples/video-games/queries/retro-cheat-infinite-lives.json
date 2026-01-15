@@ -1,12 +1,14 @@
 {
   "query": "\"Infinite Lives\" debug mode",
   "fields": ["codes.input", "codes.effect", "title", "text"],
-  "filters": [
-    { "KeywordEq": { "field": "doc_type", "value": "cheat_codes" } },
-    { "KeywordEq": { "field": "era", "value": "retro" } },
-    { "KeywordIn": { "field": "platforms", "values": ["NES", "SNES", "Genesis", "Neo Geo", "PlayStation"] } },
-    { "KeywordEq": { "field": "language", "value": "en" } }
-  ],
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "doc_type", "value": "cheat_codes" } },
+      { "KeywordEq": { "field": "era", "value": "retro" } },
+      { "KeywordIn": { "field": "platforms", "values": ["NES", "SNES", "Genesis", "Neo Geo", "PlayStation"] } },
+      { "KeywordEq": { "field": "language", "value": "en" } }
+    ]
+  },
   "limit": 5,
   "execution": "wand",
   "bmw_block_size": null,

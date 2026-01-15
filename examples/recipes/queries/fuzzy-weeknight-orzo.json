@@ -1,0 +1,34 @@
+{
+  "query": {
+    "type": "query_string",
+    "query": "orxo pastaa spinich weeknite skillet",
+    "fields": ["title", "description", "text"]
+  },
+  "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 40, "min_length": 3 },
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "language", "value": "en" } },
+      { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+      { "KeywordEq": { "field": "dietary_tags", "value": "vegetarian" } },
+      { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 40 } },
+      {
+        "Nested": {
+          "path": "ingredients",
+          "filter": { "KeywordEq": { "field": "item", "value": "orzo" } }
+        }
+      }
+    ]
+  },
+  "sort": [
+    { "field": "total_time_minutes", "order": "asc" },
+    { "field": "_score", "order": "desc" }
+  ],
+  "limit": 5,
+  "return_stored": true,
+  "highlight": {
+    "fields": {
+      "description": { "fragment_size": 120, "number_of_fragments": 1 },
+      "instructions": { "fragment_size": 100, "number_of_fragments": 2 }
+    }
+  }
+}

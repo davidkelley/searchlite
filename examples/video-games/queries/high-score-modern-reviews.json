@@ -1,13 +1,15 @@
 {
   "query": "performance polished accessibility",
   "fields": null,
-  "filters": [
-    { "KeywordEq": { "field": "doc_type", "value": "review" } },
-    { "KeywordEq": { "field": "era", "value": "modern" } },
-    { "F64Range": { "field": "review_score_out_of_10", "min": 8.5, "max": 10.0 } },
-    { "I64Range": { "field": "release_year", "min": 2015, "max": 2025 } },
-    { "KeywordIn": { "field": "platforms", "values": ["PC", "PlayStation 5", "Xbox Series X|S"] } }
-  ],
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "doc_type", "value": "review" } },
+      { "KeywordEq": { "field": "era", "value": "modern" } },
+      { "F64Range": { "field": "review_score_out_of_10", "min": 8.5, "max": 10.0 } },
+      { "I64Range": { "field": "release_year", "min": 2015, "max": 2025 } },
+      { "KeywordIn": { "field": "platforms", "values": ["PC", "PlayStation 5", "Xbox Series X|S"] } }
+    ]
+  },
   "limit": 5,
   "execution": "wand",
   "bmw_block_size": null,
