@@ -1,19 +1,21 @@
 {
   "query": "tofu high protein curry stir-fry",
   "fields": null,
-  "filters": [
-    { "KeywordEq": { "field": "language", "value": "en" } },
-    { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
-    { "KeywordEq": { "field": "dietary_tags", "value": "vegan" } },
-    { "KeywordEq": { "field": "dietary_tags", "value": "high-protein" } },
-    {
-      "Nested": {
-        "path": "ingredients",
-        "filter": { "KeywordEq": { "field": "item", "value": "tofu" } }
-      }
-    },
-    { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 50 } }
-  ],
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "language", "value": "en" } },
+      { "KeywordEq": { "field": "meal_type", "value": "dinner" } },
+      { "KeywordEq": { "field": "dietary_tags", "value": "vegan" } },
+      { "KeywordEq": { "field": "dietary_tags", "value": "high-protein" } },
+      {
+        "Nested": {
+          "path": "ingredients",
+          "filter": { "KeywordEq": { "field": "item", "value": "tofu" } }
+        }
+      },
+      { "I64Range": { "field": "total_time_minutes", "min": 0, "max": 50 } }
+    ]
+  },
   "limit": 5,
   "execution": "wand",
   "bmw_block_size": null,
