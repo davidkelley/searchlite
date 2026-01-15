@@ -3,11 +3,6 @@
   "fields": [
     "title"
   ],
-  "limit": 5,
-  "execution": "wand",
-  "bmw_block_size": null,
-  "return_stored": true,
-  "highlight_field": "instructions",
   "filter": {
     "And": [
       {
@@ -47,5 +42,10 @@
         }
       }
     ]
-  }
+  },
+  "limit": 5,
+  "execution": "wand",
+  "bmw_block_size": null,
+  "return_stored": true,
+  "highlight_field": "instructions"
 }

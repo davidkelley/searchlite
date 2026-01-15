@@ -1,0 +1,29 @@
+{
+  "query": {
+    "type": "query_string",
+    "query": "Skyeline void metta loadot",
+    "fields": ["title", "summary", "text", "notes", "tips"]
+  },
+  "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 50, "min_length": 3 },
+  "filter": {
+    "And": [
+      { "KeywordIn": { "field": "doc_type", "values": ["competitive_meta_report", "review"] } },
+      { "KeywordEq": { "field": "era", "value": "modern" } },
+      { "KeywordIn": { "field": "platforms", "values": ["PlayStation 5", "Xbox Series X|S"] } }
+    ]
+  },
+  "sort": [
+    { "field": "review_score_out_of_10", "order": "desc" },
+    { "field": "release_year", "order": "desc" }
+  ],
+  "candidate_size": 50,
+  "limit": 5,
+  "execution": "wand",
+  "return_stored": true,
+  "highlight": {
+    "fields": {
+      "summary": { "pre_tag": "<mark>", "post_tag": "</mark>", "fragment_size": 120, "number_of_fragments": 1 },
+      "text": { "fragment_size": 220, "number_of_fragments": 1 }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "query": { "type": "match_all" },
+  "limit": 1,
+  "return_hits": false,
+  "filter": { "KeywordEq": { "field": "language", "value": "en" } },
+  "aggs": {
+    "by_era": {
+      "type": "terms",
+      "field": "era",
+      "size": 5,
+      "aggs": {
+        "platforms": { "type": "terms", "field": "platforms", "size": 6 },
+        "score_stats": { "type": "stats", "field": "review_score_out_of_10" },
+        "year_histogram": { "type": "histogram", "field": "release_year", "interval": 5 }
+      }
+    },
+    "notable_genres": {
+      "type": "significant_terms",
+      "field": "genres",
+      "size": 5,
+      "background_filter": { "KeywordEq": { "field": "era", "value": "retro" } }
+    }
+  }
+}
