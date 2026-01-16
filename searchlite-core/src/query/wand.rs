@@ -566,44 +566,98 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
 }
 
 fn match_only_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
-  mut terms: Vec<TermState>,
+  terms: Vec<TermState>,
   accept: &mut F,
   mut collector: Option<&mut C>,
   mut stats: Option<&mut QueryStats>,
 ) -> Vec<RankedDoc> {
-  let mut order: Vec<usize> = (0..terms.len()).collect();
-  order.sort_by_key(|&idx| terms[idx].doc_id());
-  while !order.is_empty() {
-    let doc = terms[order[0]].doc_id();
+  // Same wrapper as wand_loop
+  #[derive(Debug)]
+  struct TermWrapper(TermState);
+  impl PartialEq for TermWrapper {
+    fn eq(&self, other: &Self) -> bool {
+      self.0.doc_id() == other.0.doc_id()
+    }
+  }
+  impl Eq for TermWrapper {}
+  impl PartialOrd for TermWrapper {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+      Some(self.cmp(other))
+    }
+  }
+  impl Ord for TermWrapper {
+    fn cmp(&self, other: &Self) -> Ordering {
+      other.0.doc_id().cmp(&self.0.doc_id())
+    }
+  }
+
+  let mut queue: BinaryHeap<TermWrapper> = terms
+    .into_iter()
+    .filter(|t| !t.is_done())
+    .map(TermWrapper)
+    .collect();
+
+  let mut pending: Vec<TermWrapper> = Vec::with_capacity(queue.len());
+
+  loop {
+    if queue.is_empty() {
+      break;
+    }
+
+    // Check head
+    if queue.peek().map(|t| t.0.is_done()).unwrap_or(false) {
+      queue.pop();
+      continue;
+    }
+
+    let Some(smallest) = queue.peek() else {
+      break;
+    };
+    let doc = smallest.0.doc_id();
+
     if doc == DOCID_END {
       break;
     }
-    let mut mutated: Vec<usize> = Vec::new();
-    let mut idx = 0usize;
-    while idx < order.len() && terms[order[idx]].doc_id() == doc {
-      let term_idx = order[idx];
-      let moved = terms[term_idx].advance();
-      with_stats(&mut stats, |s| s.postings_advanced += moved);
-      mutated.push(term_idx);
-      idx += 1;
+
+    // Collect all terms at this doc_id
+    while let Some(top) = queue.peek() {
+      if top.0.doc_id() == doc {
+        pending.push(queue.pop().unwrap());
+      } else {
+        break;
+      }
     }
+
+    // Advance all terms at this doc
+    for wrapper in pending.iter_mut() {
+      let moved = wrapper.0.advance();
+      with_stats(&mut stats, |s| s.postings_advanced += moved);
+    }
+
     with_stats(&mut stats, |s| {
       s.candidates_examined += 1;
       s.scored_docs += 1;
     });
+
     if accept(doc, 0.0) {
       if let Some(col) = collector.as_deref_mut() {
         col.collect(doc, 0.0);
       }
     }
-    requeue_terms(&mut order, &terms, &mut mutated);
+
+    // Re-push terms
+    for wrapper in pending.drain(..) {
+      if !wrapper.0.is_done() {
+        queue.push(wrapper);
+      }
+    }
   }
   Vec::new()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
-  mut terms: Vec<TermState>,
+  terms: Vec<TermState>,
   k: usize,
   rank_hits: bool,
   use_block_bounds: bool,
@@ -614,47 +668,147 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   mut score_adjust: Option<&mut ScoreAdjustFn<'_>>,
 ) -> Vec<RankedDoc> {
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-  let mut order: Vec<usize> = (0..terms.len()).collect();
-  order.sort_by_key(|&idx| terms[idx].doc_id());
+  // Using a BinaryHeap for the term queue ensures O(log N) operations instead of O(N) for insertion,
+  // substantially improving performance when the number of query terms is large.
+  // We wrap TermState in a struct that implements Ord based on doc_id.
+  #[derive(Debug)]
+  struct TermWrapper(TermState);
+  impl PartialEq for TermWrapper {
+    fn eq(&self, other: &Self) -> bool {
+      self.0.doc_id() == other.0.doc_id()
+    }
+  }
+  impl Eq for TermWrapper {}
+  impl PartialOrd for TermWrapper {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+      Some(self.cmp(other))
+    }
+  }
+  impl Ord for TermWrapper {
+    fn cmp(&self, other: &Self) -> Ordering {
+      // Min-heap behavior: smallest doc_id at the top
+      other.0.doc_id().cmp(&self.0.doc_id())
+    }
+  }
+
+  let mut queue: BinaryHeap<TermWrapper> = terms
+    .into_iter()
+    .filter(|t| !t.is_done())
+    .map(TermWrapper)
+    .collect();
+
   let mut leaf_scores = score_plan.map(|plan| vec![0.0_f32; plan.leaf_count]);
   let mut touched: Vec<usize> = Vec::new();
   let mut touched_flags = leaf_scores.as_ref().map(|buf| vec![false; buf.len()]);
+
+  // Reusable vector for holding terms popped from the queue during pivot selection/scoring
+  let mut pending: Vec<TermWrapper> = Vec::with_capacity(queue.len());
+
   loop {
-    order.retain(|idx| !terms[*idx].is_done());
-    if order.is_empty() {
+    if queue.is_empty() {
       break;
     }
-    let threshold = if rank_hits && heap.len() >= k {
+
+    // Check if the head of the queue is exhausted (should be handled by filtering before push, but safety check)
+    if queue.peek().map(|t| t.0.is_done()).unwrap_or(false) {
+      queue.pop();
+      continue;
+    }
+
+    let heap_threshold = if rank_hits && heap.len() >= k {
       heap.peek().map(|d| d.0.score).unwrap_or(0.0)
     } else {
       0.0
     };
-    let pivot_idx = match choose_pivot(
-      &order,
-      &terms,
-      if collector.is_some() {
-        f32::NEG_INFINITY
-      } else {
-        threshold
-      },
-      use_block_bounds,
-    ) {
-      Some(idx) => idx,
-      None => break,
+    // When a collector is present we must stream every matching doc (for aggs/counts),
+    // so the pivot search must not stop early based on the heap threshold.
+    let pivot_threshold = if collector.is_some() {
+      f32::NEG_INFINITY
+    } else {
+      heap_threshold
     };
-    let pivot_doc = terms[order[pivot_idx]].doc_id();
-    let smallest_doc = terms[order[0]].doc_id();
+
+    // Pivot selection
+    // In strict WAND, we need to find a pivot such that the sum of upper bounds of all terms
+    // preceding the pivot (sorted by doc_id) exceeds the threshold.
+    // Finding this in a Heap is tricky without popping.
+    // Optimization: We pop items into `pending` until we find the pivot or exhaust the heap.
+    // Then we process the pivot and push `pending` items back.
+
+    let mut pivot_idx = None;
+    let mut acc = 0.0_f32;
+
+    // We drain from the queue into pending to find the pivot.
+    // This seems expensive (pop/push cycle), but `pending` will usually be small
+    // because the threshold prunes the search space effectively.
+    // For very large K or low thresholds, this converges to brute force, which is expected.
+    // However, the previous O(N) insertion sort was worse because it happened on *every* advance.
+
+    // Note: To strictly follow WAND, we need to iterate terms sorted by doc_id.
+    // The heap gives us the smallest doc_id first, which is exactly what we need.
+
+    while let Some(wrapper) = queue.pop() {
+      let term = &wrapper.0;
+      let bound = if use_block_bounds {
+        term.block_upper_bound()
+      } else {
+        term.upper_bound()
+      };
+
+      pending.push(wrapper);
+
+      if !bound.is_finite() {
+        continue;
+      }
+      acc += bound;
+      if acc >= pivot_threshold {
+        pivot_idx = Some(pending.len() - 1);
+        break;
+      }
+    }
+
+    let Some(p_idx) = pivot_idx else {
+      // Threshold cannot be reached even with all remaining terms.
+      for wrapper in pending.drain(..) {
+        if !wrapper.0.is_done() {
+          queue.push(wrapper);
+        }
+      }
+      break;
+    };
+
+    let pivot_doc = pending[p_idx].0.doc_id();
+    let smallest_doc = pending[0].0.doc_id();
+
     if pivot_doc == smallest_doc {
+      // We have a candidate match at smallest_doc
       let doc_id = pivot_doc;
+
+      // We must ensure we have ALL terms for this doc_id, not just the ones
+      // corresponding to the pivot threshold. There might be more terms in the queue
+      // with the same doc_id that we haven't popped yet.
+      while let Some(top) = queue.peek() {
+        if top.0.doc_id() == doc_id {
+          pending.push(queue.pop().unwrap());
+        } else {
+          break;
+        }
+      }
+
       let mut score_sum = 0.0;
-      let mut mutated: Vec<usize> = Vec::new();
-      let mut idx = 0usize;
-      while idx < order.len() && terms[order[idx]].doc_id() == doc_id {
-        let term_idx = order[idx];
-        let contribution = terms[term_idx].score_current();
+
+      for wrapper in pending.iter_mut() {
+        let term = &mut wrapper.0;
+        if term.doc_id() != doc_id {
+          // This should effectively be unreachable if pivot_doc == smallest_doc
+          continue;
+        }
+
+        let contribution = term.score_current();
         score_sum += contribution;
+
         if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
-          let leaf = terms[term_idx].leaf;
+          let leaf = term.leaf;
           assert!(
             leaf < buf.len(),
             "leaf index {} out of bounds for leaf_scores buffer of length {}",
@@ -667,27 +821,30 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           }
           buf[leaf] += contribution;
         }
-        let moved = terms[term_idx].advance();
-        mutated.push(term_idx);
+
+        let moved = term.advance();
         with_stats(&mut stats, |s| s.postings_advanced += moved);
-        idx += 1;
       }
+
       with_stats(&mut stats, |s| {
         s.candidates_examined += 1;
         s.scored_docs += 1;
       });
+
       let mut score = score_sum;
       if let Some(plan) = score_plan {
         if let Some(buf) = leaf_scores.as_ref() {
           score = plan.evaluate(buf);
         }
       }
+
       let leaves_slice = leaf_scores.as_deref().unwrap_or(&[]);
       let score_opt = if let Some(adj) = score_adjust.as_deref_mut() {
         adj(doc_id, score, leaves_slice)
       } else {
         Some(score)
       };
+
       if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
         for idx in touched.drain(..) {
           buf[idx] = 0.0;
@@ -696,79 +853,53 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       } else {
         touched.clear();
       }
-      let Some(score) = score_opt else {
-        requeue_terms(&mut order, &terms, &mut mutated);
-        continue;
-      };
-      let accepted = accept(doc_id, score);
-      if accepted {
-        if let Some(collector) = collector.as_deref_mut() {
-          collector.collect(doc_id, score);
-        }
-        if rank_hits && (heap.len() < k || score > threshold) {
-          push_top_k(&mut heap, RankedDoc { doc_id, score }, k);
+
+      if let Some(final_score) = score_opt {
+        if accept(doc_id, final_score) {
+          if let Some(collector) = collector.as_deref_mut() {
+            collector.collect(doc_id, final_score);
+          }
+          if rank_hits && (heap.len() < k || final_score > heap_threshold) {
+            push_top_k(
+              &mut heap,
+              RankedDoc {
+                doc_id,
+                score: final_score,
+              },
+              k,
+            );
+          }
         }
       }
-      requeue_terms(&mut order, &terms, &mut mutated);
     } else {
-      let mut mutated: Vec<usize> = Vec::new();
-      for &ord_idx in order.iter().take(pivot_idx) {
-        let term = &mut terms[ord_idx];
+      // Pivot > Smallest. We can skip terms in `pending` forward.
+      // Terms in `pending` [0..p_idx] (exclusive of p_idx maybe?)
+      // Actually strictly: We know sum(bounds[0..p_idx]) >= threshold.
+      // But sum(bounds[0..p_idx-1]) < threshold.
+      // So optimization: We can advance terms[0]... but WAND says we pick the pivot term.
+      // The pivot term is pending[p_idx].
+      // We should advance the earlier terms to pivot_doc.
+
+      for wrapper in pending.iter_mut().take(p_idx) {
+        let term = &mut wrapper.0;
         if use_block_bounds {
           let moved = term.skip_to_block(pivot_doc);
           with_stats(&mut stats, |s| s.postings_advanced += moved);
         }
         let moved = term.advance_to(pivot_doc);
         with_stats(&mut stats, |s| s.postings_advanced += moved);
-        mutated.push(ord_idx);
       }
-      requeue_terms(&mut order, &terms, &mut mutated);
+    }
+
+    // Push everything back into the queue
+    for wrapper in pending.drain(..) {
+      if !wrapper.0.is_done() {
+        queue.push(wrapper);
+      }
     }
   }
+
   finalize_heap(heap)
-}
-
-fn requeue_terms(order: &mut Vec<usize>, terms: &[TermState], mutated: &mut Vec<usize>) {
-  if mutated.is_empty() {
-    return;
-  }
-  mutated.sort_unstable();
-  order.retain(|idx| mutated.binary_search(idx).is_err() && !terms[*idx].is_done());
-  for term_idx in mutated.drain(..) {
-    if terms[term_idx].is_done() {
-      continue;
-    }
-    let doc = terms[term_idx].doc_id();
-    let pos = order
-      .binary_search_by_key(&doc, |&i| terms[i].doc_id())
-      .unwrap_or_else(|p| p);
-    order.insert(pos, term_idx);
-  }
-}
-
-fn choose_pivot(
-  order: &[usize],
-  terms: &[TermState],
-  threshold: f32,
-  use_block_bounds: bool,
-) -> Option<usize> {
-  let mut acc = 0.0_f32;
-  for (i, &term_idx) in order.iter().enumerate() {
-    let term = &terms[term_idx];
-    let bound = if use_block_bounds {
-      term.block_upper_bound()
-    } else {
-      term.upper_bound()
-    };
-    if !bound.is_finite() {
-      continue;
-    }
-    acc += bound;
-    if acc >= threshold {
-      return Some(i);
-    }
-  }
-  None
 }
 
 fn push_top_k(heap: &mut BinaryHeap<Reverse<RankedDoc>>, doc: RankedDoc, k: usize) {
