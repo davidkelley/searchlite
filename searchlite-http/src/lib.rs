@@ -454,22 +454,34 @@ async fn add_ndjson(
   if docs.is_empty() {
     return Ok(Json(IngestResponse { queued: 0 }));
   }
-  let _writer_guard = state.writer_lock.lock().await;
-  let mut writer = index
-    .writer()
-    .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-  for doc in docs.iter() {
-    if let Err(err) = writer.add_document(doc) {
-      if let Err(rollback_err) = writer.rollback() {
-        error!(
-          error = ?rollback_err,
-          "failed to rollback writer after NDJSON add failure"
-        );
+
+  let writer_lock = state.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _writer_guard = writer_lock.blocking_lock();
+    let mut writer = index
+      .writer()
+      .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for doc in docs.iter() {
+      if let Err(err) = writer.add_document(doc) {
+        if let Err(rollback_err) = writer.rollback() {
+          error!(
+            error = ?rollback_err,
+            "failed to rollback writer after NDJSON add failure"
+          );
+        }
+        return Err(HttpError::bad_request("add_failed", err.to_string()));
       }
-      return Err(HttpError::bad_request("add_failed", err.to_string()));
     }
-  }
-  Ok(Json(IngestResponse { queued: docs.len() }))
+    Ok(Json(IngestResponse { queued: docs.len() }))
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "add_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
 }
 
 async fn bulk_ingest(
@@ -489,22 +501,34 @@ async fn bulk_ingest(
     .map(value_to_document)
     .collect::<ApiResult<_>>()?;
   let index = state.require_index().await?;
-  let _writer_guard = state.writer_lock.lock().await;
-  let mut writer = index
-    .writer()
-    .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-  for doc in docs.iter() {
-    if let Err(err) = writer.add_document(doc) {
-      if let Err(rollback_err) = writer.rollback() {
-        error!(
-          error = ?rollback_err,
-          "failed to rollback writer after bulk add failure"
-        );
+
+  let writer_lock = state.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _writer_guard = writer_lock.blocking_lock();
+    let mut writer = index
+      .writer()
+      .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for doc in docs.iter() {
+      if let Err(err) = writer.add_document(doc) {
+        if let Err(rollback_err) = writer.rollback() {
+          error!(
+            error = ?rollback_err,
+            "failed to rollback writer after bulk add failure"
+          );
+        }
+        return Err(HttpError::bad_request("add_failed", err.to_string()));
       }
-      return Err(HttpError::bad_request("add_failed", err.to_string()));
     }
-  }
-  Ok(Json(IngestResponse { queued: docs.len() }))
+    Ok(Json(IngestResponse { queued: docs.len() }))
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "add_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
 }
 
 async fn delete_documents(
