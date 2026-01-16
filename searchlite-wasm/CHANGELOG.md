@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/davidkelley/searchlite/compare/searchlite-wasm-v0.1.2...searchlite-wasm-v0.1.3) - 2026-01-16
+
+### Other
+
+- remove filters final ([#62](https://github.com/davidkelley/searchlite/pull/62))
+
 ## [0.1.2](https://github.com/davidkelley/searchlite/compare/searchlite-wasm-v0.1.1...searchlite-wasm-v0.1.2) - 2026-01-14
 
 ### Fixed
