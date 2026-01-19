@@ -681,13 +681,8 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   let mut prune_done = false;
 
   fn bubble_reposition(queue: &mut [TermState], advanced: usize) {
-    for start in 0..advanced {
-      let mut j = start;
-      while j + 1 < queue.len() && queue[j].doc_id() > queue[j + 1].doc_id() {
-        queue.swap(j, j + 1);
-        j += 1;
-      }
-    }
+    let _ = advanced;
+    queue.sort_unstable_by_key(|t| t.doc_id());
   }
 
   loop {
@@ -783,9 +778,6 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
 
       // Reposition only the advanced prefix to maintain sorted order.
       bubble_reposition(&mut queue, i);
-      if !queue.windows(2).all(|w| w[0].doc_id() <= w[1].doc_id()) {
-        queue.sort_unstable_by_key(|t| t.doc_id());
-      }
 
       with_stats(&mut stats, |s| {
         s.candidates_examined += 1;
@@ -845,9 +837,6 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       }
       // Reposition only the advanced prefix.
       bubble_reposition(&mut queue, p_idx);
-      if !queue.windows(2).all(|w| w[0].doc_id() <= w[1].doc_id()) {
-        queue.sort_unstable_by_key(|t| t.doc_id());
-      }
     }
   }
 

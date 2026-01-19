@@ -603,6 +603,11 @@ async fn add_ndjson(
     return Err(err);
   }
 
+  if writer_task.is_none() {
+    drop(tx);
+    return Ok(Json(IngestResponse { queued: 0 }));
+  }
+
   // Signal commit; ignore send error if worker already exited.
   ensure_writer_task(&mut rx_slot, &mut writer_task);
   let _ = tx.send(IngestMsg::Commit).await;
