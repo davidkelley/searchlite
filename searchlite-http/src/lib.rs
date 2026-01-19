@@ -547,31 +547,29 @@ async fn add_ndjson(
       }
     }
 
-    if !docs.is_empty() {
-      if tx.send(IngestMsg::Batch(docs)).await.is_err() {
-        let writer_err = if let Some(handle) = writer_task.take() {
-          match handle.await {
-            Ok(Err(e)) => e,
-            Ok(Ok(_)) => HttpError::from_anyhow(
-              "ingest_worker_closed",
-              StatusCode::INTERNAL_SERVER_ERROR,
-              anyhow::anyhow!("ingest worker terminated early"),
-            ),
-            Err(join_err) => HttpError::from_anyhow(
-              "add_join",
-              StatusCode::INTERNAL_SERVER_ERROR,
-              anyhow::anyhow!(join_err.to_string()),
-            ),
-          }
-        } else {
-          HttpError::from_anyhow(
+    if !docs.is_empty() && tx.send(IngestMsg::Batch(docs)).await.is_err() {
+      let writer_err = if let Some(handle) = writer_task.take() {
+        match handle.await {
+          Ok(Err(e)) => e,
+          Ok(Ok(_)) => HttpError::from_anyhow(
             "ingest_worker_closed",
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow::anyhow!("ingest worker terminated early"),
-          )
-        };
-        return Err(writer_err);
-      }
+          ),
+          Err(join_err) => HttpError::from_anyhow(
+            "add_join",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!(join_err.to_string()),
+          ),
+        }
+      } else {
+        HttpError::from_anyhow(
+          "ingest_worker_closed",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("ingest worker terminated early"),
+        )
+      };
+      return Err(writer_err);
     }
 
     Ok(())
