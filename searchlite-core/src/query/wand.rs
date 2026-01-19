@@ -678,16 +678,29 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   let mut leaf_scores = score_plan.map(|plan| vec![0.0_f32; plan.leaf_count]);
   let mut touched: Vec<usize> = Vec::new();
   let mut touched_flags = leaf_scores.as_ref().map(|buf| vec![false; buf.len()]);
+  let mut prune_done = false;
+
+  fn bubble_reposition(queue: &mut [TermState], advanced: usize) {
+    for start in 0..advanced {
+      let mut j = start;
+      while j + 1 < queue.len() && queue[j].doc_id() > queue[j + 1].doc_id() {
+        queue.swap(j, j + 1);
+        j += 1;
+      }
+    }
+  }
 
   loop {
     if queue.is_empty() {
       break;
     }
 
-    // Drop any completed terms to avoid O(n) remove(0) churn.
-    queue.retain(|t| !t.is_done());
-    if queue.is_empty() {
-      break;
+    if prune_done {
+      queue.retain(|t| !t.is_done());
+      prune_done = false;
+      if queue.is_empty() {
+        break;
+      }
     }
 
     let heap_threshold = if rank_hits && heap.len() >= k {
@@ -762,16 +775,17 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
 
         let moved = term.advance();
         with_stats(&mut stats, |s| s.postings_advanced += moved);
+        if term.is_done() {
+          prune_done = true;
+        }
         i += 1;
       }
 
-      // Re-sort the advanced terms
-      // We only touched the first `i` terms.
-      // We can sort just that prefix and merge, or just full sort.
-      // PDQSort is fast on partially sorted arrays.
-      // Optimization: if i is small, just bubble them into place?
-      // For simplicity and robustness, full sort mostly sorted array.
-      queue.sort_unstable_by_key(|t| t.doc_id());
+      // Reposition only the advanced prefix to maintain sorted order.
+      bubble_reposition(&mut queue, i);
+      if !queue.windows(2).all(|w| w[0].doc_id() <= w[1].doc_id()) {
+        queue.sort_unstable_by_key(|t| t.doc_id());
+      }
 
       with_stats(&mut stats, |s| {
         s.candidates_examined += 1;
@@ -825,9 +839,15 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         }
         let moved = term.advance_to(pivot_doc);
         with_stats(&mut stats, |s| s.postings_advanced += moved);
+        if term.is_done() {
+          prune_done = true;
+        }
       }
-      // Re-sort after updates
-      queue.sort_unstable_by_key(|t| t.doc_id());
+      // Reposition only the advanced prefix.
+      bubble_reposition(&mut queue, p_idx);
+      if !queue.windows(2).all(|w| w[0].doc_id() <= w[1].doc_id()) {
+        queue.sort_unstable_by_key(|t| t.doc_id());
+      }
     }
   }
 

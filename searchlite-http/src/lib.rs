@@ -92,6 +92,19 @@ struct AppState {
   writer_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Number of NDJSON batches buffered between reader and writer; small to bound memory while
+/// allowing a little headroom to hide writer latency.
+const INGEST_CHANNEL_BUFFER_BATCHES: usize = 4;
+/// Max documents per NDJSON batch.
+const NDJSON_BATCH_SIZE: usize = 1000;
+
+#[derive(Debug)]
+enum IngestMsg {
+  Batch(Vec<Document>),
+  Commit,
+  Abort,
+}
+
 #[derive(Debug, Error)]
 #[error("{reason}")]
 struct HttpError {
@@ -428,65 +441,88 @@ async fn add_ndjson(
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
 
-  enum IngestMsg {
-    Batch(Vec<Document>),
-    Commit,
-    Abort,
+  async fn await_writer_or_default(
+    writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>,
+    default: HttpError,
+  ) -> HttpError {
+    if let Some(handle) = writer_task.take() {
+      match handle.await {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => default,
+        Err(join_err) => HttpError::from_anyhow(
+          "add_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(join_err.to_string()),
+        ),
+      }
+    } else {
+      default
+    }
   }
 
-  const BATCH_SIZE: usize = 1000;
-  // Channel buffers a few batches so the reader isn't blocked on writer latency.
-  let (tx, mut rx) = mpsc::channel::<IngestMsg>(4);
+  let (tx, rx) = mpsc::channel::<IngestMsg>(INGEST_CHANNEL_BUFFER_BATCHES);
+  let mut rx_slot = Some(rx);
+  let mut writer_task: Option<tokio::task::JoinHandle<Result<usize, HttpError>>> = None;
 
-  let writer_lock = state.writer_lock.clone();
-  let index_ref = index.clone();
-  let mut writer_task = Some(tokio::task::spawn_blocking(
-    move || -> Result<usize, HttpError> {
-      let _writer_guard = writer_lock.blocking_lock();
-      let mut writer = index_ref
-        .writer()
-        .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-      let mut total = 0usize;
-      while let Some(msg) = rx.blocking_recv() {
-        match msg {
-          IngestMsg::Batch(batch) => {
-            for doc in batch.iter() {
-              if let Err(err) = writer.add_document(doc) {
-                if let Err(rollback_err) = writer.rollback() {
-                  error!(
-                    error = ?rollback_err,
-                    "failed to rollback writer after NDJSON add failure"
-                  );
+  let ensure_writer_task =
+    |rx_slot: &mut Option<mpsc::Receiver<IngestMsg>>,
+     writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>| {
+      if writer_task.is_some() {
+        return;
+      }
+      let Some(rx) = rx_slot.take() else {
+        return;
+      };
+      let writer_lock = state.writer_lock.clone();
+      let index_ref = index.clone();
+      let handle = tokio::task::spawn_blocking(move || -> Result<usize, HttpError> {
+        let _writer_guard = writer_lock.blocking_lock();
+        let mut writer = index_ref.writer().map_err(|e| {
+          HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+        let mut total = 0usize;
+        let mut rx = rx;
+        while let Some(msg) = rx.blocking_recv() {
+          match msg {
+            IngestMsg::Batch(batch) => {
+              for doc in batch.iter() {
+                if let Err(err) = writer.add_document(doc) {
+                  if let Err(rollback_err) = writer.rollback() {
+                    error!(
+                      error = ?rollback_err,
+                      "failed to rollback writer after NDJSON add failure"
+                    );
+                  }
+                  return Err(HttpError::bad_request("add_failed", err.to_string()));
                 }
-                return Err(HttpError::bad_request("add_failed", err.to_string()));
               }
+              total += batch.len();
             }
-            total += batch.len();
-          }
-          IngestMsg::Commit => return Ok(total),
-          IngestMsg::Abort => {
-            if let Err(rollback_err) = writer.rollback() {
-              error!(
-                error = ?rollback_err,
-                "failed to rollback writer after NDJSON add failure"
-              );
+            IngestMsg::Commit => return Ok(total),
+            IngestMsg::Abort => {
+              if let Err(rollback_err) = writer.rollback() {
+                error!(
+                  error = ?rollback_err,
+                  "failed to rollback writer after NDJSON add failure"
+                );
+              }
+              return Ok(total);
             }
-            return Ok(total);
           }
         }
-      }
-      // Channel closed without explicit commit; rollback to avoid partial ingest.
-      if let Err(rollback_err) = writer.rollback() {
-        error!(
-          error = ?rollback_err,
-          "failed to rollback writer after NDJSON channel closed unexpectedly"
-        );
-      }
-      Ok(total)
-    },
-  ));
+        // Channel closed without explicit commit; rollback to avoid partial ingest.
+        if let Err(rollback_err) = writer.rollback() {
+          error!(
+            error = ?rollback_err,
+            "failed to rollback writer after NDJSON channel closed unexpectedly"
+          );
+        }
+        Ok(total)
+      });
+      *writer_task = Some(handle);
+    };
 
-  let mut docs = Vec::with_capacity(BATCH_SIZE);
+  let mut docs = Vec::with_capacity(NDJSON_BATCH_SIZE);
   let mut line_number = 0usize;
 
   let ingest_result: ApiResult<()> = async {
@@ -517,59 +553,38 @@ async fn add_ndjson(
       let doc = value_to_document(value)?;
       docs.push(doc);
 
-      if docs.len() >= BATCH_SIZE {
-        let batch = std::mem::replace(&mut docs, Vec::with_capacity(BATCH_SIZE));
+      if docs.len() >= NDJSON_BATCH_SIZE {
+        ensure_writer_task(&mut rx_slot, &mut writer_task);
+        let batch = std::mem::replace(&mut docs, Vec::with_capacity(NDJSON_BATCH_SIZE));
         if tx.send(IngestMsg::Batch(batch)).await.is_err() {
-          // Writer task already exited; surface its error if available.
-          let writer_err = if let Some(handle) = writer_task.take() {
-            match handle.await {
-              Ok(Err(e)) => e,
-              Ok(Ok(_)) => HttpError::from_anyhow(
-                "ingest_worker_closed",
-                StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow::anyhow!("ingest worker terminated early"),
-              ),
-              Err(join_err) => HttpError::from_anyhow(
-                "add_join",
-                StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow::anyhow!(join_err.to_string()),
-              ),
-            }
-          } else {
+          let writer_err = await_writer_or_default(
+            &mut writer_task,
             HttpError::from_anyhow(
               "ingest_worker_closed",
               StatusCode::INTERNAL_SERVER_ERROR,
               anyhow::anyhow!("ingest worker terminated early"),
-            )
-          };
+            ),
+          )
+          .await;
           return Err(writer_err);
         }
       }
     }
 
-    if !docs.is_empty() && tx.send(IngestMsg::Batch(docs)).await.is_err() {
-      let writer_err = if let Some(handle) = writer_task.take() {
-        match handle.await {
-          Ok(Err(e)) => e,
-          Ok(Ok(_)) => HttpError::from_anyhow(
+    if !docs.is_empty() {
+      ensure_writer_task(&mut rx_slot, &mut writer_task);
+      if tx.send(IngestMsg::Batch(docs)).await.is_err() {
+        let writer_err = await_writer_or_default(
+          &mut writer_task,
+          HttpError::from_anyhow(
             "ingest_worker_closed",
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow::anyhow!("ingest worker terminated early"),
           ),
-          Err(join_err) => HttpError::from_anyhow(
-            "add_join",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            anyhow::anyhow!(join_err.to_string()),
-          ),
-        }
-      } else {
-        HttpError::from_anyhow(
-          "ingest_worker_closed",
-          StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!("ingest worker terminated early"),
         )
-      };
-      return Err(writer_err);
+        .await;
+        return Err(writer_err);
+      }
     }
 
     Ok(())
@@ -578,7 +593,9 @@ async fn add_ndjson(
 
   if let Err(err) = ingest_result {
     // Signal abort to rollback partial batches; ignore send errors if worker is gone.
-    let _ = tx.send(IngestMsg::Abort).await;
+    if writer_task.is_some() {
+      let _ = tx.send(IngestMsg::Abort).await;
+    }
     drop(tx);
     if let Some(handle) = writer_task.take() {
       let _ = handle.await;
@@ -587,11 +604,12 @@ async fn add_ndjson(
   }
 
   // Signal commit; ignore send error if worker already exited.
+  ensure_writer_task(&mut rx_slot, &mut writer_task);
   let _ = tx.send(IngestMsg::Commit).await;
   drop(tx);
 
-  let total_queued = if let Some(handle) = writer_task.take() {
-    match handle.await {
+  let total_queued = match writer_task.take() {
+    Some(handle) => match handle.await {
       Ok(Ok(total)) => total,
       Ok(Err(e)) => return Err(e),
       Err(join_err) => {
@@ -601,13 +619,8 @@ async fn add_ndjson(
           anyhow::anyhow!(join_err.to_string()),
         ))
       }
-    }
-  } else {
-    return Err(HttpError::from_anyhow(
-      "add_join",
-      StatusCode::INTERNAL_SERVER_ERROR,
-      anyhow::anyhow!("ingest worker handle missing"),
-    ));
+    },
+    None => 0,
   };
 
   Ok(Json(IngestResponse {
@@ -1640,6 +1653,130 @@ mod tests {
     let stats_res = client.get(format!("{base}/stats")).send().await.unwrap();
     let stats: StatsResponse = stats_res.json().await.unwrap();
     assert_eq!(stats.documents, 2500);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn ingest_ndjson_exact_batch_size() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-batches-boundary")).await;
+
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let mut ndjson = String::new();
+    for i in 0..NDJSON_BATCH_SIZE {
+      ndjson.push_str(&format!("{{\"_id\":\"{i}\",\"body\":\"doc {i}\"}}\n"));
+    }
+
+    let res = client
+      .post(format!("{base}/add"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: IngestResponse = res.json().await.unwrap();
+    assert_eq!(body.queued as u64, NDJSON_BATCH_SIZE as u64);
+
+    client.post(format!("{base}/commit")).send().await.unwrap();
+    let stats: StatsResponse = client
+      .get(format!("{base}/stats"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    assert_eq!(stats.documents, NDJSON_BATCH_SIZE as u64);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn ingest_ndjson_writer_failure_mid_batch() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-batches-writer-fail")).await;
+
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson =
+      "{\"_id\":\"ok\",\"body\":\"doc\"}\n{\"body\":\"no id\"}\n{\"_id\":\"later\",\"body\":\"doc\"}\n";
+    let res = client
+      .post(format!("{base}/add"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "add_failed");
+
+    client.post(format!("{base}/commit")).send().await.unwrap();
+    let stats: StatsResponse = client
+      .get(format!("{base}/stats"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    assert_eq!(stats.documents, 0);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn ingest_ndjson_aborts_on_parse_error_without_writer() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-batches-parse-fail")).await;
+
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let res = client
+      .post(format!("{base}/add"))
+      .body("{\"_id\":\"ok\",\"body\":\"doc\"}\nnot-json\n")
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "invalid_document");
+
+    client.post(format!("{base}/commit")).send().await.unwrap();
+    let stats: StatsResponse = client
+      .get(format!("{base}/stats"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    assert_eq!(stats.documents, 0);
 
     handle.abort();
     let _ = handle.await;
