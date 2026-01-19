@@ -24,6 +24,7 @@ use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
@@ -426,62 +427,108 @@ async fn add_ndjson(
     .map(|chunk| chunk.map_err(io::Error::other));
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
-  let mut docs = Vec::new();
-  let mut line_number = 0usize;
-  loop {
-    buf.clear();
-    let read = reader
-      .read_line(&mut buf)
-      .await
-      .map_err(|e| HttpError::from_anyhow("read_body", StatusCode::BAD_REQUEST, e.into()))?;
-    if read == 0 {
-      break;
-    }
-    line_number += 1;
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-      continue;
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-      HttpError::bad_request(
-        "invalid_document",
-        format!("invalid JSON document on NDJSON line {}: {e}", line_number),
-      )
-    })?;
-    let doc = value_to_document(value)?;
-    docs.push(doc);
-  }
-  if docs.is_empty() {
-    return Ok(Json(IngestResponse { queued: 0 }));
-  }
+
+  const BATCH_SIZE: usize = 1000;
+  // Channel buffers a few batches so the reader isn't blocked on writer latency.
+  let (tx, rx) = mpsc::channel::<Vec<Document>>(4);
 
   let writer_lock = state.writer_lock.clone();
-  tokio::task::spawn_blocking(move || {
+  let index_ref = index.clone();
+  let writer_task = tokio::task::spawn_blocking(move || -> Result<usize, HttpError> {
+    let mut rx = rx;
     let _writer_guard = writer_lock.blocking_lock();
-    let mut writer = index
+    let mut writer = index_ref
       .writer()
       .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    for doc in docs.iter() {
-      if let Err(err) = writer.add_document(doc) {
-        if let Err(rollback_err) = writer.rollback() {
-          error!(
-            error = ?rollback_err,
-            "failed to rollback writer after NDJSON add failure"
-          );
+    let mut total = 0usize;
+    while let Some(batch) = rx.blocking_recv() {
+      for doc in batch.iter() {
+        if let Err(err) = writer.add_document(doc) {
+          if let Err(rollback_err) = writer.rollback() {
+            error!(
+              error = ?rollback_err,
+              "failed to rollback writer after NDJSON add failure"
+            );
+          }
+          return Err(HttpError::bad_request("add_failed", err.to_string()));
         }
-        return Err(HttpError::bad_request("add_failed", err.to_string()));
+      }
+      total += batch.len();
+    }
+    Ok(total)
+  });
+
+  let mut docs = Vec::with_capacity(BATCH_SIZE);
+  let mut line_number = 0usize;
+
+  let ingest_result: ApiResult<()> = async {
+    loop {
+      buf.clear();
+      let read = reader
+        .read_line(&mut buf)
+        .await
+        .map_err(|e| HttpError::from_anyhow("read_body", StatusCode::BAD_REQUEST, e.into()))?;
+
+      if read == 0 {
+        break;
+      }
+
+      line_number += 1;
+      let trimmed = buf.trim();
+      if trimmed.is_empty() {
+        continue;
+      }
+
+      let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        HttpError::bad_request(
+          "invalid_document",
+          format!("invalid JSON document on NDJSON line {}: {e}", line_number),
+        )
+      })?;
+
+      let doc = value_to_document(value)?;
+      docs.push(doc);
+
+      if docs.len() >= BATCH_SIZE {
+        let batch = std::mem::replace(&mut docs, Vec::with_capacity(BATCH_SIZE));
+        tx.send(batch).await.map_err(|_| {
+          HttpError::from_anyhow(
+            "ingest_worker_closed",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("ingest worker terminated early"),
+          )
+        })?;
       }
     }
-    Ok(Json(IngestResponse { queued: docs.len() }))
-  })
-  .await
-  .map_err(|err| {
+
+    if !docs.is_empty() {
+      tx.send(docs).await.map_err(|_| {
+        HttpError::from_anyhow(
+          "ingest_worker_closed",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("ingest worker terminated early"),
+        )
+      })?;
+    }
+
+    Ok(())
+  }
+  .await;
+
+  // Ensure the worker finishes regardless of parse/validation errors.
+  drop(tx);
+  let total_queued = writer_task.await.map_err(|err| {
     HttpError::from_anyhow(
       "add_join",
       StatusCode::INTERNAL_SERVER_ERROR,
       anyhow::anyhow!(err.to_string()),
     )
-  })?
+  })??;
+
+  ingest_result?;
+  Ok(Json(IngestResponse {
+    queued: total_queued,
+  }))
 }
 
 async fn bulk_ingest(
@@ -1467,6 +1514,48 @@ mod tests {
     assert_eq!(res.status(), HttpStatus::OK);
     let body: RefreshResponse = res.json().await.unwrap();
     assert!(body.refreshed);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+  #[tokio::test]
+  async fn ingest_ndjson_batches_correctly() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-batches")).await;
+
+    // Init
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    // Create 2500 documents (2 full batches + 1 partial)
+    let mut ndjson = String::new();
+    for i in 0..2500 {
+      ndjson.push_str(&format!("{{\"_id\":\"{}\",\"body\":\"doc {}\"}}\n", i, i));
+    }
+
+    let res = client
+      .post(format!("{base}/add"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: IngestResponse = res.json().await.unwrap();
+    assert_eq!(body.queued, 2500);
+
+    // Commit
+    client.post(format!("{base}/commit")).send().await.unwrap();
+
+    // Verify stats
+    let stats_res = client.get(format!("{base}/stats")).send().await.unwrap();
+    let stats: StatsResponse = stats_res.json().await.unwrap();
+    assert_eq!(stats.documents, 2500);
 
     handle.abort();
     let _ = handle.await;
