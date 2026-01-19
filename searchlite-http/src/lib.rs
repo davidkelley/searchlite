@@ -620,7 +620,9 @@ async fn add_ndjson(
         ))
       }
     },
-    None => 0,
+    None => {
+      return Ok(Json(IngestResponse { queued: 0 }));
+    }
   };
 
   Ok(Json(IngestResponse {
