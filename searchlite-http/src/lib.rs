@@ -428,32 +428,58 @@ async fn add_ndjson(
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
 
+  enum IngestMsg {
+    Batch(Vec<Document>),
+    Commit,
+    Abort,
+  }
+
   const BATCH_SIZE: usize = 1000;
   // Channel buffers a few batches so the reader isn't blocked on writer latency.
-  let (tx, rx) = mpsc::channel::<Vec<Document>>(4);
+  let (tx, mut rx) = mpsc::channel::<IngestMsg>(4);
 
   let writer_lock = state.writer_lock.clone();
   let index_ref = index.clone();
   let writer_task = tokio::task::spawn_blocking(move || -> Result<usize, HttpError> {
-    let mut rx = rx;
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index_ref
       .writer()
       .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut total = 0usize;
-    while let Some(batch) = rx.blocking_recv() {
-      for doc in batch.iter() {
-        if let Err(err) = writer.add_document(doc) {
+    while let Some(msg) = rx.blocking_recv() {
+      match msg {
+        IngestMsg::Batch(batch) => {
+          for doc in batch.iter() {
+            if let Err(err) = writer.add_document(doc) {
+              if let Err(rollback_err) = writer.rollback() {
+                error!(
+                  error = ?rollback_err,
+                  "failed to rollback writer after NDJSON add failure"
+                );
+              }
+              return Err(HttpError::bad_request("add_failed", err.to_string()));
+            }
+          }
+          total += batch.len();
+        }
+        IngestMsg::Commit => return Ok(total),
+        IngestMsg::Abort => {
           if let Err(rollback_err) = writer.rollback() {
             error!(
               error = ?rollback_err,
               "failed to rollback writer after NDJSON add failure"
             );
           }
-          return Err(HttpError::bad_request("add_failed", err.to_string()));
+          return Ok(total);
         }
       }
-      total += batch.len();
+    }
+    // Channel closed without explicit commit; rollback to avoid partial ingest.
+    if let Err(rollback_err) = writer.rollback() {
+      error!(
+        error = ?rollback_err,
+        "failed to rollback writer after NDJSON channel closed unexpectedly"
+      );
     }
     Ok(total)
   });
@@ -491,7 +517,7 @@ async fn add_ndjson(
 
       if docs.len() >= BATCH_SIZE {
         let batch = std::mem::replace(&mut docs, Vec::with_capacity(BATCH_SIZE));
-        tx.send(batch).await.map_err(|_| {
+        tx.send(IngestMsg::Batch(batch)).await.map_err(|_| {
           HttpError::from_anyhow(
             "ingest_worker_closed",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -502,7 +528,7 @@ async fn add_ndjson(
     }
 
     if !docs.is_empty() {
-      tx.send(docs).await.map_err(|_| {
+      tx.send(IngestMsg::Batch(docs)).await.map_err(|_| {
         HttpError::from_anyhow(
           "ingest_worker_closed",
           StatusCode::INTERNAL_SERVER_ERROR,
@@ -515,8 +541,18 @@ async fn add_ndjson(
   }
   .await;
 
-  // Ensure the worker finishes regardless of parse/validation errors.
+  if let Err(err) = ingest_result {
+    // Signal abort to rollback partial batches; ignore send errors if worker is gone.
+    let _ = tx.send(IngestMsg::Abort).await;
+    drop(tx);
+    let _ = writer_task.await;
+    return Err(err);
+  }
+
+  // Signal commit; ignore send error if worker already exited.
+  let _ = tx.send(IngestMsg::Commit).await;
   drop(tx);
+
   let total_queued = writer_task.await.map_err(|err| {
     HttpError::from_anyhow(
       "add_join",
@@ -525,7 +561,6 @@ async fn add_ndjson(
     )
   })??;
 
-  ingest_result?;
   Ok(Json(IngestResponse {
     queued: total_queued,
   }))

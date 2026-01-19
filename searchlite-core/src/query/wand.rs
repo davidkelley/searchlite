@@ -684,12 +684,10 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       break;
     }
 
-    // Remove finished terms (should be rare/impossible if logic is correct, but safe)
-    if queue[0].is_done() {
-      queue.remove(0);
-      if queue.is_empty() {
-        break;
-      }
+    // Drop any completed terms to avoid O(n) remove(0) churn.
+    queue.retain(|t| !t.is_done());
+    if queue.is_empty() {
+      break;
     }
 
     let heap_threshold = if rank_hits && heap.len() >= k {
@@ -754,7 +752,7 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
 
         if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
           let leaf = term.leaf;
-          // Bound check elided for perf, guaranteed by planner
+          // leaf index is guaranteed by the planner to be in bounds
           if !flags[leaf] {
             flags[leaf] = true;
             touched.push(leaf);
