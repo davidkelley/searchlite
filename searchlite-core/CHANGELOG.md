@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.3.0...searchlite-core-v0.3.1) - 2026-01-16
+
+### Other
+
+- perf/optimize wand and http ([#63](https://github.com/davidkelley/searchlite/pull/63))
+
 ## [0.3.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.2.1...searchlite-core-v0.3.0) - 2026-01-15
 
 ### Other
