@@ -668,51 +668,34 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   mut score_adjust: Option<&mut ScoreAdjustFn<'_>>,
 ) -> Vec<RankedDoc> {
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-  // Using a BinaryHeap for the term queue ensures O(log N) operations instead of O(N) for insertion,
-  // substantially improving performance when the number of query terms is large.
-  // We wrap TermState in a struct that implements Ord based on doc_id.
-  #[derive(Debug)]
-  struct TermWrapper(TermState);
-  impl PartialEq for TermWrapper {
-    fn eq(&self, other: &Self) -> bool {
-      self.0.doc_id() == other.0.doc_id()
-    }
-  }
-  impl Eq for TermWrapper {}
-  impl PartialOrd for TermWrapper {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-      Some(self.cmp(other))
-    }
-  }
-  impl Ord for TermWrapper {
-    fn cmp(&self, other: &Self) -> Ordering {
-      // Min-heap behavior: smallest doc_id at the top
-      other.0.doc_id().cmp(&self.0.doc_id())
-    }
-  }
 
-  let mut queue: BinaryHeap<TermWrapper> = terms
-    .into_iter()
-    .filter(|t| !t.is_done())
-    .map(TermWrapper)
-    .collect();
+  // Use a sorted vector instead of BinaryHeap for the term queue.
+  let mut queue: Vec<TermState> = terms.into_iter().filter(|t| !t.is_done()).collect();
+
+  // Initial sort by doc_id
+  queue.sort_unstable_by_key(|t| t.doc_id());
 
   let mut leaf_scores = score_plan.map(|plan| vec![0.0_f32; plan.leaf_count]);
   let mut touched: Vec<usize> = Vec::new();
   let mut touched_flags = leaf_scores.as_ref().map(|buf| vec![false; buf.len()]);
+  let mut prune_done = false;
 
-  // Reusable vector for holding terms popped from the queue during pivot selection/scoring
-  let mut pending: Vec<TermWrapper> = Vec::with_capacity(queue.len());
+  fn bubble_reposition(queue: &mut [TermState], advanced: usize) {
+    let _ = advanced;
+    queue.sort_unstable_by_key(|t| t.doc_id());
+  }
 
   loop {
     if queue.is_empty() {
       break;
     }
 
-    // Check if the head of the queue is exhausted (should be handled by filtering before push, but safety check)
-    if queue.peek().map(|t| t.0.is_done()).unwrap_or(false) {
-      queue.pop();
-      continue;
+    if prune_done {
+      queue.retain(|t| !t.is_done());
+      prune_done = false;
+      if queue.is_empty() {
+        break;
+      }
     }
 
     let heap_threshold = if rank_hits && heap.len() >= k {
@@ -720,101 +703,64 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     } else {
       0.0
     };
-    // When a collector is present we must stream every matching doc (for aggs/counts),
-    // so the pivot search must not stop early based on the heap threshold.
+
     let pivot_threshold = if collector.is_some() {
       f32::NEG_INFINITY
     } else {
       heap_threshold
     };
 
-    // Pivot selection
-    // In strict WAND, we need to find a pivot such that the sum of upper bounds of all terms
-    // preceding the pivot (sorted by doc_id) exceeds the threshold.
-    // Finding this in a Heap is tricky without popping.
-    // Optimization: We pop items into `pending` until we find the pivot or exhaust the heap.
-    // Then we process the pivot and push `pending` items back.
-
     let mut pivot_idx = None;
     let mut acc = 0.0_f32;
 
-    // We drain from the queue into pending to find the pivot.
-    // This seems expensive (pop/push cycle), but `pending` will usually be small
-    // because the threshold prunes the search space effectively.
-    // For very large K or low thresholds, this converges to brute force, which is expected.
-    // However, the previous O(N) insertion sort was worse because it happened on *every* advance.
-
-    // Note: To strictly follow WAND, we need to iterate terms sorted by doc_id.
-    // The heap gives us the smallest doc_id first, which is exactly what we need.
-
-    while let Some(wrapper) = queue.pop() {
-      let term = &wrapper.0;
+    // Linear scan to find pivot
+    for (i, term) in queue.iter().enumerate() {
       let bound = if use_block_bounds {
         term.block_upper_bound()
       } else {
         term.upper_bound()
       };
 
-      pending.push(wrapper);
-
-      if !bound.is_finite() {
-        continue;
-      }
-      acc += bound;
-      if acc >= pivot_threshold {
-        pivot_idx = Some(pending.len() - 1);
-        break;
+      if bound.is_finite() {
+        acc += bound;
+        if acc >= pivot_threshold {
+          pivot_idx = Some(i);
+          break;
+        }
       }
     }
 
     let Some(p_idx) = pivot_idx else {
-      // Threshold cannot be reached even with all remaining terms.
-      for wrapper in pending.drain(..) {
-        if !wrapper.0.is_done() {
-          queue.push(wrapper);
-        }
-      }
+      // Threshold not reachable with remaining terms
       break;
     };
 
-    let pivot_doc = pending[p_idx].0.doc_id();
-    let smallest_doc = pending[0].0.doc_id();
+    let pivot_doc = queue[p_idx].doc_id();
+    let smallest_doc = queue[0].doc_id();
+
+    if pivot_doc == DOCID_END {
+      break;
+    }
 
     if pivot_doc == smallest_doc {
-      // We have a candidate match at smallest_doc
       let doc_id = pivot_doc;
-
-      // We must ensure we have ALL terms for this doc_id, not just the ones
-      // corresponding to the pivot threshold. There might be more terms in the queue
-      // with the same doc_id that we haven't popped yet.
-      while let Some(top) = queue.peek() {
-        if top.0.doc_id() == doc_id {
-          pending.push(queue.pop().unwrap());
-        } else {
-          break;
-        }
-      }
-
       let mut score_sum = 0.0;
 
-      for wrapper in pending.iter_mut() {
-        let term = &mut wrapper.0;
-        if term.doc_id() != doc_id {
-          // This should effectively be unreachable if pivot_doc == smallest_doc
-          continue;
+      // Advance all terms matching this doc_id
+      // Since queue is sorted, they are at the start
+      let mut i = 0;
+      while i < queue.len() {
+        if queue[i].doc_id() != doc_id {
+          break;
         }
 
+        let term = &mut queue[i];
         let contribution = term.score_current();
         score_sum += contribution;
 
         if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
           let leaf = term.leaf;
-          assert!(
-            leaf < buf.len(),
-            "leaf index {} out of bounds for leaf_scores buffer of length {}",
-            leaf,
-            buf.len()
-          );
+          // leaf index is guaranteed by the planner to be in bounds
           if !flags[leaf] {
             flags[leaf] = true;
             touched.push(leaf);
@@ -824,7 +770,14 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
 
         let moved = term.advance();
         with_stats(&mut stats, |s| s.postings_advanced += moved);
+        if term.is_done() {
+          prune_done = true;
+        }
+        i += 1;
       }
+
+      // Reposition only the advanced prefix to maintain sorted order.
+      bubble_reposition(&mut queue, i);
 
       with_stats(&mut stats, |s| {
         s.candidates_examined += 1;
@@ -850,8 +803,6 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
           buf[idx] = 0.0;
           flags[idx] = false;
         }
-      } else {
-        touched.clear();
       }
 
       if let Some(final_score) = score_opt {
@@ -872,30 +823,20 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         }
       }
     } else {
-      // Pivot > Smallest. We can skip terms in `pending` forward.
-      // Terms in `pending` [0..p_idx] (exclusive of p_idx maybe?)
-      // Actually strictly: We know sum(bounds[0..p_idx]) >= threshold.
-      // But sum(bounds[0..p_idx-1]) < threshold.
-      // So optimization: We can advance terms[0]... but WAND says we pick the pivot term.
-      // The pivot term is pending[p_idx].
-      // We should advance the earlier terms to pivot_doc.
-
-      for wrapper in pending.iter_mut().take(p_idx) {
-        let term = &mut wrapper.0;
+      // Pivot > Smallest. Advance terms < pivot to pivot_doc
+      for term in queue[0..p_idx].iter_mut() {
         if use_block_bounds {
           let moved = term.skip_to_block(pivot_doc);
           with_stats(&mut stats, |s| s.postings_advanced += moved);
         }
         let moved = term.advance_to(pivot_doc);
         with_stats(&mut stats, |s| s.postings_advanced += moved);
+        if term.is_done() {
+          prune_done = true;
+        }
       }
-    }
-
-    // Push everything back into the queue
-    for wrapper in pending.drain(..) {
-      if !wrapper.0.is_done() {
-        queue.push(wrapper);
-      }
+      // Reposition only the advanced prefix.
+      bubble_reposition(&mut queue, p_idx);
     }
   }
 
