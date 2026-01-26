@@ -14,8 +14,10 @@ typedef struct IndexHandle IndexHandle;
 IndexHandle* searchlite_index_open(const char* path, bool create_if_missing);
 void searchlite_index_close(IndexHandle* handle);
 int32_t searchlite_add_json(IndexHandle* handle, const char* json, size_t json_len);
+int32_t searchlite_add_json_batch(IndexHandle* handle, const char* json, size_t json_len);
 int32_t searchlite_commit(IndexHandle* handle);
 size_t searchlite_search(IndexHandle* handle, const char* query, size_t limit, const char* cursor, const char* aggs_json, size_t aggs_len, char* out_json_buf, size_t buf_cap);
+size_t searchlite_search_request(IndexHandle* handle, const char* request_json, size_t request_len, char* out_json_buf, size_t buf_cap);
 
 #ifdef __cplusplus
 }

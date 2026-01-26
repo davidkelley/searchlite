@@ -832,7 +832,12 @@ impl Searchlite {
     Ok(())
   }
 
-  pub fn search(&self, query: String, limit: usize) -> Result<JsValue, JsValue> {
+  pub fn search(
+    &self,
+    query: String,
+    limit: usize,
+    return_stored: Option<bool>,
+  ) -> Result<JsValue, JsValue> {
     let parsed_query = serde_json::from_str::<QueryNode>(&query)
       .map(Query::Node)
       .unwrap_or(Query::String(query));
@@ -853,7 +858,7 @@ impl Searchlite {
 
       #[cfg(feature = "vectors")]
       vector_filter: None,
-      return_stored: true,
+      return_stored: return_stored.unwrap_or(false),
       highlight_field: None,
       highlight: None,
       collapse: None,
@@ -868,6 +873,12 @@ impl Searchlite {
 
   pub fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
     let req: SearchRequest = serde_json::from_str(&request_json)
+      .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    self.run_search(req)
+  }
+
+  pub fn search_request_value(&self, request: JsValue) -> Result<JsValue, JsValue> {
+    let req: SearchRequest = serde_wasm_bindgen::from_value(request)
       .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
     self.run_search(req)
   }
@@ -1081,6 +1092,44 @@ mod tests {
   }
 
   #[wasm_bindgen_test]
+  async fn search_defaults_skip_stored_fields() {
+    let db = unique_db("searchlite-wasm-return-stored-default");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello wasm" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let result = idx.search("hello".to_string(), 5, None).unwrap();
+    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    let hit = &parsed["hits"][0];
+    assert!(hit["fields"].is_null());
+  }
+
+  #[wasm_bindgen_test]
+  async fn search_request_value_respects_return_stored() {
+    let db = unique_db("searchlite-wasm-return-stored");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello wasm" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": 5,
+      "return_stored": true
+    });
+    let request_js = serde_wasm_bindgen::to_value(&request).unwrap();
+    let result = idx.search_request_value(request_js).unwrap();
+    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    let hit = &parsed["hits"][0];
+    assert!(hit["fields"].is_object());
+  }
+
+  #[wasm_bindgen_test]
   async fn init_reuses_existing_index() {
     let db = unique_db("searchlite-reopen");
     let schema = Schema::default_text_body();
@@ -1095,7 +1144,7 @@ mod tests {
     drop(idx);
 
     let reopened = Searchlite::init(db, schema_json, None).await.unwrap();
-    let result = reopened.search("hello".to_string(), 5).unwrap();
+    let result = reopened.search("hello".to_string(), 5, None).unwrap();
     let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
     let hits = result_json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);

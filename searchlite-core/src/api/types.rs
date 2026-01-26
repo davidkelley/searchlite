@@ -420,6 +420,7 @@ pub struct SearchRequest {
   #[cfg(feature = "vectors")]
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_filter: Option<Filter>,
+  #[serde(default)]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,6 +467,7 @@ struct SearchRequestHelper {
   #[cfg(feature = "vectors")]
   #[serde(default)]
   pub vector_filter: Option<Filter>,
+  #[serde(default)]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]

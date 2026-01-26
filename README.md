@@ -1086,6 +1086,13 @@ For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `
 - Instantiate from JS with `await Searchlite.init("demo-db", JSON.stringify(schema), "indexeddb")` (default) or `"memory"` for ephemeral indexes. `init` reopens existing indexes with the same name and validates schemas; mismatches return an error.
 - Prefer `add_documents([...])` for bulk ingest and call `commit()` to flush everything to the manifest.
 
+### FFI + WASM lifecycle
+
+- Ingest APIs now queue documents; call `commit` (`searchlite_commit` in FFI, `commit()` in WASM) to make them searchable.
+- Searches default to `return_stored: false`; set it explicitly (or pass `true` as the third argument to the WASM `search` helper) when you need stored fields.
+- Use the full request helpers for advanced queries: `searchlite_search_request` (FFI) and `search_request_value`/`search_request` (WASM).
+- See `docs/bindings.md` for a quick reference of binding behaviors.
+
 ## Building the C library
 
 Build the FFI crate to generate a shared library and header for C or other language bindings.
