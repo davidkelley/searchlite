@@ -11,6 +11,8 @@ extern "C" {
 
 typedef struct IndexHandle IndexHandle;
 
+#define SEARCHLITE_ERR_PANIC (-100)
+
 IndexHandle* searchlite_index_open(const char* path, bool create_if_missing);
 void searchlite_index_close(IndexHandle* handle);
 int32_t searchlite_add_json(IndexHandle* handle, const char* json, size_t json_len);
