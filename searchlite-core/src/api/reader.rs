@@ -2537,8 +2537,8 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
-    if req.limit == 0 {
-      bail!("search request must set limit > 0");
+    if req.limit == 0 && req.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0");
     }
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
@@ -2694,7 +2694,9 @@ impl IndexReader {
         let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
-        if agg_ref.is_none() && (!req.return_hits || (!score_fast_path && req.limit > 0)) {
+        if agg_ref.is_none()
+          && (req.limit == 0 || !req.return_hits || (!score_fast_path && req.limit > 0))
+        {
           agg_ref = Some(&mut noop_collector);
         }
         let segment_rank_limit = if !req.return_hits {

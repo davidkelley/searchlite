@@ -374,8 +374,8 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     Query::Node(QueryNode::Vector(_)) => None,
     _ => vector_opts.clone().map(VectorQuerySpec::Structured),
   };
-  if limit == 0 {
-    bail!("search limit must be greater than zero (set --limit to a positive number)");
+  if limit == 0 && cursor.is_some() {
+    bail!("cursor is not supported when limit is 0");
   }
   Ok(SearchRequest {
     query,
@@ -411,8 +411,8 @@ fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<Sea
       fs::read_to_string(&p).with_context(|| format!("reading search request from {:?}", p))?;
     let request = serde_json::from_str::<SearchRequest>(&contents)
       .with_context(|| format!("parsing search request JSON from {:?}", p))?;
-    if request.limit == 0 {
-      bail!("search request must set limit > 0");
+    if request.limit == 0 && request.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0");
     }
     return Ok(Some(request));
   }
@@ -423,8 +423,8 @@ fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<Sea
       .context("reading search request from stdin")?;
     let request = serde_json::from_str::<SearchRequest>(&buf)
       .context("parsing search request JSON from stdin")?;
-    if request.limit == 0 {
-      bail!("search request must set limit > 0");
+    if request.limit == 0 && request.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0");
     }
     return Ok(Some(request));
   }

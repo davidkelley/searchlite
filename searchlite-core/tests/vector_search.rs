@@ -159,7 +159,7 @@ fn vector_only_search_skips_missing_vectors() {
 }
 
 #[test]
-fn vector_query_with_limit_zero_errors() {
+fn vector_query_with_limit_zero_succeeds_without_hits() {
   let dir = tempdir().unwrap();
   let schema = schema();
   IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
@@ -193,8 +193,10 @@ fn vector_query_with_limit_zero_errors() {
     vector_filter: None,
     ..base_request(Query::String("".into()), 0)
   };
-  let err = reader.search(&req).unwrap_err();
-  assert!(err.to_string().to_lowercase().contains("limit"));
+  let res = reader.search(&req).unwrap();
+  assert!(res.hits.is_empty());
+  assert_eq!(res.next_cursor, None);
+  assert!(res.total_hits_estimate > 0);
 }
 
 #[test]

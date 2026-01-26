@@ -781,10 +781,10 @@ async fn search(
   payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<SearchResult>> {
   let request = parse_json(payload)?;
-  if request.limit == 0 {
+  if request.limit == 0 && request.cursor.is_some() {
     return Err(HttpError::bad_request(
-      "invalid_limit",
-      "invalid limit: must be greater than zero (set limit to a positive integer)",
+      "invalid_cursor",
+      "cursor is not supported when limit is 0",
     ));
   }
   let index = state.require_index().await?;
@@ -1364,6 +1364,7 @@ mod tests {
     let invalid = json!({
       "query": { "type": "query_string", "query": "rust" },
       "limit": 0,
+      "cursor": "010203",
       "return_stored": true,
       "execution": "wand"
     });
@@ -1375,7 +1376,7 @@ mod tests {
       .unwrap();
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let body: ErrorResponse = res.json().await.unwrap();
-    assert_eq!(body.error.r#type, "invalid_limit");
+    assert_eq!(body.error.r#type, "invalid_cursor");
     handle.abort();
     let _ = handle.await;
   }
