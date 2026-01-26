@@ -10,6 +10,7 @@ use crate::analysis::analyzer::{
   Analyzer, AnalyzerDef, AnalyzerRegistry, EdgeNgramConfig, TokenFilterDef,
 };
 use crate::storage::Storage;
+use crate::util::doc_id::validate_doc_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -323,19 +324,19 @@ impl Schema {
   }
 
   pub fn validate_document(&self, doc: &crate::api::types::Document) -> anyhow::Result<()> {
-    if doc
-      .fields
-      .get(self.doc_id_field())
-      .and_then(|v| v.as_str())
-      .map(|s| s.trim())
-      .filter(|s| !s.is_empty())
-      .is_none()
-    {
+    let Some(doc_id) = doc.fields.get(self.doc_id_field()).and_then(|v| v.as_str()) else {
+      anyhow::bail!(
+        "missing or empty required document id field `{}`",
+        self.doc_id_field()
+      );
+    };
+    if doc_id.trim().is_empty() {
       anyhow::bail!(
         "missing or empty required document id field `{}`",
         self.doc_id_field()
       );
     }
+    validate_doc_id(doc_id)?;
     for (name, value) in doc.fields.iter() {
       if let Some(nested) = self.nested_fields.iter().find(|n| n.name == *name) {
         nested
