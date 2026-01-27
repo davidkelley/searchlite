@@ -337,6 +337,17 @@ fn search_with_zero_limit_skips_hits_but_counts_matches() {
 }
 
 #[test]
+fn explain_rejected_when_limit_zero() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  req.explain = true;
+  let err = reader.search(&req).unwrap_err();
+  assert!(err.to_string().to_lowercase().contains("explain"));
+}
+
+#[test]
 fn search_with_zero_limit_still_runs_aggregations() {
   let (_tmp, idx) = build_index_with_docs(vec![
     doc("doc-1", vec![("body", json!("hello rust"))]),

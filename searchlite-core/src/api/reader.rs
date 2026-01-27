@@ -2540,6 +2540,9 @@ impl IndexReader {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
     }
+    if req.limit == 0 && req.explain {
+      bail!("explain is not supported when limit is 0");
+    }
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
     }
