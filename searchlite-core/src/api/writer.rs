@@ -80,6 +80,7 @@ impl IndexWriter {
   /// Capture the current WAL length and pending-op count so callers can roll back
   /// only the work done after the checkpoint.
   pub fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
+    let _guard = self.inner.writer_lock.lock();
     let wal_len = self.wal.len()?;
     Ok(WriterCheckpoint {
       wal_len,
@@ -90,6 +91,7 @@ impl IndexWriter {
   /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
   /// earlier queued work.
   pub fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
+    let _guard = self.inner.writer_lock.lock();
     self.wal.truncate_to(checkpoint.wal_len)?;
     if self.pending_ops.len() > checkpoint.pending_len {
       self.pending_ops.truncate(checkpoint.pending_len);
