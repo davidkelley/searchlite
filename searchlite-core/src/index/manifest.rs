@@ -330,12 +330,6 @@ impl Schema {
         self.doc_id_field()
       );
     };
-    if doc_id.trim().is_empty() {
-      anyhow::bail!(
-        "missing or empty required document id field `{}`",
-        self.doc_id_field()
-      );
-    }
     validate_doc_id(doc_id)?;
     for (name, value) in doc.fields.iter() {
       if let Some(nested) = self.nested_fields.iter().find(|n| n.name == *name) {
@@ -436,7 +430,7 @@ mod tests {
       let err = schema.validate_document(&doc).unwrap_err();
       assert!(err
         .to_string()
-        .contains("missing or empty required document id field"));
+        .contains("document id cannot be empty or whitespace"));
     }
   }
 

@@ -270,6 +270,7 @@ fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
     .with_context(|| format!("reading document ids from {:?}", ids_path))?;
   let mut ids = Vec::new();
   for (line_no, line) in content.lines().enumerate() {
+    let line = line.strip_suffix('\r').unwrap_or(line);
     if line.trim().is_empty() {
       continue;
     }
