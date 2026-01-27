@@ -22,7 +22,13 @@ pub struct IndexHandle {
   index: Index,
 }
 
+/// Returned when a Rust panic was caught inside an FFI entrypoint. The in-flight
+/// operation is aborted; callers may retry. After a panic from a mutating call,
+/// reopening the index handle is the safest way to ensure on-disk consistency.
 const ERR_PANIC: c_int = -100;
+// All extern "C" functions use catch_unwind to prevent unwinding across the C
+// boundary. Panics abort the current operation; state is left as-consistent-as-
+// possible, but reopen after panics from mutating calls to be conservative.
 
 #[inline]
 fn catch_unwind_default<T>(api: &str, default: T, f: impl FnOnce() -> T) -> T {
@@ -178,7 +184,9 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
 /// # Safety
 /// `handle` must be a valid pointer from `searchlite_index_open`; `query` must be a valid C string; `cursor`, when provided,
 /// must be a valid C string produced by a previous response; `aggs_json`, when provided, must point to `aggs_len` bytes of JSON;
-/// `out_json_buf` must be a writable buffer of at least `buf_cap` bytes.
+/// `out_json_buf` must be a writable buffer of at least `buf_cap` bytes. Returns the number of bytes written, or a negative error
+/// code. On panic the function returns `ERR_PANIC` and the operation is aborted; reopen the index after panics from mutating calls
+/// to guarantee consistency before retrying.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_search(
   handle: *mut IndexHandle,
@@ -189,8 +197,8 @@ pub unsafe extern "C" fn searchlite_search(
   aggs_len: usize,
   out_json_buf: *mut c_char,
   buf_cap: usize,
-) -> usize {
-  catch_unwind_default("searchlite_search", 0, || {
+) -> isize {
+  catch_unwind_default("searchlite_search", ERR_PANIC as isize, || {
     #[cfg(test)]
     maybe_panic_for_tests();
 
@@ -263,7 +271,7 @@ pub unsafe extern "C" fn searchlite_search(
     let len = bytes.len().min(buf_cap.saturating_sub(1));
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, len);
     *out_json_buf.add(len) = 0;
-    len
+    len as isize
   })
 }
 
