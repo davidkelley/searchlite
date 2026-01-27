@@ -33,6 +33,12 @@ pub struct IndexWriter {
   live_generation: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WriterCheckpoint {
+  wal_len: u64,
+  pending_len: usize,
+}
+
 impl IndexWriter {
   pub(crate) fn new(inner: Arc<InnerIndex>) -> Result<Self> {
     // Hold the writer lock during initialization to avoid racing with a commit.
@@ -69,6 +75,26 @@ impl IndexWriter {
       live_docs,
       live_generation,
     })
+  }
+
+  /// Capture the current WAL length and pending-op count so callers can roll back
+  /// only the work done after the checkpoint.
+  pub fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
+    let wal_len = self.wal.len()?;
+    Ok(WriterCheckpoint {
+      wal_len,
+      pending_len: self.pending_ops.len(),
+    })
+  }
+
+  /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
+  /// earlier queued work.
+  pub fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
+    self.wal.truncate_to(checkpoint.wal_len)?;
+    if self.pending_ops.len() > checkpoint.pending_len {
+      self.pending_ops.truncate(checkpoint.pending_len);
+    }
+    Ok(())
   }
 
   pub fn add_document(&mut self, doc: &Document) -> Result<u32> {
@@ -681,6 +707,51 @@ mod tests {
     );
     let wal_len = std::fs::metadata(&wal_path).unwrap().len();
     assert_eq!(wal_len, 0, "wal should be truncated after commit");
+    let manifest = idx.manifest();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].doc_count, 1);
+  }
+
+  #[test]
+  fn rollback_to_checkpoint_preserves_prior_pending() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("doc-existing")),
+            ("body".into(), serde_json::json!("existing")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      // drop writer without commit to leave pending WAL entries.
+    }
+    let mut writer = idx.writer().unwrap();
+    assert_eq!(writer.pending_ops.len(), 1);
+    let checkpoint = writer.checkpoint().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("_id".into(), serde_json::json!("doc-batch")),
+          ("body".into(), serde_json::json!("new batch doc")),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    assert_eq!(writer.pending_ops.len(), 2);
+    writer.rollback_to(checkpoint).unwrap();
+    assert_eq!(
+      writer.pending_ops.len(),
+      1,
+      "rollback_to should keep prior pending ops intact"
+    );
+    writer.commit().unwrap();
     let manifest = idx.manifest();
     assert_eq!(manifest.segments.len(), 1);
     assert_eq!(manifest.segments[0].doc_count, 1);

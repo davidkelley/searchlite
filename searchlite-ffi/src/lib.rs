@@ -185,12 +185,16 @@ pub unsafe extern "C" fn searchlite_add_json_batch(
     Ok(w) => w,
     Err(_) => return -4,
   };
+  let checkpoint = match writer.checkpoint() {
+    Ok(c) => c,
+    Err(_) => return -4,
+  };
   let mut added: c_int = 0;
   for doc in docs.iter() {
     match writer.add_document(doc) {
       Ok(_) => added += 1,
       Err(_) => {
-        let _ = writer.rollback();
+        let _ = writer.rollback_to(checkpoint);
         return -2;
       }
     }
