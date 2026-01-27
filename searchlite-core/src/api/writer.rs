@@ -80,40 +80,23 @@ impl IndexWriter {
   /// Capture the current WAL length and pending-op count so callers can roll back
   /// only the work done after the checkpoint.
   pub fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
-    let _guard = self.inner.writer_lock.lock();
-    let wal_len = self.wal.len()?;
-    Ok(WriterCheckpoint {
-      wal_len,
-      pending_len: self.pending_ops.len(),
-    })
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    self.checkpoint_locked()
   }
 
   /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
   /// earlier queued work.
   pub fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
-    let _guard = self.inner.writer_lock.lock();
-    self.wal.truncate_to(checkpoint.wal_len)?;
-    if self.pending_ops.len() > checkpoint.pending_len {
-      self.pending_ops.truncate(checkpoint.pending_len);
-    }
-    Ok(())
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    self.rollback_to_locked(checkpoint)
   }
 
   pub fn add_document(&mut self, doc: &Document) -> Result<u32> {
-    let _guard = self.inner.writer_lock.lock();
-    self.schema.validate_document(doc)?;
-    let doc_id = doc_id_from_document(&self.schema, doc)?;
-    self.wal.append_add_doc(doc)?;
-    self.pending_ops.push(PendingOp::Add {
-      doc_id: doc_id.clone(),
-      doc: doc.clone(),
-    });
-    let add_count = self
-      .pending_ops
-      .iter()
-      .filter(|op| matches!(op, PendingOp::Add { .. }))
-      .count();
-    Ok(add_count as u32 - 1)
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    self.add_document_locked(doc)
   }
 
   pub fn delete_document(&mut self, doc_id: &str) -> Result<()> {
@@ -271,6 +254,52 @@ impl IndexWriter {
     self.pending_ops.clear();
     self.wal.truncate()?;
     Ok(())
+  }
+
+  /// Add a batch atomically: validate all docs, append to WAL, and either queue all or none.
+  pub fn add_documents_batch(&mut self, docs: &[Document]) -> Result<usize> {
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    let checkpoint = self.checkpoint_locked()?;
+    for doc in docs {
+      if let Err(e) = self.add_document_locked(doc) {
+        self.rollback_to_locked(checkpoint)?;
+        return Err(e);
+      }
+    }
+    Ok(docs.len())
+  }
+
+  fn checkpoint_locked(&mut self) -> Result<WriterCheckpoint> {
+    let wal_len = self.wal.len()?;
+    Ok(WriterCheckpoint {
+      wal_len,
+      pending_len: self.pending_ops.len(),
+    })
+  }
+
+  fn rollback_to_locked(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
+    self.wal.truncate_to(checkpoint.wal_len)?;
+    if self.pending_ops.len() > checkpoint.pending_len {
+      self.pending_ops.truncate(checkpoint.pending_len);
+    }
+    Ok(())
+  }
+
+  fn add_document_locked(&mut self, doc: &Document) -> Result<u32> {
+    self.schema.validate_document(doc)?;
+    let doc_id = doc_id_from_document(&self.schema, doc)?;
+    self.wal.append_add_doc(doc)?;
+    self.pending_ops.push(PendingOp::Add {
+      doc_id: doc_id.clone(),
+      doc: doc.clone(),
+    });
+    let add_count = self
+      .pending_ops
+      .iter()
+      .filter(|op| matches!(op, PendingOp::Add { .. }))
+      .count();
+    Ok(add_count as u32 - 1)
   }
 }
 

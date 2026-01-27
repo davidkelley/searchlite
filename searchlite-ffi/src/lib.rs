@@ -174,32 +174,14 @@ pub unsafe extern "C" fn searchlite_add_json_batch(
     Ok(docs) => docs,
     Err(_) => return -6,
   };
-  // Pre-validate to guarantee all-or-nothing semantics.
-  let schema = h.index.manifest().schema;
-  for doc in docs.iter() {
-    if schema.validate_document(doc).is_err() {
-      return -6;
-    }
-  }
   let mut writer = match h.index.writer() {
     Ok(w) => w,
     Err(_) => return -4,
   };
-  let checkpoint = match writer.checkpoint() {
-    Ok(c) => c,
-    Err(_) => return -4,
-  };
-  let mut added: c_int = 0;
-  for doc in docs.iter() {
-    match writer.add_document(doc) {
-      Ok(_) => added += 1,
-      Err(_) => {
-        let _ = writer.rollback_to(checkpoint);
-        return -2;
-      }
-    }
+  match writer.add_documents_batch(&docs) {
+    Ok(count) => count as c_int,
+    Err(_) => -2,
   }
-  added
 }
 
 /// # Safety
