@@ -200,6 +200,51 @@ fn vector_query_with_limit_zero_succeeds_without_hits() {
 }
 
 #[test]
+fn hybrid_vector_query_with_limit_zero_returns_no_hits() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("vec-1")),
+          ("body".into(), serde_json::json!("rust search")),
+          ("embedding".into(), serde_json::json!([1.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("vec-2")),
+          ("body".into(), serde_json::json!("other body")),
+          ("embedding".into(), serde_json::json!([0.0, 1.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let mut req = base_request(Query::String("rust".into()), 0);
+  req.vector_query = Some(VectorQuerySpec::Structured(VectorQuery {
+    field: "embedding".into(),
+    vector: vec![1.0, 0.0],
+    k: Some(3),
+    alpha: Some(0.5),
+    ef_search: None,
+    candidate_size: Some(3),
+    boost: None,
+  }));
+  let res = reader.search(&req).unwrap();
+  assert!(res.hits.is_empty());
+  assert_eq!(res.next_cursor, None);
+}
+
+#[test]
 fn hybrid_blends_text_and_vector() {
   let dir = tempdir().unwrap();
   let schema = schema();

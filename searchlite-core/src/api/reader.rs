@@ -2757,26 +2757,28 @@ impl IndexReader {
       hits.extend(heap);
     }
     #[cfg(feature = "vectors")]
-    if let Some(plan) = vector_plan.as_ref() {
-      let require_text_match = !plan.vector_only;
-      let vector_scores = self.collect_vector_maps(
-        plan,
-        root_filter,
-        req.vector_filter.as_ref(),
-        require_text_match,
-        &term_groups,
-        &phrase_fields,
-        &query_plan.matcher,
-      )?;
-      hits = self.merge_vector_hits(
-        hits,
-        &vector_scores,
-        plan,
-        &sort_plan,
-        cursor_key.as_ref(),
-        &mut saw_cursor,
-        top_k,
-      )?;
+    if req.limit > 0 && req.return_hits {
+      if let Some(plan) = vector_plan.as_ref() {
+        let require_text_match = !plan.vector_only;
+        let vector_scores = self.collect_vector_maps(
+          plan,
+          root_filter,
+          req.vector_filter.as_ref(),
+          require_text_match,
+          &term_groups,
+          &phrase_fields,
+          &query_plan.matcher,
+        )?;
+        hits = self.merge_vector_hits(
+          hits,
+          &vector_scores,
+          plan,
+          &sort_plan,
+          cursor_key.as_ref(),
+          &mut saw_cursor,
+          top_k,
+        )?;
+      }
     }
     if req.return_hits {
       hits.sort_by(|a, b| a.key.cmp(&b.key));
