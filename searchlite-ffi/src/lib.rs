@@ -68,6 +68,11 @@ fn maybe_panic_for_tests() {
   }
 }
 
+#[cfg(test)]
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+  TEST_PANIC_LOCK.lock().unwrap()
+}
+
 /// # Safety
 /// `path` must be a valid, non-null C string pointer that remains valid for the duration of the call.
 #[no_mangle]
@@ -283,6 +288,7 @@ mod tests {
 
   #[test]
   fn ffi_roundtrip_search() {
+    let _guard = test_guard();
     let dir = tempdir().unwrap();
     let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
     let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
@@ -313,6 +319,7 @@ mod tests {
 
   #[test]
   fn ffi_search_invalid_aggs_json_returns_error() {
+    let _guard = test_guard();
     let dir = tempdir().unwrap();
     let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
     let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
@@ -345,7 +352,7 @@ mod tests {
 
   #[test]
   fn ffi_panic_is_contained_and_returns_error_code() {
-    let _guard = TEST_PANIC_LOCK.lock().unwrap();
+    let _guard = test_guard();
 
     let dir = tempdir().unwrap();
     let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
