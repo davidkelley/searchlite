@@ -15,6 +15,7 @@ use searchlite_core::api::types::{
 #[cfg(feature = "vectors")]
 use searchlite_core::api::types::{VectorQuery, VectorQuerySpec};
 use searchlite_core::api::Index;
+use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_http::{
   init_tracing as init_http_tracing, run as http_run, ServeArgs as HttpServeArgs,
 };
@@ -269,14 +270,14 @@ fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
     .with_context(|| format!("reading document ids from {:?}", ids_path))?;
   let mut ids = Vec::new();
   for (line_no, line) in content.lines().enumerate() {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.trim().is_empty() {
       continue;
     }
-    if trimmed.chars().any(|c| c.is_control()) {
-      bail!("invalid id on line {}", line_no + 1);
+    if let Err(err) = validate_doc_id(line) {
+      bail!("invalid id on line {}: {}", line_no + 1, err);
     }
-    ids.push(trimmed.to_string());
+    ids.push(line.to_string());
   }
   if ids.is_empty() {
     bail!("no document ids provided");
@@ -674,6 +675,65 @@ mod tests {
     assert!(
       err.to_string().contains("index does not exist"),
       "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn delete_handles_whitespace_padded_ids() {
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx-whitespace-delete");
+    let schema_path = dir.path().join("schema.json");
+    let schema = searchlite_core::api::types::Schema::default_text_body();
+    fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
+
+    let docs_path = dir.path().join("docs.jsonl");
+    fs::write(
+      &docs_path,
+      "{\"_id\":\"  padded-id  \",\"body\":\"spaced\"}\n",
+    )
+    .unwrap();
+    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
+    cmd_commit(index.as_path()).unwrap();
+
+    let ids_path = dir.path().join("ids.txt");
+    fs::write(&ids_path, "  padded-id  \n").unwrap();
+    cmd_delete(index.as_path(), ids_path.as_path()).unwrap();
+    cmd_commit(index.as_path()).unwrap();
+
+    let opts = options(index.as_path(), false);
+    let idx = Index::open(opts).unwrap();
+    let reader = idx.reader().unwrap();
+    let request = SearchRequest {
+      query: "spaced".into(),
+      fields: None,
+      filter: None,
+      limit: 5,
+      return_hits: true,
+      candidate_size: None,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let result = reader.search(&request).unwrap();
+    assert!(
+      result.hits.is_empty(),
+      "expected padded id document to be deleted"
     );
   }
 }

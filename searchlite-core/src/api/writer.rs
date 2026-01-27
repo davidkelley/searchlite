@@ -10,6 +10,7 @@ use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::{SegmentFileMeta, SegmentWriter};
 use crate::index::wal::{Wal, WalEntry};
 use crate::index::InnerIndex;
+use crate::util::doc_id::validate_doc_id;
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -276,6 +277,7 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
       schema.doc_id_field()
     );
   }
+  validate_doc_id(doc_id)?;
   Ok(doc_id.to_string())
 }
 
