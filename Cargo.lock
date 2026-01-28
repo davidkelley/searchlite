@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-http"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",

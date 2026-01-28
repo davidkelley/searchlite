@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.5...searchlite-cli-v0.1.6) - 2026-01-28
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.5](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.4...searchlite-cli-v0.1.5) - 2026-01-28
 
 ### Added
