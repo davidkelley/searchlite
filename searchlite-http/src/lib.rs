@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{Document, IndexOptions, SearchRequest, StorageType};
 use searchlite_core::api::SearchResult;
+use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
@@ -797,6 +798,12 @@ async fn search(
 ) -> ApiResult<Json<SearchResult>> {
   let mut request = parse_json(payload)?;
   if request.limit == 0 {
+    if request.cursor.is_some() {
+      return Err(HttpError::bad_request(
+        "invalid_cursor",
+        "cursor is not supported when limit is 0",
+      ));
+    }
     return Err(HttpError::bad_request(
       "invalid_limit",
       "invalid limit: must be greater than zero (set limit to a positive integer)",
@@ -888,25 +895,11 @@ fn value_to_document(value: serde_json::Value) -> ApiResult<Document> {
 }
 
 fn validate_ids(ids: &[String]) -> ApiResult<()> {
-  // Avoid control characters to prevent invisible ids or log injection.
   for (idx, id) in ids.iter().enumerate() {
-    let trimmed = id.trim();
-    if trimmed.is_empty() {
+    if let Err(err) = validate_doc_id(id) {
       return Err(HttpError::bad_request(
         "invalid_id",
-        format!("id at position {} is empty", idx),
-      ));
-    }
-    if trimmed.len() != id.len() {
-      return Err(HttpError::bad_request(
-        "invalid_id",
-        format!("id at position {} has leading or trailing whitespace", idx),
-      ));
-    }
-    if id.chars().any(|c| c.is_control()) {
-      return Err(HttpError::bad_request(
-        "invalid_id",
-        format!("id at position {} contains control characters", idx),
+        format!("id at position {} is invalid: {}", idx, err),
       ));
     }
   }
@@ -1394,6 +1387,7 @@ mod tests {
     let invalid = json!({
       "query": { "type": "query_string", "query": "rust" },
       "limit": 0,
+      "cursor": "010203",
       "return_stored": true,
       "execution": "wand"
     });
@@ -1405,7 +1399,7 @@ mod tests {
       .unwrap();
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let body: ErrorResponse = res.json().await.unwrap();
-    assert_eq!(body.error.r#type, "invalid_limit");
+    assert_eq!(body.error.r#type, "invalid_cursor");
     handle.abort();
     let _ = handle.await;
   }
@@ -1613,6 +1607,83 @@ mod tests {
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let err: ErrorResponse = res.json().await.unwrap();
     assert_eq!(err.error.r#type, "invalid_id");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn delete_allows_whitespace_padded_ids() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-whitespace-delete")).await;
+    client
+      .post(format!("{base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let padded_id = "  padded-http  ";
+    let ndjson = format!("{{\"_id\":\"{padded_id}\",\"body\":\"spaced\"}}\n");
+    client
+      .post(format!("{base}/add"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    client.post(format!("{base}/commit")).send().await.unwrap();
+
+    let delete_res = client
+      .post(format!("{base}/delete"))
+      .json(&serde_json::json!({ "ids": [padded_id] }))
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(delete_res.status(), HttpStatus::OK);
+    client.post(format!("{base}/commit")).send().await.unwrap();
+
+    let request = SearchRequest {
+      query: Query::String("spaced".into()),
+      fields: None,
+      filter: None,
+      limit: 5,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: Default::default(),
+      suggest: Default::default(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let search_res = client
+      .post(format!("{base}/search"))
+      .json(&request)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(search_res.status(), HttpStatus::OK);
+    let body: SearchResult = search_res.json().await.unwrap();
+    assert!(
+      body.hits.is_empty(),
+      "padded id document should be deletable via HTTP"
+    );
 
     handle.abort();
     let _ = handle.await;

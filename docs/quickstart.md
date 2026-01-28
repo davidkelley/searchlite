@@ -4,30 +4,17 @@ This guide gets you from zero to a working Searchlite index in a few minutes usi
 
 ## Prerequisites
 
-- Rust 1.88.0+ installed (`rustup show` to verify) if you are building from source.
-- An x86_64 Linux/macOS machine with local SSD/NVMe recommended.
-- Clone this repo and stay in its root directory.
+- Linux or macOS (x86_64 or aarch64) with `curl` and `tar` available.
+- Local SSD/NVMe recommended for best ingest/search performance.
+- No build tools, package managers, or Node.js required—the installer downloads prebuilt binaries.
 
-Prefer a prebuilt binary instead of building from source? Install it directly:
+## 1) Install the CLI
 
 ```bash
 curl -fsSL https://searchlite.dev/install | sh
 ```
 
-After installing, replace `cargo run -p searchlite-cli -- ...` in the commands below with `searchlite ...`.
-
-```bash
-git clone https://github.com/davidkelley/searchlite.git
-cd searchlite
-```
-
-## 1) Build the CLI
-
-```bash
-cargo build -p searchlite-cli --release
-```
-
-The CLI binary will be at `target/release/searchlite-cli`. You can also use `cargo run -p searchlite-cli -- ...` for the steps below.
+The script installs a `searchlite` binary to `/usr/local/bin` or `~/.local/bin`. If your shell does not already include that directory, add it to `PATH` before continuing.
 
 ## 2) Create an index
 
@@ -60,10 +47,12 @@ Create a schema file that defines your fields and analyzers. Save the JSON below
 }
 ```
 
+`stored: true` lets you return fields in results, and `fast: true` enables efficient filters/aggregations (used below for `lang` and `year`).
+
 Initialize the index with that schema:
 
 ```bash
-cargo run -p searchlite-cli -- init "$INDEX" /tmp/schema.json
+searchlite init "$INDEX" /tmp/schema.json
 ```
 
 ## 3) Add documents
@@ -81,7 +70,7 @@ EOF
 Ingest the documents (this buffers them):
 
 ```bash
-cargo run -p searchlite-cli -- add "$INDEX" /tmp/docs.jsonl
+searchlite add "$INDEX" /tmp/docs.jsonl
 ```
 
 ## 4) Commit the changes
@@ -89,7 +78,7 @@ cargo run -p searchlite-cli -- add "$INDEX" /tmp/docs.jsonl
 Commit makes buffered documents visible to readers:
 
 ```bash
-cargo run -p searchlite-cli -- commit "$INDEX"
+searchlite commit "$INDEX"
 ```
 
 ## 5) Run a search
@@ -97,7 +86,7 @@ cargo run -p searchlite-cli -- commit "$INDEX"
 Search by query string plus filters. This example looks for “search” in `title`/`body` and filters by `year`:
 
 ```bash
-cargo run -p searchlite-cli -- search "$INDEX" \
+searchlite search "$INDEX" \
   --q "search" \
   --filter '{"I64Range":{"field":"year","min":2022,"max":2024}}' \
   --return-stored
@@ -123,25 +112,59 @@ For more control (sorting, aggregations, highlighting), send a full JSON payload
 Run it:
 
 ```bash
-cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
+searchlite search "$INDEX" --request /tmp/request.json
 ```
 
-## 7) Inspect and maintain
+## 7) Serve over HTTP
+
+**Security warning:** The HTTP server has no auth, no authorization, and no rate limiting. Keep it bound to localhost or behind a proxy/firewall that enforces access control.
+
+Run the bundled HTTP server straight from the installed binary (no Rust toolchain needed):
+
+```bash
+searchlite http --index "$INDEX" --bind 127.0.0.1:8080
+# Add --refresh-on-commit if you want searches to see new data immediately.
+```
+
+Send the same search over HTTP:
+
+```bash
+curl -s http://127.0.0.1:8080/search \
+  -H "content-type: application/json" \
+  -d @/tmp/request.json
+```
+
+You can also ingest over HTTP instead of the CLI:
+
+```bash
+curl -X POST \
+  -H "content-type: application/x-ndjson" \
+  --data-binary @/tmp/docs.jsonl \
+  http://127.0.0.1:8080/add
+curl -X POST http://127.0.0.1:8080/commit
+# If you did not start the server with --refresh-on-commit, also call:
+curl -X POST http://127.0.0.1:8080/refresh
+```
+
+Keep the server bound to localhost unless you front it with a proxy or firewall.
+
+## 8) Inspect and maintain
 
 - Inspect the index manifest and segments:
 
   ```bash
-  cargo run -p searchlite-cli -- inspect "$INDEX"
+  searchlite inspect "$INDEX"
   ```
 
 - Compact occasionally to merge segments and reclaim space:
 
   ```bash
-  cargo run -p searchlite-cli -- compact "$INDEX"
+  searchlite compact "$INDEX"
   ```
 
 ## Next Steps
 
+- Start with the outlines in `docs/beginner-overview.md`, `docs/cli-indexing-guide.md`, and `docs/http-serving-guide.md` for a slower, junior-friendly walkthrough.
 - Explore analyzers, nested filters, aggregations, and vectors in the feature docs.
 - Embed Searchlite via the Rust API or FFI if you want to integrate directly into your app.
 - Check the Searchlite documentation site for updates and cross-links to deeper guides once they land.

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, CollapseRequest, Document, ExecutionStrategy, FuzzyOptions, HighlightField,
-  HighlightRequest, IndexOptions, InnerHitsRequest, KeywordField, NestedField, NestedProperty,
-  NumericField, Schema, SearchRequest, StorageType, TextField, TopHitsAggregation,
+  Aggregation, AggregationResponse, CollapseRequest, Document, ExecutionStrategy, FuzzyOptions,
+  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, KeywordField, NestedField,
+  NestedProperty, NumericField, Schema, SearchRequest, StorageType, TextField, TopHitsAggregation,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -328,13 +328,59 @@ fn fuzzy_allows_two_edits() {
 }
 
 #[test]
-fn search_with_zero_limit_errors() {
+fn search_with_zero_limit_skips_hits_but_counts_matches() {
   let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
   let reader = idx.reader().unwrap();
   let mut req = base_search_request("hello");
   req.limit = 0;
+  req.return_hits = false;
+  let resp = reader.search(&req).unwrap();
+  assert!(resp.hits.is_empty());
+  assert_eq!(resp.next_cursor, None);
+  assert!(resp.total_hits_estimate > 0);
+}
+
+#[test]
+fn explain_rejected_when_limit_zero() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  req.explain = true;
   let err = reader.search(&req).unwrap_err();
-  assert!(err.to_string().to_lowercase().contains("limit"));
+  assert!(err.to_string().to_lowercase().contains("explain"));
+}
+
+#[test]
+fn search_with_zero_limit_still_runs_aggregations() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("hello rust"))]),
+    doc("doc-2", vec![("body", json!("hello world"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  req.return_hits = false;
+  req.aggs.insert(
+    "top".into(),
+    Aggregation::TopHits(TopHitsAggregation {
+      size: 1,
+      from: 0,
+      fields: None,
+      sort: Vec::new(),
+      highlight_field: None,
+    }),
+  );
+  let resp = reader.search(&req).unwrap();
+  assert!(resp.hits.is_empty());
+  assert_eq!(resp.next_cursor, None);
+  assert_eq!(
+    resp.aggregations.get("top").and_then(|agg| match agg {
+      AggregationResponse::TopHits(th) => Some(th.hits.len()),
+      _ => None,
+    }),
+    Some(1)
+  );
 }
 
 #[test]
@@ -735,7 +781,7 @@ fn cursor_rejects_when_limit_zero() {
     })
     .unwrap_err();
 
-  assert!(err.to_string().to_lowercase().contains("limit"));
+  assert!(err.to_string().to_lowercase().contains("cursor"));
 }
 
 #[test]

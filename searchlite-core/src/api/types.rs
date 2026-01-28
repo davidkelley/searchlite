@@ -406,6 +406,7 @@ pub struct SearchRequest {
   pub fields: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub filter: Option<Filter>,
+  #[serde(default = "default_limit")]
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
@@ -430,6 +431,7 @@ pub struct SearchRequest {
   #[cfg(feature = "vectors")]
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_filter: Option<Filter>,
+  #[serde(default = "default_return_stored")]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,6 +457,7 @@ struct SearchRequestHelper {
   pub fields: Option<Vec<String>>,
   #[serde(default)]
   pub filter: Option<Filter>,
+  #[serde(default = "default_limit")]
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
@@ -479,6 +482,7 @@ struct SearchRequestHelper {
   #[cfg(feature = "vectors")]
   #[serde(default)]
   pub vector_filter: Option<Filter>,
+  #[serde(default = "default_return_stored")]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
@@ -1233,4 +1237,12 @@ pub use crate::index::manifest::{
 };
 fn default_return_hits() -> bool {
   true
+}
+
+fn default_limit() -> usize {
+  10
+}
+
+fn default_return_stored() -> bool {
+  false
 }

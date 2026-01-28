@@ -2583,8 +2583,11 @@ impl IndexReader {
   }
 
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
-    if req.limit == 0 {
-      bail!("search request must set limit > 0");
+    if req.limit == 0 && req.cursor.is_some() {
+      bail!("cursor is not supported when limit is 0");
+    }
+    if req.limit == 0 && req.explain {
+      bail!("explain is not supported when limit is 0");
     }
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
@@ -2740,7 +2743,9 @@ impl IndexReader {
         let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
-        if agg_ref.is_none() && (!req.return_hits || (!score_fast_path && req.limit > 0)) {
+        if agg_ref.is_none()
+          && (req.limit == 0 || !req.return_hits || (!score_fast_path && req.limit > 0))
+        {
           agg_ref = Some(&mut noop_collector);
         }
         let segment_rank_limit = if !req.return_hits {
@@ -2798,26 +2803,28 @@ impl IndexReader {
       hits.extend(heap);
     }
     #[cfg(feature = "vectors")]
-    if let Some(plan) = vector_plan.as_ref() {
-      let require_text_match = !plan.vector_only;
-      let vector_scores = self.collect_vector_maps(
-        plan,
-        root_filter,
-        req.vector_filter.as_ref(),
-        require_text_match,
-        &term_groups,
-        &phrase_fields,
-        &query_plan.matcher,
-      )?;
-      hits = self.merge_vector_hits(
-        hits,
-        &vector_scores,
-        plan,
-        &sort_plan,
-        cursor_key.as_ref(),
-        &mut saw_cursor,
-        top_k,
-      )?;
+    if req.limit > 0 && req.return_hits {
+      if let Some(plan) = vector_plan.as_ref() {
+        let require_text_match = !plan.vector_only;
+        let vector_scores = self.collect_vector_maps(
+          plan,
+          root_filter,
+          req.vector_filter.as_ref(),
+          require_text_match,
+          &term_groups,
+          &phrase_fields,
+          &query_plan.matcher,
+        )?;
+        hits = self.merge_vector_hits(
+          hits,
+          &vector_scores,
+          plan,
+          &sort_plan,
+          cursor_key.as_ref(),
+          &mut saw_cursor,
+          top_k,
+        )?;
+      }
     }
     if req.return_hits {
       hits.sort_by(|a, b| a.key.cmp(&b.key));

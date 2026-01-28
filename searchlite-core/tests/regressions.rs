@@ -65,6 +65,15 @@ fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
 }
 
 #[test]
+fn search_request_deserializes_defaults() {
+  let raw = r#"{"query":"rust"}"#;
+  let req: SearchRequest = serde_json::from_str(raw).expect("parse request with defaults");
+  assert_eq!(req.limit, 10);
+  assert!(!req.return_stored);
+  assert!(req.return_hits);
+}
+
+#[test]
 fn compact_rejects_fast_only_fields() {
   let dir = tempdir().unwrap();
   let schema = Schema {
