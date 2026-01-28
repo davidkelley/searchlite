@@ -592,3 +592,66 @@ fn multiple_vector_clauses_merge_candidates() {
   let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
   assert_eq!(ids, vec!["doc-1", "doc-2", "doc-3"]);
 }
+
+#[test]
+fn rejects_global_cap_below_clause_count() {
+  let dir = tempdir().unwrap();
+  let schema = multi_vector_schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("first")),
+        ("vec_a".into(), serde_json::json!([1.0, 0.0])),
+        ("vec_b".into(), serde_json::json!([0.0, 1.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Vector(VectorQuery {
+        field: "vec_a".into(),
+        vector: vec![1.0, 0.0],
+        k: Some(1),
+        alpha: Some(0.0),
+        ef_search: None,
+        candidate_size: Some(1),
+        boost: Some(1.0),
+      }),
+      QueryNode::Vector(VectorQuery {
+        field: "vec_b".into(),
+        vector: vec![0.0, 1.0],
+        k: Some(1),
+        alpha: Some(0.0),
+        ef_search: None,
+        candidate_size: Some(1),
+        boost: Some(1.0),
+      }),
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let req = SearchRequest {
+    query: Query::Node(query),
+    limit: 2,
+    return_hits: true,
+    max_global_vector_candidates: Some(1), // smaller than clause count (2)
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 2)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("max_global_vector_candidates"),
+    "expected validation error, got {err}"
+  );
+}

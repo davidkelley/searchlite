@@ -803,8 +803,11 @@ async fn search(
     ));
   }
   #[cfg(feature = "vectors")]
-  if request.max_global_vector_candidates.is_none() {
-    request.max_global_vector_candidates = Some(state.max_vector_candidates);
+  {
+    // HTTP layer owns defaulting precedence: CLI flag/env override > per-request JSON > core default.
+    request
+      .max_global_vector_candidates
+      .get_or_insert(state.max_vector_candidates);
   }
   let index = state.require_index().await?;
   let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {

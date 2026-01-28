@@ -503,8 +503,6 @@ impl<'de> Deserialize<'de> for SearchRequest {
     D: serde::Deserializer<'de>,
   {
     let helper = SearchRequestHelper::deserialize(deserializer)?;
-    #[cfg(feature = "vectors")]
-    let env_max_vec = parse_env_max_vector_candidates();
     Ok(Self {
       query: helper.query,
       fields: helper.fields,
@@ -513,7 +511,7 @@ impl<'de> Deserialize<'de> for SearchRequest {
       return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,
       #[cfg(feature = "vectors")]
-      max_global_vector_candidates: helper.max_global_vector_candidates.or(env_max_vec),
+      max_global_vector_candidates: helper.max_global_vector_candidates,
       sort: helper.sort,
       cursor: helper.cursor,
       execution: helper.execution,

@@ -2175,6 +2175,14 @@ impl IndexReader {
       .unwrap_or(DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES)
       .clamp(1, HARD_MAX_VECTOR_GLOBAL_CANDIDATES);
 
+    if global_cap < clauses.len() {
+      bail!(
+        "max_global_vector_candidates ({}) must be at least the number of vector clauses ({})",
+        global_cap,
+        clauses.len()
+      );
+    }
+
     let total_candidates: usize = clauses.iter().map(|c| c.candidate_size).sum();
     if total_candidates > global_cap {
       // Distribute the global budget evenly across vector clauses to avoid
