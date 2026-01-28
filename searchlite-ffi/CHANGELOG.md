@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.3...searchlite-ffi-v0.1.4) - 2026-01-28
+
+### Fixed
+
+- make ffi/wasm search requests atomic and align   return_stored defaults ([#73](https://github.com/davidkelley/searchlite/pull/73))
+
 ## [0.1.3](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.2...searchlite-ffi-v0.1.3) - 2026-01-28
 
 ### Added
