@@ -32,6 +32,8 @@ fn base_request(query: &str, filter: Option<Filter>) -> SearchRequest {
     limit: 10,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -60,6 +62,15 @@ fn doc(id: &str, fields: Vec<(&str, serde_json::Value)>) -> Document {
     map.insert(k.to_string(), v);
   }
   Document { fields: map }
+}
+
+#[test]
+fn search_request_deserializes_defaults() {
+  let raw = r#"{"query":"rust"}"#;
+  let req: SearchRequest = serde_json::from_str(raw).expect("parse request with defaults");
+  assert_eq!(req.limit, 10);
+  assert!(!req.return_stored);
+  assert!(req.return_hits);
 }
 
 #[test]

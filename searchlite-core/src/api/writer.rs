@@ -10,6 +10,7 @@ use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::{SegmentFileMeta, SegmentWriter};
 use crate::index::wal::{Wal, WalEntry};
 use crate::index::InnerIndex;
+use crate::util::doc_id::validate_doc_id;
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,7 @@ impl IndexWriter {
 
   /// Capture the current WAL length and pending-op count so callers can roll back
   /// only the work done after the checkpoint.
+  #[allow(dead_code)]
   fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
@@ -87,6 +89,7 @@ impl IndexWriter {
 
   /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
   /// earlier queued work.
+  #[allow(dead_code)]
   fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
@@ -333,6 +336,7 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
       schema.doc_id_field()
     );
   }
+  validate_doc_id(doc_id)?;
   Ok(doc_id.to_string())
 }
 

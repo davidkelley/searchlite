@@ -360,6 +360,13 @@ enum FieldSpecList {
   Specs(Vec<FieldSpec>),
 }
 
+#[cfg(feature = "vectors")]
+pub fn parse_env_max_vector_candidates() -> Option<usize> {
+  std::env::var("SEARCHLITE_MAX_VECTOR_CANDIDATES")
+    .ok()
+    .and_then(|s| s.parse::<usize>().ok())
+}
+
 fn deserialize_field_specs<'de, D>(deserializer: D) -> Result<Vec<FieldSpec>, D::Error>
 where
   D: serde::Deserializer<'de>,
@@ -399,11 +406,15 @@ pub struct SearchRequest {
   pub fields: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub filter: Option<Filter>,
+  #[serde(default = "default_limit")]
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub candidate_size: Option<usize>,
+  #[cfg(feature = "vectors")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub max_global_vector_candidates: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -420,7 +431,7 @@ pub struct SearchRequest {
   #[cfg(feature = "vectors")]
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_filter: Option<Filter>,
-  #[serde(default)]
+  #[serde(default = "default_return_stored")]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,11 +457,15 @@ struct SearchRequestHelper {
   pub fields: Option<Vec<String>>,
   #[serde(default)]
   pub filter: Option<Filter>,
+  #[serde(default = "default_limit")]
   pub limit: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
   #[serde(default)]
   pub candidate_size: Option<usize>,
+  #[cfg(feature = "vectors")]
+  #[serde(default)]
+  pub max_global_vector_candidates: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -467,7 +482,7 @@ struct SearchRequestHelper {
   #[cfg(feature = "vectors")]
   #[serde(default)]
   pub vector_filter: Option<Filter>,
-  #[serde(default)]
+  #[serde(default = "default_return_stored")]
   pub return_stored: bool,
   pub highlight_field: Option<String>,
   #[serde(default)]
@@ -499,6 +514,8 @@ impl<'de> Deserialize<'de> for SearchRequest {
       limit: helper.limit,
       return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: helper.max_global_vector_candidates,
       sort: helper.sort,
       cursor: helper.cursor,
       execution: helper.execution,
@@ -1220,4 +1237,12 @@ pub use crate::index::manifest::{
 };
 fn default_return_hits() -> bool {
   true
+}
+
+fn default_limit() -> usize {
+  10
+}
+
+fn default_return_stored() -> bool {
+  false
 }

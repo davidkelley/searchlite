@@ -63,6 +63,8 @@ fn wand_and_bmw_match_bm25_on_random_corpora() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Bm25,
@@ -118,6 +120,8 @@ fn empty_query_returns_no_hits() {
     limit: 5,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,

@@ -20,12 +20,24 @@
       "description": "Single structured filter node applied to all results.",
       "type": ["object", "null"]
     },
-    "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "Number of hits to return; must always be >= 1 (even when hits are disabled)." },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 10,
+      "description": "Number of hits to return; set to 0 to disable hit collection (aggregations/suggest/profile still run, cursors and explain are not supported when limit is 0)."
+    },
     "return_hits": { "type": "boolean", "default": true, "description": "When false, skip hit collection/materialization and return only counts/aggregations/suggest/profile." },
     "candidate_size": {
       "description": "Optional global candidate pool size (before final top-N) capped to 20000.",
       "type": ["integer", "null"],
       "minimum": 1
+    },
+    "max_global_vector_candidates": {
+      "description": "Global cap for the combined vector candidate pool across all vector clauses. Defaults to 20000 and cannot exceed 100000.",
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 100000,
+      "default": 20000
     },
     "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
     "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },

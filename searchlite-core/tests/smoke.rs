@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, CollapseRequest, Document, ExecutionStrategy, FuzzyOptions, HighlightField,
-  HighlightRequest, IndexOptions, InnerHitsRequest, KeywordField, NestedField, NestedProperty,
-  NumericField, Schema, SearchRequest, StorageType, TextField, TopHitsAggregation,
+  Aggregation, AggregationResponse, CollapseRequest, Document, ExecutionStrategy, FuzzyOptions,
+  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, KeywordField, NestedField,
+  NestedProperty, NumericField, Schema, SearchRequest, StorageType, TextField, TopHitsAggregation,
 };
 use searchlite_core::api::Filter;
 use searchlite_core::api::Index;
@@ -28,6 +28,8 @@ fn base_search_request(query: &str) -> SearchRequest {
     limit: 10,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -131,6 +133,8 @@ fn index_and_search() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -324,13 +328,59 @@ fn fuzzy_allows_two_edits() {
 }
 
 #[test]
-fn search_with_zero_limit_errors() {
+fn search_with_zero_limit_skips_hits_but_counts_matches() {
   let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
   let reader = idx.reader().unwrap();
   let mut req = base_search_request("hello");
   req.limit = 0;
+  req.return_hits = false;
+  let resp = reader.search(&req).unwrap();
+  assert!(resp.hits.is_empty());
+  assert_eq!(resp.next_cursor, None);
+  assert!(resp.total_hits_estimate > 0);
+}
+
+#[test]
+fn explain_rejected_when_limit_zero() {
+  let (_tmp, idx) = build_index_with_docs(vec![doc("doc-1", vec![("body", json!("hello"))])]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  req.explain = true;
   let err = reader.search(&req).unwrap_err();
-  assert!(err.to_string().to_lowercase().contains("limit"));
+  assert!(err.to_string().to_lowercase().contains("explain"));
+}
+
+#[test]
+fn search_with_zero_limit_still_runs_aggregations() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("hello rust"))]),
+    doc("doc-2", vec![("body", json!("hello world"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("hello");
+  req.limit = 0;
+  req.return_hits = false;
+  req.aggs.insert(
+    "top".into(),
+    Aggregation::TopHits(TopHitsAggregation {
+      size: 1,
+      from: 0,
+      fields: None,
+      sort: Vec::new(),
+      highlight_field: None,
+    }),
+  );
+  let resp = reader.search(&req).unwrap();
+  assert!(resp.hits.is_empty());
+  assert_eq!(resp.next_cursor, None);
+  assert_eq!(
+    resp.aggregations.get("top").and_then(|agg| match agg {
+      AggregationResponse::TopHits(th) => Some(th.hits.len()),
+      _ => None,
+    }),
+    Some(1)
+  );
 }
 
 #[test]
@@ -453,6 +503,8 @@ fn upsert_and_delete_by_id() {
     limit: 5,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -546,6 +598,8 @@ fn cursor_paginates_ordered_hits() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -645,6 +699,8 @@ fn cursor_rejects_invalid_hex() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: Some("not-a-valid-cursor".to_string()),
     execution: ExecutionStrategy::Wand,
@@ -701,6 +757,8 @@ fn cursor_rejects_when_limit_zero() {
       limit: 0,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: Some("00000000000000000000000000000000".to_string()),
       execution: ExecutionStrategy::Wand,
@@ -723,7 +781,7 @@ fn cursor_rejects_when_limit_zero() {
     })
     .unwrap_err();
 
-  assert!(err.to_string().to_lowercase().contains("limit"));
+  assert!(err.to_string().to_lowercase().contains("cursor"));
 }
 
 #[test]
@@ -764,6 +822,8 @@ fn cursor_rejects_excessive_advance() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
     execution: ExecutionStrategy::Wand,
@@ -821,6 +881,8 @@ fn cursor_rejects_mismatched_position() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -905,6 +967,8 @@ fn cursor_orders_stably_across_segments() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -1020,6 +1084,8 @@ fn in_memory_storage_keeps_disk_clean() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1152,6 +1218,8 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1318,6 +1386,8 @@ fn nested_numeric_filters_bind_to_object_values() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1411,6 +1481,8 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
       limit: 10,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1521,6 +1593,8 @@ fn highlight_configuration_applies_tags() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

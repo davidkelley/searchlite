@@ -78,6 +78,8 @@ fn sorts_numeric_and_missing_last() {
       limit: 10,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: vec![SortSpec {
         field: "rating".into(),
         order: Some(SortOrder::Asc),
@@ -168,6 +170,8 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: vec![SortSpec {
         field: "tag".into(),
         order: Some(SortOrder::Desc),
@@ -269,6 +273,8 @@ fn paginates_with_sorted_cursor_across_segments() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: vec![SortSpec {
       field: "rank".into(),
       order: Some(SortOrder::Asc),
