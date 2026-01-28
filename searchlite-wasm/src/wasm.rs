@@ -843,6 +843,8 @@ impl Searchlite {
       limit,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::<SortSpec>::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1012,6 +1014,8 @@ mod tests {
       filter: None,
       limit: 5,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: vec![],
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1053,6 +1057,8 @@ mod tests {
       filter: None,
       limit: 5,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: vec![],
       cursor: None,
       execution: ExecutionStrategy::Wand,

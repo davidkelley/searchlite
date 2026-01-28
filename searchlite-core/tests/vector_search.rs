@@ -76,6 +76,8 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     limit,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::<SortSpec>::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,

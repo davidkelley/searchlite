@@ -94,6 +94,8 @@ fn bench_search(c: &mut Criterion) {
         limit: 5,
         return_hits: true,
         candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
         sort: Vec::new(),
         cursor: None,
         execution: ExecutionStrategy::Wand,
@@ -208,6 +210,8 @@ fn bench_nested_filters(c: &mut Criterion) {
         limit: 5,
         return_hits: true,
         candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
         sort: Vec::new(),
         cursor: None,
         execution: ExecutionStrategy::Wand,
@@ -279,6 +283,8 @@ fn bench_cursor_pagination(c: &mut Criterion) {
           limit: 20,
           return_hits: true,
           candidate_size: None,
+          #[cfg(feature = "vectors")]
+          max_global_vector_candidates: None,
           sort: Vec::new(),
           cursor,
           execution: ExecutionStrategy::Wand,

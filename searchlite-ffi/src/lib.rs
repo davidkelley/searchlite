@@ -139,6 +139,8 @@ pub unsafe extern "C" fn searchlite_search(
   } else {
     Some(CStr::from_ptr(cursor).to_string_lossy().to_string())
   };
+  #[cfg(feature = "vectors")]
+  let env_max_vec = searchlite_core::api::types::parse_env_max_vector_candidates();
   let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
     let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
     let body = String::from_utf8_lossy(raw).to_string();
@@ -159,6 +161,8 @@ pub unsafe extern "C" fn searchlite_search(
     limit,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: env_max_vec,
     sort: Vec::new(),
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,

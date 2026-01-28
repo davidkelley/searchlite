@@ -88,6 +88,8 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -163,6 +165,8 @@ fn histogram_requires_positive_interval() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -259,6 +263,8 @@ fn nested_terms_stats_aggregation() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -346,6 +352,8 @@ fn date_histogram_rejects_invalid_config() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -401,6 +409,8 @@ fn date_histogram_rejects_invalid_config() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -474,6 +484,8 @@ fn top_hits_returns_requested_docs() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -574,6 +586,8 @@ fn top_hits_applies_sort_spec() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -680,6 +694,8 @@ fn date_histogram_calendar_month_interval() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

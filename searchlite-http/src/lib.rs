@@ -35,6 +35,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_K1: f32 = 0.9;
 const DEFAULT_B: f32 = 0.4;
+#[cfg(feature = "vectors")]
+const DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES: usize = 20_000;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -80,6 +82,15 @@ pub struct ServeArgs {
   /// If set, commit also triggers a reader refresh to surface changes immediately.
   #[arg(long, env = "SEARCHLITE_REFRESH_ON_COMMIT", default_value_t = false)]
   refresh_on_commit: bool,
+
+  /// Global cap for combined vector candidates across clauses (when feature `vectors` is enabled).
+  #[cfg(feature = "vectors")]
+  #[arg(
+    long = "max-vector-candidates",
+    env = "SEARCHLITE_MAX_VECTOR_CANDIDATES",
+    default_value_t = DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+  )]
+  max_vector_candidates: usize,
 }
 
 #[derive(Clone)]
@@ -87,6 +98,8 @@ struct AppState {
   index_path: PathBuf,
   require_existing_index: bool,
   refresh_on_commit: bool,
+  #[cfg(feature = "vectors")]
+  max_vector_candidates: usize,
   index: Arc<tokio::sync::RwLock<Option<Arc<Index>>>>,
   // Serialize writer access across handlers to avoid concurrent writers.
   writer_lock: Arc<tokio::sync::Mutex<()>>,
@@ -245,6 +258,8 @@ impl AppState {
       index_path: args.index.clone(),
       require_existing_index: args.require_existing_index,
       refresh_on_commit: args.refresh_on_commit,
+      #[cfg(feature = "vectors")]
+      max_vector_candidates: args.max_vector_candidates,
       index: Arc::new(tokio::sync::RwLock::new(None)),
       writer_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
@@ -780,12 +795,16 @@ async fn search(
   State(state): State<Arc<AppState>>,
   payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<SearchResult>> {
-  let request = parse_json(payload)?;
+  let mut request = parse_json(payload)?;
   if request.limit == 0 {
     return Err(HttpError::bad_request(
       "invalid_limit",
       "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
+  }
+  #[cfg(feature = "vectors")]
+  if request.max_global_vector_candidates.is_none() {
+    request.max_global_vector_candidates = Some(state.max_vector_candidates);
   }
   let index = state.require_index().await?;
   let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
@@ -994,6 +1013,8 @@ mod tests {
       request_timeout_secs: 10,
       shutdown_grace_secs: 0,
       refresh_on_commit: false,
+      #[cfg(feature = "vectors")]
+      max_vector_candidates: DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,
     }
   }
 
@@ -1037,6 +1058,8 @@ mod tests {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1162,6 +1185,8 @@ mod tests {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1275,6 +1300,8 @@ mod tests {
       limit: 2,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

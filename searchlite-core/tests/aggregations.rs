@@ -114,6 +114,8 @@ fn terms_and_stats_aggregations() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -220,6 +222,8 @@ fn significant_terms_respects_deletions() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -304,6 +308,8 @@ fn aggregation_requires_fast_field() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -394,6 +400,8 @@ fn histogram_bucket_generation() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -487,6 +495,8 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -594,6 +604,8 @@ fn range_aggregation_counts() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -699,6 +711,8 @@ fn date_range_missing_and_keyed() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -798,6 +812,8 @@ fn extended_stats_and_value_count_include_missing() {
       limit: 1, // ensure aggregations still see all docs
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -913,6 +929,8 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1026,6 +1044,8 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1142,6 +1162,8 @@ fn terms_size_applied_after_merge() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1245,6 +1267,8 @@ fn filter_aggregation_counts_and_sub_aggs() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1344,6 +1368,8 @@ fn composite_aggregation_paginates() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1458,6 +1484,8 @@ fn cardinality_and_percentiles_metrics() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1604,6 +1632,8 @@ fn bucket_sort_and_avg_bucket_pipeline() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1725,6 +1755,8 @@ fn significant_and_rare_terms() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -1860,6 +1892,8 @@ fn derivative_and_moving_avg_pipeline() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -1990,6 +2024,8 @@ fn pipeline_missing_metric_path_with_gap_policy_inserts_zeros() {
       limit: 1,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

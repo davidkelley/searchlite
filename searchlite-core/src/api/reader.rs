@@ -131,6 +131,11 @@ pub struct ProfileResult {
 const MAX_CANDIDATE_SIZE: usize = 20_000;
 
 #[cfg(feature = "vectors")]
+const DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES: usize = 20_000;
+#[cfg(feature = "vectors")]
+const HARD_MAX_VECTOR_GLOBAL_CANDIDATES: usize = 100_000;
+
+#[cfg(feature = "vectors")]
 const MAX_VECTOR_CLAUSES: usize = 8;
 #[cfg(feature = "vectors")]
 const MAX_VECTOR_K: usize = 1024;
@@ -138,8 +143,6 @@ const MAX_VECTOR_K: usize = 1024;
 const MAX_VECTOR_CANDIDATE_SIZE: usize = 10_000;
 #[cfg(feature = "vectors")]
 const MAX_VECTOR_EF_SEARCH: usize = 65_536;
-#[cfg(feature = "vectors")]
-const MAX_GLOBAL_CANDIDATES: usize = MAX_CANDIDATE_SIZE;
 
 #[cfg(feature = "vectors")]
 #[derive(Clone)]
@@ -2096,7 +2099,7 @@ impl IndexReader {
       .candidate_size
       .unwrap_or_else(|| req.limit.max(10).saturating_mul(2))
       .max(req.limit)
-      .min(MAX_GLOBAL_CANDIDATES);
+      .min(MAX_CANDIDATE_SIZE);
     for vector_query in vectors.drain(..) {
       let schema_field = self
         .manifest
@@ -2167,11 +2170,46 @@ impl IndexReader {
     if clauses.is_empty() {
       return Ok(None);
     }
-    let mut candidate_size = base_candidate.max(max_k);
-    let union_estimate = candidate_size.saturating_add(total_k);
-    if union_estimate > MAX_GLOBAL_CANDIDATES {
-      candidate_size = MAX_GLOBAL_CANDIDATES.saturating_sub(total_k).max(req.limit);
+    let global_cap = req
+      .max_global_vector_candidates
+      .unwrap_or(DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES)
+      .clamp(1, HARD_MAX_VECTOR_GLOBAL_CANDIDATES);
+
+    let total_candidates: usize = clauses.iter().map(|c| c.candidate_size).sum();
+    if total_candidates > global_cap {
+      // Distribute the global budget evenly across vector clauses to avoid
+      // unbounded candidate expansion when multiple vector queries are present.
+      let per_clause_cap = (global_cap / clauses.len()).max(1);
+      for clause in clauses.iter_mut() {
+        clause.candidate_size = clause.candidate_size.min(per_clause_cap);
+      }
+      let mut capped_total: usize = clauses.iter().map(|c| c.candidate_size).sum();
+      if capped_total > global_cap {
+        // Trim any remaining excess while keeping at least one candidate per clause.
+        let mut excess = capped_total - global_cap;
+        for clause in clauses.iter_mut() {
+          if excess == 0 {
+            break;
+          }
+          let reducible = clause.candidate_size.saturating_sub(1);
+          if reducible == 0 {
+            continue;
+          }
+          let drop = reducible.min(excess);
+          clause.candidate_size -= drop;
+          excess -= drop;
+        }
+        capped_total = clauses.iter().map(|c| c.candidate_size).sum();
+        debug_assert!(capped_total <= global_cap);
+      }
     }
+    let mut candidate_size = base_candidate.max(max_k);
+    let available_candidates = clauses
+      .iter()
+      .map(|c| c.candidate_size)
+      .sum::<usize>()
+      .max(max_k);
+    candidate_size = candidate_size.min(available_candidates).min(global_cap);
     if candidate_size == 0 {
       candidate_size = max_k.max(1);
     }
@@ -3982,6 +4020,8 @@ mod tests {
     SearchRequest, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
+  #[cfg(feature = "vectors")]
+  use crate::index::manifest::{VectorField, VectorMetric};
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
   use std::collections::HashSet;
 
@@ -4254,6 +4294,8 @@ mod tests {
         limit: 5,
         return_hits: true,
         candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
         sort: Vec::new(),
         cursor: None,
         execution: ExecutionStrategy::Wand,
@@ -4538,5 +4580,109 @@ mod tests {
     assert_eq!(options.len(), 1);
     assert_eq!(options[0].text, "rust");
     assert_eq!(options[0].doc_freq, 2);
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn vector_candidate_size_respects_global_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-vectors");
+    let schema = Schema {
+      doc_id_field: "_id".into(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      vector_fields: vec![VectorField {
+        name: "vec".into(),
+        dim: 4,
+        metric: VectorMetric::Cosine,
+        hnsw: None,
+      }],
+    };
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let reader = idx.reader().unwrap();
+    let vector_clause = |field: &str| {
+      QueryNode::Vector(VectorQuery {
+        field: field.to_string(),
+        vector: vec![0.1, 0.2, 0.3, 0.4],
+        k: Some(10),
+        alpha: Some(0.5),
+        ef_search: None,
+        candidate_size: Some(MAX_VECTOR_CANDIDATE_SIZE),
+        boost: None,
+      })
+    };
+    let query = Query::Node(QueryNode::Bool {
+      must: Vec::new(),
+      should: vec![
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+        vector_clause("vec"),
+      ],
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: None,
+    });
+    let req = SearchRequest {
+      query,
+      fields: None,
+      filter: None,
+      limit: 10,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      vector_query: None,
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let plan = reader.build_vector_plan(&req).unwrap().expect("plan");
+    let total_candidates: usize = plan.clauses.iter().map(|c| c.candidate_size).sum();
+    assert!(
+      total_candidates <= DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,
+      "total vector candidates {} exceeds cap {}",
+      total_candidates,
+      DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+    );
+    assert!(
+      plan.candidate_size <= DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,
+      "plan candidate_size {} exceeds cap {}",
+      plan.candidate_size,
+      DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+    );
   }
 }
