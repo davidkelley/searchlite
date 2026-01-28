@@ -68,6 +68,8 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     limit: 10,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,

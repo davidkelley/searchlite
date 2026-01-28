@@ -28,6 +28,8 @@ fn base_search_request(query: &str) -> SearchRequest {
     limit: 10,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -131,6 +133,8 @@ fn index_and_search() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -499,6 +503,8 @@ fn upsert_and_delete_by_id() {
     limit: 5,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -592,6 +598,8 @@ fn cursor_paginates_ordered_hits() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -691,6 +699,8 @@ fn cursor_rejects_invalid_hex() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: Some("not-a-valid-cursor".to_string()),
     execution: ExecutionStrategy::Wand,
@@ -747,6 +757,8 @@ fn cursor_rejects_when_limit_zero() {
       limit: 0,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: Some("00000000000000000000000000000000".to_string()),
       execution: ExecutionStrategy::Wand,
@@ -810,6 +822,8 @@ fn cursor_rejects_excessive_advance() {
     limit: 1,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: Some(encode_cursor_with_returned(60_000, manifest_generation)),
     execution: ExecutionStrategy::Wand,
@@ -867,6 +881,8 @@ fn cursor_rejects_mismatched_position() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -951,6 +967,8 @@ fn cursor_orders_stably_across_segments() {
     limit: 2,
     return_hits: true,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -1066,6 +1084,8 @@ fn in_memory_storage_keeps_disk_clean() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1198,6 +1218,8 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1364,6 +1386,8 @@ fn nested_numeric_filters_bind_to_object_values() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1457,6 +1481,8 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
       limit: 10,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -1567,6 +1593,8 @@ fn highlight_configuration_applies_tags() {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

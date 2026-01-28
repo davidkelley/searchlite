@@ -97,6 +97,8 @@ fn bench_terms_aggregation(c: &mut Criterion) {
     limit: 1,
     return_hits: false,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,
@@ -155,6 +157,8 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
     limit: 1,
     return_hits: false,
     candidate_size: None,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: None,
     sort: Vec::new(),
     cursor: None,
     execution: ExecutionStrategy::Wand,

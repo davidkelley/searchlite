@@ -360,6 +360,13 @@ enum FieldSpecList {
   Specs(Vec<FieldSpec>),
 }
 
+#[cfg(feature = "vectors")]
+pub fn parse_env_max_vector_candidates() -> Option<usize> {
+  std::env::var("SEARCHLITE_MAX_VECTOR_CANDIDATES")
+    .ok()
+    .and_then(|s| s.parse::<usize>().ok())
+}
+
 fn deserialize_field_specs<'de, D>(deserializer: D) -> Result<Vec<FieldSpec>, D::Error>
 where
   D: serde::Deserializer<'de>,
@@ -405,6 +412,9 @@ pub struct SearchRequest {
   pub return_hits: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub candidate_size: Option<usize>,
+  #[cfg(feature = "vectors")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub max_global_vector_candidates: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -453,6 +463,9 @@ struct SearchRequestHelper {
   pub return_hits: bool,
   #[serde(default)]
   pub candidate_size: Option<usize>,
+  #[cfg(feature = "vectors")]
+  #[serde(default)]
+  pub max_global_vector_candidates: Option<usize>,
   #[serde(default)]
   pub sort: Vec<SortSpec>,
   #[serde(default)]
@@ -501,6 +514,8 @@ impl<'de> Deserialize<'de> for SearchRequest {
       limit: helper.limit,
       return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: helper.max_global_vector_candidates,
       sort: helper.sort,
       cursor: helper.cursor,
       execution: helper.execution,

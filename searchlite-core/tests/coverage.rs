@@ -104,6 +104,8 @@ fn search_with_phrase_filters_and_compaction() {
       limit: 10,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,

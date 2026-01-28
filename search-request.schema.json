@@ -32,6 +32,13 @@
       "type": ["integer", "null"],
       "minimum": 1
     },
+    "max_global_vector_candidates": {
+      "description": "Global cap for the combined vector candidate pool across all vector clauses. Defaults to 20000 and cannot exceed 100000.",
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 100000,
+      "default": 20000
+    },
     "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
     "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },
     "execution": { "type": "string", "enum": ["bm25", "wand", "bmw"], "default": "wand" },

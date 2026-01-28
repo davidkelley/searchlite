@@ -122,7 +122,7 @@ pub unsafe extern "C" fn searchlite_index_close(handle: *mut IndexHandle) {
 }
 
 /// # Safety
-/// `handle` must be a valid pointer from `searchlite_index_open`, and `json` must point to a valid, null-terminated UTF-8 string.
+/// `handle` must be a valid pointer returned by `searchlite_index_open`; `json` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_add_json(
   handle: *mut IndexHandle,
@@ -165,7 +165,7 @@ pub unsafe extern "C" fn searchlite_add_json(
 }
 
 /// # Safety
-/// `handle` must be a valid pointer returned by `searchlite_index_open` and not already freed.
+/// `handle` must be a valid pointer returned by `searchlite_index_open` that has not been freed.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
   catch_unwind_default("searchlite_commit", ERR_PANIC, || {
@@ -224,6 +224,8 @@ pub unsafe extern "C" fn searchlite_search(
     } else {
       Some(CStr::from_ptr(cursor).to_string_lossy().to_string())
     };
+    #[cfg(feature = "vectors")]
+    let env_max_vec = searchlite_core::api::types::parse_env_max_vector_candidates();
     let aggs_map: BTreeMap<String, Aggregation> = if !aggs_json.is_null() && aggs_len > 0 {
       let raw = std::slice::from_raw_parts(aggs_json as *const u8, aggs_len);
       let body = String::from_utf8_lossy(raw).to_string();
@@ -244,6 +246,8 @@ pub unsafe extern "C" fn searchlite_search(
       limit,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: env_max_vec,
       sort: Vec::new(),
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,

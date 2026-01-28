@@ -385,6 +385,8 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     limit,
     return_hits,
     candidate_size,
+    #[cfg(feature = "vectors")]
+    max_global_vector_candidates: searchlite_core::api::types::parse_env_max_vector_candidates(),
     sort: parse_sort(sort)?,
     execution: parse_execution(&execution),
     bmw_block_size,
@@ -614,6 +616,8 @@ mod tests {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -652,6 +656,8 @@ mod tests {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
@@ -711,6 +717,8 @@ mod tests {
       limit: 5,
       return_hits: true,
       candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
       execution: ExecutionStrategy::Wand,
