@@ -804,7 +804,7 @@ async fn search(
   }
   #[cfg(feature = "vectors")]
   {
-    // HTTP layer owns defaulting precedence: CLI flag/env override > per-request JSON > core default.
+    // Precedence: per-request JSON overrides the server default (CLI/env); otherwise use the server default.
     request
       .max_global_vector_candidates
       .get_or_insert(state.max_vector_candidates);
