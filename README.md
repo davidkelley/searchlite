@@ -37,15 +37,15 @@ curl -fsSL https://searchlite.dev/install | sh
 
 ## Container quickstart
 
-Easiest way to try searchlite: run the published container, mounting a local data directory and exposing the HTTP API on port 8686.
+Easiest way to try searchlite: run the published container, mounting a local data directory and exposing the HTTP API on port 8080.
 
 ```bash
-docker run --rm -p 8686:8686 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index /data --bind 0.0.0.0:8686
+docker run --rm -p 8080:8080 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index /data --bind 0.0.0.0:8080
 ```
 
 ## Development setup
 
-- Rust toolchain is pinned to `1.78.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
+- Rust toolchain is pinned to `1.92.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
 - Build everything with `cargo build --all --all-features` (or `just build`).
 - Code quality: `cargo fmt --all`, `cargo clippy --all --all-features -- -D warnings`.
 - The CLI runs directly from the workspace: `cargo run -p searchlite-cli -- <subcommand> <index> ...` (e.g., `cargo run -p searchlite-cli -- init /tmp/idx schema.json`).
