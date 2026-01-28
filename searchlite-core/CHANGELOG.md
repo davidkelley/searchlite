@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.3.1...searchlite-core-v0.4.0) - 2026-01-28
+
+### Added
+
+- vector cap env
+
+### Fixed
+
+- address remaining limit=0 review feedback
+- unify doc id validation   across ingest and delete paths
+- default search request limit and return_stored
+- stream ndjson batches with single writer ([#65](https://github.com/davidkelley/searchlite/pull/65))
+
 ## [0.3.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.3.0...searchlite-core-v0.3.1) - 2026-01-16
 
 ### Other

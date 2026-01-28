@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.4...searchlite-cli-v0.1.5) - 2026-01-28
+
+### Added
+
+- vector cap env
+
+### Fixed
+
+- address remaining limit=0 review feedback
+- unify doc id validation   across ingest and delete paths
+
 ## [0.1.4](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.3...searchlite-cli-v0.1.4) - 2026-01-16
 
 ### Other
