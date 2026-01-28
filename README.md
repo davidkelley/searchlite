@@ -35,6 +35,14 @@ curl -fsSL https://searchlite.dev/install | sh
 - Supported targets match release artifacts: `x86_64`/`aarch64` for Linux/macOS, and Windows via Git Bash/WSL (downloads the `.zip` and installs `searchlite.exe`).
 - The script downloads from GitHub releases (`searchlite-cli-<target>.{tar.gz,zip}`) and falls back to `~/.local/bin` if `/usr/local/bin` is not writable.
 
+## Container quickstart
+
+Easiest way to try searchlite: run the published container, mounting a local data directory and exposing the HTTP API on port 8686.
+
+```bash
+docker run --rm -p 8686:8686 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index /data --bind 0.0.0.0:8686
+```
+
 ## Development setup
 
 - Rust toolchain is pinned to `1.78.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
@@ -422,10 +430,17 @@ Collapse results by a fast keyword field to return one top hit per group, with o
 ```json
 {
   "query": "rust systems",
-  "sort": [{ "field": "published_at", "order": "desc" }, { "field": "_score", "order": "desc" }],
+  "sort": [
+    { "field": "published_at", "order": "desc" },
+    { "field": "_score", "order": "desc" }
+  ],
   "collapse": {
     "field": "author",
-    "inner_hits": { "size": 3, "from": 0, "sort": [{ "field": "_score", "order": "desc" }] }
+    "inner_hits": {
+      "size": 3,
+      "from": 0,
+      "sort": [{ "field": "_score", "order": "desc" }]
+    }
   },
   "limit": 10,
   "return_stored": true
@@ -443,8 +458,18 @@ Multi-field highlighting is configurable per field with custom tags and fragment
   "query": "rust systems",
   "highlight": {
     "fields": {
-      "body": { "pre_tag": "<em>", "post_tag": "</em>", "fragment_size": 120, "number_of_fragments": 2 },
-      "title": { "pre_tag": "<b>", "post_tag": "</b>", "fragment_size": 60, "number_of_fragments": 1 }
+      "body": {
+        "pre_tag": "<em>",
+        "post_tag": "</em>",
+        "fragment_size": 120,
+        "number_of_fragments": 2
+      },
+      "title": {
+        "pre_tag": "<b>",
+        "post_tag": "</b>",
+        "fragment_size": 60,
+        "number_of_fragments": 1
+      }
     }
   },
   "return_stored": true
@@ -524,7 +549,12 @@ Search requests can include an optional `suggest` map for completion-style term 
       "field": "title",
       "prefix": "ru",
       "size": 5,
-      "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 2 }
+      "fuzzy": {
+        "max_edits": 1,
+        "prefix_length": 1,
+        "max_expansions": 20,
+        "min_length": 2
+      }
     }
   }
 }
@@ -573,10 +603,7 @@ Example multi-field query with boosts:
     "type": "multi_match",
     "query": "rust search",
     "match_type": "best_fields",
-    "fields": [
-      { "field": "title", "boost": 2.0 },
-      { "field": "body" }
-    ],
+    "fields": [{ "field": "title", "boost": 2.0 }, { "field": "body" }],
     "operator": "or",
     "tie_breaker": 0.2,
     "minimum_should_match": "75%"
@@ -588,16 +615,29 @@ Example multi-field query with boosts:
 Blend multiple queries with `dis_max`:
 
 ```json
-{ "query": { "type": "dis_max", "tie_breaker": 0.4, "queries": [
-  { "type": "term", "field": "title", "value": "rust" },
-  { "type": "term", "field": "body", "value": "rust" }
-]}}
+{
+  "query": {
+    "type": "dis_max",
+    "tie_breaker": 0.4,
+    "queries": [
+      { "type": "term", "field": "title", "value": "rust" },
+      { "type": "term", "field": "body", "value": "rust" }
+    ]
+  }
+}
 ```
 
 Phrase slop example (allows one gap between terms):
 
 ```json
-{ "query": { "type": "phrase", "field": "body", "terms": ["rust","search"], "slop": 1 } }
+{
+  "query": {
+    "type": "phrase",
+    "field": "body",
+    "terms": ["rust", "search"],
+    "slop": 1
+  }
+}
 ```
 
 ## Custom scoring and reranking
@@ -612,7 +652,11 @@ Phrase slop example (allows one gap between terms):
     "type": "function_score",
     "query": { "type": "match_all" },
     "functions": [
-      { "type": "weight", "weight": 2.0, "filter": { "KeywordEq": { "field": "lang", "value": "en" } } },
+      {
+        "type": "weight",
+        "weight": 2.0,
+        "filter": { "KeywordEq": { "field": "lang", "value": "en" } }
+      },
       {
         "type": "decay",
         "field": "age_days",
@@ -642,7 +686,13 @@ Phrase slop example (allows one gap between terms):
 Constant score example:
 
 ```json
-{ "query": { "type": "constant_score", "filter": { "KeywordEq": { "field": "lang", "value": "en" } }, "boost": 2.5 } }
+{
+  "query": {
+    "type": "constant_score",
+    "filter": { "KeywordEq": { "field": "lang", "value": "en" } },
+    "boost": 2.5
+  }
+}
 ```
 
 Rescore the top window after the initial rank (ordering outside the window is unchanged):
@@ -653,7 +703,12 @@ Rescore the top window after the initial rank (ordering outside the window is un
   "limit": 10,
   "rescore": {
     "window_size": 50,
-    "query": { "type": "phrase", "field": "body", "terms": ["rust", "search"], "slop": 1 },
+    "query": {
+      "type": "phrase",
+      "field": "body",
+      "terms": ["rust", "search"],
+      "slop": 1
+    },
     "score_mode": "total"
   }
 }
@@ -1030,7 +1085,13 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
 
 ```json
 {
-  "query": { "type": "vector", "field": "embedding", "vector": [1.0, 0.0], "k": 3, "alpha": 0.0 }
+  "query": {
+    "type": "vector",
+    "field": "embedding",
+    "vector": [1.0, 0.0],
+    "k": 3,
+    "alpha": 0.0
+  }
 }
 ```
 
@@ -1038,11 +1099,17 @@ The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthe
 
 ```json
 {
-  "query": { "type": "query_string", "query": "rust", "boost": null, "fields": null },
+  "query": {
+    "type": "query_string",
+    "query": "rust",
+    "boost": null,
+    "fields": null
+  },
   "limit": 5,
   "vector_query": ["embedding", [1.0, 0.0], 0.25]
 }
 ```
+
 - `vector_query` also accepts an object form to tune ANN parameters: `{ "field": "embedding", "vector": [1.0, 0.0], "alpha": 0.25, "k": 20, "candidate_size": 40, "ef_search": 40 }`. The tuple form still works for compatibility.
 - Per-field HNSW settings can be set on `vector_fields` via `hnsw: { "m": 16, "ef_construction": 64 }`; defaults are used when omitted.
 
