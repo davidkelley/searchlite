@@ -14,6 +14,7 @@ pub enum WalEntry {
   AddDoc(Document),
   DeleteDocId(String),
   Commit,
+  WriteBinding(Vec<u8>),
 }
 
 pub struct Wal {
@@ -45,6 +46,10 @@ impl Wal {
 
   pub fn append_delete_doc_id(&mut self, doc_id: &str) -> Result<()> {
     self.append_entry(3, doc_id.as_bytes())
+  }
+
+  pub fn append_binding(&mut self, binding: &[u8]) -> Result<()> {
+    self.append_entry(4, binding)
   }
 
   fn append_entry(&mut self, entry_type: u8, payload: &[u8]) -> Result<()> {
@@ -148,26 +153,51 @@ impl Wal {
             entries.push(WalEntry::DeleteDocId(id.to_string()));
           }
         }
+        4 => entries.push(WalEntry::WriteBinding(payload.to_vec())),
         _ => {}
       }
     }
     Ok(entries)
   }
 
-  pub fn last_pending_ops(storage: &dyn Storage, path: &Path) -> Result<Vec<WalEntry>> {
+  pub fn replay_with_binding(
+    storage: &dyn Storage,
+    path: &Path,
+  ) -> Result<(Option<Vec<u8>>, Vec<WalEntry>)> {
     let entries = if storage.exists(path) {
       Self::replay(storage, path)?
     } else {
       Vec::new()
+    };
+    let mut binding: Option<Vec<u8>> = None;
+    let mut filtered = Vec::new();
+    for entry in entries {
+      match entry {
+        WalEntry::WriteBinding(b) => binding = Some(b),
+        other => filtered.push(other),
+      }
+    }
+    Ok((binding, filtered))
+  }
+
+  pub fn last_pending_ops(
+    storage: &dyn Storage,
+    path: &Path,
+  ) -> Result<(Option<Vec<u8>>, Vec<WalEntry>)> {
+    let (binding, entries) = if storage.exists(path) {
+      Self::replay_with_binding(storage, path)?
+    } else {
+      (None, Vec::new())
     };
     let mut pending = Vec::new();
     for entry in entries {
       match entry {
         WalEntry::AddDoc(_) | WalEntry::DeleteDocId(_) => pending.push(entry),
         WalEntry::Commit => pending.clear(),
+        WalEntry::WriteBinding(_) => {} // already stripped
       }
     }
-    Ok(pending)
+    Ok((binding, pending))
   }
 }
 
@@ -192,7 +222,7 @@ mod tests {
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
     let entries = Wal::replay(&storage, &path).unwrap();
     assert!(matches!(entries.last(), Some(WalEntry::Commit)));
-    let pending = Wal::last_pending_ops(&storage, &path).unwrap();
+    let (_, pending) = Wal::last_pending_ops(&storage, &path).unwrap();
     assert!(pending.is_empty());
   }
 

@@ -15,7 +15,7 @@ use std::sync::{
 
 use searchlite_core::api::types::{
   parse_env_max_vector_candidates, Aggregation, Document, ExecutionStrategy, IndexOptions, Query,
-  QueryNode, SearchRequest, StorageType,
+  QueryNode, Schema, SearchRequest, StorageType,
 };
 use searchlite_core::api::Index;
 
@@ -95,6 +95,52 @@ fn value_to_document(value: serde_json::Value) -> Result<Document, ()> {
   Ok(Document { fields })
 }
 
+fn optional_cstr(ptr: *const c_char) -> Option<String> {
+  if ptr.is_null() {
+    return None;
+  }
+  unsafe { CStr::from_ptr(ptr) }
+    .to_str()
+    .ok()
+    .map(|s| s.to_string())
+}
+
+fn open_index(
+  path: *const c_char,
+  create_if_missing: bool,
+  write_key: Option<String>,
+) -> *mut IndexHandle {
+  if path.is_null() {
+    return std::ptr::null_mut();
+  }
+  let c_str = unsafe { CStr::from_ptr(path) };
+  let path_buf = PathBuf::from(c_str.to_string_lossy().to_string());
+  let opts = IndexOptions {
+    path: path_buf.clone(),
+    create_if_missing,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let index_res = if create_if_missing && !path_buf.exists() && write_key.is_some() {
+    Index::create_with_write_key(
+      &path_buf,
+      Schema::default_text_body(),
+      opts,
+      write_key.as_deref(),
+    )
+  } else {
+    Index::open(opts)
+  };
+  match index_res {
+    Ok(index) => Box::into_raw(Box::new(IndexHandle { index })),
+    Err(_) => std::ptr::null_mut(),
+  }
+}
+
 fn value_to_documents(value: serde_json::Value) -> Result<Vec<Document>, ()> {
   match value {
     serde_json::Value::Array(items) => items.into_iter().map(value_to_document).collect(),
@@ -147,26 +193,29 @@ pub unsafe extern "C" fn searchlite_index_open(
     #[cfg(test)]
     maybe_panic_for_tests();
 
-    if path.is_null() {
-      return std::ptr::null_mut();
-    }
-    let c_str = CStr::from_ptr(path);
-    let path_buf = PathBuf::from(c_str.to_string_lossy().to_string());
-    let opts = IndexOptions {
-      path: path_buf,
-      create_if_missing,
-      enable_positions: true,
-      bm25_k1: 0.9,
-      bm25_b: 0.4,
-      storage: StorageType::Filesystem,
-      #[cfg(feature = "vectors")]
-      vector_defaults: None,
-    };
-    match Index::open(opts) {
-      Ok(index) => Box::into_raw(Box::new(IndexHandle { index })),
-      Err(_) => std::ptr::null_mut(),
-    }
+    open_index(path, create_if_missing, None)
   })
+}
+
+/// # Safety
+/// Same as `searchlite_index_open`, but accepts an optional write key to create or open a key-protected index.
+#[no_mangle]
+pub unsafe extern "C" fn searchlite_index_open_with_write_key(
+  path: *const c_char,
+  create_if_missing: bool,
+  write_key: *const c_char,
+) -> *mut IndexHandle {
+  catch_unwind_default(
+    "searchlite_index_open_with_write_key",
+    std::ptr::null_mut(),
+    || {
+      #[cfg(test)]
+      maybe_panic_for_tests();
+
+      let write_key = optional_cstr(write_key);
+      open_index(path, create_if_missing, write_key)
+    },
+  )
 }
 
 /// # Safety
@@ -224,6 +273,53 @@ pub unsafe extern "C" fn searchlite_add_json(
 }
 
 /// # Safety
+/// Same as `searchlite_add_json` but accepts an optional write key (UTF-8 C string).
+#[no_mangle]
+pub unsafe extern "C" fn searchlite_add_json_with_write_key(
+  handle: *mut IndexHandle,
+  json: *const c_char,
+  len: usize,
+  write_key: *const c_char,
+) -> c_int {
+  catch_unwind_default("searchlite_add_json_with_write_key", ERR_PANIC, || {
+    #[cfg(test)]
+    maybe_panic_for_tests();
+
+    if handle.is_null() || json.is_null() {
+      return -1;
+    }
+    let h = &mut *handle;
+    let write_key = optional_cstr(write_key);
+    let Some(json_str) = read_json_str(json, len) else {
+      return -5;
+    };
+    let val = match serde_json::from_str::<serde_json::Value>(&json_str) {
+      Ok(val) => val,
+      Err(_) => return -5,
+    };
+    let doc = match value_to_document(val) {
+      Ok(doc) => doc,
+      Err(_) => return -6,
+    };
+    let mut writer = match h.index.writer_with_key(write_key.as_deref()) {
+      Ok(w) => w,
+      Err(err) => {
+        let msg = err.to_string();
+        return if write_key.is_some() || msg.contains("write key") {
+          -8
+        } else {
+          -4
+        };
+      }
+    };
+    match writer.add_document(&doc) {
+      Ok(res) => res as c_int,
+      Err(_) => -2,
+    }
+  })
+}
+
+/// # Safety
 /// Adds one or more documents encoded as a JSON object or array of objects. Call `searchlite_commit` to make changes visible.
 /// `handle` must be valid and `json` must point to UTF-8 data of length `len` (or be null-terminated when `len == 0`).
 /// Returns the number of documents queued on success, or a negative error code on failure.
@@ -264,6 +360,57 @@ pub unsafe extern "C" fn searchlite_add_json_batch(
 }
 
 /// # Safety
+/// Batch ingest with an optional write key.
+#[no_mangle]
+pub unsafe extern "C" fn searchlite_add_json_batch_with_write_key(
+  handle: *mut IndexHandle,
+  json: *const c_char,
+  len: usize,
+  write_key: *const c_char,
+) -> c_int {
+  catch_unwind_default(
+    "searchlite_add_json_batch_with_write_key",
+    ERR_PANIC,
+    || {
+      #[cfg(test)]
+      maybe_panic_for_tests();
+
+      if handle.is_null() || json.is_null() {
+        return -1;
+      }
+      let h = &mut *handle;
+      let write_key = optional_cstr(write_key);
+      let Some(json_str) = read_json_str(json, len) else {
+        return -5;
+      };
+      let val = match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(val) => val,
+        Err(_) => return -5,
+      };
+      let docs = match value_to_documents(val) {
+        Ok(docs) => docs,
+        Err(_) => return -6,
+      };
+      let mut writer = match h.index.writer_with_key(write_key.as_deref()) {
+        Ok(w) => w,
+        Err(err) => {
+          let msg = err.to_string();
+          return if write_key.is_some() || msg.contains("write key") {
+            -8
+          } else {
+            -4
+          };
+        }
+      };
+      match writer.add_documents_batch(&docs) {
+        Ok(count) => count as c_int,
+        Err(_) => -2,
+      }
+    },
+  )
+}
+
+/// # Safety
 /// `handle` must be a valid pointer returned by `searchlite_index_open` that has not been freed.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
@@ -281,6 +428,39 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
         Err(_) => -2,
       },
       Err(_) => -3,
+    }
+  })
+}
+
+/// # Safety
+/// Commit pending writes with an optional write key (required when the index enforces one).
+#[no_mangle]
+pub unsafe extern "C" fn searchlite_commit_with_write_key(
+  handle: *mut IndexHandle,
+  write_key: *const c_char,
+) -> c_int {
+  catch_unwind_default("searchlite_commit_with_write_key", ERR_PANIC, || {
+    #[cfg(test)]
+    maybe_panic_for_tests();
+
+    if handle.is_null() {
+      return -1;
+    }
+    let h = &mut *handle;
+    let write_key = optional_cstr(write_key);
+    match h.index.writer_with_key(write_key.as_deref()) {
+      Ok(mut w) => match w.commit() {
+        Ok(_) => 0,
+        Err(_) => -2,
+      },
+      Err(err) => {
+        let msg = err.to_string();
+        if write_key.is_some() || msg.contains("write key") {
+          -8
+        } else {
+          -3
+        }
+      }
     }
   })
 }
@@ -660,6 +840,33 @@ mod tests {
       )
     };
     assert!(written > 0);
+
+    unsafe { searchlite_index_close(handle) };
+  }
+
+  #[test]
+  fn ffi_write_key_protected_index_requires_key() {
+    let _guard = test_guard();
+    let dir = tempdir().unwrap();
+    let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+    let key = CString::new("test-write-key-123").unwrap();
+    let handle = unsafe { searchlite_index_open_with_write_key(path.as_ptr(), true, key.as_ptr()) };
+    assert!(!handle.is_null());
+
+    // Missing key should fail to add.
+    let doc = CString::new(r#"{"_id":"1","body":"secured"}"#).unwrap();
+    let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
+    assert!(added < 0);
+
+    // Providing the correct key should succeed.
+    let added_with_key = unsafe {
+      searchlite_add_json_with_write_key(handle, doc.as_ptr(), doc.as_bytes().len(), key.as_ptr())
+    };
+    assert!(added_with_key >= 0);
+    assert_eq!(
+      unsafe { searchlite_commit_with_write_key(handle, key.as_ptr()) },
+      0
+    );
 
     unsafe { searchlite_index_close(handle) };
   }

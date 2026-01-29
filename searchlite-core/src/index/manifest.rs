@@ -11,6 +11,7 @@ use crate::analysis::analyzer::{
 };
 use crate::storage::Storage;
 use crate::util::doc_id::validate_doc_id;
+use crate::util::write_key::WriteKeyMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -19,6 +20,8 @@ pub struct Manifest {
   pub segments: Vec<SegmentMeta>,
   pub committed_at: String,
   pub schema: Schema,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub write_key: Option<WriteKeyMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +36,8 @@ pub struct SegmentMeta {
   pub deleted_docs: Vec<u32>,
   pub avg_field_lengths: HashMap<String, f32>,
   pub checksums: HashMap<String, u32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub write_binding_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +60,7 @@ impl Manifest {
       segments: Vec::new(),
       committed_at: Utc::now().to_rfc3339(),
       schema,
+      write_key: None,
     }
   }
 

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 
@@ -11,6 +13,7 @@ use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::SegmentWriter;
 use crate::index::wal::Wal;
 use crate::storage::{FsStorage, InMemoryStorage, Storage};
+use crate::util::write_key::derive_write_key_meta;
 
 pub mod codec;
 pub mod directory;
@@ -37,8 +40,17 @@ pub(crate) struct InnerIndex {
 
 impl Index {
   pub fn create(path: &Path, schema: Schema, opts: IndexOptions) -> Result<Self> {
+    Self::create_with_write_key(path, schema, opts, None)
+  }
+
+  pub fn create_with_write_key(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    write_key: Option<&str>,
+  ) -> Result<Self> {
     let storage = storage_from_options(&opts);
-    Self::create_with_storage(path, schema, opts, storage)
+    Self::create_with_storage_and_key(path, schema, opts, storage, write_key)
   }
 
   pub fn create_with_storage(
@@ -47,11 +59,24 @@ impl Index {
     opts: IndexOptions,
     storage: Arc<dyn Storage>,
   ) -> Result<Self> {
+    Self::create_with_storage_and_key(path, schema, opts, storage, None)
+  }
+
+  pub fn create_with_storage_and_key(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    storage: Arc<dyn Storage>,
+    write_key: Option<&str>,
+  ) -> Result<Self> {
     let mut opts = opts;
     opts.path = path.to_path_buf();
     schema.validate_config()?;
     ensure_root(storage.as_ref(), path)?;
-    let manifest = Manifest::new(schema);
+    let mut manifest = Manifest::new(schema);
+    if let Some(key) = write_key {
+      manifest.write_key = Some(derive_write_key_meta(key, None)?);
+    }
     manifest.store(storage.as_ref(), &Manifest::manifest_path(path))?;
     let inner = Arc::new(InnerIndex {
       path: path.to_path_buf(),
@@ -92,7 +117,14 @@ impl Index {
   }
 
   pub fn writer(&self) -> Result<crate::api::writer::IndexWriter> {
-    crate::api::writer::IndexWriter::new(self.inner.clone())
+    self.writer_with_key(None)
+  }
+
+  pub fn writer_with_key(
+    &self,
+    write_key: Option<&str>,
+  ) -> Result<crate::api::writer::IndexWriter> {
+    crate::api::writer::IndexWriter::new(self.inner.clone(), write_key)
   }
 
   pub fn reader(&self) -> Result<crate::api::reader::IndexReader> {
@@ -100,6 +132,10 @@ impl Index {
   }
 
   pub fn compact(&self) -> Result<()> {
+    self.compact_with_key(None)
+  }
+
+  pub fn compact_with_key(&self, write_key: Option<&str>) -> Result<()> {
     let _writer_guard = self.inner.writer_lock.lock();
     let reader = self.reader()?;
     let manifest_snapshot = reader.manifest.clone();
@@ -107,6 +143,26 @@ impl Index {
       return Ok(());
     }
     ensure_compact_safe(&manifest_snapshot.schema)?;
+    let mut write_binding: Option<Vec<u8>> = None;
+    let seg_bindings: Vec<Vec<u8>> = manifest_snapshot
+      .segments
+      .iter()
+      .filter_map(|s| s.write_binding_b64.as_deref())
+      .filter_map(|b64| BASE64.decode(b64).ok())
+      .collect();
+    if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
+      let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
+      if let Some(meta) = manifest_snapshot.write_key.as_ref() {
+        crate::util::write_key::verify_write_key(key, meta)?;
+      }
+      let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
+      for seg_binding in seg_bindings.iter() {
+        if !crate::util::write_key::verify_binding(seg_binding, &binding) {
+          bail!("write key does not match segment binding; index may be tampered");
+        }
+      }
+      write_binding = Some(binding);
+    }
     let old_segments = manifest_snapshot.segments.clone();
     let inner = &self.inner;
     let schema = manifest_snapshot.schema.clone();
@@ -141,6 +197,7 @@ impl Index {
       inner.options.enable_positions,
       cfg!(feature = "zstd"),
       inner.storage.clone(),
+      write_binding.clone(),
     );
     let new_seg = writer.write_segment_from_iter(docs, generation)?;
     manifest_guard.segments = vec![new_seg];

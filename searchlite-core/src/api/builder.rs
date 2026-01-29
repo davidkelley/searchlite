@@ -16,6 +16,15 @@ impl IndexBuilder {
     Index::create(path, schema, opts)
   }
 
+  pub fn create_with_write_key(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    write_key: Option<&str>,
+  ) -> anyhow::Result<Index> {
+    Index::create_with_write_key(path, schema, opts, write_key)
+  }
+
   #[cfg(not(target_arch = "wasm32"))]
   pub fn create_from_schema_file(
     path: &Path,
