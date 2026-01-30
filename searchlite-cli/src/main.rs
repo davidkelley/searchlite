@@ -17,8 +17,7 @@ use searchlite_core::api::types::{VectorQuery, VectorQuerySpec};
 use searchlite_core::api::Index;
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_http::{
-  init_tracing as init_http_tracing, parse_alias_spec, parse_index_spec, run as http_run,
-  AliasSpec as HttpAliasSpec, IndexSpec, ServeArgs as HttpServeArgs,
+  init_tracing as init_http_tracing, run as http_run, ServeArgs as HttpServeArgs,
 };
 use tokio::runtime::Runtime;
 use tracing::error;
@@ -122,20 +121,6 @@ enum Commands {
   },
   /// Start the HTTP server for one or more indexes (NAME:PATH mounts)
   Http {
-    /// Repeatable NAME:PATH mounts (or comma-delimited via SEARCHLITE_INDEX_MAP).
-    #[arg(
-      short = 'I',
-      long = "index",
-      value_name = "NAME:PATH",
-      value_delimiter = ','
-    )]
-    index: Vec<String>,
-    /// Optional aliases in the form ALIAS:TARGET (comma-delimited for env).
-    #[arg(long = "alias", value_name = "ALIAS:TARGET", value_delimiter = ',')]
-    alias: Vec<String>,
-    /// Override bind address
-    #[arg(long)]
-    bind: Option<String>,
     #[command(flatten)]
     args: HttpServeArgs,
   },
@@ -235,29 +220,7 @@ fn main() -> Result<()> {
       };
       cmd_search(index, request)
     }
-    Commands::Http {
-      index,
-      alias,
-      bind,
-      mut args,
-    } => {
-      if !index.is_empty() {
-        let specs: Result<Vec<IndexSpec>> = index
-          .into_iter()
-          .map(|raw| parse_index_spec(&raw).map_err(|e| anyhow::anyhow!(e)))
-          .collect();
-        args.indexes = specs?;
-      }
-      if !alias.is_empty() {
-        let aliases: Result<Vec<HttpAliasSpec>> = alias
-          .into_iter()
-          .map(|raw| parse_alias_spec(&raw).map_err(|e| anyhow::anyhow!(e)))
-          .collect();
-        args.aliases = aliases?;
-      }
-      if let Some(bind) = bind {
-        args.bind = bind.parse()?;
-      }
+    Commands::Http { args } => {
       init_http_tracing();
       let rt = Runtime::new()?;
       if let Err(err) = rt.block_on(http_run(args)) {

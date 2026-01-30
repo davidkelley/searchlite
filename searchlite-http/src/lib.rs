@@ -56,8 +56,8 @@ pub fn parse_index_spec(raw: &str) -> Result<IndexSpec, String> {
     return Err("index path cannot be empty".into());
   }
   Ok(IndexSpec {
-    name: name.to_string(),
-    path: PathBuf::from(path),
+    name: name.trim().to_string(),
+    path: PathBuf::from(path.trim()),
   })
 }
 
@@ -75,8 +75,8 @@ pub fn parse_alias_spec(raw: &str) -> Result<AliasSpec, String> {
     return Err("alias and target must be non-empty".into());
   }
   Ok(AliasSpec {
-    alias: alias.to_string(),
-    target: target.to_string(),
+    alias: alias.trim().to_string(),
+    target: target.trim().to_string(),
   })
 }
 
@@ -238,7 +238,10 @@ impl ManagedIndex {
     if !self.manifest_exists() {
       return Err(HttpError::not_found(
         "index_missing",
-        "index is not initialized; call /indexes/{name}/init first",
+        format!(
+          "index `{}` is not initialized; call /indexes/{}/init first",
+          self.name, self.name
+        ),
       ));
     }
     let idx = Index::open(self.index_options(false))
@@ -276,12 +279,14 @@ impl IndexRegistry {
 
     let mut aliases = HashMap::new();
     for alias_spec in args.aliases.iter() {
-      if !indexes.contains_key(&alias_spec.target) {
+      if indexes.contains_key(&alias_spec.alias) {
         anyhow::bail!(
-          "alias `{}` targets unknown index `{}`",
-          alias_spec.alias,
-          alias_spec.target
+          "alias `{}` conflicts with existing index name",
+          alias_spec.alias
         );
+      }
+      if aliases.contains_key(&alias_spec.alias) {
+        anyhow::bail!("duplicate alias name provided: {}", alias_spec.alias);
       }
       aliases.insert(alias_spec.alias.clone(), alias_spec.target.clone());
     }
@@ -2388,5 +2393,62 @@ mod tests {
 
     handle.abort();
     let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn alias_cycle_returns_error() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().to_path_buf();
+    let mut args = ServeArgs {
+      indexes: vec![
+        IndexSpec {
+          name: "idx1".into(),
+          path: base.join("a"),
+        },
+        IndexSpec {
+          name: "idx2".into(),
+          path: base.join("b"),
+        },
+        IndexSpec {
+          name: "idx3".into(),
+          path: base.join("c"),
+        },
+      ],
+      aliases: vec![],
+      ..default_args(base.join("primary"))
+    };
+    args.aliases = vec![
+      AliasSpec {
+        alias: "a".into(),
+        target: "b".into(),
+      },
+      AliasSpec {
+        alias: "b".into(),
+        target: "c".into(),
+      },
+      AliasSpec {
+        alias: "c".into(),
+        target: "a".into(),
+      },
+    ];
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    match registry.resolve("a") {
+      Err(err) => assert_eq!(err.kind, "alias_cycle"),
+      Ok(_) => panic!("expected alias cycle error"),
+    }
+  }
+
+  #[test]
+  fn duplicate_index_name_rejected() {
+    let mut args = default_args(PathBuf::from("/tmp/idx-one"));
+    args.indexes.push(IndexSpec {
+      name: INDEX_NAME.into(),
+      path: PathBuf::from("/tmp/idx-two"),
+    });
+    match IndexRegistry::from_args(&args) {
+      Ok(_) => panic!("expected duplicate index name error"),
+      Err(err) => assert!(err.to_string().contains("duplicate index name provided")),
+    }
   }
 }
