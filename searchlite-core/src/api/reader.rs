@@ -3197,6 +3197,9 @@ impl IndexReader {
     }
     for seg in self.segments.iter() {
       for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
+        if seg.is_deleted(doc_idx as DocId) {
+          continue;
+        }
         if let Some(targets) = requested.get(doc_id.as_str()) {
           let source = if return_stored {
             Some(seg.get_doc(doc_idx as DocId)?)
@@ -4312,6 +4315,7 @@ mod tests {
     SearchRequest, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
+  use serde_json::json;
   #[cfg(feature = "vectors")]
   use crate::index::manifest::{VectorField, VectorMetric};
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
@@ -4349,6 +4353,164 @@ mod tests {
     buf[17..].copy_from_slice(&returned.to_be_bytes());
     let encoded = hex_encode(&buf);
     assert!(PaginationCursor::decode(&encoded).is_err());
+  }
+
+  #[test]
+  fn search_after_round_trips_across_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-1")),
+          ("body".into(), json!("rust rust search")),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-2")),
+          ("body".into(), json!("rust query")),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    assert_eq!(first.hits.len(), 1);
+    let token = first.next_search_after.clone().expect("next_search_after");
+
+    let second = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: Some(token),
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    assert_eq!(second.hits.len(), 1);
+    assert_ne!(second.hits[0].doc_id, first.hits[0].doc_id);
+  }
+
+  #[test]
+  fn mget_skips_deleted_docs_and_preserves_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([("_id".into(), json!("a")), ("body".into(), json!("first"))]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([("_id".into(), json!("b")), ("body".into(), json!("second"))]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer.delete_documents(&["b".into()]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader
+      .mget(&["a".into(), "b".into(), "missing".into()], true)
+      .unwrap();
+    assert_eq!(docs.len(), 3);
+    assert!(docs[0].found);
+    assert!(docs[0]._source.is_some());
+    assert!(!docs[1].found);
+    assert!(docs[1]._source.is_none());
+    assert!(!docs[2].found);
   }
 
   #[test]

@@ -1221,7 +1221,7 @@ async fn search(
     ));
   }
   let page_cap = request.from.saturating_add(request.limit);
-  if page_cap > MAX_PAGE_SIZE {
+  if request.return_hits && page_cap > MAX_PAGE_SIZE {
     return Err(HttpError::bad_request(
       "page_too_large",
       format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
@@ -1362,9 +1362,10 @@ async fn multi_search(
         format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
       ));
     }
-    let permit = semaphore.clone().acquire_owned().await.unwrap();
+    let semaphore_clone = semaphore.clone();
     let index_clone = idx.clone();
     tasks.push(async move {
+      let permit = semaphore_clone.acquire_owned().await.unwrap();
       let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
         let _permit = permit;
         let reader = index_clone.reader()?;

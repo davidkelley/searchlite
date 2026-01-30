@@ -257,17 +257,25 @@ impl SortPlan {
     for (spec, raw) in self.fields.iter().zip(values.iter()) {
       let value = match (&spec.field, raw) {
         (_, Value::Null) => SortValue::Missing,
-        (SortField::Score, Value::Number(n)) => SortValue::Score(n.as_f64().unwrap_or(0.0) as f32),
+        (SortField::Score, Value::Number(n)) => {
+          let f = n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
+          SortValue::Score(f as f32)
+        }
         (SortField::Keyword(_), Value::String(s)) => SortValue::Str(s.clone()),
-        (SortField::I64(_), Value::Number(n)) => SortValue::I64(
-          n.as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be integer"))?,
-        ),
-        (SortField::F64(_), Value::Number(n)) => SortValue::F64(
-          n.as_f64()
-            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?,
-        ),
+        (SortField::I64(_), Value::Number(n)) => {
+          let i = n
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be integer"))?;
+          SortValue::I64(i)
+        }
+        (SortField::F64(_), Value::Number(n)) => {
+          let f = n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
+          SortValue::F64(f)
+        }
         (SortField::Keyword(_), _) => {
           bail!("search_after sort value must be string for keyword fields")
         }
