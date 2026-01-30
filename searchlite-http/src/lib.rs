@@ -88,24 +88,26 @@ pub fn parse_alias_spec(raw: &str) -> Result<AliasSpec, String> {
 )]
 pub struct ServeArgs {
   /// Mount one or more indexes as NAME:PATH pairs; repeat for multiple mounts.
+  /// When using SEARCHLITE_INDEX_MAP env var, separate entries with `;`.
   #[arg(
     short = 'I',
     long = "index",
     value_name = "NAME:PATH",
     value_parser = parse_index_spec,
     env = "SEARCHLITE_INDEX_MAP",
-    value_delimiter = ',',
+    value_delimiter = ';',
     required = true
   )]
   pub indexes: Vec<IndexSpec>,
 
   /// Optional aliases in the form ALIAS:TARGET (TARGET must be a mounted index name).
+  /// When using SEARCHLITE_INDEX_ALIASES env var, separate entries with `;`.
   #[arg(
     long = "alias",
     value_name = "ALIAS:TARGET",
     value_parser = parse_alias_spec,
     env = "SEARCHLITE_INDEX_ALIASES",
-    value_delimiter = ','
+    value_delimiter = ';'
   )]
   pub aliases: Vec<AliasSpec>,
 
@@ -291,6 +293,8 @@ impl IndexRegistry {
       aliases.insert(alias_spec.alias.clone(), alias_spec.target.clone());
     }
 
+    Self::validate_aliases(&indexes, &aliases)?;
+
     Ok(Self { indexes, aliases })
   }
 
@@ -317,6 +321,39 @@ impl IndexRegistry {
     self.indexes.get(cursor).cloned().ok_or_else(|| {
       HttpError::not_found("unknown_index", format!("index `{}` not registered", name))
     })
+  }
+
+  fn validate_aliases(
+    indexes: &HashMap<String, Arc<ManagedIndex>>,
+    aliases: &HashMap<String, String>,
+  ) -> anyhow::Result<()> {
+    for (alias_name, initial_target) in aliases.iter() {
+      let mut cursor: &str = alias_name;
+      let mut visited = HashSet::new();
+      loop {
+        if indexes.contains_key(cursor) {
+          break;
+        }
+        if !visited.insert(cursor.to_string()) {
+          anyhow::bail!(
+            "alias cycle detected involving `{}` while validating alias `{}`",
+            cursor,
+            alias_name
+          );
+        }
+        match aliases.get(cursor) {
+          Some(next) => cursor = next,
+          None => {
+            anyhow::bail!(
+              "alias `{}` targets unknown index or alias `{}`",
+              alias_name,
+              initial_target
+            );
+          }
+        }
+      }
+    }
+    Ok(())
   }
 
   fn list_indexes(&self) -> Vec<IndexDescriptor> {

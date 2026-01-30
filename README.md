@@ -233,7 +233,7 @@ If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"
 
 This HTTP service provides no authentication, authorization, or rate limiting. Do not expose it directly to untrusted networks; front it with your own proxy or API gateway that enforces access control and rate limits.
 
-Run the bundled HTTP server for a single index (available directly from the CLI):
+Run the bundled HTTP server for one or more indexes (available directly from the CLI):
 
 ```bash
 searchlite http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
