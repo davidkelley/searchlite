@@ -76,6 +76,7 @@ fn sorts_numeric_and_missing_last() {
       fields: None,
       filter: None,
       limit: 10,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
@@ -85,6 +86,7 @@ fn sorts_numeric_and_missing_last() {
         order: Some(SortOrder::Asc),
       }],
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
@@ -168,6 +170,7 @@ fn sorts_keywords_descending_with_multivalue_mode() {
       fields: None,
       filter: None,
       limit: 5,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
@@ -177,6 +180,7 @@ fn sorts_keywords_descending_with_multivalue_mode() {
         order: Some(SortOrder::Desc),
       }],
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
@@ -271,6 +275,7 @@ fn paginates_with_sorted_cursor_across_segments() {
     fields: None,
     filter: None,
     limit: 2,
+    from: 0,
     return_hits: true,
     candidate_size: None,
     #[cfg(feature = "vectors")]
@@ -280,6 +285,7 @@ fn paginates_with_sorted_cursor_across_segments() {
       order: Some(SortOrder::Asc),
     }],
     cursor: None,
+    search_after: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,

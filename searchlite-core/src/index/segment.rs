@@ -1372,6 +1372,18 @@ impl SegmentReader {
     self.doc_ids.get(doc_id as usize).map(|s| s.as_str())
   }
 
+  pub fn find_doc_id(&self, id: &str) -> Option<DocId> {
+    self
+      .doc_ids
+      .iter()
+      .position(|d| d == id)
+      .map(|i| i as DocId)
+  }
+
+  pub fn doc_ids(&self) -> &[String] {
+    &self.doc_ids
+  }
+
   pub fn is_deleted(&self, doc_id: DocId) -> bool {
     self.deleted.contains(&doc_id)
   }

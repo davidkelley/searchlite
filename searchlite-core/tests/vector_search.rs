@@ -74,12 +74,14 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     fields: None,
     filter: None,
     limit,
+    from: 0,
     return_hits: true,
     candidate_size: None,
     #[cfg(feature = "vectors")]
     max_global_vector_candidates: None,
     sort: Vec::<SortSpec>::new(),
     cursor: None,
+    search_after: None,
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
@@ -628,6 +630,7 @@ fn multiple_vector_clauses_merge_candidates() {
   let req = SearchRequest {
     query: Query::Node(query),
     limit: 3,
+    from: 0,
     return_hits: true,
     #[cfg(feature = "vectors")]
     vector_query: None,
@@ -690,6 +693,7 @@ fn rejects_global_cap_below_clause_count() {
   let req = SearchRequest {
     query: Query::Node(query),
     limit: 2,
+    from: 0,
     return_hits: true,
     max_global_vector_candidates: Some(1), // smaller than clause count (2)
     vector_query: None,

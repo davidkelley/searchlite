@@ -406,8 +406,10 @@ pub struct SearchRequest {
   pub fields: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub filter: Option<Filter>,
-  #[serde(default = "default_limit")]
+  #[serde(default = "default_limit", alias = "size")]
   pub limit: usize,
+  #[serde(default)]
+  pub from: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +421,8 @@ pub struct SearchRequest {
   pub sort: Vec<SortSpec>,
   #[serde(default)]
   pub cursor: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub search_after: Option<Vec<serde_json::Value>>,
   #[serde(default)]
   pub execution: ExecutionStrategy,
   #[serde(default)]
@@ -457,8 +461,10 @@ struct SearchRequestHelper {
   pub fields: Option<Vec<String>>,
   #[serde(default)]
   pub filter: Option<Filter>,
-  #[serde(default = "default_limit")]
+  #[serde(default = "default_limit", alias = "size")]
   pub limit: usize,
+  #[serde(default)]
+  pub from: usize,
   #[serde(default = "default_return_hits")]
   pub return_hits: bool,
   #[serde(default)]
@@ -470,6 +476,8 @@ struct SearchRequestHelper {
   pub sort: Vec<SortSpec>,
   #[serde(default)]
   pub cursor: Option<String>,
+  #[serde(default)]
+  pub search_after: Option<Vec<serde_json::Value>>,
   #[serde(default)]
   pub execution: ExecutionStrategy,
   #[serde(default)]
@@ -512,12 +520,14 @@ impl<'de> Deserialize<'de> for SearchRequest {
       fields: helper.fields,
       filter: helper.filter,
       limit: helper.limit,
+      from: helper.from,
       return_hits: helper.return_hits,
       candidate_size: helper.candidate_size,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: helper.max_global_vector_candidates,
       sort: helper.sort,
       cursor: helper.cursor,
+      search_after: helper.search_after,
       execution: helper.execution,
       bmw_block_size: helper.bmw_block_size,
       fuzzy: helper.fuzzy,
@@ -544,6 +554,35 @@ pub struct RescoreRequest {
   pub query: QueryNode,
   #[serde(default)]
   pub score_mode: RescoreMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MgetRequest {
+  pub ids: Vec<String>,
+  #[serde(default)]
+  pub return_stored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MgetDoc {
+  pub id: String,
+  pub found: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub _source: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MgetResponse {
+  pub docs: Vec<MgetDoc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSearchRequest {
+  pub searches: Vec<SearchRequest>,
+  #[serde(default)]
+  pub parallel: bool,
+  #[serde(default)]
+  pub max_concurrency: Option<usize>,
 }
 
 /// How to combine the original document score with a rescore query score.

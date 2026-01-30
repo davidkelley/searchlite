@@ -14,8 +14,8 @@ use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, CollapseRequest, DateHistogramAggregation,
   DecayFunction, Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation,
-  IndexOptions, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder,
-  SuggestOption, SuggestRequest, SuggestResult,
+  IndexOptions, MgetDoc, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest,
+  SortOrder, SuggestOption, SuggestRequest, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -53,6 +53,8 @@ use crate::vectors::{blend_scores, normalize_in_place, DEFAULT_VECTOR_ALPHA};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
+const MAX_PAGE_SIZE: usize = 1_000;
+const MAX_MGET_IDS: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
@@ -60,6 +62,8 @@ pub struct Hit {
   pub score: f32,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_score: Option<f32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sort_key: Option<Vec<serde_json::Value>>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,12 +108,19 @@ pub struct SearchResult {
   pub hits: Vec<Hit>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub next_cursor: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub next_search_after: Option<Vec<serde_json::Value>>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggregations: BTreeMap<String, AggregationResponse>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub suggest: BTreeMap<String, SuggestResult>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub profile: Option<ProfileResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSearchResponse {
+  pub results: Vec<SearchResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -819,6 +830,103 @@ fn push_ranked(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) {
 struct CursorState {
   key: SortKey,
   returned: u32,
+}
+
+fn sort_value_to_json(value: &SortValue) -> serde_json::Value {
+  match value {
+    SortValue::Score(v) => serde_json::Number::from_f64(*v as f64)
+      .map(serde_json::Value::Number)
+      .unwrap_or(serde_json::Value::Null),
+    SortValue::I64(v) => serde_json::Value::Number((*v).into()),
+    SortValue::F64(v) => serde_json::Number::from_f64(*v)
+      .map(serde_json::Value::Number)
+      .unwrap_or(serde_json::Value::Null),
+    SortValue::Str(v) => serde_json::Value::String(v.clone()),
+    SortValue::Missing => serde_json::Value::Null,
+  }
+}
+
+fn parse_segment_ord(raw: &serde_json::Value) -> Result<u32> {
+  match raw {
+    serde_json::Value::Number(n) => n
+      .as_u64()
+      .and_then(|v| u32::try_from(v).ok())
+      .ok_or_else(|| anyhow::anyhow!("search_after segment_ord must be a non-negative integer")),
+    serde_json::Value::String(s) => {
+      let trimmed = if let Some(rest) = s.strip_prefix("seg") {
+        rest
+      } else {
+        s.as_str()
+      };
+      trimmed
+        .trim()
+        .parse::<u32>()
+        .context("parsing search_after segment_ord")
+    }
+    _ => Err(anyhow::anyhow!(
+      "search_after segment_ord must be string or integer"
+    )),
+  }
+}
+
+fn decode_search_after_token(
+  token: &[serde_json::Value],
+  sort_plan: &SortPlan,
+  segments: &[SegmentReader],
+) -> Result<SortKey> {
+  if token.len() < sort_plan.len().saturating_add(2) {
+    bail!(
+      "search_after token length {} is less than expected {} values plus doc_id and segment_ord",
+      token.len(),
+      sort_plan.len()
+    );
+  }
+  if token.len() != sort_plan.len().saturating_add(2) {
+    bail!(
+      "search_after token must contain {} sort values plus doc_id and segment_ord",
+      sort_plan.len()
+    );
+  }
+  let values = sort_plan.values_from_json(&token[..sort_plan.len()])?;
+  let doc_id_value = token.get(sort_plan.len()).unwrap();
+  let seg_value = token.get(sort_plan.len() + 1).unwrap();
+  let segment_ord = parse_segment_ord(seg_value)?;
+  let seg = segments
+    .get(segment_ord as usize)
+    .ok_or_else(|| anyhow::anyhow!("search_after segment_ord {} out of range", segment_ord))?;
+  let doc_id_str = match doc_id_value {
+    serde_json::Value::String(s) => s.clone(),
+    serde_json::Value::Number(n) => n.to_string(),
+    _ => {
+      bail!("search_after doc_id must be string or number");
+    }
+  };
+  let doc_id = seg.find_doc_id(&doc_id_str).ok_or_else(|| {
+    anyhow::anyhow!(
+      "search_after doc_id `{}` not found in segment {}",
+      doc_id_str,
+      seg.meta.id
+    )
+  })?;
+  sort_plan.key_from_values(&values, segment_ord, doc_id as DocId)
+}
+
+fn encode_search_after_token(
+  sort_plan: &SortPlan,
+  key: &SortKey,
+  segments: &[SegmentReader],
+) -> Result<Vec<serde_json::Value>> {
+  let values = sort_plan.values_from_key(key)?;
+  let mut out: Vec<serde_json::Value> = values.iter().map(sort_value_to_json).collect();
+  let seg = segments
+    .get(key.segment_ord as usize)
+    .ok_or_else(|| anyhow::anyhow!("segment {} missing for search_after", key.segment_ord))?;
+  let doc_id_str = seg
+    .doc_id(key.doc_id)
+    .ok_or_else(|| anyhow::anyhow!("doc_id {} missing in segment", key.doc_id))?;
+  out.push(serde_json::Value::String(doc_id_str.to_string()));
+  out.push(serde_json::Value::Number(key.segment_ord.into()));
+  Ok(out)
 }
 
 fn decode_cursor(
@@ -2245,9 +2353,11 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
-    let collect_hits = req.return_hits && req.limit > 0;
+    let from = if cursor_state.is_some() { 0 } else { req.from };
+    let page_cap = from.saturating_add(req.limit);
+    let collect_hits = req.return_hits && page_cap > 0;
     let heap_limit = if collect_hits {
-      plan.candidate_size.max(req.limit).saturating_add(1)
+      plan.candidate_size.max(page_cap).saturating_add(1)
     } else {
       0
     };
@@ -2358,28 +2468,62 @@ impl IndexReader {
       }
     }
     let mut next_cursor = None;
-    if req.return_hits && req.limit > 0 && hits.len() > req.limit {
-      let key = hits[req.limit - 1].key.clone();
-      next_cursor = Some(encode_cursor(
-        manifest_generation,
-        (cursor_returned + req.limit) as u32,
-        &key,
-        &sort_plan,
-        score_fast_path,
-      )?);
-      hits.truncate(req.limit);
-    }
+    let mut next_search_after = None;
     let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
     let hits: Vec<Hit> = if req.return_hits {
-      hits
+      let total_needed = from.saturating_add(req.limit);
+      if total_needed > 0 && hits.len() > total_needed {
+        let key = hits[total_needed - 1].key.clone();
+        next_cursor = Some(encode_cursor(
+          manifest_generation,
+          (cursor_returned + total_needed) as u32,
+          &key,
+          &sort_plan,
+          score_fast_path,
+        )?);
+      }
+      let mut last_returned_key: Option<SortKey> = None;
+      let include_sort_keys = true;
+      let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
+        .skip(from)
+        .take(req.limit)
         .filter_map(|(idx, h)| {
-          let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
+          last_returned_key = Some(h.key.clone());
+          let sort_json = if include_sort_keys {
+            encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
+          } else {
+            None
+          };
+          let mut hit = self.materialize_hit(
+            h,
+            req,
+            &[],
+            &empty_phrases,
+            &sort_plan,
+            include_sort_keys,
+            sort_json.clone(),
+          )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
-              .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
+              .filter_map(|ih| {
+                let inner_sort = if include_sort_keys {
+                  encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                } else {
+                  None
+                };
+                self.materialize_hit(
+                  ih.clone(),
+                  req,
+                  &[],
+                  &empty_phrases,
+                  &sort_plan,
+                  include_sort_keys,
+                  inner_sort,
+                )
+              })
               .collect();
             if !inner_hits.is_empty() {
               hit.inner_hits = Some(inner_hits);
@@ -2387,7 +2531,13 @@ impl IndexReader {
           }
           Some(hit)
         })
-        .collect()
+        .collect();
+      if include_sort_keys {
+        if let Some(key) = last_returned_key.as_ref() {
+          next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
+        }
+      }
+      out
     } else {
       Vec::new()
     };
@@ -2406,6 +2556,7 @@ impl IndexReader {
       total_groups,
       hits,
       next_cursor,
+      next_search_after,
       aggregations,
       suggest,
       profile: if req.profile {
@@ -2586,11 +2737,25 @@ impl IndexReader {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
     }
+    if req.limit == 0 && req.from > 0 {
+      bail!("from is not supported when limit is 0");
+    }
     if req.limit == 0 && req.explain {
       bail!("explain is not supported when limit is 0");
     }
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
+    }
+    // Precedence: cursor wins; ignore search_after if both provided.
+    if req.search_after.is_some() && req.from > 0 {
+      bail!("search_after cannot be combined with from; use one pagination method");
+    }
+    let page_cap = req.from.saturating_add(req.limit);
+    if req.return_hits && page_cap > MAX_PAGE_SIZE {
+      bail!(
+        "from + size exceeds max page size {}; adjust pagination",
+        MAX_PAGE_SIZE
+      );
     }
     if let Some(collapse) = req.collapse.as_ref() {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
@@ -2605,15 +2770,20 @@ impl IndexReader {
       .map(|s| s.generation)
       .max()
       .unwrap_or(0);
+    let mut from = req.from;
     let cursor_state = if req.limit == 0 {
       None
     } else if let Some(raw) = req.cursor.as_deref() {
+      from = 0;
       Some(decode_cursor(
         raw,
         manifest_generation,
         &sort_plan,
         score_fast_path,
       )?)
+    } else if let Some(token) = req.search_after.as_ref() {
+      let key = decode_search_after_token(token, &sort_plan, &self.segments)?;
+      Some(CursorState { key, returned: 0 })
     } else {
       None
     };
@@ -2641,22 +2811,27 @@ impl IndexReader {
         vector_plan = None;
       }
     }
-    let base_candidate = if req.limit == 0 {
+    let page_limit = if req.return_hits {
+      from.saturating_add(req.limit)
+    } else {
+      0
+    };
+    let base_candidate = if page_limit == 0 {
       0
     } else {
       req
         .candidate_size
-        .unwrap_or(req.limit)
-        .max(req.limit)
+        .unwrap_or(page_limit)
+        .max(page_limit)
         .min(MAX_CANDIDATE_SIZE)
     };
     #[cfg(feature = "vectors")]
-    let effective_limit = if req.limit == 0 {
+    let effective_limit = if page_limit == 0 {
       0
     } else {
       vector_plan
         .as_ref()
-        .map(|p| p.candidate_size.max(req.limit))
+        .map(|p| p.candidate_size.max(page_limit))
         .unwrap_or(base_candidate)
     };
     #[cfg(not(feature = "vectors"))]
@@ -2723,7 +2898,7 @@ impl IndexReader {
         .transpose()?;
       let mut noop_collector = NoopCollector;
       let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
-      if req.return_hits && !score_fast_path && req.limit > 0 && !req.explain {
+      if req.return_hits && !score_fast_path && page_limit > 0 && !req.explain {
         let heap_limit = top_k;
         let heap_ref = &mut heap;
         collect_hits = Some(Box::new(move |key: SortKey, score: f32| {
@@ -2744,7 +2919,7 @@ impl IndexReader {
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
         if agg_ref.is_none()
-          && (req.limit == 0 || !req.return_hits || (!score_fast_path && req.limit > 0))
+          && (page_limit == 0 || !req.return_hits || (!score_fast_path && page_limit > 0))
         {
           agg_ref = Some(&mut noop_collector);
         }
@@ -2803,7 +2978,7 @@ impl IndexReader {
       hits.extend(heap);
     }
     #[cfg(feature = "vectors")]
-    if req.limit > 0 && req.return_hits {
+    if page_limit > 0 && req.return_hits {
       if let Some(plan) = vector_plan.as_ref() {
         let require_text_match = !plan.vector_only;
         let vector_scores = self.collect_vector_maps(
@@ -2887,11 +3062,13 @@ impl IndexReader {
       }
     }
     let mut next_cursor = None;
+    let mut next_search_after = None;
     let hits: Vec<Hit> = if req.return_hits {
-      if req.limit > 0 && hits.len() > req.limit {
-        let last = &hits[req.limit - 1];
+      let total_needed = from.saturating_add(req.limit);
+      if total_needed > 0 && hits.len() > total_needed {
+        let last = &hits[total_needed - 1];
         let returned = cursor_returned
-          .saturating_add(req.limit)
+          .saturating_add(total_needed)
           .try_into()
           .unwrap_or(u32::MAX);
         next_cursor = Some(encode_cursor(
@@ -2901,18 +3078,48 @@ impl IndexReader {
           &sort_plan,
           score_fast_path,
         )?);
-        hits.truncate(req.limit);
       }
-      hits
+      let mut last_returned_key: Option<SortKey> = None;
+      let include_sort_keys = true;
+      let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
+        .skip(from)
+        .take(req.limit)
         .filter_map(|(idx, h)| {
-          let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
+          last_returned_key = Some(h.key.clone());
+          let sort_json = if include_sort_keys {
+            encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
+          } else {
+            None
+          };
+          let mut hit = self.materialize_hit(
+            h,
+            req,
+            &highlight_terms,
+            &highlight_phrases,
+            &sort_plan,
+            include_sort_keys,
+            sort_json.clone(),
+          )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
               .filter_map(|ih| {
-                self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
+                let inner_sort = if include_sort_keys {
+                  encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                } else {
+                  None
+                };
+                self.materialize_hit(
+                  ih.clone(),
+                  req,
+                  &highlight_terms,
+                  &highlight_phrases,
+                  &sort_plan,
+                  include_sort_keys,
+                  inner_sort,
+                )
               })
               .collect();
             if !inner_hits.is_empty() {
@@ -2921,7 +3128,13 @@ impl IndexReader {
           }
           Some(hit)
         })
-        .collect()
+        .collect();
+      if include_sort_keys {
+        if let Some(key) = last_returned_key.as_ref() {
+          next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
+        }
+      }
+      out
     } else {
       Vec::new()
     };
@@ -2940,6 +3153,7 @@ impl IndexReader {
       total_groups,
       hits,
       next_cursor,
+      next_search_after,
       aggregations,
       suggest,
       profile: if req.profile {
@@ -2956,6 +3170,59 @@ impl IndexReader {
         None
       },
     })
+  }
+
+  pub fn mget(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
+    if ids.len() > MAX_MGET_IDS {
+      bail!(
+        "mget ids length {} exceeds max supported {}",
+        ids.len(),
+        MAX_MGET_IDS
+      );
+    }
+    let mut results: Vec<MgetDoc> = ids
+      .iter()
+      .map(|id| MgetDoc {
+        id: id.clone(),
+        found: false,
+        _source: None,
+      })
+      .collect();
+    if results.is_empty() {
+      return Ok(results);
+    }
+    let mut requested: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, id) in ids.iter().enumerate() {
+      requested.entry(id.as_str()).or_default().push(idx);
+    }
+    for seg in self.segments.iter() {
+      for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
+        if let Some(targets) = requested.get(doc_id.as_str()) {
+          let source = if return_stored {
+            Some(seg.get_doc(doc_idx as DocId)?)
+          } else {
+            None
+          };
+          for pos in targets.iter().copied() {
+            results[pos].found = true;
+            results[pos]._source = source.clone();
+          }
+        }
+      }
+      // Early exit if all requested ids found
+      if results.iter().all(|r| r.found) {
+        break;
+      }
+    }
+    Ok(results)
+  }
+
+  pub fn multi_search(&self, requests: &[SearchRequest]) -> Result<Vec<SearchResult>> {
+    let mut out = Vec::with_capacity(requests.len());
+    for req in requests.iter() {
+      out.push(self.search(req)?);
+    }
+    Ok(out)
   }
 
   fn search_segment(
@@ -3450,12 +3717,16 @@ impl IndexReader {
     Ok(())
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn materialize_hit(
     &self,
     ranked: RankedHit,
     req: &SearchRequest,
     highlight_terms: &[String],
     phrase_terms: &BTreeMap<String, Vec<Vec<String>>>,
+    sort_plan: &SortPlan,
+    include_sort_key: bool,
+    sort_key_json: Option<Vec<serde_json::Value>>,
   ) -> Option<Hit> {
     let seg = self.segments.get(ranked.key.segment_ord as usize)?;
     let doc_id_str = seg.doc_id(ranked.key.doc_id)?;
@@ -3541,6 +3812,12 @@ impl IndexReader {
       doc_id: doc_id_str.to_string(),
       score: ranked.score,
       vector_score: ranked.vector_score,
+      sort_key: if include_sort_key {
+        sort_key_json
+          .or_else(|| encode_search_after_token(sort_plan, &ranked.key, &self.segments).ok())
+      } else {
+        None
+      },
       fields: fields_val,
       snippet,
       explanation: ranked.explanation,
@@ -4307,12 +4584,14 @@ mod tests {
         fields: None,
         filter: None,
         limit: 5,
+        from: 0,
         return_hits: true,
         candidate_size: None,
         #[cfg(feature = "vectors")]
         max_global_vector_candidates: None,
         sort: Vec::new(),
         cursor: None,
+        search_after: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
@@ -4664,12 +4943,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 10,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
