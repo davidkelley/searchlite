@@ -95,14 +95,12 @@ fn value_to_document(value: serde_json::Value) -> Result<Document, ()> {
   Ok(Document { fields })
 }
 
-fn optional_cstr(ptr: *const c_char) -> Option<String> {
+fn optional_cstr(ptr: *const c_char) -> Result<Option<String>, std::str::Utf8Error> {
   if ptr.is_null() {
-    return None;
+    return Ok(None);
   }
-  unsafe { CStr::from_ptr(ptr) }
-    .to_str()
-    .ok()
-    .map(|s| s.to_string())
+  let c_str = unsafe { CStr::from_ptr(ptr) };
+  c_str.to_str().map(|s| Some(s.to_string()))
 }
 
 fn open_index(
@@ -125,7 +123,8 @@ fn open_index(
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
-  let index_res = if create_if_missing && !path_buf.exists() && write_key.is_some() {
+  let manifest_path = path_buf.join("MANIFEST.json");
+  let index_res = if create_if_missing && !manifest_path.exists() {
     Index::create_with_write_key(
       &path_buf,
       Schema::default_text_body(),
@@ -212,7 +211,10 @@ pub unsafe extern "C" fn searchlite_index_open_with_write_key(
       #[cfg(test)]
       maybe_panic_for_tests();
 
-      let write_key = optional_cstr(write_key);
+      let write_key = match optional_cstr(write_key) {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+      };
       open_index(path, create_if_missing, write_key)
     },
   )
@@ -289,7 +291,10 @@ pub unsafe extern "C" fn searchlite_add_json_with_write_key(
       return -1;
     }
     let h = &mut *handle;
-    let write_key = optional_cstr(write_key);
+    let write_key = match optional_cstr(write_key) {
+      Ok(v) => v,
+      Err(_) => return -8,
+    };
     let Some(json_str) = read_json_str(json, len) else {
       return -5;
     };
@@ -379,7 +384,10 @@ pub unsafe extern "C" fn searchlite_add_json_batch_with_write_key(
         return -1;
       }
       let h = &mut *handle;
-      let write_key = optional_cstr(write_key);
+      let write_key = match optional_cstr(write_key) {
+        Ok(v) => v,
+        Err(_) => return -8,
+      };
       let Some(json_str) = read_json_str(json, len) else {
         return -5;
       };
@@ -447,7 +455,10 @@ pub unsafe extern "C" fn searchlite_commit_with_write_key(
       return -1;
     }
     let h = &mut *handle;
-    let write_key = optional_cstr(write_key);
+    let write_key = match optional_cstr(write_key) {
+      Ok(v) => v,
+      Err(_) => return -8,
+    };
     match h.index.writer_with_key(write_key.as_deref()) {
       Ok(mut w) => match w.commit() {
         Ok(_) => 0,

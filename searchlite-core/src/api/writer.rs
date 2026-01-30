@@ -61,19 +61,23 @@ impl IndexWriter {
       .unwrap_or(0);
     let mut write_binding: Option<Vec<u8>> = None;
 
-    let mut segments_binding: Vec<Vec<u8>> = manifest
-      .segments
-      .iter()
-      .filter_map(|seg| seg.write_binding_b64.as_deref())
-      .filter_map(|b64| BASE64.decode(b64).ok())
-      .collect();
+    let mut segments_binding: Vec<Vec<u8>> = Vec::new();
+    for seg in manifest.segments.iter() {
+      if let Some(b64) = seg.write_binding_b64.as_deref() {
+        let decoded = BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment manifest write_binding_b64: {e}"))?;
+        segments_binding.push(decoded);
+      }
+    }
     for seg in manifest.segments.iter() {
       if let Ok(bytes) = inner.storage.read_to_end(Path::new(&seg.paths.meta)) {
         if let Ok(seg_meta) = serde_json::from_slice::<SegmentFileMeta>(&bytes) {
           if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
-            if let Ok(decoded) = BASE64.decode(b64) {
-              segments_binding.push(decoded);
-            }
+            let decoded = BASE64
+              .decode(b64)
+              .map_err(|e| anyhow!("invalid base64 in segment metadata write_binding_b64: {e}"))?;
+            segments_binding.push(decoded);
           }
         }
       }
@@ -765,6 +769,32 @@ mod tests {
     assert_eq!(std::fs::metadata(wal_path).unwrap().len(), 0);
     let manifest = idx.manifest();
     assert!(manifest.segments[0].deleted_docs.is_empty());
+  }
+
+  #[test]
+  fn write_key_enforced_for_writer_open() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let key = "super-secret-key";
+    let idx = Index::create_with_write_key(dir.path(), schema.clone(), opts(dir.path()), Some(key))
+      .unwrap();
+
+    // Missing key -> error.
+    assert!(idx.writer_with_key(None).is_err());
+
+    // Wrong key -> error.
+    assert!(idx.writer_with_key(Some("wrong")).is_err());
+
+    // Correct key works and allows commit.
+    let mut writer = idx.writer_with_key(Some(key)).unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("_id".into(), serde_json::json!("1"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
   }
 
   #[test]

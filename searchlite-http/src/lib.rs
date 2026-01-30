@@ -527,15 +527,17 @@ async fn add_ndjson(
         let mut writer = index_ref
           .writer_with_key(write_key.as_deref())
           .map_err(|e| {
-            HttpError::from_anyhow(
-              "writer_open",
+            let msg = e.to_string().to_lowercase();
+            let status = if msg.contains("write key") || msg.contains("unauthorized") {
               if write_key.is_some() {
                 StatusCode::FORBIDDEN
               } else {
                 StatusCode::UNAUTHORIZED
-              },
-              e,
-            )
+              }
+            } else {
+              StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpError::from_anyhow("writer_open", status, e)
           })?;
         let mut total = 0usize;
         let mut rx = rx;
@@ -724,15 +726,17 @@ async fn bulk_ingest(
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-      HttpError::from_anyhow(
-        "writer_open",
+      let msg = e.to_string().to_lowercase();
+      let status = if msg.contains("write key") || msg.contains("unauthorized") {
         if write_key.is_some() {
           StatusCode::FORBIDDEN
         } else {
           StatusCode::UNAUTHORIZED
-        },
-        e,
-      )
+        }
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      HttpError::from_anyhow("writer_open", status, e)
     })?;
     for doc in docs.iter() {
       if let Err(err) = writer.add_document(doc) {
@@ -782,15 +786,17 @@ async fn delete_documents(
   }
   let _writer_guard = state.writer_lock.lock().await;
   let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-    HttpError::from_anyhow(
-      "writer_open",
+    let msg = e.to_string().to_lowercase();
+    let status = if msg.contains("write key") || msg.contains("unauthorized") {
       if write_key.is_some() {
         StatusCode::FORBIDDEN
       } else {
         StatusCode::UNAUTHORIZED
-      },
-      e,
-    )
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("writer_open", status, e)
   })?;
   writer
     .delete_documents(&body.ids)
@@ -841,15 +847,17 @@ async fn commit(
     )
   })?
   .map_err(|err| {
-    HttpError::from_anyhow(
-      "commit_failed",
+    let msg = err.to_string();
+    let status = if msg.to_lowercase().contains("write key") {
       if write_key.is_some() {
         StatusCode::FORBIDDEN
       } else {
         StatusCode::UNAUTHORIZED
-      },
-      err,
-    )
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("commit_failed", status, err)
   })?;
   Ok(Json(CommitResponse { committed: true }))
 }
@@ -900,15 +908,17 @@ async fn compact(
     )
   })?
   .map_err(|err| {
-    HttpError::from_anyhow(
-      "compact_failed",
+    let msg = err.to_string();
+    let status = if msg.to_lowercase().contains("write key") {
       if write_key.is_some() {
         StatusCode::FORBIDDEN
       } else {
         StatusCode::UNAUTHORIZED
-      },
-      err,
-    )
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("compact_failed", status, err)
   })?;
   Ok(Json(CompactResponse { compacted: true }))
 }

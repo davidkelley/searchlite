@@ -148,8 +148,12 @@ impl Index {
       .segments
       .iter()
       .filter_map(|s| s.write_binding_b64.as_deref())
-      .filter_map(|b64| BASE64.decode(b64).ok())
-      .collect();
+      .map(|b64| {
+        BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment write_binding_b64: {e}"))
+      })
+      .collect::<Result<Vec<_>>>()?;
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
       if let Some(meta) = manifest_snapshot.write_key.as_ref() {

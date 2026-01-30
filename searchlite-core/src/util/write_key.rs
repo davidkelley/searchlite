@@ -22,7 +22,8 @@ pub struct WriteKeyMeta {
   pub params: KdfParams,
 }
 
-const DEFAULT_M_COST: u32 = 19; // ~512 MiB
+// Argon2 memory cost is in KiB; 512 MiB = 512 * 1024 KiB.
+const DEFAULT_M_COST: u32 = 524_288;
 const DEFAULT_T_COST: u32 = 2;
 const DEFAULT_P_COST: u32 = 1;
 const DEFAULT_OUTPUT_LEN: u32 = 32;
