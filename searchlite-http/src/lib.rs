@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -145,6 +145,21 @@ struct ErrorResponseBody {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ErrorResponse {
   error: ErrorResponseBody,
+}
+
+fn extract_write_key(headers: &HeaderMap) -> Option<String> {
+  headers
+    .get("x-write-key")
+    .and_then(|v| v.to_str().ok())
+    .map(|s| s.to_string())
+}
+
+fn write_key_required(manifest: &Manifest) -> bool {
+  manifest.write_key.is_some()
+    || manifest
+      .segments
+      .iter()
+      .any(|s| s.write_binding_b64.is_some())
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -418,6 +433,7 @@ async fn health() -> impl IntoResponse {
 
 async fn init_index(
   State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
   payload: Result<Json<Schema>, JsonRejection>,
 ) -> ApiResult<Json<InitResponse>> {
   let schema = parse_json(payload)?;
@@ -429,16 +445,19 @@ async fn init_index(
   }
   let path = state.index_path.clone();
   let opts = state.index_options(true);
-  let created = tokio::task::spawn_blocking(move || IndexBuilder::create(&path, schema, opts))
-    .await
-    .map_err(|err| {
-      HttpError::from_anyhow(
-        "init_join",
-        StatusCode::INTERNAL_SERVER_ERROR,
-        anyhow::anyhow!(err.to_string()),
-      )
-    })?
-    .map_err(|err| HttpError::from_anyhow("init_failed", StatusCode::BAD_REQUEST, err))?;
+  let write_key = extract_write_key(&headers);
+  let created = tokio::task::spawn_blocking(move || {
+    IndexBuilder::create_with_write_key(&path, schema, opts, write_key.as_deref())
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "init_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
+  .map_err(|err| HttpError::from_anyhow("init_failed", StatusCode::BAD_REQUEST, err))?;
   // IndexBuilder::create must either return a fully initialized, ready-to-use index
   // or fail with an error. At this point the index is safe for subsequent writer/reader
   // creation, otherwise the call above would have erred.
@@ -448,9 +467,19 @@ async fn init_index(
 
 async fn add_ndjson(
   State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
   body: Body,
 ) -> ApiResult<Json<IngestResponse>> {
   let index = state.require_index().await?;
+  let write_key = extract_write_key(&headers);
+  let manifest = index.manifest();
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
   let mapped_stream = body
     .into_data_stream()
     .map(|chunk| chunk.map_err(io::Error::other));
@@ -479,6 +508,7 @@ async fn add_ndjson(
   let (tx, rx) = mpsc::channel::<IngestMsg>(INGEST_CHANNEL_BUFFER_BATCHES);
   let mut rx_slot = Some(rx);
   let mut writer_task: Option<tokio::task::JoinHandle<Result<usize, HttpError>>> = None;
+  let write_key_clone = write_key.clone();
 
   let ensure_writer_task =
     |rx_slot: &mut Option<mpsc::Receiver<IngestMsg>>,
@@ -491,11 +521,24 @@ async fn add_ndjson(
       };
       let writer_lock = state.writer_lock.clone();
       let index_ref = index.clone();
+      let write_key = write_key_clone.clone();
       let handle = tokio::task::spawn_blocking(move || -> Result<usize, HttpError> {
         let _writer_guard = writer_lock.blocking_lock();
-        let mut writer = index_ref.writer().map_err(|e| {
-          HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+        let mut writer = index_ref
+          .writer_with_key(write_key.as_deref())
+          .map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            let status = if msg.contains("write key") || msg.contains("unauthorized") {
+              if write_key.is_some() {
+                StatusCode::FORBIDDEN
+              } else {
+                StatusCode::UNAUTHORIZED
+              }
+            } else {
+              StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpError::from_anyhow("writer_open", status, e)
+          })?;
         let mut total = 0usize;
         let mut rx = rx;
         while let Some(msg) = rx.blocking_recv() {
@@ -653,6 +696,7 @@ async fn add_ndjson(
 
 async fn bulk_ingest(
   State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
   payload: Result<Json<BulkRequest>, JsonRejection>,
 ) -> ApiResult<Json<IngestResponse>> {
   let body = parse_json(payload)?;
@@ -668,13 +712,32 @@ async fn bulk_ingest(
     .map(value_to_document)
     .collect::<ApiResult<_>>()?;
   let index = state.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
 
   let writer_lock = state.writer_lock.clone();
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
-    let mut writer = index
-      .writer()
-      .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
+      let msg = e.to_string().to_lowercase();
+      let status = if msg.contains("write key") || msg.contains("unauthorized") {
+        if write_key.is_some() {
+          StatusCode::FORBIDDEN
+        } else {
+          StatusCode::UNAUTHORIZED
+        }
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      HttpError::from_anyhow("writer_open", status, e)
+    })?;
     for doc in docs.iter() {
       if let Err(err) = writer.add_document(doc) {
         if let Err(rollback_err) = writer.rollback() {
@@ -700,6 +763,7 @@ async fn bulk_ingest(
 
 async fn delete_documents(
   State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
   payload: Result<Json<DeleteRequest>, JsonRejection>,
 ) -> ApiResult<Json<DeleteResponse>> {
   let body = parse_json(payload)?;
@@ -711,10 +775,29 @@ async fn delete_documents(
   }
   validate_ids(&body.ids)?;
   let index = state.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
   let _writer_guard = state.writer_lock.lock().await;
-  let mut writer = index
-    .writer()
-    .map_err(|e| HttpError::from_anyhow("writer_open", StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
+    let msg = e.to_string().to_lowercase();
+    let status = if msg.contains("write key") || msg.contains("unauthorized") {
+      if write_key.is_some() {
+        StatusCode::FORBIDDEN
+      } else {
+        StatusCode::UNAUTHORIZED
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("writer_open", status, e)
+  })?;
   writer
     .delete_documents(&body.ids)
     .map_err(|e| HttpError::bad_request("delete_failed", e.to_string()))?;
@@ -729,13 +812,26 @@ fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
   index.reader().map(|_| ())
 }
 
-async fn commit(State(state): State<Arc<AppState>>) -> ApiResult<Json<CommitResponse>> {
+async fn commit(
+  State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
+) -> ApiResult<Json<CommitResponse>> {
   let index = state.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
   let refresh = state.refresh_on_commit;
   let writer_lock = state.writer_lock.clone();
+  let write_key_clone = write_key.clone();
   tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
     let _guard = writer_lock.blocking_lock();
-    let mut writer = index.writer()?;
+    let mut writer = index.writer_with_key(write_key_clone.as_deref())?;
     writer.commit()?;
     if refresh {
       trigger_reader_refresh(&index)?;
@@ -750,7 +846,19 @@ async fn commit(State(state): State<Arc<AppState>>) -> ApiResult<Json<CommitResp
       anyhow::anyhow!(err.to_string()),
     )
   })?
-  .map_err(|err| HttpError::from_anyhow("commit_failed", StatusCode::INTERNAL_SERVER_ERROR, err))?;
+  .map_err(|err| {
+    let msg = err.to_string();
+    let status = if msg.to_lowercase().contains("write key") {
+      if write_key.is_some() {
+        StatusCode::FORBIDDEN
+      } else {
+        StatusCode::UNAUTHORIZED
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("commit_failed", status, err)
+  })?;
   Ok(Json(CommitResponse { committed: true }))
 }
 
@@ -771,12 +879,25 @@ async fn refresh(State(state): State<Arc<AppState>>) -> ApiResult<Json<RefreshRe
   Ok(Json(RefreshResponse { refreshed: true }))
 }
 
-async fn compact(State(state): State<Arc<AppState>>) -> ApiResult<Json<CompactResponse>> {
+async fn compact(
+  State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
+) -> ApiResult<Json<CompactResponse>> {
   let index = state.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
   let writer_lock = state.writer_lock.clone();
+  let write_key_clone = write_key.clone();
   tokio::task::spawn_blocking(move || {
     let _guard = writer_lock.blocking_lock();
-    index.compact()
+    index.compact_with_key(write_key_clone.as_deref())
   })
   .await
   .map_err(|err| {
@@ -787,7 +908,17 @@ async fn compact(State(state): State<Arc<AppState>>) -> ApiResult<Json<CompactRe
     )
   })?
   .map_err(|err| {
-    HttpError::from_anyhow("compact_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
+    let msg = err.to_string();
+    let status = if msg.to_lowercase().contains("write key") {
+      if write_key.is_some() {
+        StatusCode::FORBIDDEN
+      } else {
+        StatusCode::UNAUTHORIZED
+      }
+    } else {
+      StatusCode::INTERNAL_SERVER_ERROR
+    };
+    HttpError::from_anyhow("compact_failed", status, err)
   })?;
   Ok(Json(CompactResponse { compacted: true }))
 }
@@ -835,7 +966,7 @@ async fn search(
 
 async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectResponse>> {
   let index = state.require_index().await?;
-  let manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
+  let mut manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
     .await
     .map_err(|err| {
       HttpError::from_anyhow(
@@ -847,6 +978,11 @@ async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectRe
     .map_err(|err| {
       HttpError::from_anyhow("inspect_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
     })?;
+  // Redact write-key metadata to avoid leaking hash/salt material in public responses.
+  manifest.write_key = None;
+  for seg in manifest.segments.iter_mut() {
+    seg.write_binding_b64 = None;
+  }
   Ok(Json(InspectResponse { manifest }))
 }
 

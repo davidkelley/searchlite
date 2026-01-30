@@ -21,6 +21,8 @@ paths:
   /init:
     post:
       summary: Create a new index if missing
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
         content:
@@ -54,6 +56,8 @@ paths:
         as a document object whose keys map to schema fields (including `_id`). Writes are
         queued in the index writer; call `/commit` (and optionally `/refresh`) to make them
         durable and visible to searches.
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
         content:
@@ -79,6 +83,8 @@ paths:
       description: >
         Upsert a JSON array of documents; writes are queued in the index writer and require
         `/commit` (and optionally `/refresh`) before they become visible to searches.
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
         content:
@@ -104,6 +110,8 @@ paths:
       description: >
         Deletes are queued in the index writer and require a subsequent `/commit`
         (and optional `/refresh`) to take effect.
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
         content:
@@ -127,6 +135,8 @@ paths:
     post:
       summary: Flush WAL to immutable segments
       description: Persist queued writes/deletes; combine with `/refresh` if you want readers reloaded.
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       responses:
         "200":
           description: Commit complete
@@ -160,6 +170,8 @@ paths:
   /compact:
     post:
       summary: Merge segments to reduce fragmentation
+      parameters:
+        - $ref: "#/components/parameters/WriteKeyHeader"
       responses:
         "200":
           description: Compaction completed
@@ -299,6 +311,14 @@ components:
         compacted:
           type: boolean
       required: [compacted]
+  parameters:
+    WriteKeyHeader:
+      name: X-Write-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Optional write key. Required for any write operation when the index was created with a write key.
     BulkRequest:
       type: object
       properties:

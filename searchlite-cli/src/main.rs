@@ -33,15 +33,40 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Commands {
   /// Initialize a new index with a schema
-  Init { index: PathBuf, schema: PathBuf },
+  Init {
+    index: PathBuf,
+    schema: PathBuf,
+    /// Optional write key required for all future writes
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
   /// Add documents from a JSONL file
-  Add { index: PathBuf, doc: PathBuf },
+  Add {
+    index: PathBuf,
+    doc: PathBuf,
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
   /// Update (upsert) documents from a JSONL file
-  Update { index: PathBuf, doc: PathBuf },
+  Update {
+    index: PathBuf,
+    doc: PathBuf,
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
   /// Delete documents by id (newline-delimited list)
-  Delete { index: PathBuf, ids: PathBuf },
+  Delete {
+    index: PathBuf,
+    ids: PathBuf,
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
   /// Commit pending documents
-  Commit { index: PathBuf },
+  Commit {
+    index: PathBuf,
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
   /// Execute a search query
   Search {
     index: PathBuf,
@@ -102,18 +127,38 @@ enum Commands {
   /// Inspect manifest and segments
   Inspect { index: PathBuf },
   /// Compact segments
-  Compact { index: PathBuf },
+  Compact {
+    index: PathBuf,
+    #[arg(long = "write-key")]
+    write_key: Option<String>,
+  },
 }
 
 fn main() -> Result<()> {
   env_logger::init();
   let cli = Cli::parse();
   match cli.command {
-    Commands::Init { index, schema } => cmd_init(index.as_path(), schema.as_path()),
-    Commands::Add { index, doc } => cmd_add(index.as_path(), doc.as_path()),
-    Commands::Update { index, doc } => cmd_add(index.as_path(), doc.as_path()),
-    Commands::Delete { index, ids } => cmd_delete(index.as_path(), ids.as_path()),
-    Commands::Commit { index } => cmd_commit(index.as_path()),
+    Commands::Init {
+      index,
+      schema,
+      write_key,
+    } => cmd_init(index.as_path(), schema.as_path(), write_key.as_deref()),
+    Commands::Add {
+      index,
+      doc,
+      write_key,
+    } => cmd_add(index.as_path(), doc.as_path(), write_key.as_deref()),
+    Commands::Update {
+      index,
+      doc,
+      write_key,
+    } => cmd_add(index.as_path(), doc.as_path(), write_key.as_deref()),
+    Commands::Delete {
+      index,
+      ids,
+      write_key,
+    } => cmd_delete(index.as_path(), ids.as_path(), write_key.as_deref()),
+    Commands::Commit { index, write_key } => cmd_commit(index.as_path(), write_key.as_deref()),
     Commands::Search {
       index,
       query,
@@ -185,7 +230,7 @@ fn main() -> Result<()> {
       Ok(())
     }
     Commands::Inspect { index } => cmd_inspect(index.as_path()),
-    Commands::Compact { index } => cmd_compact(index.as_path()),
+    Commands::Compact { index, write_key } => cmd_compact(index.as_path(), write_key.as_deref()),
   }
 }
 
@@ -229,19 +274,19 @@ struct SearchCliArgs {
   aggs_file: Option<PathBuf>,
 }
 
-fn cmd_init(index: &Path, schema_path: &Path) -> Result<()> {
+fn cmd_init(index: &Path, schema_path: &Path, write_key: Option<&str>) -> Result<()> {
   let opts = options(index, true);
   let schema_str = fs::read_to_string(schema_path)?;
   let schema: searchlite_core::api::types::Schema = serde_json::from_str(&schema_str)?;
-  IndexBuilder::create(index, schema, opts)?;
+  IndexBuilder::create_with_write_key(index, schema, opts, write_key)?;
   println!("initialized index at {:?}", index);
   Ok(())
 }
 
-fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
+fn cmd_add(index: &Path, doc_path: &Path, write_key: Option<&str>) -> Result<()> {
   let opts = options(index, false);
   let idx = Index::open(opts)?;
-  let mut writer = idx.writer()?;
+  let mut writer = idx.writer_with_key(write_key)?;
   let content =
     fs::read_to_string(doc_path).with_context(|| format!("reading docs from {:?}", doc_path))?;
   for (line_no, line) in content.lines().enumerate() {
@@ -262,10 +307,10 @@ fn cmd_add(index: &Path, doc_path: &Path) -> Result<()> {
   Ok(())
 }
 
-fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
+fn cmd_delete(index: &Path, ids_path: &Path, write_key: Option<&str>) -> Result<()> {
   let opts = options(index, false);
   let idx = Index::open(opts)?;
-  let mut writer = idx.writer()?;
+  let mut writer = idx.writer_with_key(write_key)?;
   let content = fs::read_to_string(ids_path)
     .with_context(|| format!("reading document ids from {:?}", ids_path))?;
   let mut ids = Vec::new();
@@ -287,10 +332,10 @@ fn cmd_delete(index: &Path, ids_path: &Path) -> Result<()> {
   Ok(())
 }
 
-fn cmd_commit(index: &Path) -> Result<()> {
+fn cmd_commit(index: &Path, write_key: Option<&str>) -> Result<()> {
   let opts = options(index, false);
   let idx = Index::open(opts)?;
-  let mut writer = idx.writer()?;
+  let mut writer = idx.writer_with_key(write_key)?;
   writer.commit()?;
   println!("committed");
   Ok(())
@@ -533,10 +578,10 @@ fn cmd_inspect(index: &Path) -> Result<()> {
   Ok(())
 }
 
-fn cmd_compact(index: &Path) -> Result<()> {
+fn cmd_compact(index: &Path, write_key: Option<&str>) -> Result<()> {
   let opts = options(index, false);
   let idx = Index::open(opts)?;
-  idx.compact()?;
+  idx.compact_with_key(write_key)?;
   println!("compaction complete");
   Ok(())
 }
@@ -553,7 +598,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -561,8 +606,8 @@ mod tests {
       "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another document\"}\n",
     )
     .unwrap();
-    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
-    cmd_commit(index.as_path()).unwrap();
+    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
+    cmd_commit(index.as_path(), None).unwrap();
     let request = build_search_request_from_cli(SearchCliArgs {
       query: Some("rust".into()),
       limit: 5,
@@ -592,7 +637,7 @@ mod tests {
     .unwrap();
     cmd_search(index.clone(), request).unwrap();
     cmd_inspect(index.as_path()).unwrap();
-    cmd_compact(index.as_path()).unwrap();
+    cmd_compact(index.as_path(), None).unwrap();
   }
 
   #[test]
@@ -602,12 +647,12 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(&docs_path, "{\"_id\":\"1\",\"body\":\"Rust search\"}\n").unwrap();
-    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
-    cmd_commit(index.as_path()).unwrap();
+    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
+    cmd_commit(index.as_path(), None).unwrap();
 
     let request = SearchRequest {
       query: "rust".into(),
@@ -691,7 +736,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -699,13 +744,13 @@ mod tests {
       "{\"_id\":\"  padded-id  \",\"body\":\"spaced\"}\n",
     )
     .unwrap();
-    cmd_add(index.as_path(), docs_path.as_path()).unwrap();
-    cmd_commit(index.as_path()).unwrap();
+    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
+    cmd_commit(index.as_path(), None).unwrap();
 
     let ids_path = dir.path().join("ids.txt");
     fs::write(&ids_path, "  padded-id  \n").unwrap();
-    cmd_delete(index.as_path(), ids_path.as_path()).unwrap();
-    cmd_commit(index.as_path()).unwrap();
+    cmd_delete(index.as_path(), ids_path.as_path(), None).unwrap();
+    cmd_commit(index.as_path(), None).unwrap();
 
     let opts = options(index.as_path(), false);
     let idx = Index::open(opts).unwrap();

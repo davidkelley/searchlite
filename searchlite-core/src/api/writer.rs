@@ -3,6 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::Utc;
 
 use crate::api::types::Document;
@@ -11,6 +13,7 @@ use crate::index::segment::{SegmentFileMeta, SegmentWriter};
 use crate::index::wal::{Wal, WalEntry};
 use crate::index::InnerIndex;
 use crate::util::doc_id::validate_doc_id;
+use crate::util::write_key::{binding_for_uuid, verify_binding, verify_write_key};
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -32,6 +35,7 @@ pub struct IndexWriter {
   schema: Schema,
   live_docs: HashMap<String, DocAddress>,
   live_generation: u32,
+  write_binding: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,12 +45,12 @@ struct WriterCheckpoint {
 }
 
 impl IndexWriter {
-  pub(crate) fn new(inner: Arc<InnerIndex>) -> Result<Self> {
+  pub(crate) fn new(inner: Arc<InnerIndex>, write_key: Option<&str>) -> Result<Self> {
     // Hold the writer lock during initialization to avoid racing with a commit.
     let _guard = inner.writer_lock.lock();
     let wal_path = crate::index::directory::wal_path(&inner.path);
-    let pending_entries = Wal::last_pending_ops(inner.storage.as_ref(), &wal_path)?;
-    let wal = inner.wal()?;
+    let (wal_binding, pending_entries) = Wal::last_pending_ops(inner.storage.as_ref(), &wal_path)?;
+    let mut wal = inner.wal()?;
     let manifest = inner.manifest.read().clone();
     let schema = manifest.schema.clone();
     let live_generation = manifest
@@ -55,6 +59,75 @@ impl IndexWriter {
       .map(|s| s.generation)
       .max()
       .unwrap_or(0);
+    let mut write_binding: Option<Vec<u8>> = None;
+
+    let mut segments_binding: Vec<Vec<u8>> = Vec::new();
+    let mut binding_required = manifest.write_key.is_some() || wal_binding.is_some();
+    for seg in manifest.segments.iter() {
+      if let Some(b64) = seg.write_binding_b64.as_deref() {
+        let decoded = BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment manifest write_binding_b64: {e}"))?;
+        segments_binding.push(decoded);
+        binding_required = true;
+      }
+    }
+    for seg in manifest.segments.iter() {
+      match inner.storage.read_to_end(Path::new(&seg.paths.meta)) {
+        Ok(bytes) => match serde_json::from_slice::<SegmentFileMeta>(&bytes) {
+          Ok(seg_meta) => {
+            if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
+              let decoded = BASE64.decode(b64).map_err(|e| {
+                anyhow!("invalid base64 in segment metadata write_binding_b64: {e}")
+              })?;
+              segments_binding.push(decoded);
+              binding_required = true;
+            }
+          }
+          Err(e) => {
+            if binding_required {
+              return Err(anyhow!(
+                "failed to decode segment metadata from {}: {e}",
+                seg.paths.meta
+              ));
+            }
+          }
+        },
+        Err(e) => {
+          if binding_required {
+            return Err(anyhow!(
+              "failed to read segment metadata from {}: {e}",
+              seg.paths.meta
+            ));
+          }
+        }
+      }
+    }
+    if binding_required {
+      let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
+      if let Some(meta) = manifest.write_key.as_ref() {
+        verify_write_key(key, meta)?;
+      }
+      let candidate = binding_for_uuid(key, &manifest.uuid);
+      if let Some(b) = wal_binding.as_ref() {
+        if !verify_binding(b, &candidate) {
+          bail!("write key does not match WAL binding; index may be tampered");
+        }
+      }
+      for seg_binding in segments_binding.iter() {
+        if !verify_binding(seg_binding, &candidate) {
+          bail!("write key does not match segment binding; index may be tampered");
+        }
+      }
+      if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
+        bail!("write key metadata missing but bindings exist; index metadata was likely tampered");
+      }
+      write_binding = Some(candidate.clone());
+      if wal_binding.is_none() {
+        wal.append_binding(&candidate)?;
+        wal.sync()?;
+      }
+    }
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
     let mut pending_ops = Vec::new();
     for entry in pending_entries {
@@ -65,6 +138,7 @@ impl IndexWriter {
         }
         WalEntry::DeleteDocId(doc_id) => pending_ops.push(PendingOp::Delete { doc_id }),
         WalEntry::Commit => {}
+        WalEntry::WriteBinding(_) => {}
       }
     }
     drop(_guard);
@@ -75,6 +149,7 @@ impl IndexWriter {
       schema,
       live_docs,
       live_generation,
+      write_binding,
     })
   }
 
@@ -186,6 +261,7 @@ impl IndexWriter {
         self.inner.options.enable_positions,
         cfg!(feature = "zstd"),
         self.inner.storage.clone(),
+        self.write_binding.clone(),
       );
       let docs: Vec<Document> = pending_new.values().cloned().collect();
       let segment = writer.write_segment(&docs, generation)?;
@@ -491,7 +567,7 @@ mod tests {
 
     storage.fail_next_manifest_store();
 
-    let mut writer = super::IndexWriter::new(inner).unwrap();
+    let mut writer = super::IndexWriter::new(inner, None).unwrap();
     writer
       .add_document(&Document {
         fields: [
@@ -514,7 +590,7 @@ mod tests {
     );
 
     let wal_path = directory::wal_path(dir.path());
-    let pending = Wal::last_pending_ops(storage.as_ref(), &wal_path).unwrap();
+    let (_, pending) = Wal::last_pending_ops(storage.as_ref(), &wal_path).unwrap();
     assert!(
       !pending.is_empty(),
       "wal should retain pending ops when manifest persistence fails"
@@ -715,6 +791,32 @@ mod tests {
   }
 
   #[test]
+  fn write_key_enforced_for_writer_open() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let key = "super-secret-key";
+    let idx = Index::create_with_write_key(dir.path(), schema.clone(), opts(dir.path()), Some(key))
+      .unwrap();
+
+    // Missing key -> error.
+    assert!(idx.writer_with_key(None).is_err());
+
+    // Wrong key -> error.
+    assert!(idx.writer_with_key(Some("wrong")).is_err());
+
+    // Correct key works and allows commit.
+    let mut writer = idx.writer_with_key(Some(key)).unwrap();
+    writer
+      .add_document(&Document {
+        fields: [("_id".into(), serde_json::json!("1"))]
+          .into_iter()
+          .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  #[test]
   fn commit_clears_wal_and_pending_entries() {
     let dir = tempdir().unwrap();
     let schema = Schema::default_text_body();
@@ -735,7 +837,7 @@ mod tests {
     }
     let wal_path = directory::wal_path(dir.path());
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
-    let pending = Wal::last_pending_ops(&storage, &wal_path).unwrap();
+    let (_, pending) = Wal::last_pending_ops(&storage, &wal_path).unwrap();
     assert!(
       pending.is_empty(),
       "pending WAL ops should be cleared on commit"

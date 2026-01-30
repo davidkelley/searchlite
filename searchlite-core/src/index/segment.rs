@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use base64::Engine as _;
 #[cfg(feature = "vectors")]
 use bincode::Options;
 #[cfg(feature = "vectors")]
@@ -50,6 +51,8 @@ pub struct SegmentFileMeta {
   #[serde(default)]
   pub vector_fields: HashMap<String, VectorFieldMeta>,
   pub use_zstd: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub write_binding_b64: Option<String>,
 }
 
 #[cfg(feature = "vectors")]
@@ -569,6 +572,7 @@ pub struct SegmentWriter<'a> {
   enable_positions: bool,
   use_zstd: bool,
   storage: Arc<dyn Storage>,
+  write_binding: Option<Vec<u8>>,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -578,6 +582,7 @@ impl<'a> SegmentWriter<'a> {
     enable_positions: bool,
     use_zstd: bool,
     storage: Arc<dyn Storage>,
+    write_binding: Option<Vec<u8>>,
   ) -> Self {
     Self {
       root,
@@ -585,6 +590,7 @@ impl<'a> SegmentWriter<'a> {
       enable_positions,
       use_zstd,
       storage,
+      write_binding,
     }
   }
 
@@ -898,6 +904,10 @@ impl<'a> SegmentWriter<'a> {
       #[cfg(feature = "vectors")]
       vector_fields: vector_meta.clone(),
       use_zstd: self.use_zstd,
+      write_binding_b64: self
+        .write_binding
+        .as_ref()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
     };
     write_segment_meta(
       self.storage.as_ref(),
@@ -928,6 +938,10 @@ impl<'a> SegmentWriter<'a> {
       deleted_docs: Vec::new(),
       avg_field_lengths,
       checksums,
+      write_binding_b64: self
+        .write_binding
+        .as_ref()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
     };
     Ok(meta)
   }
@@ -1455,7 +1469,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let schema = sample_schema();
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
-    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone());
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone(), None);
     let meta = writer
       .write_segment(
         &[
@@ -1481,7 +1495,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let schema = sample_schema();
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
-    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone());
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone(), None);
     let docs = vec![
       doc("Iter body one", "alpha", 2022),
       doc("Iter body two", "beta", 2023),
@@ -1501,7 +1515,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let schema = sample_schema();
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
-    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage);
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage, None);
     let mut bad_doc = doc("Rust search engine", "news", 2024);
     bad_doc
       .fields
@@ -1531,6 +1545,7 @@ mod tests {
       doc_ids: Vec::new(),
       avg_field_lengths: HashMap::new(),
       use_zstd: true,
+      write_binding_b64: None,
       #[cfg(feature = "vectors")]
       vector_fields: HashMap::new(),
     };
@@ -1546,6 +1561,7 @@ mod tests {
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
       checksums: HashMap::new(),
+      write_binding_b64: None,
     };
     let err = SegmentReader::open(storage, meta, true);
     assert!(err.is_err(), "expected zstd error for missing feature");

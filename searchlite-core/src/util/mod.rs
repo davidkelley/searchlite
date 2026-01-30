@@ -4,6 +4,7 @@ pub mod doc_id;
 pub mod fst;
 pub mod regex;
 pub mod varint;
+pub mod write_key;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mmap;

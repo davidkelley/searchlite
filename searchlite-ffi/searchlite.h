@@ -20,15 +20,21 @@ extern "C" {
 typedef struct IndexHandle IndexHandle;
 
 #define SEARCHLITE_ERR_PANIC (-100)
+// Returned when a write key is required or incorrect.
+#define SEARCHLITE_ERR_WRITE_KEY (-8)
 // Returned when a Rust panic is caught across the FFI boundary. The operation
 // did not complete; callers may retry. After a panic from a mutating call,
 // closing and reopening the index handle is the safest way to ensure consistency.
 
 IndexHandle* searchlite_index_open(const char* path, bool create_if_missing);
+IndexHandle* searchlite_index_open_with_write_key(const char* path, bool create_if_missing, const char* write_key);
 void searchlite_index_close(IndexHandle* handle);
 int32_t searchlite_add_json(IndexHandle* handle, const char* json, size_t json_len);
+int32_t searchlite_add_json_with_write_key(IndexHandle* handle, const char* json, size_t json_len, const char* write_key);
 int32_t searchlite_add_json_batch(IndexHandle* handle, const char* json, size_t json_len);
+int32_t searchlite_add_json_batch_with_write_key(IndexHandle* handle, const char* json, size_t json_len, const char* write_key);
 int32_t searchlite_commit(IndexHandle* handle);
+int32_t searchlite_commit_with_write_key(IndexHandle* handle, const char* write_key);
 ssize_t searchlite_search(
   IndexHandle* handle,
   const char* query,
