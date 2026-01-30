@@ -119,7 +119,7 @@ enum Commands {
     #[arg(long)]
     aggs_file: Option<PathBuf>,
   },
-  /// Start the HTTP server for a single index
+  /// Start the HTTP server for one or more indexes (NAME:PATH mounts)
   Http {
     #[command(flatten)]
     args: HttpServeArgs,

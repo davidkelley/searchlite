@@ -3,8 +3,10 @@ info:
   title: Searchlite HTTP API
   version: "0.1.0"
   description: >
-    HTTP surface for a single Searchlite index. The request schema for `/search`
-    matches `search-request.schema.json`; the `/init` schema matches `index-schema.json`.
+    HTTP surface for one or more mounted Searchlite indexes. All mutating and search
+    endpoints are scoped by index name via the `/indexes/{name}/...` path prefix. The
+    search request schema matches `search-request.schema.json`; the init schema matches
+    `index-schema.json`.
 servers:
   - url: http://localhost:8080
 paths:
@@ -18,10 +20,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
-  /init:
+  /indexes:
+    get:
+      summary: List configured indexes and aliases
+      responses:
+        "200":
+          description: Names and on-disk paths for mounted indexes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexListResponse"
+  /indexes/{name}/init:
     post:
       summary: Create a new index if missing
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
@@ -48,15 +61,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /add:
+  /indexes/{name}/add:
     post:
       summary: Upsert documents via streaming NDJSON
       description: >
         The request body must be newline-delimited JSON documents. Each line is parsed
         as a document object whose keys map to schema fields (including `_id`). Writes are
-        queued in the index writer; call `/commit` (and optionally `/refresh`) to make them
-        durable and visible to searches.
+        queued in the index writer; call `/indexes/{name}/commit` (and optionally
+        `/indexes/{name}/refresh`) to make them durable and visible to searches.
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
@@ -72,18 +86,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/IngestResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /bulk:
+  /indexes/{name}/bulk:
     post:
       summary: Upsert documents with a JSON payload
       description: >
         Upsert a JSON array of documents; writes are queued in the index writer and require
-        `/commit` (and optionally `/refresh`) before they become visible to searches.
+        `/indexes/{name}/commit` (and optionally `/indexes/{name}/refresh`) before they become
+        visible to searches.
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
@@ -99,18 +115,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/IngestResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /delete:
+  /indexes/{name}/delete:
     post:
       summary: Queue document deletions by id
       description: >
-        Deletes are queued in the index writer and require a subsequent `/commit`
-        (and optional `/refresh`) to take effect.
+        Deletes are queued in the index writer and require a subsequent `/indexes/{name}/commit`
+        (and optional `/indexes/{name}/refresh`) to take effect.
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       requestBody:
         required: true
@@ -126,16 +143,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeleteResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /commit:
+  /indexes/{name}/commit:
     post:
       summary: Flush WAL to immutable segments
-      description: Persist queued writes/deletes; combine with `/refresh` if you want readers reloaded.
+      description: Persist queued writes/deletes; combine with `/indexes/{name}/refresh` if you want readers reloaded.
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       responses:
         "200":
@@ -145,15 +163,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/CommitResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /refresh:
+  /indexes/{name}/refresh:
     post:
       summary: Refresh readers (lightweight)
       description: Trigger a lightweight reload of index readers without modifying index contents.
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
       responses:
         "200":
           description: Refresh acknowledged
@@ -162,15 +182,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/RefreshResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /compact:
+  /indexes/{name}/compact:
     post:
       summary: Merge segments to reduce fragmentation
       parameters:
+        - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
       responses:
         "200":
@@ -180,14 +201,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/CompactResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /search:
+  /indexes/{name}/search:
     post:
       summary: Execute a search, aggregation, suggest, or vector query
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
       requestBody:
         required: true
         content:
@@ -208,14 +231,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /inspect:
+  /indexes/{name}/inspect:
     get:
       summary: Inspect manifest and segment metadata
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
       responses:
         "200":
           description: Current manifest snapshot
@@ -224,14 +249,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/InspectResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /stats:
+  /indexes/{name}/stats:
     get:
       summary: Lightweight index stats
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
       responses:
         "200":
           description: Stats payload
@@ -240,12 +267,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/StatsResponse"
         "404":
-          description: Index missing
+          description: Index missing or uninitialized
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 components:
+  parameters:
+    IndexName:
+      name: name
+      in: path
+      required: true
+      description: Logical index name configured at startup (aliases allowed)
+      schema:
+        type: string
+    WriteKeyHeader:
+      name: X-Write-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Optional write key. Required for any write operation when the index was created with a write key.
   schemas:
     ErrorResponse:
       type: object
@@ -265,6 +307,34 @@ components:
         status:
           type: string
       required: [status]
+    IndexDescriptor:
+      type: object
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+      required: [name, path]
+    AliasDescriptor:
+      type: object
+      properties:
+        alias:
+          type: string
+        target:
+          type: string
+      required: [alias, target]
+    IndexListResponse:
+      type: object
+      properties:
+        indexes:
+          type: array
+          items:
+            $ref: "#/components/schemas/IndexDescriptor"
+        aliases:
+          type: array
+          items:
+            $ref: "#/components/schemas/AliasDescriptor"
+      required: [indexes, aliases]
     InitResponse:
       type: object
       properties:
@@ -311,14 +381,6 @@ components:
         compacted:
           type: boolean
       required: [compacted]
-  parameters:
-    WriteKeyHeader:
-      name: X-Write-Key
-      in: header
-      required: false
-      schema:
-        type: string
-      description: Optional write key. Required for any write operation when the index was created with a write key.
     BulkRequest:
       type: object
       properties:
@@ -417,7 +479,9 @@ components:
           type: string
         index_path:
           type: string
-      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_path]
+        index_name:
+          type: string
+      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_path, index_name]
     SearchResult:
       type: object
       properties:
