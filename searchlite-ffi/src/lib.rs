@@ -197,7 +197,8 @@ pub unsafe extern "C" fn searchlite_index_open(
 }
 
 /// # Safety
-/// Same as `searchlite_index_open`, but accepts an optional write key to create or open a key-protected index.
+/// Same as `searchlite_index_open`, but accepts an optional write key that is used when creating a new
+/// key-protected index. The key is not required to open an existing index, but is still enforced on write calls.
 #[no_mangle]
 pub unsafe extern "C" fn searchlite_index_open_with_write_key(
   path: *const c_char,
@@ -265,7 +266,14 @@ pub unsafe extern "C" fn searchlite_add_json(
     };
     let mut writer = match h.index.writer() {
       Ok(w) => w,
-      Err(_) => return -4,
+      Err(err) => {
+        let msg = err.to_string();
+        return if msg.to_lowercase().contains("write key") {
+          -8
+        } else {
+          -4
+        };
+      }
     };
     match writer.add_document(&doc) {
       Ok(res) => res as c_int,
@@ -355,7 +363,14 @@ pub unsafe extern "C" fn searchlite_add_json_batch(
     };
     let mut writer = match h.index.writer() {
       Ok(w) => w,
-      Err(_) => return -4,
+      Err(err) => {
+        let msg = err.to_string();
+        return if msg.to_lowercase().contains("write key") {
+          -8
+        } else {
+          -4
+        };
+      }
     };
     match writer.add_documents_batch(&docs) {
       Ok(count) => count as c_int,
@@ -435,7 +450,14 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
         Ok(_) => 0,
         Err(_) => -2,
       },
-      Err(_) => -3,
+      Err(err) => {
+        let msg = err.to_string();
+        if msg.to_lowercase().contains("write key") {
+          -8
+        } else {
+          -3
+        }
+      }
     }
   })
 }

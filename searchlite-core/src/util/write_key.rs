@@ -22,15 +22,19 @@ pub struct WriteKeyMeta {
   pub params: KdfParams,
 }
 
-// Argon2 memory cost is in KiB; 512 MiB = 512 * 1024 KiB.
-const DEFAULT_M_COST: u32 = 524_288;
+// Argon2 memory cost is in KiB. Default to 64 MiB to balance safety and latency.
+const DEFAULT_M_COST: u32 = 65_536;
 const DEFAULT_T_COST: u32 = 2;
 const DEFAULT_P_COST: u32 = 1;
 const DEFAULT_OUTPUT_LEN: u32 = 32;
 
 pub fn default_kdf_params() -> KdfParams {
+  // Allow operators to tune memory requirements via env; falls back to a conservative default.
+  let env_m_cost = std::env::var("SEARCHLITE_WRITE_KEY_M_COST_KIB")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok());
   KdfParams {
-    m_cost: DEFAULT_M_COST,
+    m_cost: env_m_cost.unwrap_or(DEFAULT_M_COST),
     t_cost: DEFAULT_T_COST,
     p_cost: DEFAULT_P_COST,
     output_len: DEFAULT_OUTPUT_LEN,

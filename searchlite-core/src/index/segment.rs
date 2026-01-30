@@ -1545,6 +1545,7 @@ mod tests {
       doc_ids: Vec::new(),
       avg_field_lengths: HashMap::new(),
       use_zstd: true,
+      write_binding_b64: None,
       #[cfg(feature = "vectors")]
       vector_fields: HashMap::new(),
     };
@@ -1560,6 +1561,7 @@ mod tests {
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
       checksums: HashMap::new(),
+      write_binding_b64: None,
     };
     let err = SegmentReader::open(storage, meta, true);
     assert!(err.is_err(), "expected zstd error for missing feature");

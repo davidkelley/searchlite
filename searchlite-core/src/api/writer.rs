@@ -62,28 +62,47 @@ impl IndexWriter {
     let mut write_binding: Option<Vec<u8>> = None;
 
     let mut segments_binding: Vec<Vec<u8>> = Vec::new();
+    let mut binding_required = manifest.write_key.is_some() || wal_binding.is_some();
     for seg in manifest.segments.iter() {
       if let Some(b64) = seg.write_binding_b64.as_deref() {
         let decoded = BASE64
           .decode(b64)
           .map_err(|e| anyhow!("invalid base64 in segment manifest write_binding_b64: {e}"))?;
         segments_binding.push(decoded);
+        binding_required = true;
       }
     }
     for seg in manifest.segments.iter() {
-      if let Ok(bytes) = inner.storage.read_to_end(Path::new(&seg.paths.meta)) {
-        if let Ok(seg_meta) = serde_json::from_slice::<SegmentFileMeta>(&bytes) {
-          if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
-            let decoded = BASE64
-              .decode(b64)
-              .map_err(|e| anyhow!("invalid base64 in segment metadata write_binding_b64: {e}"))?;
-            segments_binding.push(decoded);
+      match inner.storage.read_to_end(Path::new(&seg.paths.meta)) {
+        Ok(bytes) => match serde_json::from_slice::<SegmentFileMeta>(&bytes) {
+          Ok(seg_meta) => {
+            if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
+              let decoded = BASE64.decode(b64).map_err(|e| {
+                anyhow!("invalid base64 in segment metadata write_binding_b64: {e}")
+              })?;
+              segments_binding.push(decoded);
+              binding_required = true;
+            }
+          }
+          Err(e) => {
+            if binding_required {
+              return Err(anyhow!(
+                "failed to decode segment metadata from {}: {e}",
+                seg.paths.meta
+              ));
+            }
+          }
+        },
+        Err(e) => {
+          if binding_required {
+            return Err(anyhow!(
+              "failed to read segment metadata from {}: {e}",
+              seg.paths.meta
+            ));
           }
         }
       }
     }
-    let binding_required =
-      manifest.write_key.is_some() || wal_binding.is_some() || !segments_binding.is_empty();
     if binding_required {
       let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
       if let Some(meta) = manifest.write_key.as_ref() {

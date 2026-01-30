@@ -139,12 +139,9 @@ impl Index {
     let _writer_guard = self.inner.writer_lock.lock();
     let reader = self.reader()?;
     let manifest_snapshot = reader.manifest.clone();
-    if manifest_snapshot.segments.len() <= 1 {
-      return Ok(());
-    }
     ensure_compact_safe(&manifest_snapshot.schema)?;
     let mut write_binding: Option<Vec<u8>> = None;
-    let seg_bindings: Vec<Vec<u8>> = manifest_snapshot
+    let mut seg_bindings: Vec<Vec<u8>> = manifest_snapshot
       .segments
       .iter()
       .filter_map(|s| s.write_binding_b64.as_deref())
@@ -154,6 +151,21 @@ impl Index {
           .map_err(|e| anyhow!("invalid base64 in segment write_binding_b64: {e}"))
       })
       .collect::<Result<Vec<_>>>()?;
+    for seg in manifest_snapshot.segments.iter() {
+      let bytes = self
+        .inner
+        .storage
+        .read_to_end(Path::new(&seg.paths.meta))
+        .map_err(|e| anyhow!("failed to read segment meta {}: {e}", seg.id))?;
+      let seg_meta: crate::index::segment::SegmentFileMeta = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("failed to parse segment meta {}: {e}", seg.id))?;
+      if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
+        let decoded = BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment metadata write_binding_b64: {e}"))?;
+        seg_bindings.push(decoded);
+      }
+    }
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
       if let Some(meta) = manifest_snapshot.write_key.as_ref() {
@@ -166,6 +178,9 @@ impl Index {
         }
       }
       write_binding = Some(binding);
+    }
+    if manifest_snapshot.segments.len() <= 1 {
+      return Ok(());
     }
     let old_segments = manifest_snapshot.segments.clone();
     let inner = &self.inner;
@@ -347,5 +362,85 @@ mod tests {
       err.to_string().contains("indexed/fast but not stored"),
       "unexpected error: {err}"
     );
+  }
+
+  #[test]
+  fn compaction_requires_write_key_even_if_manifest_tampered() {
+    use std::fs;
+
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let key = "super-secret";
+    let idx = Index::create_with_write_key(dir.path(), schema.clone(), opts(dir.path()), Some(key))
+      .unwrap();
+    {
+      let mut writer = idx.writer_with_key(Some(key)).unwrap();
+      writer
+        .add_document(&Document {
+          fields: [("_id".into(), serde_json::json!("1"))]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    // Ensure segment metadata contains a binding written at commit time.
+    let manifest = idx.manifest();
+    let seg = &manifest.segments[0];
+    let seg_meta_bytes = std::fs::read(&seg.paths.meta).unwrap();
+    let seg_meta: crate::index::segment::SegmentFileMeta =
+      serde_json::from_slice(&seg_meta_bytes).unwrap();
+    assert!(
+      seg_meta.write_binding_b64.is_some(),
+      "segment metadata should contain write binding"
+    );
+
+    // Tamper manifest to strip write_key and segment binding, but keep segment meta binding.
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let mut manifest_json: serde_json::Value =
+      serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest_json.as_object_mut().unwrap().remove("write_key");
+    if let Some(segments) = manifest_json
+      .get_mut("segments")
+      .and_then(|v| v.as_array_mut())
+    {
+      for seg in segments.iter_mut() {
+        if let Some(obj) = seg.as_object_mut() {
+          obj.remove("write_binding_b64");
+        }
+      }
+    }
+    fs::write(
+      &manifest_path,
+      serde_json::to_vec_pretty(&manifest_json).unwrap(),
+    )
+    .unwrap();
+
+    let mut tampered_opts = opts(dir.path());
+    tampered_opts.create_if_missing = false;
+    let idx_tampered = Index::open(tampered_opts).unwrap();
+
+    // Recompute bindings as compaction would.
+    let manifest_snapshot = idx_tampered.manifest();
+    let mut seg_bindings = Vec::new();
+    for seg in manifest_snapshot.segments.iter() {
+      let bytes =
+        std::fs::read(&seg.paths.meta).expect("segment meta readable for tampered manifest");
+      let seg_meta: crate::index::segment::SegmentFileMeta =
+        serde_json::from_slice(&bytes).expect("parse segment meta");
+      if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
+        seg_bindings.push(b64.to_string());
+      }
+    }
+    assert!(
+      !seg_bindings.is_empty(),
+      "expected binding present in segment metadata after tamper"
+    );
+
+    // Without key, compaction should fail because segment metadata still carries the binding.
+    assert!(idx_tampered.compact_with_key(None).is_err());
+
+    // With correct key, compaction should succeed.
+    idx_tampered.compact_with_key(Some(key)).unwrap();
   }
 }

@@ -966,7 +966,7 @@ async fn search(
 
 async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectResponse>> {
   let index = state.require_index().await?;
-  let manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
+  let mut manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
     .await
     .map_err(|err| {
       HttpError::from_anyhow(
@@ -978,6 +978,11 @@ async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectRe
     .map_err(|err| {
       HttpError::from_anyhow("inspect_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
     })?;
+  // Redact write-key metadata to avoid leaking hash/salt material in public responses.
+  manifest.write_key = None;
+  for seg in manifest.segments.iter_mut() {
+    seg.write_binding_b64 = None;
+  }
   Ok(Json(InspectResponse { manifest }))
 }
 
