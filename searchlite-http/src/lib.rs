@@ -2468,11 +2468,9 @@ mod tests {
         target: "a".into(),
       },
     ];
-    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
-    registry.bootstrap_all().await.unwrap();
-    match registry.resolve("a") {
-      Err(err) => assert_eq!(err.kind, "alias_cycle"),
-      Ok(_) => panic!("expected alias cycle error"),
+    match IndexRegistry::from_args(&args) {
+      Ok(_) => panic!("expected alias cycle detection"),
+      Err(err) => assert!(err.to_string().contains("alias cycle detected")),
     }
   }
 
