@@ -1326,9 +1326,11 @@ async fn multi_search(
           req.search_after = None;
           req.from = 0;
         }
-        let cap = req.from.saturating_add(req.limit);
-        if cap > MAX_PAGE_SIZE {
-          anyhow::bail!("from + size exceeds max page size {MAX_PAGE_SIZE}");
+        if req.return_hits {
+          let cap = req.from.saturating_add(req.limit);
+          if cap > MAX_PAGE_SIZE {
+            anyhow::bail!("from + size exceeds max page size {MAX_PAGE_SIZE}");
+          }
         }
         results.push(reader.search(&req)?);
       }
@@ -1355,36 +1357,46 @@ async fn multi_search(
       req.search_after = None;
       req.from = 0;
     }
-    let cap = req.from.saturating_add(req.limit);
-    if cap > MAX_PAGE_SIZE {
-      return Err(HttpError::bad_request(
-        "page_too_large",
-        format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
-      ));
+    if req.return_hits {
+      let cap = req.from.saturating_add(req.limit);
+      if cap > MAX_PAGE_SIZE {
+        return Err(HttpError::bad_request(
+          "page_too_large",
+          format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
+        ));
+      }
     }
     let semaphore_clone = semaphore.clone();
     let index_clone = idx.clone();
     tasks.push(async move {
-      let permit = semaphore_clone.acquire_owned().await.unwrap();
+      let permit = semaphore_clone.acquire_owned().await.map_err(|err| {
+        HttpError::from_anyhow(
+          "multi_search_cancelled",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(err.to_string()),
+        )
+      })?;
       let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
         let _permit = permit;
         let reader = index_clone.reader()?;
         reader.search(&req)
       });
-      (search_idx, handle.await)
+      let joined = handle.await.map_err(|err: tokio::task::JoinError| {
+        HttpError::from_anyhow(
+          "multi_search_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(err.to_string()),
+        )
+      })?;
+      let search_res = joined.map_err(|err| {
+        HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
+      })?;
+      Ok::<(usize, SearchResult), HttpError>((search_idx, search_res))
     });
   }
   let mut results: Vec<Option<SearchResult>> = vec![None; tasks.len()];
-  while let Some((idx_search, res)) = tasks.next().await {
-    let res = res.map_err(|err: tokio::task::JoinError| {
-      HttpError::from_anyhow(
-        "multi_search_join",
-        StatusCode::INTERNAL_SERVER_ERROR,
-        anyhow::anyhow!(err.to_string()),
-      )
-    })?;
-    let search_res = res
-      .map_err(|err| HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err))?;
+  while let Some(res) = tasks.next().await {
+    let (idx_search, search_res) = res?;
     if let Some(slot) = results.get_mut(idx_search) {
       *slot = Some(search_res);
     }

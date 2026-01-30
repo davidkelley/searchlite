@@ -1056,6 +1056,7 @@ struct SegmentSearchParams<'a> {
   root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
+  skipped_by_cursor: &'a mut u64,
   req: &'a SearchRequest,
   segment_ord: u32,
   rank_limit: usize,
@@ -1990,6 +1991,7 @@ fn collect_completion_candidates(
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
+  doc_lookup: HashMap<String, (usize, DocId)>,
   analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -2006,9 +2008,19 @@ impl IndexReader {
         inner.options.enable_positions,
       )?);
     }
+    let mut doc_lookup = HashMap::new();
+    for (seg_idx, seg) in segments.iter().enumerate() {
+      for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
+        if seg.is_deleted(doc_idx as DocId) {
+          continue;
+        }
+        doc_lookup.insert(doc_id.clone(), (seg_idx, doc_idx as DocId));
+      }
+    }
     Ok(Self {
       manifest,
       segments,
+      doc_lookup,
       options: IndexOptions {
         path: inner.path.clone(),
         create_if_missing: inner.options.create_if_missing,
@@ -2374,6 +2386,7 @@ impl IndexReader {
     };
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
+    let mut skipped_by_cursor: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
@@ -2412,6 +2425,7 @@ impl IndexReader {
               if ord.is_eq() {
                 saw_cursor = true;
               }
+              skipped_by_cursor += 1;
               continue;
             }
           }
@@ -2456,7 +2470,13 @@ impl IndexReader {
     } else {
       hits.clear();
     }
-    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
+    let total_hits_value = total_matches
+      .saturating_add(cursor_returned as u64)
+      .saturating_add(if req.search_after.is_some() {
+        skipped_by_cursor
+      } else {
+        0
+      });
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if req.return_hits {
@@ -2472,7 +2492,8 @@ impl IndexReader {
     let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
     let hits: Vec<Hit> = if req.return_hits {
       let total_needed = from.saturating_add(req.limit);
-      if total_needed > 0 && hits.len() > total_needed {
+      let has_more = total_needed > 0 && hits.len() > total_needed;
+      if has_more {
         let key = hits[total_needed - 1].key.clone();
         next_cursor = Some(encode_cursor(
           manifest_generation,
@@ -2483,7 +2504,7 @@ impl IndexReader {
         )?);
       }
       let mut last_returned_key: Option<SortKey> = None;
-      let include_sort_keys = true;
+      let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
       let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
@@ -2491,7 +2512,7 @@ impl IndexReader {
         .take(req.limit)
         .filter_map(|(idx, h)| {
           last_returned_key = Some(h.key.clone());
-          let sort_json = if include_sort_keys {
+          let sort_json = if return_sort_keys {
             encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
           } else {
             None
@@ -2502,14 +2523,14 @@ impl IndexReader {
             &[],
             &empty_phrases,
             &sort_plan,
-            include_sort_keys,
+            return_sort_keys,
             sort_json.clone(),
           )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
               .filter_map(|ih| {
-                let inner_sort = if include_sort_keys {
+                let inner_sort = if return_sort_keys {
                   encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
                 } else {
                   None
@@ -2520,7 +2541,7 @@ impl IndexReader {
                   &[],
                   &empty_phrases,
                   &sort_plan,
-                  include_sort_keys,
+                  return_sort_keys,
                   inner_sort,
                 )
               })
@@ -2532,7 +2553,7 @@ impl IndexReader {
           Some(hit)
         })
         .collect();
-      if include_sort_keys {
+      if has_more {
         if let Some(key) = last_returned_key.as_ref() {
           next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
         }
@@ -2676,6 +2697,7 @@ impl IndexReader {
     sort_plan: &SortPlan,
     cursor_key: Option<&SortKey>,
     saw_cursor: &mut bool,
+    skipped_by_cursor: &mut u64,
     heap_limit: usize,
   ) -> Result<Vec<RankedHit>> {
     let mut heap = BinaryHeap::new();
@@ -2715,6 +2737,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           continue;
         }
       }
@@ -2884,6 +2907,7 @@ impl IndexReader {
     let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
+    let mut skipped_by_cursor: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let search_start = Instant::now();
     let mut timings: BTreeMap<String, f64> = BTreeMap::new();
@@ -2945,6 +2969,7 @@ impl IndexReader {
           root_filter,
           agg_collector: agg_ref,
           match_counter: Some(&mut total_matches),
+          skipped_by_cursor: &mut skipped_by_cursor,
           req,
           segment_ord: segment_ord as u32,
           rank_limit: segment_rank_limit,
@@ -2997,6 +3022,7 @@ impl IndexReader {
           &sort_plan,
           cursor_key.as_ref(),
           &mut saw_cursor,
+          &mut skipped_by_cursor,
           top_k,
         )?;
       }
@@ -3050,7 +3076,13 @@ impl IndexReader {
         end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
-    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
+    let total_hits_value = total_matches
+      .saturating_add(cursor_returned as u64)
+      .saturating_add(if req.search_after.is_some() {
+        skipped_by_cursor
+      } else {
+        0
+      });
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if req.return_hits {
@@ -3065,7 +3097,8 @@ impl IndexReader {
     let mut next_search_after = None;
     let hits: Vec<Hit> = if req.return_hits {
       let total_needed = from.saturating_add(req.limit);
-      if total_needed > 0 && hits.len() > total_needed {
+      let has_more = total_needed > 0 && hits.len() > total_needed;
+      if has_more {
         let last = &hits[total_needed - 1];
         let returned = cursor_returned
           .saturating_add(total_needed)
@@ -3080,7 +3113,7 @@ impl IndexReader {
         )?);
       }
       let mut last_returned_key: Option<SortKey> = None;
-      let include_sort_keys = true;
+      let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
       let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
@@ -3088,7 +3121,7 @@ impl IndexReader {
         .take(req.limit)
         .filter_map(|(idx, h)| {
           last_returned_key = Some(h.key.clone());
-          let sort_json = if include_sort_keys {
+          let sort_json = if return_sort_keys {
             encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
           } else {
             None
@@ -3099,14 +3132,14 @@ impl IndexReader {
             &highlight_terms,
             &highlight_phrases,
             &sort_plan,
-            include_sort_keys,
+            return_sort_keys,
             sort_json.clone(),
           )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
               .filter_map(|ih| {
-                let inner_sort = if include_sort_keys {
+                let inner_sort = if return_sort_keys {
                   encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
                 } else {
                   None
@@ -3117,7 +3150,7 @@ impl IndexReader {
                   &highlight_terms,
                   &highlight_phrases,
                   &sort_plan,
-                  include_sort_keys,
+                  return_sort_keys,
                   inner_sort,
                 )
               })
@@ -3129,7 +3162,7 @@ impl IndexReader {
           Some(hit)
         })
         .collect();
-      if include_sort_keys {
+      if has_more {
         if let Some(key) = last_returned_key.as_ref() {
           next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
         }
@@ -3195,26 +3228,25 @@ impl IndexReader {
     for (idx, id) in ids.iter().enumerate() {
       requested.entry(id.as_str()).or_default().push(idx);
     }
-    for seg in self.segments.iter() {
-      for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
-        if seg.is_deleted(doc_idx as DocId) {
-          continue;
-        }
-        if let Some(targets) = requested.get(doc_id.as_str()) {
-          let source = if return_stored {
-            Some(seg.get_doc(doc_idx as DocId)?)
-          } else {
-            None
-          };
-          for pos in targets.iter().copied() {
-            results[pos].found = true;
-            results[pos]._source = source.clone();
-          }
-        }
+    for (doc_id, positions) in requested.iter() {
+      let Some((seg_idx, doc_idx)) = self.doc_lookup.get(*doc_id) else {
+        continue;
+      };
+      let seg = self
+        .segments
+        .get(*seg_idx)
+        .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+      if seg.is_deleted(*doc_idx) {
+        continue;
       }
-      // Early exit if all requested ids found
-      if results.iter().all(|r| r.found) {
-        break;
+      let source = if return_stored {
+        Some(seg.get_doc(*doc_idx)?)
+      } else {
+        None
+      };
+      for pos in positions.iter().copied() {
+        results[pos].found = true;
+        results[pos]._source = source.clone();
       }
     }
     Ok(results)
@@ -3246,6 +3278,7 @@ impl IndexReader {
       root_filter,
       agg_collector,
       match_counter,
+      skipped_by_cursor,
       req,
       segment_ord,
       rank_limit,
@@ -3346,6 +3379,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           return false;
         }
       }
@@ -4315,10 +4349,10 @@ mod tests {
     SearchRequest, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
-  use serde_json::json;
   #[cfg(feature = "vectors")]
   use crate::index::manifest::{VectorField, VectorMetric};
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
+  use serde_json::json;
   use std::collections::HashSet;
 
   #[test]
