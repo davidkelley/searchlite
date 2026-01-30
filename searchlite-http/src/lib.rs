@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -39,50 +39,109 @@ const DEFAULT_B: f32 = 0.4;
 #[cfg(feature = "vectors")]
 const DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES: usize = 20_000;
 
+#[derive(Debug, Clone)]
+pub struct IndexSpec {
+  pub name: String,
+  pub path: PathBuf,
+}
+
+pub fn parse_index_spec(raw: &str) -> Result<IndexSpec, String> {
+  let Some((name, path)) = raw.split_once([':', '=']) else {
+    return Err("expected NAME:PATH".into());
+  };
+  if name.trim().is_empty() {
+    return Err("index name cannot be empty".into());
+  }
+  if path.trim().is_empty() {
+    return Err("index path cannot be empty".into());
+  }
+  Ok(IndexSpec {
+    name: name.to_string(),
+    path: PathBuf::from(path),
+  })
+}
+
+#[derive(Debug, Clone)]
+pub struct AliasSpec {
+  pub alias: String,
+  pub target: String,
+}
+
+pub fn parse_alias_spec(raw: &str) -> Result<AliasSpec, String> {
+  let Some((alias, target)) = raw.split_once([':', '=']) else {
+    return Err("expected ALIAS:TARGET".into());
+  };
+  if alias.trim().is_empty() || target.trim().is_empty() {
+    return Err("alias and target must be non-empty".into());
+  }
+  Ok(AliasSpec {
+    alias: alias.to_string(),
+    target: target.to_string(),
+  })
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
   name = "searchlite-http",
   version,
-  about = "HTTP API for a single searchlite index"
+  about = "HTTP API for multiple searchlite indexes"
 )]
 pub struct ServeArgs {
-  /// Path to the index directory on disk.
-  #[arg(long, env = "SEARCHLITE_INDEX_PATH")]
-  index: PathBuf,
+  /// Mount one or more indexes as NAME:PATH pairs; repeat for multiple mounts.
+  #[arg(
+    short = 'I',
+    long = "index",
+    value_name = "NAME:PATH",
+    value_parser = parse_index_spec,
+    env = "SEARCHLITE_INDEX_MAP",
+    value_delimiter = ',',
+    required = true
+  )]
+  pub indexes: Vec<IndexSpec>,
+
+  /// Optional aliases in the form ALIAS:TARGET (TARGET must be a mounted index name).
+  #[arg(
+    long = "alias",
+    value_name = "ALIAS:TARGET",
+    value_parser = parse_alias_spec,
+    env = "SEARCHLITE_INDEX_ALIASES",
+    value_delimiter = ','
+  )]
+  pub aliases: Vec<AliasSpec>,
 
   /// Bind address for the HTTP server.
   /// WARNING: Binding to 0.0.0.0 or any non-localhost address exposes this
   /// unauthenticated service to the network; front it with a proxy or firewall.
   #[arg(long, env = "SEARCHLITE_BIND_ADDR", default_value = "127.0.0.1:8080")]
-  bind: SocketAddr,
+  pub bind: SocketAddr,
 
-  /// Require the index to already exist on disk at startup.
+  /// Require each index to already exist on disk at startup.
   #[arg(
     long,
     env = "SEARCHLITE_REQUIRE_EXISTING_INDEX",
     default_value_t = false
   )]
-  require_existing_index: bool,
+  pub require_existing_index: bool,
 
   /// Maximum allowed request body size in bytes.
   #[arg(long, env = "SEARCHLITE_MAX_BODY_BYTES", default_value_t = 50 * 1024 * 1024)]
-  max_body_bytes: u64,
+  pub max_body_bytes: u64,
 
   /// Maximum number of in-flight requests.
   #[arg(long, env = "SEARCHLITE_MAX_CONCURRENCY", default_value_t = 64)]
-  max_concurrency: usize,
+  pub max_concurrency: usize,
 
   /// Per-request timeout in seconds.
   #[arg(long, env = "SEARCHLITE_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
-  request_timeout_secs: u64,
+  pub request_timeout_secs: u64,
 
   /// Grace period in seconds before forcing shutdown after a signal.
   #[arg(long, env = "SEARCHLITE_GRACEFUL_SHUTDOWN_SECS", default_value_t = 5)]
-  shutdown_grace_secs: u64,
+  pub shutdown_grace_secs: u64,
 
   /// If set, commit also triggers a reader refresh to surface changes immediately.
   #[arg(long, env = "SEARCHLITE_REFRESH_ON_COMMIT", default_value_t = false)]
-  refresh_on_commit: bool,
+  pub refresh_on_commit: bool,
 
   /// Global cap for combined vector candidates across clauses (when feature `vectors` is enabled).
   #[cfg(feature = "vectors")]
@@ -91,19 +150,210 @@ pub struct ServeArgs {
     env = "SEARCHLITE_MAX_VECTOR_CANDIDATES",
     default_value_t = DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
   )]
-  max_vector_candidates: usize,
+  pub max_vector_candidates: usize,
 }
 
 #[derive(Clone)]
-struct AppState {
-  index_path: PathBuf,
+struct ManagedIndex {
+  name: String,
+  path: PathBuf,
   require_existing_index: bool,
   refresh_on_commit: bool,
   #[cfg(feature = "vectors")]
   max_vector_candidates: usize,
   index: Arc<tokio::sync::RwLock<Option<Arc<Index>>>>,
-  // Serialize writer access across handlers to avoid concurrent writers.
   writer_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ManagedIndex {
+  fn new(
+    spec: &IndexSpec,
+    require_existing_index: bool,
+    refresh_on_commit: bool,
+    #[cfg(feature = "vectors")] max_vector_candidates: usize,
+  ) -> Self {
+    Self {
+      name: spec.name.clone(),
+      path: spec.path.clone(),
+      require_existing_index,
+      refresh_on_commit,
+      #[cfg(feature = "vectors")]
+      max_vector_candidates,
+      index: Arc::new(tokio::sync::RwLock::new(None)),
+      writer_lock: Arc::new(tokio::sync::Mutex::new(())),
+    }
+  }
+
+  async fn bootstrap(&self) -> anyhow::Result<()> {
+    if !self.manifest_exists() {
+      if self.require_existing_index {
+        anyhow::bail!(
+          "index `{}` does not exist at {:?}",
+          self.name,
+          Manifest::manifest_path(&self.path)
+        );
+      }
+      return Ok(());
+    }
+    let idx = Index::open(self.index_options(false)).with_context(|| {
+      format!(
+        "failed to open existing index `{}` during startup",
+        self.name
+      )
+    })?;
+    let arc = Arc::new(idx);
+    let mut guard = self.index.write().await;
+    *guard = Some(arc);
+    Ok(())
+  }
+
+  fn manifest_exists(&self) -> bool {
+    Manifest::manifest_path(&self.path).exists()
+  }
+
+  fn index_options(&self, create_if_missing: bool) -> IndexOptions {
+    IndexOptions {
+      path: self.path.clone(),
+      create_if_missing,
+      enable_positions: true,
+      bm25_k1: DEFAULT_K1,
+      bm25_b: DEFAULT_B,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    }
+  }
+
+  async fn set_index(&self, index: Index) -> Arc<Index> {
+    let arc = Arc::new(index);
+    let mut guard = self.index.write().await;
+    *guard = Some(arc.clone());
+    arc
+  }
+
+  async fn require_index(&self) -> ApiResult<Arc<Index>> {
+    if let Some(existing) = self.index.read().await.as_ref() {
+      return Ok(existing.clone());
+    }
+    if !self.manifest_exists() {
+      return Err(HttpError::not_found(
+        "index_missing",
+        "index is not initialized; call /indexes/{name}/init first",
+      ));
+    }
+    let idx = Index::open(self.index_options(false))
+      .map_err(|e| HttpError::from_anyhow("open_index", StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(self.set_index(idx).await)
+  }
+}
+
+#[derive(Clone)]
+struct IndexRegistry {
+  indexes: HashMap<String, Arc<ManagedIndex>>,
+  aliases: HashMap<String, String>,
+}
+
+impl IndexRegistry {
+  fn from_args(args: &ServeArgs) -> anyhow::Result<Self> {
+    if args.indexes.is_empty() {
+      anyhow::bail!("at least one index must be configured via --index or SEARCHLITE_INDEX_MAP");
+    }
+
+    let mut indexes = HashMap::new();
+    for spec in args.indexes.iter() {
+      if indexes.contains_key(&spec.name) {
+        anyhow::bail!("duplicate index name provided: {}", spec.name);
+      }
+      let managed = ManagedIndex::new(
+        spec,
+        args.require_existing_index,
+        args.refresh_on_commit,
+        #[cfg(feature = "vectors")]
+        args.max_vector_candidates,
+      );
+      indexes.insert(spec.name.clone(), Arc::new(managed));
+    }
+
+    let mut aliases = HashMap::new();
+    for alias_spec in args.aliases.iter() {
+      if !indexes.contains_key(&alias_spec.target) {
+        anyhow::bail!(
+          "alias `{}` targets unknown index `{}`",
+          alias_spec.alias,
+          alias_spec.target
+        );
+      }
+      aliases.insert(alias_spec.alias.clone(), alias_spec.target.clone());
+    }
+
+    Ok(Self { indexes, aliases })
+  }
+
+  async fn bootstrap_all(&self) -> anyhow::Result<()> {
+    for managed in self.indexes.values() {
+      managed.bootstrap().await?;
+    }
+    Ok(())
+  }
+
+  fn resolve(&self, name: &str) -> ApiResult<Arc<ManagedIndex>> {
+    let mut cursor = name;
+    let mut visited = HashSet::new();
+    while let Some(target) = self.aliases.get(cursor) {
+      if !visited.insert(cursor.to_string()) {
+        return Err(HttpError::from_anyhow(
+          "alias_cycle",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("alias cycle detected for {name}"),
+        ));
+      }
+      cursor = target;
+    }
+    self.indexes.get(cursor).cloned().ok_or_else(|| {
+      HttpError::not_found("unknown_index", format!("index `{}` not registered", name))
+    })
+  }
+
+  fn list_indexes(&self) -> Vec<IndexDescriptor> {
+    let mut items: Vec<_> = self
+      .indexes
+      .values()
+      .map(|idx| IndexDescriptor {
+        name: idx.name.clone(),
+        path: idx.path.display().to_string(),
+      })
+      .collect();
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    items
+  }
+
+  fn list_aliases(&self) -> Vec<AliasDescriptor> {
+    let mut items: Vec<_> = self
+      .aliases
+      .iter()
+      .map(|(alias, target)| AliasDescriptor {
+        alias: alias.clone(),
+        target: target.clone(),
+      })
+      .collect();
+    items.sort_by(|a, b| a.alias.cmp(&b.alias));
+    items
+  }
+}
+
+#[derive(Clone)]
+struct AppState {
+  registry: Arc<IndexRegistry>,
+}
+
+impl AppState {
+  fn new(registry: Arc<IndexRegistry>) -> Self {
+    Self { registry }
+  }
+
+  fn registry(&self) -> Arc<IndexRegistry> {
+    self.registry.clone()
+  }
 }
 
 /// Number of NDJSON batches buffered between reader and writer; small to bound memory while
@@ -205,11 +455,30 @@ struct StatsResponse {
   committed_at: String,
   index_uuid: String,
   index_path: String,
+  index_name: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct HealthResponse {
   status: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct IndexDescriptor {
+  name: String,
+  path: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AliasDescriptor {
+  alias: String,
+  target: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct IndexListResponse {
+  indexes: Vec<IndexDescriptor>,
+  aliases: Vec<AliasDescriptor>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -268,80 +537,10 @@ impl IntoResponse for HttpError {
   }
 }
 
-impl AppState {
-  fn new(args: &ServeArgs) -> Self {
-    Self {
-      index_path: args.index.clone(),
-      require_existing_index: args.require_existing_index,
-      refresh_on_commit: args.refresh_on_commit,
-      #[cfg(feature = "vectors")]
-      max_vector_candidates: args.max_vector_candidates,
-      index: Arc::new(tokio::sync::RwLock::new(None)),
-      writer_lock: Arc::new(tokio::sync::Mutex::new(())),
-    }
-  }
-
-  async fn bootstrap(&self) -> anyhow::Result<()> {
-    if !self.manifest_exists() {
-      if self.require_existing_index {
-        anyhow::bail!(
-          "index does not exist at {:?}",
-          Manifest::manifest_path(&self.index_path)
-        );
-      }
-      return Ok(());
-    }
-    let idx = Index::open(self.index_options(false))
-      .with_context(|| "failed to open existing index during startup".to_string())?;
-    let arc = Arc::new(idx);
-    let mut guard = self.index.write().await;
-    *guard = Some(arc);
-    Ok(())
-  }
-
-  fn manifest_exists(&self) -> bool {
-    Manifest::manifest_path(&self.index_path).exists()
-  }
-
-  fn index_options(&self, create_if_missing: bool) -> IndexOptions {
-    IndexOptions {
-      path: self.index_path.clone(),
-      create_if_missing,
-      enable_positions: true,
-      bm25_k1: DEFAULT_K1,
-      bm25_b: DEFAULT_B,
-      storage: StorageType::Filesystem,
-      #[cfg(feature = "vectors")]
-      vector_defaults: None,
-    }
-  }
-
-  async fn set_index(&self, index: Index) -> Arc<Index> {
-    let arc = Arc::new(index);
-    let mut guard = self.index.write().await;
-    *guard = Some(arc.clone());
-    arc
-  }
-
-  async fn require_index(&self) -> ApiResult<Arc<Index>> {
-    if let Some(existing) = self.index.read().await.as_ref() {
-      return Ok(existing.clone());
-    }
-    if !self.manifest_exists() {
-      return Err(HttpError::not_found(
-        "index_missing",
-        "index is not initialized; call /init first",
-      ));
-    }
-    let idx = Index::open(self.index_options(false))
-      .map_err(|e| HttpError::from_anyhow("open_index", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(self.set_index(idx).await)
-  }
-}
-
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
-  let state = Arc::new(AppState::new(&args));
-  state.bootstrap().await?;
+  let registry = Arc::new(IndexRegistry::from_args(&args)?);
+  registry.bootstrap_all().await?;
+  let state = Arc::new(AppState::new(registry.clone()));
   let listener = TcpListener::bind(args.bind)
     .await
     .with_context(|| format!("binding to {}", args.bind))?;
@@ -371,16 +570,17 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
 
   Router::new()
     .route("/healthz", get(health))
-    .route("/init", post(init_index))
-    .route("/add", post(add_ndjson))
-    .route("/bulk", post(bulk_ingest))
-    .route("/delete", post(delete_documents))
-    .route("/commit", post(commit))
-    .route("/refresh", post(refresh))
-    .route("/compact", post(compact))
-    .route("/search", post(search))
-    .route("/inspect", get(inspect))
-    .route("/stats", get(stats))
+    .route("/indexes", get(list_indexes))
+    .route("/indexes/:name/init", post(init_index))
+    .route("/indexes/:name/add", post(add_ndjson))
+    .route("/indexes/:name/bulk", post(bulk_ingest))
+    .route("/indexes/:name/delete", post(delete_documents))
+    .route("/indexes/:name/commit", post(commit))
+    .route("/indexes/:name/refresh", post(refresh))
+    .route("/indexes/:name/compact", post(compact))
+    .route("/indexes/:name/search", post(search))
+    .route("/indexes/:name/inspect", get(inspect))
+    .route("/indexes/:name/stats", get(stats))
     .with_state(state)
     .layer(middleware)
     .layer(middleware::from_fn(move |req, next| {
@@ -431,20 +631,30 @@ async fn health() -> impl IntoResponse {
   )
 }
 
+async fn list_indexes(State(state): State<Arc<AppState>>) -> ApiResult<Json<IndexListResponse>> {
+  let registry = state.registry();
+  Ok(Json(IndexListResponse {
+    indexes: registry.list_indexes(),
+    aliases: registry.list_aliases(),
+  }))
+}
+
 async fn init_index(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
   payload: Result<Json<Schema>, JsonRejection>,
 ) -> ApiResult<Json<InitResponse>> {
   let schema = parse_json(payload)?;
-  if state.manifest_exists() {
+  let managed = state.registry().resolve(&index_name)?;
+  if managed.manifest_exists() {
     return Err(HttpError::conflict(
       "index_exists",
       "index already exists at this path",
     ));
   }
-  let path = state.index_path.clone();
-  let opts = state.index_options(true);
+  let path = managed.path.clone();
+  let opts = managed.index_options(true);
   let write_key = extract_write_key(&headers);
   let created = tokio::task::spawn_blocking(move || {
     IndexBuilder::create_with_write_key(&path, schema, opts, write_key.as_deref())
@@ -458,19 +668,18 @@ async fn init_index(
     )
   })?
   .map_err(|err| HttpError::from_anyhow("init_failed", StatusCode::BAD_REQUEST, err))?;
-  // IndexBuilder::create must either return a fully initialized, ready-to-use index
-  // or fail with an error. At this point the index is safe for subsequent writer/reader
-  // creation, otherwise the call above would have erred.
-  state.set_index(created).await;
+  managed.set_index(created).await;
   Ok(Json(InitResponse { created: true }))
 }
 
 async fn add_ndjson(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
   body: Body,
 ) -> ApiResult<Json<IngestResponse>> {
-  let index = state.require_index().await?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let write_key = extract_write_key(&headers);
   let manifest = index.manifest();
   if write_key.is_none() && write_key_required(&manifest) {
@@ -519,7 +728,7 @@ async fn add_ndjson(
       let Some(rx) = rx_slot.take() else {
         return;
       };
-      let writer_lock = state.writer_lock.clone();
+      let writer_lock = managed.writer_lock.clone();
       let index_ref = index.clone();
       let write_key = write_key_clone.clone();
       let handle = tokio::task::spawn_blocking(move || -> Result<usize, HttpError> {
@@ -696,6 +905,7 @@ async fn add_ndjson(
 
 async fn bulk_ingest(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
   payload: Result<Json<BulkRequest>, JsonRejection>,
 ) -> ApiResult<Json<IngestResponse>> {
@@ -711,7 +921,8 @@ async fn bulk_ingest(
     .into_iter()
     .map(value_to_document)
     .collect::<ApiResult<_>>()?;
-  let index = state.require_index().await?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let manifest = index.manifest();
   let write_key = extract_write_key(&headers);
   if write_key.is_none() && write_key_required(&manifest) {
@@ -722,7 +933,7 @@ async fn bulk_ingest(
     ));
   }
 
-  let writer_lock = state.writer_lock.clone();
+  let writer_lock = managed.writer_lock.clone();
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
@@ -763,6 +974,7 @@ async fn bulk_ingest(
 
 async fn delete_documents(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
   payload: Result<Json<DeleteRequest>, JsonRejection>,
 ) -> ApiResult<Json<DeleteResponse>> {
@@ -774,7 +986,8 @@ async fn delete_documents(
     ));
   }
   validate_ids(&body.ids)?;
-  let index = state.require_index().await?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let manifest = index.manifest();
   let write_key = extract_write_key(&headers);
   if write_key.is_none() && write_key_required(&manifest) {
@@ -784,7 +997,7 @@ async fn delete_documents(
       anyhow::anyhow!("write key required"),
     ));
   }
-  let _writer_guard = state.writer_lock.lock().await;
+  let _writer_guard = managed.writer_lock.lock().await;
   let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
     let msg = e.to_string().to_lowercase();
     let status = if msg.contains("write key") || msg.contains("unauthorized") {
@@ -814,9 +1027,11 @@ fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
 
 async fn commit(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
 ) -> ApiResult<Json<CommitResponse>> {
-  let index = state.require_index().await?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let manifest = index.manifest();
   let write_key = extract_write_key(&headers);
   if write_key.is_none() && write_key_required(&manifest) {
@@ -826,8 +1041,8 @@ async fn commit(
       anyhow::anyhow!("write key required"),
     ));
   }
-  let refresh = state.refresh_on_commit;
-  let writer_lock = state.writer_lock.clone();
+  let refresh = managed.refresh_on_commit;
+  let writer_lock = managed.writer_lock.clone();
   let write_key_clone = write_key.clone();
   tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
     let _guard = writer_lock.blocking_lock();
@@ -862,8 +1077,12 @@ async fn commit(
   Ok(Json(CommitResponse { committed: true }))
 }
 
-async fn refresh(State(state): State<Arc<AppState>>) -> ApiResult<Json<RefreshResponse>> {
-  let index = state.require_index().await?;
+async fn refresh(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+) -> ApiResult<Json<RefreshResponse>> {
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   tokio::task::spawn_blocking(move || trigger_reader_refresh(&index))
     .await
     .map_err(|err| {
@@ -881,9 +1100,11 @@ async fn refresh(State(state): State<Arc<AppState>>) -> ApiResult<Json<RefreshRe
 
 async fn compact(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   headers: HeaderMap,
 ) -> ApiResult<Json<CompactResponse>> {
-  let index = state.require_index().await?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let manifest = index.manifest();
   let write_key = extract_write_key(&headers);
   if write_key.is_none() && write_key_required(&manifest) {
@@ -893,7 +1114,7 @@ async fn compact(
       anyhow::anyhow!("write key required"),
     ));
   }
-  let writer_lock = state.writer_lock.clone();
+  let writer_lock = managed.writer_lock.clone();
   let write_key_clone = write_key.clone();
   tokio::task::spawn_blocking(move || {
     let _guard = writer_lock.blocking_lock();
@@ -925,6 +1146,7 @@ async fn compact(
 
 async fn search(
   State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
   payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<SearchResult>> {
   let mut request = parse_json(payload)?;
@@ -940,14 +1162,15 @@ async fn search(
       "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
   }
+  let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
     // Precedence: per-request JSON overrides the server default (CLI/env); otherwise use the server default.
     request
       .max_global_vector_candidates
-      .get_or_insert(state.max_vector_candidates);
+      .get_or_insert(managed.max_vector_candidates);
   }
-  let index = state.require_index().await?;
+  let index = managed.require_index().await?;
   let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
     let reader = index.reader()?;
     reader.search(&request)
@@ -964,8 +1187,12 @@ async fn search(
   Ok(Json(result))
 }
 
-async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectResponse>> {
-  let index = state.require_index().await?;
+async fn inspect(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+) -> ApiResult<Json<InspectResponse>> {
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let mut manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
     .await
     .map_err(|err| {
@@ -986,8 +1213,12 @@ async fn inspect(State(state): State<Arc<AppState>>) -> ApiResult<Json<InspectRe
   Ok(Json(InspectResponse { manifest }))
 }
 
-async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<StatsResponse>> {
-  let index = state.require_index().await?;
+async fn stats(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+) -> ApiResult<Json<StatsResponse>> {
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
   let manifest = tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>(index.manifest()))
     .await
     .map_err(|err| {
@@ -1012,7 +1243,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<StatsRespon
     segments: manifest.segments.len(),
     committed_at: manifest.committed_at.clone(),
     index_uuid: manifest.uuid.to_string(),
-    index_path: state.index_path.display().to_string(),
+    index_path: managed.path.display().to_string(),
+    index_name: managed.name.clone(),
   }))
 }
 
@@ -1098,6 +1330,8 @@ mod tests {
   use tempfile::tempdir;
   use tokio::task::JoinHandle;
 
+  const INDEX_NAME: &str = "primary";
+
   async fn spawn_server(
     args: ServeArgs,
     state: Arc<AppState>,
@@ -1122,22 +1356,29 @@ mod tests {
   ) -> (
     Client,
     String,
+    String,
     JoinHandle<anyhow::Result<()>>,
     Arc<AppState>,
     ServeArgs,
   ) {
     let args = default_args(index);
-    let state = Arc::new(AppState::new(&args));
-    state.bootstrap().await.unwrap();
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = Arc::new(AppState::new(registry));
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
-    (client, base, handle, state, args)
+    let index_base = format!("{}/indexes/{}", base, INDEX_NAME);
+    (client, base, index_base, handle, state, args)
   }
 
   fn default_args(index: PathBuf) -> ServeArgs {
     ServeArgs {
-      index,
+      indexes: vec![IndexSpec {
+        name: INDEX_NAME.into(),
+        path: index,
+      }],
+      aliases: vec![],
       bind: "127.0.0.1:0".parse().unwrap(),
       require_existing_index: false,
       max_body_bytes: 10 * 1024 * 1024,
@@ -1155,12 +1396,12 @@ mod tests {
     init_tracing();
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("idx");
-    let (client, base, handle, _state, _args) = setup_server(index_path.clone()).await;
+    let (client, base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
 
     // init
     let schema = Schema::default_text_body();
     let res = client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&schema)
       .send()
       .await
@@ -1171,7 +1412,7 @@ mod tests {
     let ndjson =
       "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another doc\"}\n";
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson.to_string())
       .send()
       .await
@@ -1179,7 +1420,11 @@ mod tests {
     assert!(res.status().is_success());
 
     // commit
-    let res = client.post(format!("{base}/commit")).send().await.unwrap();
+    let res = client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
     assert!(res.status().is_success());
 
     // search
@@ -1212,7 +1457,7 @@ mod tests {
       profile: false,
     };
     let res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&req)
       .send()
       .await
@@ -1224,7 +1469,7 @@ mod tests {
 
     // inspect
     let res = client
-      .get(format!("{base}/inspect"))
+      .get(format!("{index_base}/inspect"))
       .send()
       .await
       .unwrap()
@@ -1235,7 +1480,7 @@ mod tests {
 
     // stats
     let stats = client
-      .get(format!("{base}/stats"))
+      .get(format!("{index_base}/stats"))
       .send()
       .await
       .unwrap()
@@ -1243,6 +1488,18 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(stats.documents, 2);
+    assert_eq!(stats.index_name, INDEX_NAME);
+
+    // list indexes
+    let list = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json::<IndexListResponse>()
+      .await
+      .unwrap();
+    assert_eq!(list.indexes.len(), 1);
 
     handle.abort();
     let _ = handle.await;
@@ -1253,7 +1510,7 @@ mod tests {
     init_tracing();
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("idx-aggs");
-    let (client, base, handle, _state, _args) = setup_server(index_path).await;
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(json!({
       "doc_id_field": "_id",
@@ -1269,7 +1526,7 @@ mod tests {
     }))
     .unwrap();
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&schema)
       .send()
       .await
@@ -1279,12 +1536,16 @@ mod tests {
                   {\"_id\":\"2\",\"body\":\"Rustaceans write Rust\",\"lang\":\"en\"}\n\
                   {\"_id\":\"3\",\"body\":\"Recherche en français\",\"lang\":\"fr\"}\n";
     client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson.to_string())
       .send()
       .await
       .unwrap();
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
 
     let aggs: BTreeMap<String, Aggregation> = serde_json::from_value(json!({
       "langs": { "type": "terms", "field": "lang", "size": 5 }
@@ -1344,7 +1605,7 @@ mod tests {
       profile: false,
     };
     let res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&request)
       .send()
       .await
@@ -1367,7 +1628,11 @@ mod tests {
     let suggestions = body.suggest.get("complete").expect("suggest results");
     assert!(!suggestions.options.is_empty());
 
-    let compact = client.post(format!("{base}/compact")).send().await.unwrap();
+    let compact = client
+      .post(format!("{index_base}/compact"))
+      .send()
+      .await
+      .unwrap();
     assert!(compact.status().is_success());
 
     handle.abort();
@@ -1380,7 +1645,7 @@ mod tests {
     init_tracing();
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("idx-vector");
-    let (client, base, handle, _state, _args) = setup_server(index_path).await;
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(json!({
       "doc_id_field": "_id",
@@ -1396,7 +1661,7 @@ mod tests {
     }))
     .unwrap();
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&schema)
       .send()
       .await
@@ -1410,12 +1675,16 @@ mod tests {
       ]
     });
     client
-      .post(format!("{base}/bulk"))
+      .post(format!("{index_base}/bulk"))
       .json(&bulk)
       .send()
       .await
       .unwrap();
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
 
     let request = SearchRequest {
       query: Query::Node(QueryNode::Vector(VectorQuery {
@@ -1452,7 +1721,7 @@ mod tests {
       profile: false,
     };
     let res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&request)
       .send()
       .await
@@ -1472,12 +1741,13 @@ mod tests {
   async fn require_existing_index_blocks_startup() {
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("missing");
-    let args = ServeArgs {
-      require_existing_index: true,
-      ..default_args(index_path)
-    };
-    let state = Arc::new(AppState::new(&args));
-    let err = state.bootstrap().await.unwrap_err();
+    let mut args = default_args(index_path);
+    args.require_existing_index = true;
+    let err = IndexRegistry::from_args(&args)
+      .unwrap()
+      .bootstrap_all()
+      .await
+      .unwrap_err();
     assert!(err.to_string().contains("does not exist"));
   }
 
@@ -1485,7 +1755,8 @@ mod tests {
   async fn invalid_schema_returns_error() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-invalid")).await;
+    let (_client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-invalid")).await;
     let bad_schema: Schema = serde_json::from_value(json!({
       "doc_id_field": "a.b",
       "text_fields": [],
@@ -1495,8 +1766,8 @@ mod tests {
       "vector_fields": []
     }))
     .unwrap();
-    let res = client
-      .post(format!("{base}/init"))
+    let res = _client
+      .post(format!("{index_base}/init"))
       .json(&bad_schema)
       .send()
       .await
@@ -1512,10 +1783,10 @@ mod tests {
   async fn invalid_search_request_returns_structured_error() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-invalid-search")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1528,7 +1799,7 @@ mod tests {
       "execution": "wand"
     });
     let res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&invalid)
       .send()
       .await
@@ -1546,14 +1817,16 @@ mod tests {
     let dir = tempdir().unwrap();
     let mut args = default_args(dir.path().join("idx-limit"));
     args.max_body_bytes = 512;
-    let state = Arc::new(AppState::new(&args));
-    state.bootstrap().await.unwrap();
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = Arc::new(AppState::new(registry));
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
+    let index_base = format!("{base}/indexes/{INDEX_NAME}");
 
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1562,7 +1835,7 @@ mod tests {
     let long_line = format!("{{\"_id\":\"1\",\"body\":\"{}\"}}\n", "a".repeat(400));
     let body = long_line.repeat(3);
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(body)
       .send()
       .await
@@ -1579,15 +1852,16 @@ mod tests {
   async fn init_conflict_returns_409() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-conflict")).await;
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-conflict")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
     let res = client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1603,11 +1877,11 @@ mod tests {
   async fn missing_index_requests_return_404() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-missing-req")).await;
 
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body("{\"_id\":\"1\"}\n")
       .send()
       .await
@@ -1617,7 +1891,7 @@ mod tests {
     assert_eq!(err.error.r#type, "index_missing");
 
     let search_res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&serde_json::json!({
         "query": "rust",
         "limit": 1,
@@ -1638,16 +1912,16 @@ mod tests {
   async fn invalid_ndjson_returns_bad_request() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-bad-ndjson")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body("{\"_id\":\"1\"}\nnot-json\n")
       .send()
       .await
@@ -1663,17 +1937,17 @@ mod tests {
   async fn bulk_requires_docs_and_delete_requires_ids() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-empty-bulk")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
 
     let bulk_res = client
-      .post(format!("{base}/bulk"))
+      .post(format!("{index_base}/bulk"))
       .json(&serde_json::json!({ "docs": [] }))
       .send()
       .await
@@ -1683,7 +1957,7 @@ mod tests {
     assert_eq!(bulk_err.error.r#type, "missing_documents");
 
     let delete_res = client
-      .post(format!("{base}/delete"))
+      .post(format!("{index_base}/delete"))
       .json(&serde_json::json!({ "ids": [] }))
       .send()
       .await
@@ -1700,16 +1974,16 @@ mod tests {
   async fn delete_rejects_control_character_ids() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-control-ids")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
     let res = client
-      .post(format!("{base}/delete"))
+      .post(format!("{index_base}/delete"))
       .json(&serde_json::json!({ "ids": ["ok", "bad\tid"] }))
       .send()
       .await
@@ -1726,16 +2000,16 @@ mod tests {
   async fn delete_rejects_whitespace_only_ids() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-whitespace-ids")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
     let res = client
-      .post(format!("{base}/delete"))
+      .post(format!("{index_base}/delete"))
       .json(&serde_json::json!({ "ids": ["  ", "ok"] }))
       .send()
       .await
@@ -1752,10 +2026,10 @@ mod tests {
   async fn delete_allows_whitespace_padded_ids() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-whitespace-delete")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1764,21 +2038,29 @@ mod tests {
     let padded_id = "  padded-http  ";
     let ndjson = format!("{{\"_id\":\"{padded_id}\",\"body\":\"spaced\"}}\n");
     client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson)
       .send()
       .await
       .unwrap();
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
 
     let delete_res = client
-      .post(format!("{base}/delete"))
+      .post(format!("{index_base}/delete"))
       .json(&serde_json::json!({ "ids": [padded_id] }))
       .send()
       .await
       .unwrap();
     assert_eq!(delete_res.status(), HttpStatus::OK);
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
 
     let request = SearchRequest {
       query: Query::String("spaced".into()),
@@ -1809,7 +2091,7 @@ mod tests {
       profile: false,
     };
     let search_res = client
-      .post(format!("{base}/search"))
+      .post(format!("{index_base}/search"))
       .json(&request)
       .send()
       .await
@@ -1829,7 +2111,8 @@ mod tests {
   async fn health_endpoint_returns_ok() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-healthz")).await;
+    let (client, base, _index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-healthz")).await;
     let res = client.get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(res.status(), HttpStatus::OK);
     let body: HealthResponse = res.json().await.unwrap();
@@ -1843,15 +2126,20 @@ mod tests {
   async fn refresh_endpoint_returns_ok() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-refresh")).await;
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-refresh")).await;
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
 
-    let res = client.post(format!("{base}/refresh")).send().await.unwrap();
+    let res = client
+      .post(format!("{index_base}/refresh"))
+      .send()
+      .await
+      .unwrap();
     assert_eq!(res.status(), HttpStatus::OK);
     let body: RefreshResponse = res.json().await.unwrap();
     assert!(body.refreshed);
@@ -1859,15 +2147,17 @@ mod tests {
     handle.abort();
     let _ = handle.await;
   }
+
   #[tokio::test]
   async fn ingest_ndjson_batches_correctly() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) = setup_server(dir.path().join("idx-batches")).await;
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-batches")).await;
 
     // Init
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1880,7 +2170,7 @@ mod tests {
     }
 
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson)
       .send()
       .await
@@ -1891,10 +2181,18 @@ mod tests {
     assert_eq!(body.queued, 2500);
 
     // Commit
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
 
     // Verify stats
-    let stats_res = client.get(format!("{base}/stats")).send().await.unwrap();
+    let stats_res = client
+      .get(format!("{index_base}/stats"))
+      .send()
+      .await
+      .unwrap();
     let stats: StatsResponse = stats_res.json().await.unwrap();
     assert_eq!(stats.documents, 2500);
 
@@ -1906,11 +2204,11 @@ mod tests {
   async fn ingest_ndjson_exact_batch_size() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-batches-boundary")).await;
 
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1922,7 +2220,7 @@ mod tests {
     }
 
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson)
       .send()
       .await
@@ -1931,9 +2229,13 @@ mod tests {
     let body: IngestResponse = res.json().await.unwrap();
     assert_eq!(body.queued as u64, NDJSON_BATCH_SIZE as u64);
 
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
     let stats: StatsResponse = client
-      .get(format!("{base}/stats"))
+      .get(format!("{index_base}/stats"))
       .send()
       .await
       .unwrap()
@@ -1950,11 +2252,11 @@ mod tests {
   async fn ingest_ndjson_writer_failure_mid_batch() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-batches-writer-fail")).await;
 
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
@@ -1963,7 +2265,7 @@ mod tests {
     let ndjson =
       "{\"_id\":\"ok\",\"body\":\"doc\"}\n{\"body\":\"no id\"}\n{\"_id\":\"later\",\"body\":\"doc\"}\n";
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body(ndjson)
       .send()
       .await
@@ -1972,9 +2274,13 @@ mod tests {
     let err: ErrorResponse = res.json().await.unwrap();
     assert_eq!(err.error.r#type, "add_failed");
 
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
     let stats: StatsResponse = client
-      .get(format!("{base}/stats"))
+      .get(format!("{index_base}/stats"))
       .send()
       .await
       .unwrap()
@@ -1991,18 +2297,18 @@ mod tests {
   async fn ingest_ndjson_aborts_on_parse_error_without_writer() {
     init_tracing();
     let dir = tempdir().unwrap();
-    let (client, base, handle, _state, _args) =
+    let (client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-batches-parse-fail")).await;
 
     client
-      .post(format!("{base}/init"))
+      .post(format!("{index_base}/init"))
       .json(&Schema::default_text_body())
       .send()
       .await
       .unwrap();
 
     let res = client
-      .post(format!("{base}/add"))
+      .post(format!("{index_base}/add"))
       .body("{\"_id\":\"ok\",\"body\":\"doc\"}\nnot-json\n")
       .send()
       .await
@@ -2011,9 +2317,13 @@ mod tests {
     let err: ErrorResponse = res.json().await.unwrap();
     assert_eq!(err.error.r#type, "invalid_document");
 
-    client.post(format!("{base}/commit")).send().await.unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
     let stats: StatsResponse = client
-      .get(format!("{base}/stats"))
+      .get(format!("{index_base}/stats"))
       .send()
       .await
       .unwrap()
@@ -2021,6 +2331,60 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(stats.documents, 0);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn unknown_index_returns_404() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (_client, base, _index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-unknown")).await;
+    let res = _client
+      .get(format!("{base}/indexes/not-there/stats"))
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::NOT_FOUND);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "unknown_index");
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn alias_resolves_to_target() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-alias");
+    let mut args = default_args(index_path.clone());
+    args.aliases = vec![AliasSpec {
+      alias: "alias".into(),
+      target: INDEX_NAME.into(),
+    }];
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = Arc::new(AppState::new(registry));
+    let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
+    let client = Client::new();
+    let base = format!("http://{}", addr);
+    let index_base = format!("{base}/indexes/alias");
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let stats = client
+      .get(format!("{index_base}/stats"))
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(stats.status(), HttpStatus::OK);
 
     handle.abort();
     let _ = handle.await;

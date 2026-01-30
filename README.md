@@ -1,6 +1,6 @@
 # searchlite
 
-Embedded, SQLite-flavored search engine with a single on-disk index and an ergonomic Rust API, CLI, and optional C FFI.
+Embedded, SQLite-flavored search engine with one or more on-disk indexes and an ergonomic Rust API, CLI, and optional C FFI.
 
 **Crates**
 
@@ -40,7 +40,7 @@ curl -fsSL https://searchlite.dev/install | sh
 Easiest way to try searchlite: run the published container, mounting a local data directory and exposing the HTTP API on port 8080.
 
 ```bash
-docker run --rm -p 8080:8080 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index /data --bind 0.0.0.0:8080
+docker run --rm -p 8080:8080 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index default:/data --bind 0.0.0.0:8080
 ```
 
 ## Development setup
@@ -237,10 +237,10 @@ Run the bundled HTTP server for a single index (available directly from the CLI)
 
 ```bash
 searchlite http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
-# Or via cargo without installing first:
-cargo run -p searchlite-cli -- http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
-# Env-style config is supported too:
-SEARCHLITE_INDEX_PATH=/tmp/searchlite_idx \
+# Or via cargo without installing first (mount one or more NAME:PATH pairs):
+cargo run -p searchlite-cli -- http --index default:/tmp/searchlite_idx --bind 0.0.0.0:8080
+# Env-style config is supported too (comma-delimited map):
+SEARCHLITE_INDEX_MAP=default:/tmp/searchlite_idx \
 SEARCHLITE_BIND_ADDR=0.0.0.0:8080 \
 SEARCHLITE_MAX_BODY_BYTES=$((50*1024*1024)) \
 cargo run -p searchlite-cli -- http --refresh-on-commit
@@ -250,19 +250,20 @@ The standalone `searchlite-http` binary remains available; both entrypoints shar
 
 Flags/env:
 
-- `--index` / `SEARCHLITE_INDEX_PATH`: directory for the single index served by this instance.
+- `--index` / `SEARCHLITE_INDEX_MAP`: repeatable NAME:PATH mounts (comma-delimited for env).
+- `--alias` / `SEARCHLITE_INDEX_ALIASES`: optional ALIAS:TARGET indirections.
 - `--bind` / `SEARCHLITE_BIND_ADDR`: listen address (default `127.0.0.1:8080`).
 - `--require-existing-index`: fail fast at startup if the manifest is missing.
 - `--max-body-bytes`, `--max-concurrency`, `--request-timeout-secs`, `--shutdown-grace-secs`, `--refresh-on-commit`: resource limits and shutdown behavior.
 
-All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/add`, `/bulk`, or `/delete` are queued in the writer and become durable/searchable only after calling `/commit` (optionally followed by `/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
+All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/indexes/{name}/add`, `/indexes/{name}/bulk`, or `/indexes/{name}/delete` are queued in the writer and become durable/searchable only after calling `/indexes/{name}/commit` (optionally followed by `/indexes/{name}/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
 
 ### Example requests
 
 - Init (fails if the index already exists):
 
 ```bash
-curl -XPOST http://localhost:8080/init \
+curl -XPOST http://localhost:8080/indexes/default/init \
   -H 'Content-Type: application/json' \
   --data-binary @schema.json
 ```
@@ -270,16 +271,16 @@ curl -XPOST http://localhost:8080/init \
 - Stream writes:
 
 ```bash
-curl -XPOST http://localhost:8080/add \
+curl -XPOST http://localhost:8080/indexes/default/add \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @docs.ndjson
-curl -XPOST http://localhost:8080/commit
+curl -XPOST http://localhost:8080/indexes/default/commit
 ```
 
 - JSON bulk ingest:
 
 ```bash
-curl -XPOST http://localhost:8080/bulk \
+curl -XPOST http://localhost:8080/indexes/default/bulk \
   -H 'Content-Type: application/json' \
   -d '{"docs":[{"_id":"1","body":"Rust search"},{"_id":"2","body":"More docs"}]}'
 ```
