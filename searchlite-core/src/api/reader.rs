@@ -2488,13 +2488,15 @@ impl IndexReader {
       let has_more = total_needed > 0 && hits.len() > total_needed;
       if has_more {
         let key = hits[total_needed - 1].key.clone();
-        next_cursor = Some(encode_cursor(
-          manifest_generation,
-          (cursor_returned + total_needed) as u32,
-          &key,
-          &sort_plan,
-          score_fast_path,
-        )?);
+        if !search_after_mode {
+          next_cursor = Some(encode_cursor(
+            manifest_generation,
+            (cursor_returned + total_needed) as u32,
+            &key,
+            &sort_plan,
+            score_fast_path,
+          )?);
+        }
       }
       let mut last_returned_key: Option<SortKey> = None;
       let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
@@ -3094,17 +3096,19 @@ impl IndexReader {
       let has_more = total_needed > 0 && hits.len() > total_needed;
       if has_more {
         let last = &hits[total_needed - 1];
-        let returned = cursor_returned
-          .saturating_add(total_needed)
-          .try_into()
-          .unwrap_or(u32::MAX);
-        next_cursor = Some(encode_cursor(
-          manifest_generation,
-          returned,
-          &last.key,
-          &sort_plan,
-          score_fast_path,
-        )?);
+        if !search_after_mode {
+          let returned = cursor_returned
+            .saturating_add(total_needed)
+            .try_into()
+            .unwrap_or(u32::MAX);
+          next_cursor = Some(encode_cursor(
+            manifest_generation,
+            returned,
+            &last.key,
+            &sort_plan,
+            score_fast_path,
+          )?);
+        }
       }
       let mut last_returned_key: Option<SortKey> = None;
       let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
