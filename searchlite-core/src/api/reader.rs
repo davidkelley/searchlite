@@ -2009,15 +2009,6 @@ impl IndexReader {
         inner.options.enable_positions,
       )?);
     }
-    let mut doc_lookup = HashMap::new();
-    for (seg_idx, seg) in segments.iter().enumerate() {
-      for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
-        if seg.is_deleted(doc_idx as DocId) {
-          continue;
-        }
-        doc_lookup.insert(doc_id.clone(), (seg_idx, doc_idx as DocId));
-      }
-    }
     Ok(Self {
       manifest,
       segments,
