@@ -874,6 +874,7 @@ fn decode_search_after_token(
   token: &[serde_json::Value],
   sort_plan: &SortPlan,
   segments: &[SegmentReader],
+  doc_lookup: Option<&HashMap<String, (usize, DocId)>>,
 ) -> Result<SortKey> {
   if token.len() < sort_plan.len().saturating_add(2) {
     bail!(
@@ -902,21 +903,41 @@ fn decode_search_after_token(
       bail!("search_after doc_id must be string or number");
     }
   };
-  let doc_id = seg.find_doc_id(&doc_id_str).ok_or_else(|| {
-    anyhow::anyhow!(
-      "search_after doc_id `{}` not found in segment {}",
-      doc_id_str,
-      seg.meta.id
-    )
-  })?;
-  if seg.is_deleted(doc_id as DocId) {
+  let doc_id: DocId = if let Some(map) = doc_lookup {
+    if let Some((seg_idx, doc)) = map.get(doc_id_str.as_str()) {
+      if *seg_idx != segment_ord as usize {
+        bail!(
+          "search_after doc_id `{}` points to segment {}, expected {}",
+          doc_id_str,
+          seg_idx,
+          segment_ord
+        );
+      }
+      *doc
+    } else {
+      bail!(
+        "search_after doc_id `{}` not found in segment {}",
+        doc_id_str,
+        seg.meta.id
+      );
+    }
+  } else {
+    seg.find_doc_id(&doc_id_str).ok_or_else(|| {
+      anyhow::anyhow!(
+        "search_after doc_id `{}` not found in segment {}",
+        doc_id_str,
+        seg.meta.id
+      )
+    })?
+  };
+  if seg.is_deleted(doc_id) {
     bail!(
       "search_after doc_id `{}` in segment {} refers to a deleted document",
       doc_id_str,
       seg.meta.id
     );
   }
-  sort_plan.key_from_values(&values, segment_ord, doc_id as DocId)
+  sort_plan.key_from_values(&values, segment_ord, doc_id)
 }
 
 fn encode_search_after_token(
@@ -2800,7 +2821,8 @@ impl IndexReader {
         score_fast_path,
       )?)
     } else if let Some(token) = req.search_after.as_ref() {
-      let key = decode_search_after_token(token, &sort_plan, &self.segments)?;
+      let key =
+        decode_search_after_token(token, &sort_plan, &self.segments, Some(self.doc_lookup()))?;
       Some(CursorState { key, returned: 0 })
     } else {
       None
