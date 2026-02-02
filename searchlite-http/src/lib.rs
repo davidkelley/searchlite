@@ -1214,15 +1214,27 @@ async fn search(
       "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
   }
-  if request.cursor.is_some() {
-    request.search_after = None;
-    request.from = 0;
+  if request.cursor.is_some() && request.search_after.is_some() {
+    return Err(HttpError::bad_request(
+      "invalid_pagination",
+      "cursor cannot be combined with search_after; supply only one pagination token",
+    ));
   }
   if request.search_after.is_some() && request.from > 0 {
     return Err(HttpError::bad_request(
       "invalid_pagination",
       "search_after cannot be combined with from; choose one pagination method",
     ));
+  }
+  if request.cursor.is_some() && request.from > 0 {
+    return Err(HttpError::bad_request(
+      "invalid_pagination",
+      "from must be 0 when using cursor pagination; remove from or use offset pagination alone",
+    ));
+  }
+  if request.cursor.is_some() {
+    request.search_after = None;
+    request.from = 0;
   }
   let page_cap = request.from.saturating_add(request.limit);
   if request.return_hits && page_cap > MAX_PAGE_SIZE {
