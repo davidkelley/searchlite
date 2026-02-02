@@ -1214,6 +1214,10 @@ async fn search(
       "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
   }
+  if request.cursor.is_some() {
+    request.search_after = None;
+    request.from = 0;
+  }
   if request.search_after.is_some() && request.from > 0 {
     return Err(HttpError::bad_request(
       "invalid_pagination",
@@ -1226,10 +1230,6 @@ async fn search(
       "page_too_large",
       format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
     ));
-  }
-  if request.cursor.is_some() {
-    request.search_after = None;
-    request.from = 0;
   }
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
