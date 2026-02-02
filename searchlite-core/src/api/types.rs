@@ -565,7 +565,8 @@ pub struct MgetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MgetDoc {
-  pub id: String,
+  #[serde(rename = "id")]
+  pub doc_id: String,
   pub found: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub _source: Option<serde_json::Value>,

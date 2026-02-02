@@ -1322,6 +1322,18 @@ async fn multi_search(
   }
   // Validate each sub-request to mirror /search pagination and page-size rules.
   for req in body.searches.iter() {
+    if req.limit == 0 {
+      if req.cursor.is_some() {
+        return Err(HttpError::bad_request(
+          "invalid_cursor",
+          "cursor is not supported when limit is 0",
+        ));
+      }
+      return Err(HttpError::bad_request(
+        "invalid_limit",
+        "invalid limit: must be greater than zero (set limit to a positive integer)",
+      ));
+    }
     let has_cursor = req.cursor.is_some();
     let tmp_from = if has_cursor { 0 } else { req.from };
     if has_cursor && req.search_after.is_some() {

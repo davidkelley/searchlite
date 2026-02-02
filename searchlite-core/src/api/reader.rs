@@ -2786,6 +2786,9 @@ impl IndexReader {
     if req.limit == 0 && req.from > 0 {
       bail!("from is not supported when limit is 0");
     }
+    if !req.return_hits && req.search_after.is_some() {
+      bail!("search_after is not supported when return_hits is false");
+    }
     if req.limit == 0 && req.explain {
       bail!("explain is not supported when limit is 0");
     }
@@ -3244,7 +3247,7 @@ impl IndexReader {
     let mut results: Vec<MgetDoc> = ids
       .iter()
       .map(|id| MgetDoc {
-        id: id.clone(),
+        doc_id: id.clone(),
         found: false,
         _source: None,
       })
