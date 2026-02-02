@@ -3310,6 +3310,7 @@ impl IndexReader {
         root_filter,
         agg_collector,
         match_counter,
+        skipped_by_cursor,
         segment_ord,
         rank_limit,
         cursor_key,
@@ -3492,6 +3493,7 @@ impl IndexReader {
     root_filter: RootFilter<'_>,
     mut agg_collector: Option<&mut dyn DocCollector>,
     match_counter: Option<&mut u64>,
+    skipped_by_cursor: &mut u64,
     segment_ord: u32,
     rank_limit: usize,
     cursor_key: Option<SortKey>,
@@ -3548,6 +3550,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           continue;
         }
       }
