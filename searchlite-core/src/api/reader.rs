@@ -2775,13 +2775,6 @@ impl IndexReader {
     if req.search_after.is_some() && req.from > 0 {
       bail!("search_after cannot be combined with from; use one pagination method");
     }
-    let page_cap = req.from.saturating_add(req.limit);
-    if req.return_hits && page_cap > MAX_PAGE_SIZE {
-      bail!(
-        "from + size exceeds max page size {}; adjust pagination",
-        MAX_PAGE_SIZE
-      );
-    }
     if let Some(collapse) = req.collapse.as_ref() {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
     }
@@ -2817,6 +2810,13 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
+    let page_cap = from.saturating_add(req.limit);
+    if req.return_hits && page_cap > MAX_PAGE_SIZE {
+      bail!(
+        "from + size exceeds max page size {}; adjust pagination",
+        MAX_PAGE_SIZE
+      );
+    }
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
     } else {
