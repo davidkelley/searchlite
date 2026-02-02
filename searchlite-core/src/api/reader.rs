@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -1991,7 +1992,7 @@ fn collect_completion_candidates(
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
-  doc_lookup: HashMap<String, (usize, DocId)>,
+  doc_lookup: OnceLock<HashMap<String, (usize, DocId)>>,
   analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -2020,7 +2021,7 @@ impl IndexReader {
     Ok(Self {
       manifest,
       segments,
-      doc_lookup,
+      doc_lookup: OnceLock::new(),
       options: IndexOptions {
         path: inner.path.clone(),
         create_if_missing: inner.options.create_if_missing,
@@ -2470,9 +2471,10 @@ impl IndexReader {
     } else {
       hits.clear();
     }
+    let search_after_mode = req.search_after.is_some() && req.cursor.is_none();
     let total_hits_value = total_matches
       .saturating_add(cursor_returned as u64)
-      .saturating_add(if req.search_after.is_some() {
+      .saturating_add(if search_after_mode {
         skipped_by_cursor
       } else {
         0
@@ -3076,9 +3078,10 @@ impl IndexReader {
         end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
+    let search_after_mode = req.search_after.is_some() && req.cursor.is_none();
     let total_hits_value = total_matches
       .saturating_add(cursor_returned as u64)
-      .saturating_add(if req.search_after.is_some() {
+      .saturating_add(if search_after_mode {
         skipped_by_cursor
       } else {
         0
@@ -3213,6 +3216,7 @@ impl IndexReader {
         MAX_MGET_IDS
       );
     }
+    let doc_lookup = self.doc_lookup();
     let mut results: Vec<MgetDoc> = ids
       .iter()
       .map(|id| MgetDoc {
@@ -3229,7 +3233,7 @@ impl IndexReader {
       requested.entry(id.as_str()).or_default().push(idx);
     }
     for (doc_id, positions) in requested.iter() {
-      let Some((seg_idx, doc_idx)) = self.doc_lookup.get(*doc_id) else {
+      let Some((seg_idx, doc_idx)) = doc_lookup.get(*doc_id) else {
         continue;
       };
       let seg = self
@@ -3250,6 +3254,21 @@ impl IndexReader {
       }
     }
     Ok(results)
+  }
+
+  fn doc_lookup(&self) -> &HashMap<String, (usize, DocId)> {
+    self.doc_lookup.get_or_init(|| {
+      let mut map = HashMap::new();
+      for (seg_idx, seg) in self.segments.iter().enumerate() {
+        for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
+          if seg.is_deleted(doc_idx as DocId) {
+            continue;
+          }
+          map.insert(doc_id.clone(), (seg_idx, doc_idx as DocId));
+        }
+      }
+      map
+    })
   }
 
   pub fn multi_search(&self, requests: &[SearchRequest]) -> Result<Vec<SearchResult>> {
