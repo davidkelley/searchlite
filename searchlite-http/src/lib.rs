@@ -1320,6 +1320,36 @@ async fn multi_search(
       "searches array must contain at least one search request",
     ));
   }
+  // Validate each sub-request to mirror /search pagination and page-size rules.
+  for req in body.searches.iter() {
+    let has_cursor = req.cursor.is_some();
+    let tmp_from = if has_cursor { 0 } else { req.from };
+    if has_cursor && req.search_after.is_some() {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "cursor cannot be combined with search_after; choose one pagination method",
+      ));
+    }
+    if has_cursor && req.from > 0 {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "from must be 0 when using cursor pagination",
+      ));
+    }
+    if req.search_after.is_some() && req.from > 0 {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "search_after cannot be combined with from; choose one pagination method",
+      ));
+    }
+    let cap = tmp_from.saturating_add(req.limit);
+    if req.return_hits && cap > MAX_PAGE_SIZE {
+      return Err(HttpError::bad_request(
+        "page_too_large",
+        format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
+      ));
+    }
+  }
   let managed = state.registry().resolve(&index_name)?;
   let index = managed.require_index().await?;
   let parallel = body.parallel;

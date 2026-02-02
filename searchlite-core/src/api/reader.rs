@@ -909,6 +909,13 @@ fn decode_search_after_token(
       seg.meta.id
     )
   })?;
+  if seg.is_deleted(doc_id as DocId) {
+    bail!(
+      "search_after doc_id `{}` in segment {} refers to a deleted document",
+      doc_id_str,
+      seg.meta.id
+    );
+  }
   sort_plan.key_from_values(&values, segment_ord, doc_id as DocId)
 }
 
