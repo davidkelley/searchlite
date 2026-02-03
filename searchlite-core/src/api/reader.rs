@@ -2517,6 +2517,23 @@ impl IndexReader {
       }
       let mut last_returned_key: Option<SortKey> = None;
       let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
+      let inner_sort_plan = if return_sort_keys {
+        if let Some(collapse) = req.collapse.as_ref() {
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            Some(
+              SortPlan::from_request(&self.manifest.schema, &cfg.sort).with_context(|| {
+                format!("invalid inner_hits sort for collapse on {}", collapse.field)
+              })?,
+            )
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      };
       let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
@@ -2543,7 +2560,14 @@ impl IndexReader {
               .iter()
               .filter_map(|ih| {
                 let inner_sort = if return_sort_keys {
-                  encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  if let Some(inner_plan) = inner_sort_plan.as_ref() {
+                    let seg = self.segments.get(ih.key.segment_ord as usize)?;
+                    let inner_key =
+                      inner_plan.build_key(seg, ih.key.doc_id, ih.score, ih.key.segment_ord);
+                    encode_search_after_token(inner_plan, &inner_key, &self.segments).ok()
+                  } else {
+                    encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  }
                 } else {
                   None
                 };
@@ -3135,6 +3159,23 @@ impl IndexReader {
       }
       let mut last_returned_key: Option<SortKey> = None;
       let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
+      let inner_sort_plan = if return_sort_keys {
+        if let Some(collapse) = req.collapse.as_ref() {
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            Some(
+              SortPlan::from_request(&self.manifest.schema, &cfg.sort).with_context(|| {
+                format!("invalid inner_hits sort for collapse on {}", collapse.field)
+              })?,
+            )
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      };
       let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
@@ -3161,7 +3202,14 @@ impl IndexReader {
               .iter()
               .filter_map(|ih| {
                 let inner_sort = if return_sort_keys {
-                  encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  if let Some(inner_plan) = inner_sort_plan.as_ref() {
+                    let seg = self.segments.get(ih.key.segment_ord as usize)?;
+                    let inner_key =
+                      inner_plan.build_key(seg, ih.key.doc_id, ih.score, ih.key.segment_ord);
+                    encode_search_after_token(inner_plan, &inner_key, &self.segments).ok()
+                  } else {
+                    encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  }
                 } else {
                   None
                 };
@@ -4400,8 +4448,9 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
 mod tests {
   use super::*;
   use crate::api::types::{
-    ExecutionStrategy, FieldSpec, IndexOptions, MatchOperator, MultiMatchType, QueryNode, Schema,
-    SearchRequest, TextField,
+    CollapseRequest, ExecutionStrategy, FieldSpec, IndexOptions, InnerHitsRequest, KeywordField,
+    MatchOperator, MultiMatchType, NumericField, QueryNode, Schema, SearchRequest, SortOrder,
+    SortSpec, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
   #[cfg(feature = "vectors")]
@@ -4553,6 +4602,141 @@ mod tests {
       .unwrap();
     assert_eq!(second.hits.len(), 1);
     assert_ne!(second.hits[0].doc_id, first.hits[0].doc_id);
+  }
+
+  #[test]
+  fn inner_hits_use_inner_sort_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "author".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+    schema.keyword_fields.push(KeywordField {
+      name: "title".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+    schema.numeric_fields.push(NumericField {
+      name: "rank".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("a-1")),
+          ("body".into(), json!("rust search")),
+          ("author".into(), json!("alice")),
+          ("title".into(), json!("beta")),
+          ("rank".into(), json!(2)),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("a-2")),
+          ("body".into(), json!("rust systems")),
+          ("author".into(), json!("alice")),
+          ("title".into(), json!("alpha")),
+          ("rank".into(), json!(1)),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("b-1")),
+          ("body".into(), json!("rust memory")),
+          ("author".into(), json!("bob")),
+          ("title".into(), json!("gamma")),
+          ("rank".into(), json!(3)),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let resp = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 10,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: vec![SortSpec {
+          field: "rank".into(),
+          order: Some(SortOrder::Asc),
+        }],
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: true,
+        highlight_field: None,
+        highlight: None,
+        collapse: Some(CollapseRequest {
+          field: "author".into(),
+          inner_hits: Some(InnerHitsRequest {
+            size: Some(2),
+            from: Some(0),
+            sort: vec![SortSpec {
+              field: "title".into(),
+              order: Some(SortOrder::Asc),
+            }],
+          }),
+        }),
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let alice_group = resp
+      .hits
+      .iter()
+      .find(|hit| hit.inner_hits.as_ref().map(|h| h.len()) == Some(1))
+      .expect("expected collapsed group with one inner hit");
+    let inner = alice_group.inner_hits.as_ref().expect("inner hits present");
+    assert_eq!(inner[0].doc_id, "a-1");
+    let sort_key = inner[0].sort_key.as_ref().expect("inner hit sort_key");
+    assert_eq!(sort_key.first().expect("sort value"), &json!("beta"));
   }
 
   #[test]
