@@ -2784,6 +2784,9 @@ impl IndexReader {
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
     }
+    if req.cursor.is_some() && req.from > 0 {
+      bail!("from must be 0 when using cursor pagination");
+    }
     // Precedence: cursor wins; ignore search_after if both provided.
     if req.search_after.is_some() && req.from > 0 {
       bail!("search_after cannot be combined with from; use one pagination method");
@@ -4550,6 +4553,117 @@ mod tests {
       .unwrap();
     assert_eq!(second.hits.len(), 1);
     assert_ne!(second.hits[0].doc_id, first.hits[0].doc_id);
+  }
+
+  #[test]
+  fn cursor_rejects_from_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-1")),
+          ("body".into(), json!("rust rust search")),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-2")),
+          ("body".into(), json!("rust query")),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    let cursor = first.next_cursor.clone().expect("next_cursor");
+
+    let err = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 1,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: Some(cursor),
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap_err();
+    assert!(err
+      .to_string()
+      .contains("from must be 0 when using cursor pagination"));
   }
 
   #[test]
