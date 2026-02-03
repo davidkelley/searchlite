@@ -874,7 +874,7 @@ fn decode_search_after_token(
   token: &[serde_json::Value],
   sort_plan: &SortPlan,
   segments: &[SegmentReader],
-  doc_lookup: Option<&HashMap<String, (usize, DocId)>>,
+  doc_lookup: &HashMap<String, Vec<(usize, DocId)>>,
 ) -> Result<SortKey> {
   if token.len() < sort_plan.len().saturating_add(2) {
     bail!(
@@ -903,33 +903,22 @@ fn decode_search_after_token(
       bail!("search_after doc_id must be string or number");
     }
   };
-  let doc_id: DocId = if let Some(map) = doc_lookup {
-    if let Some((seg_idx, doc)) = map.get(doc_id_str.as_str()) {
-      if *seg_idx != segment_ord as usize {
-        bail!(
-          "search_after doc_id `{}` points to segment {}, expected {}",
-          doc_id_str,
-          seg_idx,
-          segment_ord
-        );
-      }
-      *doc
-    } else {
-      bail!(
-        "search_after doc_id `{}` not found in segment {}",
-        doc_id_str,
-        seg.meta.id
-      );
-    }
-  } else {
-    seg.find_doc_id(&doc_id_str).ok_or_else(|| {
+  let doc_id: DocId = doc_lookup
+    .get(doc_id_str.as_str())
+    .and_then(|entries| {
+      entries
+        .iter()
+        .find(|(seg_idx, _)| *seg_idx == segment_ord as usize)
+        .map(|(_, doc_idx)| *doc_idx)
+    })
+    .or_else(|| seg.find_doc_id(&doc_id_str))
+    .ok_or_else(|| {
       anyhow::anyhow!(
         "search_after doc_id `{}` not found in segment {}",
         doc_id_str,
         seg.meta.id
       )
-    })?
-  };
+    })?;
   if seg.is_deleted(doc_id) {
     bail!(
       "search_after doc_id `{}` in segment {} refers to a deleted document",
@@ -2020,7 +2009,7 @@ fn collect_completion_candidates(
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
-  doc_lookup: OnceLock<HashMap<String, (usize, DocId)>>,
+  doc_lookup: OnceLock<HashMap<String, Vec<(usize, DocId)>>>,
   analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -2824,8 +2813,7 @@ impl IndexReader {
         score_fast_path,
       )?)
     } else if let Some(token) = req.search_after.as_ref() {
-      let key =
-        decode_search_after_token(token, &sort_plan, &self.segments, Some(self.doc_lookup()))?;
+      let key = decode_search_after_token(token, &sort_plan, &self.segments, self.doc_lookup())?;
       Some(CursorState { key, returned: 0 })
     } else {
       None
@@ -3260,18 +3248,30 @@ impl IndexReader {
       requested.entry(id.as_str()).or_default().push(idx);
     }
     for (doc_id, positions) in requested.iter() {
-      let Some((seg_idx, doc_idx)) = doc_lookup.get(*doc_id) else {
+      let Some(entries) = doc_lookup.get(*doc_id) else {
+        continue;
+      };
+      let mut chosen: Option<(usize, DocId)> = None;
+      for (seg_idx, doc_idx) in entries.iter().rev() {
+        let seg = self
+          .segments
+          .get(*seg_idx)
+          .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+        if seg.is_deleted(*doc_idx) {
+          continue;
+        }
+        chosen = Some((*seg_idx, *doc_idx));
+        break;
+      }
+      let Some((seg_idx, doc_idx)) = chosen else {
         continue;
       };
       let seg = self
         .segments
-        .get(*seg_idx)
+        .get(seg_idx)
         .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
-      if seg.is_deleted(*doc_idx) {
-        continue;
-      }
       let source = if return_stored {
-        Some(seg.get_doc(*doc_idx)?)
+        Some(seg.get_doc(doc_idx)?)
       } else {
         None
       };
@@ -3283,7 +3283,7 @@ impl IndexReader {
     Ok(results)
   }
 
-  fn doc_lookup(&self) -> &HashMap<String, (usize, DocId)> {
+  fn doc_lookup(&self) -> &HashMap<String, Vec<(usize, DocId)>> {
     self.doc_lookup.get_or_init(|| {
       let mut map = HashMap::new();
       for (seg_idx, seg) in self.segments.iter().enumerate() {
@@ -3291,7 +3291,10 @@ impl IndexReader {
           if seg.is_deleted(doc_idx as DocId) {
             continue;
           }
-          map.insert(doc_id.clone(), (seg_idx, doc_idx as DocId));
+          map
+            .entry(doc_id.clone())
+            .or_insert_with(Vec::new)
+            .push((seg_idx, doc_idx as DocId));
         }
       }
       map

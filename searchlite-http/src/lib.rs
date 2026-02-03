@@ -1321,7 +1321,7 @@ async fn multi_search(
     ));
   }
   // Validate each sub-request to mirror /search pagination and page-size rules.
-  for req in body.searches.iter() {
+  let validate_search = |req: &SearchRequest| -> Result<(), HttpError> {
     if req.limit == 0 {
       if req.cursor.is_some() {
         return Err(HttpError::bad_request(
@@ -1361,6 +1361,10 @@ async fn multi_search(
         format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
       ));
     }
+    Ok(())
+  };
+  for req in body.searches.iter() {
+    validate_search(req)?;
   }
   let managed = state.registry().resolve(&index_name)?;
   let index = managed.require_index().await?;
@@ -1379,12 +1383,6 @@ async fn multi_search(
         if req.cursor.is_some() {
           req.search_after = None;
           req.from = 0;
-        }
-        if req.return_hits {
-          let cap = req.from.saturating_add(req.limit);
-          if cap > MAX_PAGE_SIZE {
-            anyhow::bail!("from + size exceeds max page size {MAX_PAGE_SIZE}");
-          }
         }
         results.push(reader.search(&req)?);
       }
@@ -1410,15 +1408,6 @@ async fn multi_search(
     if req.cursor.is_some() {
       req.search_after = None;
       req.from = 0;
-    }
-    if req.return_hits {
-      let cap = req.from.saturating_add(req.limit);
-      if cap > MAX_PAGE_SIZE {
-        return Err(HttpError::bad_request(
-          "page_too_large",
-          format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
-        ));
-      }
     }
     let semaphore_clone = semaphore.clone();
     let index_clone = idx.clone();
@@ -1457,18 +1446,7 @@ async fn multi_search(
   }
   let results: Vec<SearchResult> = results
     .into_iter()
-    .map(|r| {
-      r.unwrap_or_else(|| SearchResult {
-        total_hits_estimate: 0,
-        total_groups: None,
-        hits: Vec::new(),
-        next_cursor: None,
-        next_search_after: None,
-        aggregations: BTreeMap::new(),
-        suggest: BTreeMap::new(),
-        profile: None,
-      })
-    })
+    .map(|r| r.expect("multi_search invariant violated: missing SearchResult for a task"))
     .collect();
   Ok(Json(MultiSearchResponse { results }))
 }
