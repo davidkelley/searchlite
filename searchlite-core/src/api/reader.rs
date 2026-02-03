@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -14,8 +15,8 @@ use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, CollapseRequest, DateHistogramAggregation,
   DecayFunction, Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation,
-  IndexOptions, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder,
-  SuggestOption, SuggestRequest, SuggestResult,
+  IndexOptions, MgetDoc, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest,
+  SortOrder, SuggestOption, SuggestRequest, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -53,6 +54,8 @@ use crate::vectors::{blend_scores, normalize_in_place, DEFAULT_VECTOR_ALPHA};
 use crate::DocId;
 
 const MAX_CURSOR_ADVANCE: usize = 50_000;
+const MAX_PAGE_SIZE: usize = 1_000;
+const MAX_MGET_IDS: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
@@ -60,6 +63,8 @@ pub struct Hit {
   pub score: f32,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_score: Option<f32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sort_key: Option<Vec<serde_json::Value>>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,12 +109,19 @@ pub struct SearchResult {
   pub hits: Vec<Hit>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub next_cursor: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub next_search_after: Option<Vec<serde_json::Value>>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub aggregations: BTreeMap<String, AggregationResponse>,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub suggest: BTreeMap<String, SuggestResult>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub profile: Option<ProfileResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSearchResponse {
+  pub results: Vec<SearchResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -821,6 +833,120 @@ struct CursorState {
   returned: u32,
 }
 
+fn sort_value_to_json(value: &SortValue) -> serde_json::Value {
+  match value {
+    SortValue::Score(v) => serde_json::Number::from_f64(*v as f64)
+      .map(serde_json::Value::Number)
+      .unwrap_or(serde_json::Value::Null),
+    SortValue::I64(v) => serde_json::Value::Number((*v).into()),
+    SortValue::F64(v) => serde_json::Number::from_f64(*v)
+      .map(serde_json::Value::Number)
+      .unwrap_or(serde_json::Value::Null),
+    SortValue::Str(v) => serde_json::Value::String(v.clone()),
+    SortValue::Missing => serde_json::Value::Null,
+  }
+}
+
+fn parse_segment_ord(raw: &serde_json::Value) -> Result<u32> {
+  match raw {
+    serde_json::Value::Number(n) => n
+      .as_u64()
+      .and_then(|v| u32::try_from(v).ok())
+      .ok_or_else(|| anyhow::anyhow!("search_after segment_ord must be a non-negative integer")),
+    serde_json::Value::String(s) => {
+      let trimmed = if let Some(rest) = s.strip_prefix("seg") {
+        rest
+      } else {
+        s.as_str()
+      };
+      trimmed
+        .trim()
+        .parse::<u32>()
+        .context("parsing search_after segment_ord")
+    }
+    _ => Err(anyhow::anyhow!(
+      "search_after segment_ord must be string or integer"
+    )),
+  }
+}
+
+fn decode_search_after_token(
+  token: &[serde_json::Value],
+  sort_plan: &SortPlan,
+  segments: &[SegmentReader],
+  doc_lookup: &HashMap<String, Vec<(usize, DocId)>>,
+) -> Result<SortKey> {
+  if token.len() < sort_plan.len().saturating_add(2) {
+    bail!(
+      "search_after token length {} is less than expected {} values plus doc_id and segment_ord",
+      token.len(),
+      sort_plan.len()
+    );
+  }
+  if token.len() != sort_plan.len().saturating_add(2) {
+    bail!(
+      "search_after token must contain {} sort values plus doc_id and segment_ord",
+      sort_plan.len()
+    );
+  }
+  let values = sort_plan.values_from_json(&token[..sort_plan.len()])?;
+  let doc_id_value = token.get(sort_plan.len()).unwrap();
+  let seg_value = token.get(sort_plan.len() + 1).unwrap();
+  let segment_ord = parse_segment_ord(seg_value)?;
+  let seg = segments
+    .get(segment_ord as usize)
+    .ok_or_else(|| anyhow::anyhow!("search_after segment_ord {} out of range", segment_ord))?;
+  let doc_id_str = match doc_id_value {
+    serde_json::Value::String(s) => s.clone(),
+    serde_json::Value::Number(n) => n.to_string(),
+    _ => {
+      bail!("search_after doc_id must be string or number");
+    }
+  };
+  let doc_id: DocId = doc_lookup
+    .get(doc_id_str.as_str())
+    .and_then(|entries| {
+      entries
+        .iter()
+        .find(|(seg_idx, _)| *seg_idx == segment_ord as usize)
+        .map(|(_, doc_idx)| *doc_idx)
+    })
+    .or_else(|| seg.find_doc_id(&doc_id_str))
+    .ok_or_else(|| {
+      anyhow::anyhow!(
+        "search_after doc_id `{}` not found in segment {}",
+        doc_id_str,
+        seg.meta.id
+      )
+    })?;
+  if seg.is_deleted(doc_id) {
+    bail!(
+      "search_after doc_id `{}` in segment {} refers to a deleted document",
+      doc_id_str,
+      seg.meta.id
+    );
+  }
+  sort_plan.key_from_values(&values, segment_ord, doc_id)
+}
+
+fn encode_search_after_token(
+  sort_plan: &SortPlan,
+  key: &SortKey,
+  segments: &[SegmentReader],
+) -> Result<Vec<serde_json::Value>> {
+  let values = sort_plan.values_from_key(key)?;
+  let mut out: Vec<serde_json::Value> = values.iter().map(sort_value_to_json).collect();
+  let seg = segments
+    .get(key.segment_ord as usize)
+    .ok_or_else(|| anyhow::anyhow!("segment {} missing for search_after", key.segment_ord))?;
+  let doc_id_str = seg
+    .doc_id(key.doc_id)
+    .ok_or_else(|| anyhow::anyhow!("doc_id {} missing in segment", key.doc_id))?;
+  out.push(serde_json::Value::String(doc_id_str.to_string()));
+  out.push(serde_json::Value::Number(key.segment_ord.into()));
+  Ok(out)
+}
+
 fn decode_cursor(
   raw: &str,
   manifest_generation: u32,
@@ -948,6 +1074,7 @@ struct SegmentSearchParams<'a> {
   root_filter: RootFilter<'a>,
   agg_collector: Option<&'a mut dyn DocCollector>,
   match_counter: Option<&'a mut u64>,
+  skipped_by_cursor: &'a mut u64,
   req: &'a SearchRequest,
   segment_ord: u32,
   rank_limit: usize,
@@ -1882,6 +2009,7 @@ fn collect_completion_candidates(
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
+  doc_lookup: OnceLock<HashMap<String, Vec<(usize, DocId)>>>,
   analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -1901,6 +2029,7 @@ impl IndexReader {
     Ok(Self {
       manifest,
       segments,
+      doc_lookup: OnceLock::new(),
       options: IndexOptions {
         path: inner.path.clone(),
         create_if_missing: inner.options.create_if_missing,
@@ -2245,9 +2374,11 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
-    let collect_hits = req.return_hits && req.limit > 0;
+    let from = if cursor_state.is_some() { 0 } else { req.from };
+    let page_cap = from.saturating_add(req.limit);
+    let collect_hits = req.return_hits && page_cap > 0;
     let heap_limit = if collect_hits {
-      plan.candidate_size.max(req.limit).saturating_add(1)
+      plan.candidate_size.max(page_cap).saturating_add(1)
     } else {
       0
     };
@@ -2264,6 +2395,7 @@ impl IndexReader {
     };
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
+    let mut skipped_by_cursor: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
@@ -2302,6 +2434,7 @@ impl IndexReader {
               if ord.is_eq() {
                 saw_cursor = true;
               }
+              skipped_by_cursor += 1;
               continue;
             }
           }
@@ -2346,7 +2479,14 @@ impl IndexReader {
     } else {
       hits.clear();
     }
-    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
+    let search_after_mode = req.search_after.is_some() && req.cursor.is_none();
+    let total_hits_value = total_matches
+      .saturating_add(cursor_returned as u64)
+      .saturating_add(if search_after_mode {
+        skipped_by_cursor
+      } else {
+        0
+      });
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if req.return_hits {
@@ -2358,28 +2498,89 @@ impl IndexReader {
       }
     }
     let mut next_cursor = None;
-    if req.return_hits && req.limit > 0 && hits.len() > req.limit {
-      let key = hits[req.limit - 1].key.clone();
-      next_cursor = Some(encode_cursor(
-        manifest_generation,
-        (cursor_returned + req.limit) as u32,
-        &key,
-        &sort_plan,
-        score_fast_path,
-      )?);
-      hits.truncate(req.limit);
-    }
+    let mut next_search_after = None;
     let empty_phrases: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
     let hits: Vec<Hit> = if req.return_hits {
-      hits
+      let total_needed = from.saturating_add(req.limit);
+      let has_more = total_needed > 0 && hits.len() > total_needed;
+      if has_more {
+        let key = hits[total_needed - 1].key.clone();
+        if !search_after_mode {
+          next_cursor = Some(encode_cursor(
+            manifest_generation,
+            (cursor_returned + total_needed) as u32,
+            &key,
+            &sort_plan,
+            score_fast_path,
+          )?);
+        }
+      }
+      let mut last_returned_key: Option<SortKey> = None;
+      let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
+      let inner_sort_plan = if return_sort_keys {
+        if let Some(collapse) = req.collapse.as_ref() {
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            Some(
+              SortPlan::from_request(&self.manifest.schema, &cfg.sort).with_context(|| {
+                format!("invalid inner_hits sort for collapse on {}", collapse.field)
+              })?,
+            )
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      };
+      let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
+        .skip(from)
+        .take(req.limit)
         .filter_map(|(idx, h)| {
-          let mut hit = self.materialize_hit(h, req, &[], &empty_phrases)?;
+          last_returned_key = Some(h.key.clone());
+          let sort_json = if return_sort_keys {
+            encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
+          } else {
+            None
+          };
+          let mut hit = self.materialize_hit(
+            h,
+            req,
+            &[],
+            &empty_phrases,
+            &sort_plan,
+            return_sort_keys,
+            sort_json.clone(),
+          )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
-              .filter_map(|ih| self.materialize_hit(ih.clone(), req, &[], &empty_phrases))
+              .filter_map(|ih| {
+                let inner_sort = if return_sort_keys {
+                  if let Some(inner_plan) = inner_sort_plan.as_ref() {
+                    let seg = self.segments.get(ih.key.segment_ord as usize)?;
+                    let inner_key =
+                      inner_plan.build_key(seg, ih.key.doc_id, ih.score, ih.key.segment_ord);
+                    encode_search_after_token(inner_plan, &inner_key, &self.segments).ok()
+                  } else {
+                    encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  }
+                } else {
+                  None
+                };
+                self.materialize_hit(
+                  ih.clone(),
+                  req,
+                  &[],
+                  &empty_phrases,
+                  &sort_plan,
+                  return_sort_keys,
+                  inner_sort,
+                )
+              })
               .collect();
             if !inner_hits.is_empty() {
               hit.inner_hits = Some(inner_hits);
@@ -2387,7 +2588,13 @@ impl IndexReader {
           }
           Some(hit)
         })
-        .collect()
+        .collect();
+      if has_more {
+        if let Some(key) = last_returned_key.as_ref() {
+          next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
+        }
+      }
+      out
     } else {
       Vec::new()
     };
@@ -2406,6 +2613,7 @@ impl IndexReader {
       total_groups,
       hits,
       next_cursor,
+      next_search_after,
       aggregations,
       suggest,
       profile: if req.profile {
@@ -2525,6 +2733,7 @@ impl IndexReader {
     sort_plan: &SortPlan,
     cursor_key: Option<&SortKey>,
     saw_cursor: &mut bool,
+    skipped_by_cursor: &mut u64,
     heap_limit: usize,
   ) -> Result<Vec<RankedHit>> {
     let mut heap = BinaryHeap::new();
@@ -2564,6 +2773,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           continue;
         }
       }
@@ -2586,11 +2796,27 @@ impl IndexReader {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
     }
+    if req.limit == 0 && req.from > 0 {
+      bail!("from is not supported when limit is 0");
+    }
+    if !req.return_hits && req.search_after.is_some() {
+      bail!("search_after is not supported when return_hits is false");
+    }
     if req.limit == 0 && req.explain {
       bail!("explain is not supported when limit is 0");
     }
     if !req.return_hits && req.cursor.is_some() {
       bail!("cursor is not supported when return_hits is false");
+    }
+    if req.cursor.is_some() && req.search_after.is_some() {
+      bail!("cursor cannot be combined with search_after; use one pagination method");
+    }
+    if req.cursor.is_some() && req.from > 0 {
+      bail!("from must be 0 when using cursor pagination");
+    }
+    // Precedence: cursor wins; ignore search_after if both provided.
+    if req.search_after.is_some() && req.from > 0 {
+      bail!("search_after cannot be combined with from; use one pagination method");
     }
     if let Some(collapse) = req.collapse.as_ref() {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
@@ -2605,15 +2831,20 @@ impl IndexReader {
       .map(|s| s.generation)
       .max()
       .unwrap_or(0);
+    let mut from = req.from;
     let cursor_state = if req.limit == 0 {
       None
     } else if let Some(raw) = req.cursor.as_deref() {
+      from = 0;
       Some(decode_cursor(
         raw,
         manifest_generation,
         &sort_plan,
         score_fast_path,
       )?)
+    } else if let Some(token) = req.search_after.as_ref() {
+      let key = decode_search_after_token(token, &sort_plan, &self.segments, self.doc_lookup())?;
+      Some(CursorState { key, returned: 0 })
     } else {
       None
     };
@@ -2622,6 +2853,13 @@ impl IndexReader {
       .as_ref()
       .map(|c| c.returned as usize)
       .unwrap_or(0);
+    let page_cap = from.saturating_add(req.limit);
+    if req.return_hits && page_cap > MAX_PAGE_SIZE {
+      bail!(
+        "from + size exceeds max page size {}; adjust pagination",
+        MAX_PAGE_SIZE
+      );
+    }
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
     } else {
@@ -2641,22 +2879,27 @@ impl IndexReader {
         vector_plan = None;
       }
     }
-    let base_candidate = if req.limit == 0 {
+    let page_limit = if req.return_hits {
+      from.saturating_add(req.limit)
+    } else {
+      0
+    };
+    let base_candidate = if page_limit == 0 {
       0
     } else {
       req
         .candidate_size
-        .unwrap_or(req.limit)
-        .max(req.limit)
+        .unwrap_or(page_limit)
+        .max(page_limit)
         .min(MAX_CANDIDATE_SIZE)
     };
     #[cfg(feature = "vectors")]
-    let effective_limit = if req.limit == 0 {
+    let effective_limit = if page_limit == 0 {
       0
     } else {
       vector_plan
         .as_ref()
-        .map(|p| p.candidate_size.max(req.limit))
+        .map(|p| p.candidate_size.max(page_limit))
         .unwrap_or(base_candidate)
     };
     #[cfg(not(feature = "vectors"))]
@@ -2709,6 +2952,7 @@ impl IndexReader {
     let mut heap = std::collections::BinaryHeap::<RankedHit>::new();
     let mut agg_results = Vec::new();
     let mut total_matches: u64 = 0;
+    let mut skipped_by_cursor: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
     let search_start = Instant::now();
     let mut timings: BTreeMap<String, f64> = BTreeMap::new();
@@ -2723,7 +2967,7 @@ impl IndexReader {
         .transpose()?;
       let mut noop_collector = NoopCollector;
       let mut collect_hits: Option<Box<dyn FnMut(SortKey, f32) + '_>> = None;
-      if req.return_hits && !score_fast_path && req.limit > 0 && !req.explain {
+      if req.return_hits && !score_fast_path && page_limit > 0 && !req.explain {
         let heap_limit = top_k;
         let heap_ref = &mut heap;
         collect_hits = Some(Box::new(move |key: SortKey, score: f32| {
@@ -2744,7 +2988,7 @@ impl IndexReader {
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
         if agg_ref.is_none()
-          && (req.limit == 0 || !req.return_hits || (!score_fast_path && req.limit > 0))
+          && (page_limit == 0 || !req.return_hits || (!score_fast_path && page_limit > 0))
         {
           agg_ref = Some(&mut noop_collector);
         }
@@ -2770,6 +3014,7 @@ impl IndexReader {
           root_filter,
           agg_collector: agg_ref,
           match_counter: Some(&mut total_matches),
+          skipped_by_cursor: &mut skipped_by_cursor,
           req,
           segment_ord: segment_ord as u32,
           rank_limit: segment_rank_limit,
@@ -2803,7 +3048,7 @@ impl IndexReader {
       hits.extend(heap);
     }
     #[cfg(feature = "vectors")]
-    if req.limit > 0 && req.return_hits {
+    if page_limit > 0 && req.return_hits {
       if let Some(plan) = vector_plan.as_ref() {
         let require_text_match = !plan.vector_only;
         let vector_scores = self.collect_vector_maps(
@@ -2822,6 +3067,7 @@ impl IndexReader {
           &sort_plan,
           cursor_key.as_ref(),
           &mut saw_cursor,
+          &mut skipped_by_cursor,
           top_k,
         )?;
       }
@@ -2875,7 +3121,14 @@ impl IndexReader {
         end.duration_since(search_start).as_secs_f64() * 1000.0,
       );
     }
-    let total_hits_value = total_matches.saturating_add(cursor_returned as u64);
+    let search_after_mode = req.search_after.is_some() && req.cursor.is_none();
+    let total_hits_value = total_matches
+      .saturating_add(cursor_returned as u64)
+      .saturating_add(if search_after_mode {
+        skipped_by_cursor
+      } else {
+        0
+      });
     let mut total_groups = None;
     let mut group_inner_hits: Vec<Vec<RankedHit>> = Vec::new();
     if req.return_hits {
@@ -2887,32 +3140,91 @@ impl IndexReader {
       }
     }
     let mut next_cursor = None;
+    let mut next_search_after = None;
     let hits: Vec<Hit> = if req.return_hits {
-      if req.limit > 0 && hits.len() > req.limit {
-        let last = &hits[req.limit - 1];
-        let returned = cursor_returned
-          .saturating_add(req.limit)
-          .try_into()
-          .unwrap_or(u32::MAX);
-        next_cursor = Some(encode_cursor(
-          manifest_generation,
-          returned,
-          &last.key,
-          &sort_plan,
-          score_fast_path,
-        )?);
-        hits.truncate(req.limit);
+      let total_needed = from.saturating_add(req.limit);
+      let has_more = total_needed > 0 && hits.len() > total_needed;
+      if has_more {
+        let last = &hits[total_needed - 1];
+        if !search_after_mode {
+          let returned = cursor_returned
+            .saturating_add(total_needed)
+            .try_into()
+            .unwrap_or(u32::MAX);
+          next_cursor = Some(encode_cursor(
+            manifest_generation,
+            returned,
+            &last.key,
+            &sort_plan,
+            score_fast_path,
+          )?);
+        }
       }
-      hits
+      let mut last_returned_key: Option<SortKey> = None;
+      let return_sort_keys = req.search_after.is_some() || !req.sort.is_empty();
+      let inner_sort_plan = if return_sort_keys {
+        if let Some(collapse) = req.collapse.as_ref() {
+          if let Some(cfg) = collapse.inner_hits.as_ref() {
+            Some(
+              SortPlan::from_request(&self.manifest.schema, &cfg.sort).with_context(|| {
+                format!("invalid inner_hits sort for collapse on {}", collapse.field)
+              })?,
+            )
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      };
+      let out: Vec<Hit> = hits
         .into_iter()
         .enumerate()
+        .skip(from)
+        .take(req.limit)
         .filter_map(|(idx, h)| {
-          let mut hit = self.materialize_hit(h, req, &highlight_terms, &highlight_phrases)?;
+          last_returned_key = Some(h.key.clone());
+          let sort_json = if return_sort_keys {
+            encode_search_after_token(&sort_plan, &h.key, &self.segments).ok()
+          } else {
+            None
+          };
+          let mut hit = self.materialize_hit(
+            h,
+            req,
+            &highlight_terms,
+            &highlight_phrases,
+            &sort_plan,
+            return_sort_keys,
+            sort_json.clone(),
+          )?;
           if let Some(inner) = group_inner_hits.get(idx) {
             let inner_hits: Vec<Hit> = inner
               .iter()
               .filter_map(|ih| {
-                self.materialize_hit(ih.clone(), req, &highlight_terms, &highlight_phrases)
+                let inner_sort = if return_sort_keys {
+                  if let Some(inner_plan) = inner_sort_plan.as_ref() {
+                    let seg = self.segments.get(ih.key.segment_ord as usize)?;
+                    let inner_key =
+                      inner_plan.build_key(seg, ih.key.doc_id, ih.score, ih.key.segment_ord);
+                    encode_search_after_token(inner_plan, &inner_key, &self.segments).ok()
+                  } else {
+                    encode_search_after_token(&sort_plan, &ih.key, &self.segments).ok()
+                  }
+                } else {
+                  None
+                };
+                self.materialize_hit(
+                  ih.clone(),
+                  req,
+                  &highlight_terms,
+                  &highlight_phrases,
+                  &sort_plan,
+                  return_sort_keys,
+                  inner_sort,
+                )
               })
               .collect();
             if !inner_hits.is_empty() {
@@ -2921,7 +3233,13 @@ impl IndexReader {
           }
           Some(hit)
         })
-        .collect()
+        .collect();
+      if has_more {
+        if let Some(key) = last_returned_key.as_ref() {
+          next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
+        }
+      }
+      out
     } else {
       Vec::new()
     };
@@ -2940,6 +3258,7 @@ impl IndexReader {
       total_groups,
       hits,
       next_cursor,
+      next_search_after,
       aggregations,
       suggest,
       profile: if req.profile {
@@ -2956,6 +3275,92 @@ impl IndexReader {
         None
       },
     })
+  }
+
+  pub fn mget(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
+    if ids.len() > MAX_MGET_IDS {
+      bail!(
+        "mget ids length {} exceeds max supported {}",
+        ids.len(),
+        MAX_MGET_IDS
+      );
+    }
+    let doc_lookup = self.doc_lookup();
+    let mut results: Vec<MgetDoc> = ids
+      .iter()
+      .map(|id| MgetDoc {
+        doc_id: id.clone(),
+        found: false,
+        _source: None,
+      })
+      .collect();
+    if results.is_empty() {
+      return Ok(results);
+    }
+    let mut requested: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, id) in ids.iter().enumerate() {
+      requested.entry(id.as_str()).or_default().push(idx);
+    }
+    for (doc_id, positions) in requested.iter() {
+      let Some(entries) = doc_lookup.get(*doc_id) else {
+        continue;
+      };
+      let mut chosen: Option<(usize, DocId)> = None;
+      for (seg_idx, doc_idx) in entries.iter().rev() {
+        let seg = self
+          .segments
+          .get(*seg_idx)
+          .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+        if seg.is_deleted(*doc_idx) {
+          continue;
+        }
+        chosen = Some((*seg_idx, *doc_idx));
+        break;
+      }
+      let Some((seg_idx, doc_idx)) = chosen else {
+        continue;
+      };
+      let seg = self
+        .segments
+        .get(seg_idx)
+        .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+      let source = if return_stored {
+        Some(seg.get_doc(doc_idx)?)
+      } else {
+        None
+      };
+      for pos in positions.iter().copied() {
+        results[pos].found = true;
+        results[pos]._source = source.clone();
+      }
+    }
+    Ok(results)
+  }
+
+  fn doc_lookup(&self) -> &HashMap<String, Vec<(usize, DocId)>> {
+    self.doc_lookup.get_or_init(|| {
+      let mut map = HashMap::new();
+      for (seg_idx, seg) in self.segments.iter().enumerate() {
+        for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
+          if seg.is_deleted(doc_idx as DocId) {
+            continue;
+          }
+          map
+            .entry(doc_id.clone())
+            .or_insert_with(Vec::new)
+            .push((seg_idx, doc_idx as DocId));
+        }
+      }
+      map
+    })
+  }
+
+  pub fn multi_search(&self, requests: &[SearchRequest]) -> Result<Vec<SearchResult>> {
+    let mut out = Vec::with_capacity(requests.len());
+    for req in requests.iter() {
+      out.push(self.search(req)?);
+    }
+    Ok(out)
   }
 
   fn search_segment(
@@ -2976,6 +3381,7 @@ impl IndexReader {
       root_filter,
       agg_collector,
       match_counter,
+      skipped_by_cursor,
       req,
       segment_ord,
       rank_limit,
@@ -3007,6 +3413,7 @@ impl IndexReader {
         root_filter,
         agg_collector,
         match_counter,
+        skipped_by_cursor,
         segment_ord,
         rank_limit,
         cursor_key,
@@ -3076,6 +3483,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           return false;
         }
       }
@@ -3188,6 +3596,7 @@ impl IndexReader {
     root_filter: RootFilter<'_>,
     mut agg_collector: Option<&mut dyn DocCollector>,
     match_counter: Option<&mut u64>,
+    skipped_by_cursor: &mut u64,
     segment_ord: u32,
     rank_limit: usize,
     cursor_key: Option<SortKey>,
@@ -3244,6 +3653,7 @@ impl IndexReader {
           if ord.is_eq() {
             *saw_cursor = true;
           }
+          *skipped_by_cursor += 1;
           continue;
         }
       }
@@ -3450,12 +3860,16 @@ impl IndexReader {
     Ok(())
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn materialize_hit(
     &self,
     ranked: RankedHit,
     req: &SearchRequest,
     highlight_terms: &[String],
     phrase_terms: &BTreeMap<String, Vec<Vec<String>>>,
+    sort_plan: &SortPlan,
+    include_sort_key: bool,
+    sort_key_json: Option<Vec<serde_json::Value>>,
   ) -> Option<Hit> {
     let seg = self.segments.get(ranked.key.segment_ord as usize)?;
     let doc_id_str = seg.doc_id(ranked.key.doc_id)?;
@@ -3541,6 +3955,12 @@ impl IndexReader {
       doc_id: doc_id_str.to_string(),
       score: ranked.score,
       vector_score: ranked.vector_score,
+      sort_key: if include_sort_key {
+        sort_key_json
+          .or_else(|| encode_search_after_token(sort_plan, &ranked.key, &self.segments).ok())
+      } else {
+        None
+      },
       fields: fields_val,
       snippet,
       explanation: ranked.explanation,
@@ -4031,13 +4451,15 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
 mod tests {
   use super::*;
   use crate::api::types::{
-    ExecutionStrategy, FieldSpec, IndexOptions, MatchOperator, MultiMatchType, QueryNode, Schema,
-    SearchRequest, TextField,
+    CollapseRequest, ExecutionStrategy, FieldSpec, IndexOptions, InnerHitsRequest, KeywordField,
+    MatchOperator, MultiMatchType, NumericField, QueryNode, Schema, SearchRequest, SortOrder,
+    SortSpec, TextField,
   };
   use crate::api::{Document, Index, Query, StorageType};
   #[cfg(feature = "vectors")]
   use crate::index::manifest::{VectorField, VectorMetric};
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
+  use serde_json::json;
   use std::collections::HashSet;
 
   #[test]
@@ -4072,6 +4494,522 @@ mod tests {
     buf[17..].copy_from_slice(&returned.to_be_bytes());
     let encoded = hex_encode(&buf);
     assert!(PaginationCursor::decode(&encoded).is_err());
+  }
+
+  #[test]
+  fn search_after_round_trips_across_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-1")),
+          ("body".into(), json!("rust rust search")),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-2")),
+          ("body".into(), json!("rust query")),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    assert_eq!(first.hits.len(), 1);
+    let token = first.next_search_after.clone().expect("next_search_after");
+
+    let second = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: Some(token),
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    assert_eq!(second.hits.len(), 1);
+    assert_ne!(second.hits[0].doc_id, first.hits[0].doc_id);
+  }
+
+  #[test]
+  fn inner_hits_use_inner_sort_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "author".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+    schema.keyword_fields.push(KeywordField {
+      name: "title".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+    schema.numeric_fields.push(NumericField {
+      name: "rank".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("a-1")),
+          ("body".into(), json!("rust search")),
+          ("author".into(), json!("alice")),
+          ("title".into(), json!("beta")),
+          ("rank".into(), json!(2)),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("a-2")),
+          ("body".into(), json!("rust systems")),
+          ("author".into(), json!("alice")),
+          ("title".into(), json!("alpha")),
+          ("rank".into(), json!(1)),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("b-1")),
+          ("body".into(), json!("rust memory")),
+          ("author".into(), json!("bob")),
+          ("title".into(), json!("gamma")),
+          ("rank".into(), json!(3)),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let resp = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 10,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: vec![SortSpec {
+          field: "rank".into(),
+          order: Some(SortOrder::Asc),
+        }],
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: true,
+        highlight_field: None,
+        highlight: None,
+        collapse: Some(CollapseRequest {
+          field: "author".into(),
+          inner_hits: Some(InnerHitsRequest {
+            size: Some(2),
+            from: Some(0),
+            sort: vec![SortSpec {
+              field: "title".into(),
+              order: Some(SortOrder::Asc),
+            }],
+          }),
+        }),
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let alice_group = resp
+      .hits
+      .iter()
+      .find(|hit| hit.inner_hits.as_ref().map(|h| h.len()) == Some(1))
+      .expect("expected collapsed group with one inner hit");
+    let inner = alice_group.inner_hits.as_ref().expect("inner hits present");
+    assert_eq!(inner[0].doc_id, "a-1");
+    let sort_key = inner[0].sort_key.as_ref().expect("inner hit sort_key");
+    assert_eq!(sort_key.first().expect("sort value"), &json!("beta"));
+  }
+
+  #[test]
+  fn cursor_rejects_from_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-1")),
+          ("body".into(), json!("rust rust search")),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-2")),
+          ("body".into(), json!("rust query")),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    let cursor = first.next_cursor.clone().expect("next_cursor");
+
+    let err = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 1,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: Some(cursor),
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap_err();
+    assert!(err
+      .to_string()
+      .contains("from must be 0 when using cursor pagination"));
+  }
+
+  #[test]
+  fn cursor_rejects_search_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-1")),
+          ("body".into(), json!("rust rust search")),
+        ]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([
+          ("_id".into(), json!("doc-2")),
+          ("body".into(), json!("rust query")),
+        ]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    let cursor = first.next_cursor.clone().expect("next_cursor");
+    let token = first.next_search_after.clone().expect("next_search_after");
+
+    let err = reader
+      .search(&SearchRequest {
+        query: Query::String("rust".into()),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: Some(cursor),
+        search_after: Some(token),
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs: BTreeMap::new(),
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap_err();
+    assert!(err
+      .to_string()
+      .contains("cursor cannot be combined with search_after"));
+  }
+
+  #[test]
+  fn mget_skips_deleted_docs_and_preserves_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([("_id".into(), json!("a")), ("body".into(), json!("first"))]),
+      })
+      .unwrap();
+    writer
+      .add_document(&Document {
+        fields: BTreeMap::from([("_id".into(), json!("b")), ("body".into(), json!("second"))]),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer.delete_documents(&["b".into()]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader
+      .mget(&["a".into(), "b".into(), "missing".into()], true)
+      .unwrap();
+    assert_eq!(docs.len(), 3);
+    assert!(docs[0].found);
+    assert!(docs[0]._source.is_some());
+    assert!(!docs[1].found);
+    assert!(docs[1]._source.is_none());
+    assert!(!docs[2].found);
   }
 
   #[test]
@@ -4307,12 +5245,14 @@ mod tests {
         fields: None,
         filter: None,
         limit: 5,
+        from: 0,
         return_hits: true,
         candidate_size: None,
         #[cfg(feature = "vectors")]
         max_global_vector_candidates: None,
         sort: Vec::new(),
         cursor: None,
+        search_after: None,
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
@@ -4664,12 +5604,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 10,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,

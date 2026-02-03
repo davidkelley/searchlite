@@ -9,14 +9,15 @@ pub use crate::index::Index;
 pub use builder::IndexBuilder;
 pub use errors::AggregationError;
 pub use reader::{
-  ExecutionProfile, FunctionExplanation, Hit, HitExplanation, IndexReader, ProfileResult,
-  RescoreExplanation, SearchResult,
+  ExecutionProfile, FunctionExplanation, Hit, HitExplanation, IndexReader, MultiSearchResponse,
+  ProfileResult, RescoreExplanation, SearchResult,
 };
 pub use types::{
   Aggregation, AggregationResponse, Aggregations, CollapseRequest, DecayFunction, Document,
   FieldValueModifier, Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, FuzzyOptions,
-  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, Query, QueryNode,
-  RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SortSpec,
-  StorageType, SuggestOption, SuggestRequest, SuggestResult,
+  HighlightField, HighlightRequest, IndexOptions, InnerHitsRequest, MgetDoc, MgetRequest,
+  MgetResponse, MultiSearchRequest, Query, QueryNode, RankFeatureModifier, RescoreMode,
+  RescoreRequest, SearchRequest, SortOrder, SortSpec, StorageType, SuggestOption, SuggestRequest,
+  SuggestResult,
 };
 pub use writer::IndexWriter;

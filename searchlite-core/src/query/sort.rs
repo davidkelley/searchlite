@@ -6,6 +6,7 @@ use crate::api::types::{SortOrder, SortSpec};
 use crate::index::manifest::{FieldKind, Schema};
 use crate::index::segment::SegmentReader;
 use crate::DocId;
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 enum SortField {
@@ -234,6 +235,59 @@ impl SortPlan {
       .fields
       .iter()
       .any(|f| matches!(f.field, SortField::Score))
+  }
+
+  pub fn len(&self) -> usize {
+    self.fields.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.fields.is_empty()
+  }
+
+  pub fn values_from_json(&self, values: &[Value]) -> Result<Vec<SortValue>> {
+    if values.len() != self.fields.len() {
+      bail!(
+        "search_after contained {} sort values but plan expects {}",
+        values.len(),
+        self.fields.len()
+      );
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for (spec, raw) in self.fields.iter().zip(values.iter()) {
+      let value = match (&spec.field, raw) {
+        (_, Value::Null) => SortValue::Missing,
+        (SortField::Score, Value::Number(n)) => {
+          let f = n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
+          SortValue::Score(f as f32)
+        }
+        (SortField::Keyword(_), Value::String(s)) => SortValue::Str(s.clone()),
+        (SortField::I64(_), Value::Number(n)) => {
+          let i = n
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be integer"))?;
+          SortValue::I64(i)
+        }
+        (SortField::F64(_), Value::Number(n)) => {
+          let f = n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
+          SortValue::F64(f)
+        }
+        (SortField::Keyword(_), _) => {
+          bail!("search_after sort value must be string for keyword fields")
+        }
+        (SortField::Score, _) => bail!("search_after sort value must be number for _score"),
+        (SortField::I64(_), _) => {
+          bail!("search_after sort value must be integer for numeric field")
+        }
+        (SortField::F64(_), _) => bail!("search_after sort value must be number for numeric field"),
+      };
+      out.push(value);
+    }
+    Ok(out)
   }
 
   pub fn build_key(

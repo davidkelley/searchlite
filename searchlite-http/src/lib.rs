@@ -16,16 +16,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use searchlite_core::api::builder::IndexBuilder;
-use searchlite_core::api::types::{Document, IndexOptions, SearchRequest, StorageType};
-use searchlite_core::api::SearchResult;
+use searchlite_core::api::types::{
+  Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
+};
+use searchlite_core::api::{MultiSearchResponse, SearchResult};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
@@ -403,6 +407,10 @@ impl AppState {
 const INGEST_CHANNEL_BUFFER_BATCHES: usize = 4;
 /// Max documents per NDJSON batch.
 const NDJSON_BATCH_SIZE: usize = 1000;
+const MAX_PAGE_SIZE: usize = 1_000;
+const MAX_MGET_IDS: usize = 1_024;
+const DEFAULT_MULTI_SEARCH_MAX_CONCURRENCY: usize = 4;
+const HARD_MULTI_SEARCH_MAX_CONCURRENCY: usize = 16;
 
 #[derive(Debug)]
 enum IngestMsg {
@@ -621,6 +629,8 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/indexes/:name/refresh", post(refresh))
     .route("/indexes/:name/compact", post(compact))
     .route("/indexes/:name/search", post(search))
+    .route("/indexes/:name/mget", post(mget))
+    .route("/indexes/:name/multi_search", post(multi_search))
     .route("/indexes/:name/inspect", get(inspect))
     .route("/indexes/:name/stats", get(stats))
     .with_state(state)
@@ -1204,6 +1214,35 @@ async fn search(
       "invalid limit: must be greater than zero (set limit to a positive integer)",
     ));
   }
+  if request.cursor.is_some() && request.search_after.is_some() {
+    return Err(HttpError::bad_request(
+      "invalid_pagination",
+      "cursor cannot be combined with search_after; supply only one pagination token",
+    ));
+  }
+  if request.search_after.is_some() && request.from > 0 {
+    return Err(HttpError::bad_request(
+      "invalid_pagination",
+      "search_after cannot be combined with from; choose one pagination method",
+    ));
+  }
+  if request.cursor.is_some() && request.from > 0 {
+    return Err(HttpError::bad_request(
+      "invalid_pagination",
+      "from must be 0 when using cursor pagination; remove from or use offset pagination alone",
+    ));
+  }
+  if request.cursor.is_some() {
+    request.search_after = None;
+    request.from = 0;
+  }
+  let page_cap = request.from.saturating_add(request.limit);
+  if request.return_hits && page_cap > MAX_PAGE_SIZE {
+    return Err(HttpError::bad_request(
+      "page_too_large",
+      format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
+    ));
+  }
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
@@ -1227,6 +1266,197 @@ async fn search(
   })?
   .map_err(|err| HttpError::from_anyhow("search_failed", StatusCode::BAD_REQUEST, err))?;
   Ok(Json(result))
+}
+
+async fn mget(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  payload: Result<Json<MgetRequest>, JsonRejection>,
+) -> ApiResult<Json<MgetResponse>> {
+  let body = parse_json(payload)?;
+  if body.ids.is_empty() {
+    return Err(HttpError::bad_request(
+      "missing_ids",
+      "ids array must contain at least one document id",
+    ));
+  }
+  if body.ids.len() > MAX_MGET_IDS {
+    return Err(HttpError::bad_request(
+      "too_many_ids",
+      format!("mget supports up to {MAX_MGET_IDS} ids per request"),
+    ));
+  }
+  validate_ids(&body.ids)?;
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
+  let return_stored = body.return_stored;
+  let ids = body.ids.clone();
+  let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<MgetResponse> {
+    let reader = index.reader()?;
+    let docs = reader.mget(&ids, return_stored)?;
+    Ok(MgetResponse { docs })
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "mget_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
+  .map_err(|err| HttpError::from_anyhow("mget_failed", StatusCode::BAD_REQUEST, err))?;
+  Ok(Json(resp))
+}
+
+async fn multi_search(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  payload: Result<Json<MultiSearchRequest>, JsonRejection>,
+) -> ApiResult<Json<MultiSearchResponse>> {
+  let mut body = parse_json(payload)?;
+  if body.searches.is_empty() {
+    return Err(HttpError::bad_request(
+      "missing_searches",
+      "searches array must contain at least one search request",
+    ));
+  }
+  // Validate each sub-request to mirror /search pagination and page-size rules.
+  let validate_search = |req: &SearchRequest| -> Result<(), HttpError> {
+    if req.limit == 0 {
+      if req.cursor.is_some() {
+        return Err(HttpError::bad_request(
+          "invalid_cursor",
+          "cursor is not supported when limit is 0",
+        ));
+      }
+      return Err(HttpError::bad_request(
+        "invalid_limit",
+        "invalid limit: must be greater than zero (set limit to a positive integer)",
+      ));
+    }
+    let has_cursor = req.cursor.is_some();
+    let tmp_from = if has_cursor { 0 } else { req.from };
+    if has_cursor && req.search_after.is_some() {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "cursor cannot be combined with search_after; choose one pagination method",
+      ));
+    }
+    if has_cursor && req.from > 0 {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "from must be 0 when using cursor pagination",
+      ));
+    }
+    if req.search_after.is_some() && req.from > 0 {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "search_after cannot be combined with from; choose one pagination method",
+      ));
+    }
+    let cap = tmp_from.saturating_add(req.limit);
+    if req.return_hits && cap > MAX_PAGE_SIZE {
+      return Err(HttpError::bad_request(
+        "page_too_large",
+        format!("from + size exceeds max page size {MAX_PAGE_SIZE}"),
+      ));
+    }
+    Ok(())
+  };
+  for req in body.searches.iter() {
+    validate_search(req)?;
+  }
+  let managed = state.registry().resolve(&index_name)?;
+  #[cfg(feature = "vectors")]
+  {
+    for req in body.searches.iter_mut() {
+      req
+        .max_global_vector_candidates
+        .get_or_insert(managed.max_vector_candidates);
+    }
+  }
+  let index = managed.require_index().await?;
+  let parallel = body.parallel;
+  let max_concurrency = body
+    .max_concurrency
+    .unwrap_or(DEFAULT_MULTI_SEARCH_MAX_CONCURRENCY)
+    .clamp(1, HARD_MULTI_SEARCH_MAX_CONCURRENCY);
+
+  if !parallel {
+    let searches = body.searches.clone();
+    let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<MultiSearchResponse> {
+      let reader = index.reader()?;
+      let mut results = Vec::with_capacity(searches.len());
+      for mut req in searches.into_iter() {
+        if req.cursor.is_some() {
+          req.search_after = None;
+          req.from = 0;
+        }
+        results.push(reader.search(&req)?);
+      }
+      Ok(MultiSearchResponse { results })
+    })
+    .await
+    .map_err(|err| {
+      HttpError::from_anyhow(
+        "multi_search_join",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!(err.to_string()),
+      )
+    })?
+    .map_err(|err| HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err))?;
+    return Ok(Json(resp));
+  }
+
+  let searches = body.searches.clone();
+  let idx = index.clone();
+  let semaphore = Arc::new(Semaphore::new(max_concurrency));
+  let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
+  for (search_idx, mut req) in searches.into_iter().enumerate() {
+    if req.cursor.is_some() {
+      req.search_after = None;
+      req.from = 0;
+    }
+    let semaphore_clone = semaphore.clone();
+    let index_clone = idx.clone();
+    tasks.push(async move {
+      let permit = semaphore_clone.acquire_owned().await.map_err(|err| {
+        HttpError::from_anyhow(
+          "multi_search_cancelled",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(err.to_string()),
+        )
+      })?;
+      let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
+        let _permit = permit;
+        let reader = index_clone.reader()?;
+        reader.search(&req)
+      });
+      let joined = handle.await.map_err(|err: tokio::task::JoinError| {
+        HttpError::from_anyhow(
+          "multi_search_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(err.to_string()),
+        )
+      })?;
+      let search_res = joined.map_err(|err| {
+        HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
+      })?;
+      Ok::<(usize, SearchResult), HttpError>((search_idx, search_res))
+    });
+  }
+  let mut results: Vec<Option<SearchResult>> = vec![None; tasks.len()];
+  while let Some(res) = tasks.next().await {
+    let (idx_search, search_res) = res?;
+    if let Some(slot) = results.get_mut(idx_search) {
+      *slot = Some(search_res);
+    }
+  }
+  let results: Vec<SearchResult> = results
+    .into_iter()
+    .map(|r| r.expect("multi_search invariant violated: missing SearchResult for a task"))
+    .collect();
+  Ok(Json(MultiSearchResponse { results }))
 }
 
 async fn inspect(
@@ -1362,8 +1592,9 @@ mod tests {
   use searchlite_core::api::types::VectorQuery;
   use searchlite_core::api::types::{
     Aggregation, AggregationResponse, CollapseRequest, ExecutionStrategy, HighlightField,
-    HighlightRequest, Query, SuggestRequest,
+    HighlightRequest, MgetResponse, MultiSearchRequest, Query, SuggestRequest,
   };
+  use searchlite_core::api::MultiSearchResponse;
   #[cfg(feature = "vectors")]
   use searchlite_core::api::QueryNode;
   use serde_json::json;
@@ -1475,12 +1706,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 5,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
@@ -1618,12 +1851,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 5,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
@@ -1741,12 +1976,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 2,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
@@ -1774,6 +2011,389 @@ mod tests {
     assert_eq!(body.hits[0].doc_id, "vec-1");
     assert!(body.hits[0].vector_score.is_some());
     assert!(body.hits.iter().all(|h| h.doc_id != "no-vector"));
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[cfg(feature = "vectors")]
+  #[tokio::test]
+  async fn multi_search_applies_server_vector_cap() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let mut args = default_args(dir.path().join("idx-multi-vector-cap"));
+    args.max_vector_candidates = 1;
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = Arc::new(AppState::new(registry));
+    let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
+    let client = Client::new();
+    let base = format!("http://{}", addr);
+    let index_base = format!("{base}/indexes/{INDEX_NAME}");
+
+    let schema: Schema = serde_json::from_value(json!({
+      "doc_id_field": "_id",
+      "text_fields": [
+        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+      ],
+      "keyword_fields": [],
+      "numeric_fields": [],
+      "nested_fields": [],
+      "vector_fields": [
+        { "name": "embedding", "dim": 2, "metric": "Cosine" }
+      ]
+    }))
+    .unwrap();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = json!({
+      "docs": [
+        { "_id": "vec-1", "body": "rust search", "embedding": [1.0, 0.0] },
+        { "_id": "vec-2", "body": "other doc", "embedding": [0.0, 1.0] }
+      ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let vector_a = QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0],
+      k: Some(2),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: None,
+      boost: None,
+    });
+    let vector_b = QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![0.0, 1.0],
+      k: Some(2),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: None,
+      boost: None,
+    });
+    let request = SearchRequest {
+      query: Query::Node(QueryNode::Bool {
+        must: vec![],
+        should: vec![vector_a, vector_b],
+        must_not: vec![],
+        filter: vec![],
+        minimum_should_match: Some(1),
+        boost: None,
+      }),
+      fields: None,
+      filter: None,
+      limit: 2,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      vector_query: None,
+      vector_filter: None,
+      return_stored: true,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let req = MultiSearchRequest {
+      searches: vec![request],
+      parallel: false,
+      max_concurrency: None,
+    };
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "multi_search_failed");
+    assert!(err.error.reason.contains("max_global_vector_candidates"));
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_mget_and_missing_order() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-mget");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let req = serde_json::json!({ "ids": ["1", "missing", "2", "1"], "return_stored": true });
+    let res = client
+      .post(format!("{index_base}/mget"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MgetResponse = res.json().await.unwrap();
+    assert_eq!(body.docs.len(), 4);
+    assert!(body.docs[0].found);
+    assert!(!body.docs[1].found);
+    assert!(body.docs[2].found);
+    assert!(body.docs[3].found);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_from_and_search_after() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-page");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema: Schema = serde_json::from_value(serde_json::json!({
+      "doc_id_field": "_id",
+      "text_fields": [
+        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+      ],
+      "keyword_fields": [],
+      "numeric_fields": [
+        { "name": "rank", "stored": true, "fast": true, "nullable": false, "i64": true }
+      ],
+      "nested_fields": [],
+      "vector_fields": []
+    }))
+    .unwrap();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = "{\"_id\":\"a\",\"body\":\"rust one\",\"rank\":1}\n\
+                  {\"_id\":\"b\",\"body\":\"rust two\",\"rank\":2}\n\
+                  {\"_id\":\"c\",\"body\":\"rust three\",\"rank\":3}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let first_req = serde_json::json!({
+      "query": "rust",
+      "limit": 1,
+      "return_stored": true,
+      "sort": [{ "field": "rank", "order": "asc" }]
+    });
+    let first_res = client
+      .post(format!("{index_base}/search"))
+      .json(&first_req)
+      .send()
+      .await
+      .unwrap();
+    assert!(first_res.status().is_success());
+    let first_body: SearchResult = first_res.json().await.unwrap();
+    assert_eq!(first_body.hits.len(), 1);
+    let first_id = &first_body.hits[0].doc_id;
+    assert_eq!(first_id, "a");
+    let token = first_body
+      .next_search_after
+      .clone()
+      .expect("next_search_after present");
+
+    let second_req = serde_json::json!({
+      "query": "rust",
+      "limit": 1,
+      "search_after": token,
+      "return_stored": true,
+      "sort": [{ "field": "rank", "order": "asc" }]
+    });
+    let second_res = client
+      .post(format!("{index_base}/search"))
+      .json(&second_req)
+      .send()
+      .await
+      .unwrap();
+    let second_body: SearchResult = second_res.json().await.unwrap();
+    assert_eq!(second_body.hits.len(), 1);
+    assert_ne!(second_body.hits[0].doc_id, *first_id);
+    assert_eq!(second_body.hits[0].doc_id, "b");
+
+    let from_req = serde_json::json!({
+      "query": "rust",
+      "limit": 1,
+      "from": 1,
+      "return_stored": true,
+      "sort": [{ "field": "rank", "order": "asc" }]
+    });
+    let from_res = client
+      .post(format!("{index_base}/search"))
+      .json(&from_req)
+      .send()
+      .await
+      .unwrap();
+    let from_body: SearchResult = from_res.json().await.unwrap();
+    assert_eq!(from_body.hits.len(), 1);
+    assert_eq!(from_body.hits[0].doc_id, "b");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_multi_search() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-multi");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson = "{\"_id\":\"1\",\"body\":\"rust\"}\n{\"_id\":\"2\",\"body\":\"go\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let req = MultiSearchRequest {
+      searches: vec![
+        SearchRequest {
+          query: Query::String("rust".into()),
+          fields: None,
+          filter: None,
+          limit: 1,
+          from: 0,
+          return_hits: true,
+          candidate_size: None,
+          #[cfg(feature = "vectors")]
+          max_global_vector_candidates: None,
+          sort: vec![],
+          cursor: None,
+          search_after: None,
+          execution: ExecutionStrategy::Wand,
+          bmw_block_size: None,
+          fuzzy: None,
+          #[cfg(feature = "vectors")]
+          vector_query: None,
+          #[cfg(feature = "vectors")]
+          vector_filter: None,
+          return_stored: false,
+          highlight_field: None,
+          highlight: None,
+          collapse: None,
+          aggs: BTreeMap::new(),
+          suggest: BTreeMap::new(),
+          rescore: None,
+          explain: false,
+          profile: false,
+        },
+        SearchRequest {
+          query: Query::String("go".into()),
+          fields: None,
+          filter: None,
+          limit: 1,
+          from: 0,
+          return_hits: true,
+          candidate_size: None,
+          #[cfg(feature = "vectors")]
+          max_global_vector_candidates: None,
+          sort: vec![],
+          cursor: None,
+          search_after: None,
+          execution: ExecutionStrategy::Wand,
+          bmw_block_size: None,
+          fuzzy: None,
+          #[cfg(feature = "vectors")]
+          vector_query: None,
+          #[cfg(feature = "vectors")]
+          vector_filter: None,
+          return_stored: false,
+          highlight_field: None,
+          highlight: None,
+          collapse: None,
+          aggs: BTreeMap::new(),
+          suggest: BTreeMap::new(),
+          rescore: None,
+          explain: false,
+          profile: false,
+        },
+      ],
+      parallel: true,
+      max_concurrency: Some(2),
+    };
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MultiSearchResponse = res.json().await.unwrap();
+    assert_eq!(body.results.len(), 2);
+    assert_eq!(body.results[0].hits.first().unwrap().doc_id, "1");
+    assert_eq!(body.results[1].hits.first().unwrap().doc_id, "2");
 
     handle.abort();
     let _ = handle.await;
@@ -2109,12 +2729,14 @@ mod tests {
       fields: None,
       filter: None,
       limit: 5,
+      from: 0,
       return_hits: true,
       candidate_size: None,
       #[cfg(feature = "vectors")]
       max_global_vector_candidates: None,
       sort: Vec::new(),
       cursor: None,
+      search_after: None,
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
