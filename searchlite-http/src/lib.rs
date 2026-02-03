@@ -1313,7 +1313,7 @@ async fn multi_search(
   Path(index_name): Path<String>,
   payload: Result<Json<MultiSearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<MultiSearchResponse>> {
-  let body = parse_json(payload)?;
+  let mut body = parse_json(payload)?;
   if body.searches.is_empty() {
     return Err(HttpError::bad_request(
       "missing_searches",
@@ -1367,6 +1367,14 @@ async fn multi_search(
     validate_search(req)?;
   }
   let managed = state.registry().resolve(&index_name)?;
+  #[cfg(feature = "vectors")]
+  {
+    for req in body.searches.iter_mut() {
+      req
+        .max_global_vector_candidates
+        .get_or_insert(managed.max_vector_candidates);
+    }
+  }
   let index = managed.require_index().await?;
   let parallel = body.parallel;
   let max_concurrency = body
@@ -2003,6 +2011,132 @@ mod tests {
     assert_eq!(body.hits[0].doc_id, "vec-1");
     assert!(body.hits[0].vector_score.is_some());
     assert!(body.hits.iter().all(|h| h.doc_id != "no-vector"));
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[cfg(feature = "vectors")]
+  #[tokio::test]
+  async fn multi_search_applies_server_vector_cap() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let mut args = default_args(dir.path().join("idx-multi-vector-cap"));
+    args.max_vector_candidates = 1;
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = Arc::new(AppState::new(registry));
+    let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
+    let client = Client::new();
+    let base = format!("http://{}", addr);
+    let index_base = format!("{base}/indexes/{INDEX_NAME}");
+
+    let schema: Schema = serde_json::from_value(json!({
+      "doc_id_field": "_id",
+      "text_fields": [
+        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+      ],
+      "keyword_fields": [],
+      "numeric_fields": [],
+      "nested_fields": [],
+      "vector_fields": [
+        { "name": "embedding", "dim": 2, "metric": "Cosine" }
+      ]
+    }))
+    .unwrap();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = json!({
+      "docs": [
+        { "_id": "vec-1", "body": "rust search", "embedding": [1.0, 0.0] },
+        { "_id": "vec-2", "body": "other doc", "embedding": [0.0, 1.0] }
+      ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let vector_a = QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0],
+      k: Some(2),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: None,
+      boost: None,
+    });
+    let vector_b = QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![0.0, 1.0],
+      k: Some(2),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: None,
+      boost: None,
+    });
+    let request = SearchRequest {
+      query: Query::Node(QueryNode::Bool {
+        must: vec![],
+        should: vec![vector_a, vector_b],
+        must_not: vec![],
+        filter: vec![],
+        minimum_should_match: Some(1),
+        boost: None,
+      }),
+      fields: None,
+      filter: None,
+      limit: 2,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      vector_query: None,
+      vector_filter: None,
+      return_stored: true,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let req = MultiSearchRequest {
+      searches: vec![request],
+      parallel: false,
+      max_concurrency: None,
+    };
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "multi_search_failed");
+    assert!(err.error.reason.contains("max_global_vector_candidates"));
 
     handle.abort();
     let _ = handle.await;
