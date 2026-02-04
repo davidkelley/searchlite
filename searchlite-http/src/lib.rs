@@ -555,6 +555,40 @@ struct UpdateResponse {
   updated: bool,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdateAction {
+  update: BulkUpdateActionMeta,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdateActionMeta {
+  #[serde(rename = "_id")]
+  id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdatePatch {
+  #[serde(default)]
+  set: BTreeMap<String, serde_json::Value>,
+  #[serde(default)]
+  unset: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BulkUpdateItem {
+  id: String,
+  status: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BulkUpdateResponse {
+  updated: u64,
+  failed: u64,
+  items: Vec<BulkUpdateItem>,
+}
+
 impl HttpError {
   fn bad_request(kind: &'static str, reason: impl Into<String>) -> Self {
     Self {
@@ -639,6 +673,7 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/indexes/:name/add", post(add_ndjson))
     .route("/indexes/:name/bulk", post(bulk_ingest))
     .route("/indexes/:name/update", post(update_document))
+    .route("/indexes/:name/_bulk_update", post(bulk_update))
     .route("/indexes/:name/delete", post(delete_documents))
     .route("/indexes/:name/commit", post(commit))
     .route("/indexes/:name/refresh", post(refresh))
@@ -1146,6 +1181,138 @@ async fn update_document(
   .map_err(|err| {
     HttpError::from_anyhow(
       "update_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
+}
+
+async fn bulk_update(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  headers: HeaderMap,
+  body: Body,
+) -> ApiResult<Json<BulkUpdateResponse>> {
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
+
+  let mapped_stream = body
+    .into_data_stream()
+    .map(|chunk| chunk.map_err(io::Error::other));
+  let mut reader = StreamReader::new(mapped_stream);
+  let mut buf = String::new();
+  let mut line_number = 0usize;
+  let mut pending_action: Option<String> = None;
+  let mut updates: Vec<(String, BulkUpdatePatch)> = Vec::new();
+
+  loop {
+    buf.clear();
+    let read = reader
+      .read_line(&mut buf)
+      .await
+      .map_err(|e| HttpError::from_anyhow("read_body", StatusCode::BAD_REQUEST, e.into()))?;
+    if read == 0 {
+      break;
+    }
+    line_number += 1;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+
+    if pending_action.is_none() {
+      let action: BulkUpdateAction = serde_json::from_str(trimmed).map_err(|e| {
+        HttpError::bad_request(
+          "invalid_bulk_update",
+          format!("invalid update action on NDJSON line {}: {e}", line_number),
+        )
+      })?;
+      pending_action = Some(action.update.id);
+    } else {
+      let patch: BulkUpdatePatch = serde_json::from_str(trimmed).map_err(|e| {
+        HttpError::bad_request(
+          "invalid_bulk_update",
+          format!("invalid update body on NDJSON line {}: {e}", line_number),
+        )
+      })?;
+      let id = pending_action
+        .take()
+        .expect("pending action must exist for update body");
+      updates.push((id, patch));
+    }
+  }
+
+  if pending_action.is_some() {
+    return Err(HttpError::bad_request(
+      "invalid_bulk_update",
+      "update action missing corresponding body line",
+    ));
+  }
+
+  let writer_lock = managed.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _writer_guard = writer_lock.blocking_lock();
+    let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
+      let msg = e.to_string().to_lowercase();
+      let status = if msg.contains("write key") || msg.contains("unauthorized") {
+        if write_key.is_some() {
+          StatusCode::FORBIDDEN
+        } else {
+          StatusCode::UNAUTHORIZED
+        }
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      HttpError::from_anyhow("writer_open", status, e)
+    })?;
+    let mut updated = 0u64;
+    let mut failed = 0u64;
+    let mut items = Vec::with_capacity(updates.len());
+    for (id, patch) in updates {
+      match writer.apply_patch(&id, &patch.set, &patch.unset) {
+        Ok(()) => {
+          updated = updated.saturating_add(1);
+          items.push(BulkUpdateItem {
+            id,
+            status: StatusCode::OK.as_u16(),
+            error: None,
+          });
+        }
+        Err(err) => {
+          failed = failed.saturating_add(1);
+          let msg = err.to_string();
+          let status = if msg.contains("document not found") {
+            StatusCode::NOT_FOUND.as_u16()
+          } else {
+            StatusCode::BAD_REQUEST.as_u16()
+          };
+          items.push(BulkUpdateItem {
+            id,
+            status,
+            error: Some(msg),
+          });
+        }
+      }
+    }
+    Ok(Json(BulkUpdateResponse {
+      updated,
+      failed,
+      items,
+    }))
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "bulk_update_join",
       StatusCode::INTERNAL_SERVER_ERROR,
       anyhow::anyhow!(err.to_string()),
     )
@@ -2330,6 +2497,60 @@ mod tests {
       .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["docs"][0]["_source"]["body"], "updated");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_bulk_update_best_effort() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "doc-1", "body": "hello" } ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = [
+      r#"{"update":{"_id":"doc-1"}}"#,
+      r#"{"set":{"body":"updated"}}"#,
+      r#"{"update":{"_id":"missing"}}"#,
+      r#"{"set":{"body":"nope"}}"#,
+      "",
+    ]
+    .join("\n");
+
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["updated"], 1);
+    assert_eq!(body["failed"], 1);
 
     handle.abort();
     let _ = handle.await;
