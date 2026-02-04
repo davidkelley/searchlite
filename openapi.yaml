@@ -120,6 +120,81 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /indexes/{name}/update:
+    post:
+      summary: Update document fields
+      description: >
+        Partially update stored fields using `set`/`unset`. Updates are queued in the index
+        writer and require `/indexes/{name}/commit` (and optionally `/indexes/{name}/refresh`)
+        before they become visible to searches.
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+        - $ref: "#/components/parameters/WriteKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRequest"
+      responses:
+        "200":
+          description: Update queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateResponse"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Document or index missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /indexes/{name}/_bulk_update:
+    post:
+      summary: Bulk update documents with NDJSON pairs
+      description: >
+        Send NDJSON pairs consisting of an update action line and a patch line. The server
+        processes updates in best-effort mode and returns per-item status. Updates are queued
+        and require `/indexes/{name}/commit` before they become visible.
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+        - $ref: "#/components/parameters/WriteKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+            example: |
+              {"update":{"_id":"1"}}
+              {"set":{"available":8},"unset":["metadata.alt"]}
+              {"update":{"_id":"missing"}}
+              {"set":{"available":0}}
+      responses:
+        "200":
+          description: Bulk update results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkUpdateResponse"
+        "400":
+          description: Invalid NDJSON or update payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Index missing or uninitialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /indexes/{name}/delete:
     post:
       summary: Queue document deletions by id
@@ -507,6 +582,53 @@ components:
           items:
             $ref: "#/components/schemas/Document"
       required: [docs]
+    UpdateRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        set:
+          type: object
+          additionalProperties: true
+          default: {}
+        unset:
+          type: array
+          items:
+            type: string
+          default: []
+      required: [id]
+    UpdateResponse:
+      type: object
+      properties:
+        updated:
+          type: boolean
+      required: [updated]
+    BulkUpdateItem:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: integer
+          format: int32
+        error:
+          type: string
+          nullable: true
+      required: [id, status]
+    BulkUpdateResponse:
+      type: object
+      properties:
+        updated:
+          type: integer
+          format: int64
+        failed:
+          type: integer
+          format: int64
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BulkUpdateItem"
+      required: [updated, failed, items]
     Document:
       type: object
       description: |
