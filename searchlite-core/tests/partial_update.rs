@@ -29,7 +29,8 @@ fn update_set_unset_top_level_fields() {
     "numeric_fields": [
       { "name": "count", "i64": true, "fast": false, "stored": true, "nullable": false }
     ],
-    "nested_fields": []
+    "nested_fields": [],
+    "vector_fields": []
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -76,7 +77,8 @@ fn update_supports_nested_paths() {
           { "type": "keyword", "name": "alt", "stored": true, "indexed": true, "fast": false, "nullable": true }
         ]
       }
-    ]
+    ],
+    "vector_fields": []
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -158,7 +160,8 @@ fn update_rejects_nonstored_indexed_fields() {
     ],
     "keyword_fields": [],
     "numeric_fields": [],
-    "nested_fields": []
+    "nested_fields": [],
+    "vector_fields": []
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();

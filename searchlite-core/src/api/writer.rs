@@ -442,10 +442,7 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
   Ok(doc_id.to_string())
 }
 
-fn load_document_for_patch(
-  inner: Arc<InnerIndex>,
-  doc_id: &str,
-) -> Result<Option<Document>> {
+fn load_document_for_patch(inner: Arc<InnerIndex>, doc_id: &str) -> Result<Option<Document>> {
   let reader = IndexReader::open(inner)?;
   let mut docs = reader.mget(&[doc_id.to_string()], true)?;
   let Some(found) = docs.pop() else {
@@ -513,11 +510,7 @@ fn value_to_document(value: serde_json::Value) -> Result<Document> {
   Ok(Document { fields })
 }
 
-fn set_path(
-  root: &mut serde_json::Value,
-  path: &str,
-  value: serde_json::Value,
-) -> Result<()> {
+fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) -> Result<()> {
   let mut parts = path.split('.').peekable();
   if parts.peek().is_none() {
     bail!("path must not be empty");
