@@ -7,6 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
+use crate::api::reader::IndexReader;
 use crate::api::types::Document;
 use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::{SegmentFileMeta, SegmentWriter};
@@ -189,6 +190,29 @@ impl IndexWriter {
         .pending_ops
         .push(PendingOp::Delete { doc_id: id.clone() });
     }
+    Ok(())
+  }
+
+  pub fn apply_patch(
+    &mut self,
+    doc_id: &str,
+    set: &BTreeMap<String, serde_json::Value>,
+    unset: &[String],
+  ) -> Result<()> {
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    let mut doc = load_document_for_patch(inner.clone(), doc_id)?
+      .ok_or_else(|| anyhow!("document not found"))?;
+    let mut value = document_to_value(&doc)?;
+    for path in unset.iter() {
+      unset_path(&mut value, path)?;
+    }
+    for (path, val) in set.iter() {
+      set_path(&mut value, path, val.clone())?;
+    }
+    doc = value_to_document(value)?;
+    self.schema.validate_document(&doc)?;
+    self.add_document_locked(&doc)?;
     Ok(())
   }
 
@@ -414,6 +438,103 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
   }
   validate_doc_id(doc_id)?;
   Ok(doc_id.to_string())
+}
+
+fn load_document_for_patch(
+  inner: Arc<InnerIndex>,
+  doc_id: &str,
+) -> Result<Option<Document>> {
+  let reader = IndexReader::open(inner)?;
+  let mut docs = reader.mget(&[doc_id.to_string()], true)?;
+  let Some(found) = docs.pop() else {
+    return Ok(None);
+  };
+  if !found.found {
+    return Ok(None);
+  }
+  let source = found
+    ._source
+    .ok_or_else(|| anyhow!("stored fields are unavailable for document {doc_id}"))?;
+  value_to_document(source).map(Some)
+}
+
+fn document_to_value(doc: &Document) -> Result<serde_json::Value> {
+  let mut map = serde_json::Map::new();
+  for (k, v) in doc.fields.iter() {
+    map.insert(k.clone(), v.clone());
+  }
+  Ok(serde_json::Value::Object(map))
+}
+
+fn value_to_document(value: serde_json::Value) -> Result<Document> {
+  let Some(obj) = value.as_object() else {
+    bail!("document must be a JSON object");
+  };
+  let mut fields = BTreeMap::new();
+  for (k, v) in obj.iter() {
+    fields.insert(k.clone(), v.clone());
+  }
+  Ok(Document { fields })
+}
+
+fn set_path(
+  root: &mut serde_json::Value,
+  path: &str,
+  value: serde_json::Value,
+) -> Result<()> {
+  let mut parts = path.split('.').peekable();
+  if parts.peek().is_none() {
+    bail!("path must not be empty");
+  }
+  let mut current = root;
+  while let Some(part) = parts.next() {
+    let is_last = parts.peek().is_none();
+    match current {
+      serde_json::Value::Object(map) => {
+        if is_last {
+          map.insert(part.to_string(), value);
+          return Ok(());
+        }
+        let entry = map
+          .entry(part)
+          .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+          bail!("path {path} cannot traverse non-object");
+        }
+        current = entry;
+      }
+      _ => bail!("path {path} cannot traverse non-object"),
+    }
+  }
+  Ok(())
+}
+
+fn unset_path(root: &mut serde_json::Value, path: &str) -> Result<()> {
+  let mut parts = path.split('.').peekable();
+  if parts.peek().is_none() {
+    bail!("path must not be empty");
+  }
+  let mut current = root;
+  while let Some(part) = parts.next() {
+    let is_last = parts.peek().is_none();
+    match current {
+      serde_json::Value::Object(map) => {
+        if is_last {
+          map.remove(part);
+          return Ok(());
+        }
+        let Some(next) = map.get_mut(part) else {
+          return Ok(());
+        };
+        if !next.is_object() {
+          bail!("path {path} cannot traverse non-object");
+        }
+        current = next;
+      }
+      _ => bail!("path {path} cannot traverse non-object"),
+    }
+  }
+  Ok(())
 }
 
 fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<String, DocAddress>> {
