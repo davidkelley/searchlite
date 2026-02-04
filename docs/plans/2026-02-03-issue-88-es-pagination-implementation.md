@@ -1,7 +1,5 @@
 # Issue 88 ES-Style Pagination Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Verify the existing mget/from/search_after/multi_search implementation and align the public API contract (OpenAPI, JSON schema, docs) with the shipped behavior.
 
 **Architecture:** The reader and HTTP layers already implement the functionality; this plan focuses on validation and specification. We will add schema and OpenAPI entries for new pagination fields and endpoints, document the limits and pagination precedence, and add/adjust tests only if gaps are found.

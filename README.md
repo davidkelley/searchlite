@@ -353,10 +353,10 @@ curl -XPOST http://localhost:8080/indexes/default/search \
 - Maintenance endpoints:
 
 ```bash
-curl -XPOST http://localhost:8080/refresh   # lightweight reader reload
-curl -XPOST http://localhost:8080/compact   # merge segments
-curl -XGET  http://localhost:8080/inspect   # manifest + segments
-curl -XGET  http://localhost:8080/stats     # doc/segment counts
+curl -XPOST http://localhost:8080/indexes/default/refresh   # lightweight reader reload
+curl -XPOST http://localhost:8080/indexes/default/compact   # merge segments
+curl -XGET  http://localhost:8080/indexes/default/inspect   # manifest + segments
+curl -XGET  http://localhost:8080/indexes/default/stats     # doc/segment counts
 ```
 
 ### Aggregations quick reference

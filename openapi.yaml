@@ -430,6 +430,8 @@ components:
           type: array
           items:
             type: string
+          minItems: 1
+          maxItems: 1024
         return_stored:
           type: boolean
           default: false
@@ -467,6 +469,9 @@ components:
         max_concurrency:
           type: integer
           nullable: true
+          minimum: 1
+          maximum: 16
+          default: 4
       required: [searches]
     MultiSearchResponse:
       type: object
@@ -615,6 +620,7 @@ components:
         next_search_after:
           type: array
           nullable: true
+          items: {}
           description: Sort token for the next page (sort values + doc_id + segment ord).
         aggregations:
           type: object
@@ -640,6 +646,7 @@ components:
         sort_key:
           type: array
           nullable: true
+          items: {}
           description: Sort token to feed into search_after for this hit.
         fields:
           type: object
