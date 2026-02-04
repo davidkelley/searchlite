@@ -201,6 +201,8 @@ impl IndexWriter {
   ) -> Result<()> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
+    ensure_patch_safe(&self.schema)?;
+    validate_patch_fields(&self.schema, doc_id, set, unset)?;
     let mut doc = load_document_for_patch(inner.clone(), doc_id)?
       .ok_or_else(|| anyhow!("document not found"))?;
     let mut value = document_to_value(&doc)?;
@@ -456,6 +458,40 @@ fn load_document_for_patch(
     ._source
     .ok_or_else(|| anyhow!("stored fields are unavailable for document {doc_id}"))?;
   value_to_document(source).map(Some)
+}
+
+fn ensure_patch_safe(schema: &Schema) -> Result<()> {
+  for field in schema.resolved_fields().into_iter() {
+    if (field.indexed || field.fast) && !field.stored {
+      bail!(
+        "cannot update documents: field `{}` is indexed/fast but not stored",
+        field.path
+      );
+    }
+  }
+  Ok(())
+}
+
+fn validate_patch_fields(
+  schema: &Schema,
+  doc_id: &str,
+  set: &BTreeMap<String, serde_json::Value>,
+  unset: &[String],
+) -> Result<()> {
+  if set.is_empty() && unset.is_empty() {
+    bail!("update must include at least one of set or unset");
+  }
+  validate_doc_id(doc_id)?;
+  let doc_id_field = schema.doc_id_field();
+  for path in set.keys().chain(unset.iter()) {
+    if path == doc_id_field {
+      bail!("cannot update doc_id_field `{}`", doc_id_field);
+    }
+    if schema.field_meta(path).is_none() {
+      bail!("unknown field {path}");
+    }
+  }
+  Ok(())
 }
 
 fn document_to_value(doc: &Document) -> Result<serde_json::Value> {

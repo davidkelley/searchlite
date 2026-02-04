@@ -107,3 +107,78 @@ fn update_supports_nested_paths() {
   let doc = res[0]._source.clone().unwrap();
   assert_eq!(doc["metadata"]["alt"], "v2");
 }
+
+#[test]
+fn update_rejects_missing_doc() {
+  let dir = tempdir().unwrap();
+  let schema = Schema::default_text_body();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("new"));
+
+  let mut writer = idx.writer().unwrap();
+  let err = writer.apply_patch("missing", &set, &[]).unwrap_err();
+  assert!(err.to_string().contains("document not found"));
+}
+
+#[test]
+fn update_rejects_doc_id_mutation() {
+  let dir = tempdir().unwrap();
+  let schema = Schema::default_text_body();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("_id".to_string(), serde_json::json!("other"));
+  let mut writer = idx.writer().unwrap();
+  let err = writer.apply_patch("doc-1", &set, &[]).unwrap_err();
+  assert!(err.to_string().contains("doc_id_field"));
+}
+
+#[test]
+fn update_rejects_nonstored_indexed_fields() {
+  let dir = tempdir().unwrap();
+  let schema: Schema = serde_json::from_value(serde_json::json!({
+    "doc_id_field": "_id",
+    "text_fields": [
+      { "name": "body", "analyzer": "default", "stored": false, "indexed": true, "nullable": false }
+    ],
+    "keyword_fields": [],
+    "numeric_fields": [],
+    "nested_fields": []
+  }))
+  .unwrap();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("new"));
+  let mut writer = idx.writer().unwrap();
+  let err = writer.apply_patch("doc-1", &set, &[]).unwrap_err();
+  assert!(err.to_string().contains("indexed/fast but not stored"));
+}
