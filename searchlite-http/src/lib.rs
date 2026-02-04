@@ -1209,10 +1209,12 @@ async fn search(
         "cursor is not supported when limit is 0",
       ));
     }
-    return Err(HttpError::bad_request(
-      "invalid_limit",
-      "invalid limit: must be greater than zero (set limit to a positive integer)",
-    ));
+    if request.from > 0 {
+      return Err(HttpError::bad_request(
+        "invalid_pagination",
+        "from is not supported when limit is 0",
+      ));
+    }
   }
   if request.cursor.is_some() && request.search_after.is_some() {
     return Err(HttpError::bad_request(
@@ -1329,10 +1331,12 @@ async fn multi_search(
           "cursor is not supported when limit is 0",
         ));
       }
-      return Err(HttpError::bad_request(
-        "invalid_limit",
-        "invalid limit: must be greater than zero (set limit to a positive integer)",
-      ));
+      if req.from > 0 {
+        return Err(HttpError::bad_request(
+          "invalid_pagination",
+          "from is not supported when limit is 0",
+        ));
+      }
     }
     let has_cursor = req.cursor.is_some();
     let tmp_from = if has_cursor { 0 } else { req.from };
@@ -2400,6 +2404,56 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn multi_search_allows_zero_limit() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-multi-zero-limit");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson = "{\"_id\":\"1\",\"body\":\"rust\"}\n{\"_id\":\"2\",\"body\":\"go\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let req = json!({
+      "searches": [
+        { "query": "rust", "limit": 0, "return_stored": true },
+        { "query": "go", "limit": 1, "return_stored": true }
+      ],
+      "parallel": true,
+      "max_concurrency": 2
+    });
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MultiSearchResponse = res.json().await.unwrap();
+    assert_eq!(body.results.len(), 2);
+    assert!(body.results[0].hits.is_empty());
+    assert_eq!(body.results[1].hits.first().unwrap().doc_id, "2");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
   async fn require_existing_index_blocks_startup() {
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("missing");
@@ -2469,6 +2523,53 @@ mod tests {
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let body: ErrorResponse = res.json().await.unwrap();
     assert_eq!(body.error.r#type, "invalid_cursor");
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn search_allows_zero_limit() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-zero-limit")).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson =
+      "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another doc\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let req = json!({
+      "query": "rust",
+      "limit": 0,
+      "return_stored": true
+    });
+    let res = client
+      .post(format!("{index_base}/search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: SearchResult = res.json().await.unwrap();
+    assert!(body.hits.is_empty());
+    assert!(body.total_hits_estimate > 0);
+
     handle.abort();
     let _ = handle.await;
   }

@@ -24,7 +24,13 @@
       "type": "integer",
       "minimum": 0,
       "default": 10,
-      "description": "Number of hits to return; set to 0 to disable hit collection (aggregations/suggest/profile still run, cursors and explain are not supported when limit is 0)."
+      "description": "Number of hits to return; set to 0 to disable hit collection (aggregations/suggest/profile still run, cursors and explain are not supported when limit is 0). Accepts `size` as an alias."
+    },
+    "from": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Offset into the result set (use with limit/size)."
     },
     "return_hits": { "type": "boolean", "default": true, "description": "When false, skip hit collection/materialization and return only counts/aggregations/suggest/profile." },
     "candidate_size": {
@@ -41,6 +47,10 @@
     },
     "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
     "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },
+    "search_after": {
+      "type": ["array", "null"],
+      "description": "Pagination token from the previous page (sort values + doc_id + segment ord)."
+    },
     "execution": { "type": "string", "enum": ["bm25", "wand", "bmw"], "default": "wand" },
     "bmw_block_size": { "type": ["integer", "null"], "minimum": 1 },
     "fuzzy": { "type": ["object", "null"], "description": "Fuzzy matching options." },

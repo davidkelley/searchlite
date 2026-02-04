@@ -13,9 +13,11 @@ use std::sync::{
   Mutex,
 };
 
+#[cfg(feature = "vectors")]
+use searchlite_core::api::types::parse_env_max_vector_candidates;
 use searchlite_core::api::types::{
-  parse_env_max_vector_candidates, Aggregation, Document, ExecutionStrategy, IndexOptions, Query,
-  QueryNode, Schema, SearchRequest, StorageType,
+  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, Schema, SearchRequest,
+  StorageType,
 };
 use searchlite_core::api::Index;
 
