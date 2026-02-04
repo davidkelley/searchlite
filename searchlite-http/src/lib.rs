@@ -1563,7 +1563,7 @@ async fn multi_search(
   Path(index_name): Path<String>,
   payload: Result<Json<MultiSearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<MultiSearchResponse>> {
-  let mut body = parse_json(payload)?;
+  let body = parse_json(payload)?;
   if body.searches.is_empty() {
     return Err(HttpError::bad_request(
       "missing_searches",
@@ -1615,13 +1615,14 @@ async fn multi_search(
     }
     Ok(())
   };
-  for req in body.searches.iter() {
+  let mut searches = body.searches;
+  for req in searches.iter() {
     validate_search(req)?;
   }
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
-    for req in body.searches.iter_mut() {
+    for req in searches.iter_mut() {
       req
         .max_global_vector_candidates
         .get_or_insert(managed.max_vector_candidates);
@@ -1635,7 +1636,7 @@ async fn multi_search(
     .clamp(1, HARD_MULTI_SEARCH_MAX_CONCURRENCY);
 
   if !parallel {
-    let searches = body.searches.clone();
+    let searches = searches.clone();
     let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<MultiSearchResponse> {
       let reader = index.reader()?;
       let mut results = Vec::with_capacity(searches.len());
@@ -1660,7 +1661,7 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
-  let searches = body.searches.clone();
+  let searches = searches.clone();
   let idx = index.clone();
   let semaphore = Arc::new(Semaphore::new(max_concurrency));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
