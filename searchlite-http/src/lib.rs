@@ -541,6 +541,20 @@ struct DeleteRequest {
   ids: Vec<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct UpdateRequest {
+  id: String,
+  #[serde(default)]
+  set: BTreeMap<String, serde_json::Value>,
+  #[serde(default)]
+  unset: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct UpdateResponse {
+  updated: bool,
+}
+
 impl HttpError {
   fn bad_request(kind: &'static str, reason: impl Into<String>) -> Self {
     Self {
@@ -624,6 +638,7 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/indexes/:name/init", post(init_index))
     .route("/indexes/:name/add", post(add_ndjson))
     .route("/indexes/:name/bulk", post(bulk_ingest))
+    .route("/indexes/:name/update", post(update_document))
     .route("/indexes/:name/delete", post(delete_documents))
     .route("/indexes/:name/commit", post(commit))
     .route("/indexes/:name/refresh", post(refresh))
@@ -1069,6 +1084,72 @@ async fn delete_documents(
   Ok(Json(DeleteResponse {
     queued: body.ids.len(),
   }))
+}
+
+async fn update_document(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  headers: HeaderMap,
+  payload: Result<Json<UpdateRequest>, JsonRejection>,
+) -> ApiResult<Json<UpdateResponse>> {
+  let body = parse_json(payload)?;
+  if body.set.is_empty() && body.unset.is_empty() {
+    return Err(HttpError::bad_request(
+      "missing_patch",
+      "update must include at least one set or unset field",
+    ));
+  }
+  if let Err(err) = validate_doc_id(&body.id) {
+    return Err(HttpError::bad_request(
+      "invalid_id",
+      format!("invalid document id: {}", err),
+    ));
+  }
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
+
+  let writer_lock = managed.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _writer_guard = writer_lock.blocking_lock();
+    let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
+      let msg = e.to_string().to_lowercase();
+      let status = if msg.contains("write key") || msg.contains("unauthorized") {
+        if write_key.is_some() {
+          StatusCode::FORBIDDEN
+        } else {
+          StatusCode::UNAUTHORIZED
+        }
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      HttpError::from_anyhow("writer_open", status, e)
+    })?;
+    if let Err(err) = writer.apply_patch(&body.id, &body.set, &body.unset) {
+      let msg = err.to_string();
+      if msg.contains("document not found") {
+        return Err(HttpError::not_found("document_not_found", msg));
+      }
+      return Err(HttpError::bad_request("update_failed", msg));
+    }
+    Ok(Json(UpdateResponse { updated: true }))
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "update_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
 }
 
 fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
@@ -2187,6 +2268,68 @@ mod tests {
     assert!(!body.docs[1].found);
     assert!(body.docs[2].found);
     assert!(body.docs[3].found);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_update_document() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-update");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "doc-1", "body": "hello" } ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let update = serde_json::json!({
+      "id": "doc-1",
+      "set": { "body": "updated" },
+      "unset": []
+    });
+    let res = client
+      .post(format!("{index_base}/update"))
+      .json(&update)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let mget = serde_json::json!({ "ids": ["doc-1"], "return_stored": true });
+    let res = client
+      .post(format!("{index_base}/mget"))
+      .json(&mget)
+      .send()
+      .await
+      .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["docs"][0]["_source"]["body"], "updated");
 
     handle.abort();
     let _ = handle.await;
