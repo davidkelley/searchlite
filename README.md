@@ -301,15 +301,41 @@ cat > /tmp/search.json <<'EOF'
   }
 }
 EOF
-curl -XPOST http://localhost:8080/search \
+curl -XPOST http://localhost:8080/indexes/default/search \
   -H 'Content-Type: application/json' \
   --data-binary @/tmp/search.json
 ```
 
+- Offset pagination (`from`/`size`):
+
+```bash
+curl -XPOST http://localhost:8080/indexes/default/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"rust","from":10,"size":5}'
+```
+
+- `search_after` pagination (use the `next_search_after` value from the prior page):
+
+```bash
+curl -XPOST http://localhost:8080/indexes/default/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"rust","sort":[{"field":"year","order":"asc"}],"size":5,"search_after":[2024,"doc-42",0]}'
+```
+
+- Multi-get by id:
+
+```bash
+curl -XPOST http://localhost:8080/indexes/default/mget \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["1","2"],"return_stored":true}'
+```
+
+Pagination limits: `from + size` must be <= 1000; `mget` supports up to 1024 ids. Pagination modes are mutually exclusive (cursor, search_after, or from/size).
+
 - Vector-only query (when built with `--features vectors`):
 
 ```bash
-curl -XPOST http://localhost:8080/search \
+curl -XPOST http://localhost:8080/indexes/default/search \
   -H 'Content-Type: application/json' \
   -d '{"query":{"type":"vector","field":"embedding","vector":[1.0,0.0],"k":5,"alpha":0.0},"limit":5,"return_stored":true}'
 ```
@@ -317,7 +343,7 @@ curl -XPOST http://localhost:8080/search \
 - Multiple vector clauses (blends candidates across fields/queries):
 
 ```bash
-curl -XPOST http://localhost:8080/search \
+curl -XPOST http://localhost:8080/indexes/default/search \
   -H 'Content-Type: application/json' \
   -d '{"query":{"type":"bool","should":[{"type":"vector","field":"vec_a","vector":[1,0,0],"alpha":0.0,"k":20},{"type":"vector","field":"vec_b","vector":[0,1,0],"alpha":0.0,"k":20}]},"candidate_size":100,"limit":20,"return_stored":true}'
 ```

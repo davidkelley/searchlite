@@ -236,6 +236,66 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /indexes/{name}/mget:
+    post:
+      summary: Fetch stored documents by id
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MgetRequest"
+      responses:
+        "200":
+          description: Documents found or missing by id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MgetResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Index missing or uninitialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /indexes/{name}/multi_search:
+    post:
+      summary: Execute multiple searches in one request
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MultiSearchRequest"
+      responses:
+        "200":
+          description: Search results for each request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MultiSearchResponse"
+        "400":
+          description: Invalid search request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Index missing or uninitialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /indexes/{name}/inspect:
     get:
       summary: Inspect manifest and segment metadata
@@ -363,6 +423,59 @@ components:
           type: integer
           format: int64
       required: [queued]
+    MgetRequest:
+      type: object
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+        return_stored:
+          type: boolean
+          default: false
+      required: [ids]
+    MgetDoc:
+      type: object
+      properties:
+        id:
+          type: string
+        found:
+          type: boolean
+        _source:
+          type: object
+          nullable: true
+          additionalProperties: true
+      required: [id, found]
+    MgetResponse:
+      type: object
+      properties:
+        docs:
+          type: array
+          items:
+            $ref: "#/components/schemas/MgetDoc"
+      required: [docs]
+    MultiSearchRequest:
+      type: object
+      properties:
+        searches:
+          type: array
+          items:
+            $ref: "./search-request.schema.json"
+        parallel:
+          type: boolean
+          default: false
+        max_concurrency:
+          type: integer
+          nullable: true
+      required: [searches]
+    MultiSearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+      required: [results]
     CommitResponse:
       type: object
       properties:
@@ -499,6 +612,10 @@ components:
         next_cursor:
           type: string
           nullable: true
+        next_search_after:
+          type: array
+          nullable: true
+          description: Sort token for the next page (sort values + doc_id + segment ord).
         aggregations:
           type: object
           additionalProperties: true
@@ -520,6 +637,10 @@ components:
         vector_score:
           type: number
           nullable: true
+        sort_key:
+          type: array
+          nullable: true
+          description: Sort token to feed into search_after for this hit.
         fields:
           type: object
           nullable: true
