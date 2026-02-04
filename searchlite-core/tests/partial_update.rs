@@ -111,6 +111,67 @@ fn update_supports_nested_paths() {
 }
 
 #[test]
+fn update_uses_pending_add_before_commit() {
+  let dir = tempdir().unwrap();
+  let schema = Schema::default_text_body();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("updated"));
+  writer.apply_patch("doc-1", &set, &[]).unwrap();
+  writer.commit().unwrap();
+
+  let reader = idx.reader().unwrap();
+  let res = reader.mget(&["doc-1".to_string()], true).unwrap();
+  let doc = res[0]._source.clone().unwrap();
+  assert_eq!(doc["body"], "updated");
+}
+
+#[test]
+fn update_respects_pending_delete_before_commit() {
+  let dir = tempdir().unwrap();
+  let schema = Schema::default_text_body();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer.delete_document("doc-1").unwrap();
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("updated"));
+  let err = writer.apply_patch("doc-1", &set, &[]).unwrap_err();
+  assert!(err.to_string().contains("document not found"));
+  writer.commit().unwrap();
+
+  let reader = idx.reader().unwrap();
+  let res = reader.mget(&["doc-1".to_string()], true).unwrap();
+  assert!(!res[0].found);
+}
+
+#[test]
 fn update_rejects_missing_doc() {
   let dir = tempdir().unwrap();
   let schema = Schema::default_text_body();

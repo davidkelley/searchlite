@@ -552,7 +552,7 @@ struct UpdateRequest {
 
 #[derive(Debug, serde::Serialize)]
 struct UpdateResponse {
-  updated: bool,
+  accepted: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1175,7 +1175,7 @@ async fn update_document(
       }
       return Err(HttpError::bad_request("update_failed", msg));
     }
-    Ok(Json(UpdateResponse { updated: true }))
+    Ok(Json(UpdateResponse { accepted: true }))
   })
   .await
   .map_err(|err| {
@@ -1933,7 +1933,6 @@ mod tests {
       .await
       .unwrap();
     assert!(res.status().is_success());
-
     // add docs
     let ndjson =
       "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another doc\"}\n";
@@ -2483,6 +2482,8 @@ mod tests {
       .await
       .unwrap();
     assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["accepted"], true);
     client
       .post(format!("{index_base}/commit"))
       .send()

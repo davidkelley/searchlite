@@ -291,6 +291,7 @@ curl -XPOST http://localhost:8080/indexes/default/bulk \
 curl -XPOST http://localhost:8080/indexes/default/update \
   -H 'Content-Type: application/json' \
   -d '{"id":"1","set":{"available":8},"unset":["metadata.alt"]}'
+# {"accepted":true}
 ```
 
 - Bulk update (NDJSON pairs, best-effort):

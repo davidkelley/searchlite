@@ -203,8 +203,12 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     ensure_patch_safe(&self.schema)?;
     validate_patch_fields(&self.schema, doc_id, set, unset)?;
-    let mut doc = load_document_for_patch(inner.clone(), doc_id)?
-      .ok_or_else(|| anyhow!("document not found"))?;
+    let mut doc = match pending_doc_for_patch(&self.pending_ops, doc_id) {
+      Some(Some(doc)) => doc,
+      Some(None) => return Err(anyhow!("document not found")),
+      None => load_document_for_patch(inner.clone(), doc_id)?
+        .ok_or_else(|| anyhow!("document not found"))?,
+    };
     let mut value = document_to_value(&doc)?;
     for path in unset.iter() {
       unset_path(&mut value, path)?;
@@ -455,6 +459,19 @@ fn load_document_for_patch(inner: Arc<InnerIndex>, doc_id: &str) -> Result<Optio
     ._source
     .ok_or_else(|| anyhow!("stored fields are unavailable for document {doc_id}"))?;
   value_to_document(source).map(Some)
+}
+
+fn pending_doc_for_patch(pending_ops: &[PendingOp], doc_id: &str) -> Option<Option<Document>> {
+  for op in pending_ops.iter().rev() {
+    match op {
+      PendingOp::Add { doc_id: id, doc } if id == doc_id => {
+        return Some(Some(doc.clone()));
+      }
+      PendingOp::Delete { doc_id: id } if id == doc_id => return Some(None),
+      _ => {}
+    }
+  }
+  None
 }
 
 fn ensure_patch_safe(schema: &Schema) -> Result<()> {

@@ -600,9 +600,9 @@ components:
     UpdateResponse:
       type: object
       properties:
-        updated:
+        accepted:
           type: boolean
-      required: [updated]
+      required: [accepted]
     BulkUpdateItem:
       type: object
       properties:
