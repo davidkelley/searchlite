@@ -126,7 +126,8 @@ paths:
       description: >
         Partially update stored fields using `set`/`unset`. Updates are queued in the index
         writer and require `/indexes/{name}/commit` (and optionally `/indexes/{name}/refresh`)
-        before they become visible to searches.
+        before they become visible to searches. Updates are rejected when the schema defines
+        vector fields because vector values are not stored.
       parameters:
         - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"
@@ -161,7 +162,8 @@ paths:
       description: >
         Send NDJSON pairs consisting of an update action line and a patch line. The server
         processes updates in best-effort mode and returns per-item status. Updates are queued
-        and require `/indexes/{name}/commit` before they become visible.
+        and require `/indexes/{name}/commit` before they become visible. Updates are rejected
+        when the schema defines vector fields because vector values are not stored.
       parameters:
         - $ref: "#/components/parameters/IndexName"
         - $ref: "#/components/parameters/WriteKeyHeader"

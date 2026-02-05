@@ -285,7 +285,7 @@ curl -XPOST http://localhost:8080/indexes/default/bulk \
   -d '{"docs":[{"_id":"1","body":"Rust search"},{"_id":"2","body":"More docs"}]}'
 ```
 
-- Update a single document (set/unset):
+- Update a single document (set/unset; not supported for vector fields):
 
 ```bash
 curl -XPOST http://localhost:8080/indexes/default/update \

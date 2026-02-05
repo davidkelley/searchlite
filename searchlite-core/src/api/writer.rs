@@ -7,6 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
+use crate::api::errors::PatchError;
 use crate::api::reader::IndexReader;
 use crate::api::types::Document;
 use crate::index::manifest::{Manifest, Schema};
@@ -205,9 +206,10 @@ impl IndexWriter {
     validate_patch_fields(&self.schema, doc_id, set, unset)?;
     let mut doc = match pending_doc_for_patch(&self.pending_ops, doc_id) {
       Some(Some(doc)) => doc,
-      Some(None) => return Err(anyhow!("document not found")),
-      None => load_document_for_patch(inner.clone(), doc_id)?
-        .ok_or_else(|| anyhow!("document not found"))?,
+      Some(None) => return Err(PatchError::DocumentNotFound.into()),
+      None => {
+        load_document_for_patch(inner.clone(), doc_id)?.ok_or(PatchError::DocumentNotFound)?
+      }
     };
     let mut value = document_to_value(&doc)?;
     for path in unset.iter() {
@@ -475,6 +477,10 @@ fn pending_doc_for_patch(pending_ops: &[PendingOp], doc_id: &str) -> Option<Opti
 }
 
 fn ensure_patch_safe(schema: &Schema) -> Result<()> {
+  #[cfg(feature = "vectors")]
+  if !schema.vector_fields.is_empty() {
+    return Err(PatchError::VectorFieldsUnsupported.into());
+  }
   for field in schema.resolved_fields().into_iter() {
     if (field.indexed || field.fast) && !field.stored {
       bail!(

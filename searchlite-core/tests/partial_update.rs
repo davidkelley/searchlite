@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use searchlite_core::api::errors::PatchError;
 use searchlite_core::api::types::{Document, IndexOptions, Schema, StorageType};
 use searchlite_core::Index;
 use tempfile::tempdir;
@@ -182,6 +183,10 @@ fn update_rejects_missing_doc() {
 
   let mut writer = idx.writer().unwrap();
   let err = writer.apply_patch("missing", &set, &[]).unwrap_err();
+  assert!(matches!(
+    err.downcast_ref::<PatchError>(),
+    Some(PatchError::DocumentNotFound)
+  ));
   assert!(err.to_string().contains("document not found"));
 }
 
@@ -245,4 +250,48 @@ fn update_rejects_nonstored_indexed_fields() {
   let mut writer = idx.writer().unwrap();
   let err = writer.apply_patch("doc-1", &set, &[]).unwrap_err();
   assert!(err.to_string().contains("indexed/fast but not stored"));
+}
+
+#[cfg(feature = "vectors")]
+#[test]
+fn update_rejects_vector_fields() {
+  let dir = tempdir().unwrap();
+  let schema: Schema = serde_json::from_value(serde_json::json!({
+    "doc_id_field": "_id",
+    "text_fields": [
+      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+    ],
+    "keyword_fields": [],
+    "numeric_fields": [],
+    "nested_fields": [],
+    "vector_fields": [
+      { "name": "embedding", "dim": 2, "metric": "Cosine" }
+    ]
+  }))
+  .unwrap();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("updated"));
+  let mut writer = idx.writer().unwrap();
+  let err = writer.apply_patch("doc-1", &set, &[]).unwrap_err();
+  assert!(matches!(
+    err.downcast_ref::<PatchError>(),
+    Some(PatchError::VectorFieldsUnsupported)
+  ));
+  assert!(err.to_string().contains("vector fields are not supported"));
 }
