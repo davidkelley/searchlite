@@ -1372,6 +1372,15 @@ async fn bulk_update(
             format!("invalid update action on NDJSON line {}: {e}", line_number),
           )
         })?;
+        if let Err(err) = validate_doc_id(&action.update.id) {
+          return Err(HttpError::bad_request(
+            "invalid_bulk_update",
+            format!(
+              "invalid update action on NDJSON line {}: invalid document id: {}",
+              line_number, err
+            ),
+          ));
+        }
         pending_action = Some(action.update.id);
       } else {
         let patch: BulkUpdatePatch = serde_json::from_str(trimmed).map_err(|e| {
@@ -1737,8 +1746,12 @@ async fn multi_search(
   Path(index_name): Path<String>,
   payload: Result<Json<MultiSearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<MultiSearchResponse>> {
-  let body = parse_json(payload)?;
-  if body.searches.is_empty() {
+  let MultiSearchRequest {
+    searches,
+    parallel,
+    max_concurrency,
+  } = parse_json(payload)?;
+  if searches.is_empty() {
     return Err(HttpError::bad_request(
       "missing_searches",
       "searches array must contain at least one search request",
@@ -1789,13 +1802,13 @@ async fn multi_search(
     }
     Ok(())
   };
-  #[cfg(feature = "vectors")]
-  let mut searches = body.searches;
-  #[cfg(not(feature = "vectors"))]
-  let searches = body.searches;
   for req in searches.iter() {
     validate_search(req)?;
   }
+  #[cfg(feature = "vectors")]
+  let mut searches = searches;
+  #[cfg(not(feature = "vectors"))]
+  let searches = searches;
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
@@ -1806,14 +1819,11 @@ async fn multi_search(
     }
   }
   let index = managed.require_index().await?;
-  let parallel = body.parallel;
-  let max_concurrency = body
-    .max_concurrency
+  let max_concurrency = max_concurrency
     .unwrap_or(DEFAULT_MULTI_SEARCH_MAX_CONCURRENCY)
     .clamp(1, HARD_MULTI_SEARCH_MAX_CONCURRENCY);
 
   if !parallel {
-    let searches = searches.clone();
     let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<MultiSearchResponse> {
       let reader = index.reader()?;
       let mut results = Vec::with_capacity(searches.len());
@@ -1838,7 +1848,6 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
-  let searches = searches.clone();
   let idx = index.clone();
   let semaphore = Arc::new(Semaphore::new(max_concurrency));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
@@ -2730,6 +2739,36 @@ mod tests {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["updated"], 1);
     assert_eq!(body["failed"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_bulk_update_rejects_invalid_id() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update-invalid-id");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = "{\"update\":{\"_id\":\"bad\\u0001\"}}\n{\"set\":{\"body\":\"updated\"}}\n";
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_bulk_update");
 
     handle.abort();
     let _ = handle.await;

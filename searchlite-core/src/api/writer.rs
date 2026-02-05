@@ -534,10 +534,13 @@ fn value_to_document(value: serde_json::Value) -> Result<Document> {
 }
 
 fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) -> Result<()> {
-  let mut parts = path.split('.').peekable();
-  if parts.peek().is_none() {
+  if path.is_empty() {
     bail!("path must not be empty");
   }
+  if path.split('.').any(|part| part.is_empty()) {
+    bail!("path must not contain empty path segment");
+  }
+  let mut parts = path.split('.').peekable();
   let mut current = root;
   while let Some(part) = parts.next() {
     let is_last = parts.peek().is_none();
@@ -562,10 +565,13 @@ fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) 
 }
 
 fn unset_path(root: &mut serde_json::Value, path: &str) -> Result<()> {
-  let mut parts = path.split('.').peekable();
-  if parts.peek().is_none() {
+  if path.is_empty() {
     bail!("path must not be empty");
   }
+  if path.split('.').any(|part| part.is_empty()) {
+    bail!("path must not contain empty path segment");
+  }
+  let mut parts = path.split('.').peekable();
   let mut current = root;
   while let Some(part) = parts.next() {
     let is_last = parts.peek().is_none();
@@ -1065,5 +1071,25 @@ mod tests {
     let manifest = idx.manifest();
     assert_eq!(manifest.segments.len(), 1);
     assert_eq!(manifest.segments[0].doc_count, 1);
+  }
+
+  #[test]
+  fn set_path_rejects_empty_segments() {
+    let invalid_paths = ["a..b", ".field", "field."];
+    for path in invalid_paths.iter() {
+      let mut value = serde_json::json!({});
+      let err = super::set_path(&mut value, path, serde_json::json!(1)).unwrap_err();
+      assert!(err.to_string().contains("empty path segment"));
+    }
+  }
+
+  #[test]
+  fn unset_path_rejects_empty_segments() {
+    let invalid_paths = ["a..b", ".field", "field."];
+    for path in invalid_paths.iter() {
+      let mut value = serde_json::json!({ "field": { "x": 1 } });
+      let err = super::unset_path(&mut value, path).unwrap_err();
+      assert!(err.to_string().contains("empty path segment"));
+    }
   }
 }
