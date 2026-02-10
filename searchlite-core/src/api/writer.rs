@@ -503,15 +503,29 @@ fn validate_patch_fields(
   }
   validate_doc_id(doc_id)?;
   let doc_id_field = schema.doc_id_field();
+  let patchable_paths = patchable_schema_paths(schema);
   for path in set.keys().chain(unset.iter()) {
     if path == doc_id_field {
       bail!("cannot update doc_id_field `{}`", doc_id_field);
     }
-    if schema.field_meta(path).is_none() {
+    if !patchable_paths.contains(path) {
       bail!("unknown field {path}");
     }
   }
   Ok(())
+}
+
+fn patchable_schema_paths(schema: &Schema) -> HashSet<String> {
+  let mut paths = HashSet::new();
+  for field in schema.resolved_fields().into_iter() {
+    let mut current = field.path.as_str();
+    paths.insert(current.to_string());
+    while let Some((parent, _)) = current.rsplit_once('.') {
+      paths.insert(parent.to_string());
+      current = parent;
+    }
+  }
+  paths
 }
 
 fn document_to_value(doc: &Document) -> Result<serde_json::Value> {
@@ -628,6 +642,7 @@ fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<Str
 
 #[cfg(test)]
 mod tests {
+  use std::collections::BTreeMap;
   use std::path::PathBuf;
   use std::sync::atomic::{AtomicBool, Ordering};
   use std::sync::Arc;
@@ -636,7 +651,9 @@ mod tests {
   use parking_lot::{Mutex, RwLock};
 
   use super::PendingOp;
-  use crate::api::types::{Document, IndexOptions, Schema, StorageType};
+  use crate::api::types::{
+    Document, IndexOptions, KeywordField, NestedField, NestedProperty, Schema, StorageType,
+  };
   use crate::index::{directory, manifest::Manifest, wal::Wal, Index, InnerIndex};
   use crate::storage::{InMemoryStorage, Storage};
   use tempfile::tempdir;
@@ -652,6 +669,35 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
+  }
+
+  fn nested_schema_for_patch() -> Schema {
+    let mut schema = Schema::default_text_body();
+    schema.nested_fields = vec![NestedField {
+      name: "comment".into(),
+      fields: vec![
+        NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        }),
+        NestedProperty::Object(NestedField {
+          name: "reply".into(),
+          fields: vec![NestedProperty::Keyword(KeywordField {
+            name: "author".into(),
+            stored: true,
+            indexed: true,
+            fast: false,
+            nullable: false,
+          })],
+          nullable: false,
+        }),
+      ],
+      nullable: false,
+    }];
+    schema
   }
 
   struct FailingManifestStorage {
@@ -1071,6 +1117,73 @@ mod tests {
     let manifest = idx.manifest();
     assert_eq!(manifest.segments.len(), 1);
     assert_eq!(manifest.segments[0].doc_count, 1);
+  }
+
+  #[test]
+  fn validate_patch_fields_accepts_nested_roots() {
+    let schema = nested_schema_for_patch();
+    let mut set = BTreeMap::new();
+    set.insert(
+      "comment".to_string(),
+      serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+    );
+    set.insert(
+      "comment.reply".to_string(),
+      serde_json::json!({ "author": "carol" }),
+    );
+    super::validate_patch_fields(&schema, "doc-1", &set, &[]).unwrap();
+  }
+
+  #[test]
+  fn validate_patch_fields_rejects_unknown_nested_roots() {
+    let schema = nested_schema_for_patch();
+    let mut set = BTreeMap::new();
+    set.insert("comment.missing".to_string(), serde_json::json!("nope"));
+    let err = super::validate_patch_fields(&schema, "doc-1", &set, &[]).unwrap_err();
+    assert!(err.to_string().contains("unknown field comment.missing"));
+  }
+
+  #[test]
+  fn apply_patch_allows_replacing_nested_root() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert(
+        "comment".to_string(),
+        serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }]),
+      );
+      writer.apply_patch("1", &set, &[]).unwrap();
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    assert_eq!(
+      docs[0]._source.as_ref().unwrap()["comment"],
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }])
+    );
   }
 
   #[test]
