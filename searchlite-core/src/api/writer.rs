@@ -34,10 +34,12 @@ pub struct IndexWriter {
   inner: Arc<InnerIndex>,
   wal: Wal,
   pending_ops: Vec<PendingOp>,
+  pending_latest: HashMap<String, Option<Document>>,
   schema: Schema,
   live_docs: HashMap<String, DocAddress>,
   live_generation: u32,
   write_binding: Option<Vec<u8>>,
+  patch_reader: Option<IndexReader>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,15 +145,18 @@ impl IndexWriter {
         WalEntry::WriteBinding(_) => {}
       }
     }
+    let pending_latest = pending_latest_from_ops(&pending_ops);
     drop(_guard);
     Ok(Self {
       inner,
       wal,
       pending_ops,
+      pending_latest,
       schema,
       live_docs,
       live_generation,
       write_binding,
+      patch_reader: None,
     })
   }
 
@@ -188,6 +193,7 @@ impl IndexWriter {
       self
         .pending_ops
         .push(PendingOp::Delete { doc_id: id.clone() });
+      self.pending_latest.insert(id.clone(), None);
     }
     Ok(())
   }
@@ -202,12 +208,11 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     ensure_patch_safe(&self.schema)?;
     validate_patch_fields(&self.schema, doc_id, set, unset)?;
-    let mut doc = match pending_doc_for_patch(&self.pending_ops, doc_id) {
+    let mut doc = match pending_doc_for_patch(&self.pending_latest, doc_id) {
       Some(Some(doc)) => doc,
       Some(None) => return Err(PatchError::DocumentNotFound.into()),
-      None => {
-        load_document_for_patch(inner.clone(), doc_id)?.ok_or(PatchError::DocumentNotFound)?
-      }
+      None => load_document_for_patch(inner.clone(), &mut self.patch_reader, doc_id)?
+        .ok_or(PatchError::DocumentNotFound)?,
     };
     let mut value = document_to_value(&doc)?;
     for path in unset.iter() {
@@ -345,6 +350,7 @@ impl IndexWriter {
       if !new_segments.is_empty() {
         let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
       }
+      self.patch_reader = None;
       return Err(e);
     }
     {
@@ -353,6 +359,8 @@ impl IndexWriter {
     }
     self.wal.truncate()?;
     self.pending_ops.clear();
+    self.pending_latest.clear();
+    self.patch_reader = None;
     self.live_docs = live_docs;
     self.live_generation = new_generation;
     Ok(())
@@ -361,6 +369,7 @@ impl IndexWriter {
   pub fn rollback(&mut self) -> Result<()> {
     let _guard = self.inner.writer_lock.lock();
     self.pending_ops.clear();
+    self.pending_latest.clear();
     self.wal.truncate()?;
     Ok(())
   }
@@ -391,6 +400,7 @@ impl IndexWriter {
     self.wal.truncate_to(checkpoint.wal_len)?;
     if self.pending_ops.len() > checkpoint.pending_len {
       self.pending_ops.truncate(checkpoint.pending_len);
+      self.pending_latest = pending_latest_from_ops(&self.pending_ops);
     }
     Ok(())
   }
@@ -403,6 +413,9 @@ impl IndexWriter {
       doc_id: doc_id.clone(),
       doc: doc.clone(),
     });
+    self
+      .pending_latest
+      .insert(doc_id.clone(), Some(doc.clone()));
     let add_count = self
       .pending_ops
       .iter()
@@ -446,8 +459,12 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
   Ok(doc_id.to_string())
 }
 
-fn load_document_for_patch(inner: Arc<InnerIndex>, doc_id: &str) -> Result<Option<Document>> {
-  let reader = IndexReader::open(inner)?;
+fn load_document_for_patch(
+  inner: Arc<InnerIndex>,
+  patch_reader: &mut Option<IndexReader>,
+  doc_id: &str,
+) -> Result<Option<Document>> {
+  let reader = patch_reader.get_or_insert(IndexReader::open(inner)?);
   let mut docs = reader.mget(&[doc_id.to_string()], true)?;
   let Some(found) = docs.pop() else {
     return Ok(None);
@@ -461,17 +478,26 @@ fn load_document_for_patch(inner: Arc<InnerIndex>, doc_id: &str) -> Result<Optio
   value_to_document(source).map(Some)
 }
 
-fn pending_doc_for_patch(pending_ops: &[PendingOp], doc_id: &str) -> Option<Option<Document>> {
-  for op in pending_ops.iter().rev() {
+fn pending_latest_from_ops(pending_ops: &[PendingOp]) -> HashMap<String, Option<Document>> {
+  let mut latest = HashMap::new();
+  for op in pending_ops.iter() {
     match op {
-      PendingOp::Add { doc_id: id, doc } if id == doc_id => {
-        return Some(Some(doc.clone()));
+      PendingOp::Add { doc_id: id, doc } => {
+        latest.insert(id.clone(), Some(doc.clone()));
       }
-      PendingOp::Delete { doc_id: id } if id == doc_id => return Some(None),
-      _ => {}
+      PendingOp::Delete { doc_id: id } => {
+        latest.insert(id.clone(), None);
+      }
     }
   }
-  None
+  latest
+}
+
+fn pending_doc_for_patch(
+  pending_latest: &HashMap<String, Option<Document>>,
+  doc_id: &str,
+) -> Option<Option<Document>> {
+  pending_latest.get(doc_id).cloned()
 }
 
 fn ensure_patch_safe(schema: &Schema) -> Result<()> {
@@ -1239,6 +1265,54 @@ mod tests {
     let source = docs[0]._source.as_ref().unwrap();
     assert_eq!(source["comment"][0]["reply"]["author"], "eve");
     assert_eq!(source["comment"][1]["reply"]["author"], "eve");
+  }
+
+  #[test]
+  fn apply_patch_reuses_fresh_committed_state_across_commits() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let mut writer = idx.writer().unwrap();
+    let mut first = BTreeMap::new();
+    first.insert(
+      "comment".to_string(),
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }]),
+    );
+    writer.apply_patch("1", &first, &[]).unwrap();
+    writer.commit().unwrap();
+    let mut second = BTreeMap::new();
+    second.insert("body".to_string(), serde_json::json!("after"));
+    writer.apply_patch("1", &second, &[]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["body"], "after");
+    assert_eq!(
+      source["comment"],
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }])
+    );
   }
 
   #[test]
