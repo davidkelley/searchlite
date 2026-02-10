@@ -1274,6 +1274,13 @@ async fn bulk_update(
             };
             HttpError::from_anyhow("writer_open", status, e)
           })?;
+        let checkpoint = writer.checkpoint().map_err(|e| {
+          HttpError::from_anyhow(
+            "bulk_update_checkpoint",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e,
+          )
+        })?;
         let mut updated = 0u64;
         let mut failed = 0u64;
         let mut items: Vec<BulkUpdateItem> = Vec::new();
@@ -1318,10 +1325,10 @@ async fn bulk_update(
               });
             }
             BulkUpdateMsg::Abort => {
-              if let Err(rollback_err) = writer.rollback() {
+              if let Err(rollback_err) = writer.rollback_to(checkpoint) {
                 error!(
                   error = ?rollback_err,
-                  "failed to rollback writer after bulk update failure"
+                  "failed to rollback bulk update request scope"
                 );
               }
               return Ok(BulkUpdateResponse {
@@ -1332,10 +1339,10 @@ async fn bulk_update(
             }
           }
         }
-        if let Err(rollback_err) = writer.rollback() {
+        if let Err(rollback_err) = writer.rollback_to(checkpoint) {
           error!(
             error = ?rollback_err,
-            "failed to rollback writer after bulk update channel closed unexpectedly"
+            "failed to rollback bulk update request scope after channel closure"
           );
         }
         Ok(BulkUpdateResponse {
@@ -2739,6 +2746,77 @@ mod tests {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["updated"], 1);
     assert_eq!(body["failed"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn bulk_update_abort_preserves_preexisting_pending_writes() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update-abort-preserve");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    // Queue a write from another request and leave it pending (no commit yet).
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "seed", "body": "seed" } ]
+    });
+    let res = client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+
+    // Force writer task startup (first full batch), then trigger abort with a trailing action line.
+    let mut ndjson = String::new();
+    for i in 0..NDJSON_BATCH_SIZE {
+      ndjson.push_str(r#"{"update":{"_id":"seed"}}"#);
+      ndjson.push('\n');
+      ndjson.push_str(&format!(r#"{{"set":{{"body":"bulk-{i}"}}}}"#));
+      ndjson.push('\n');
+    }
+    ndjson.push_str(r#"{"update":{"_id":"seed"}}"#);
+    ndjson.push('\n');
+
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "invalid_bulk_update");
+
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let mget = serde_json::json!({ "ids": ["seed"], "return_stored": true });
+    let res = client
+      .post(format!("{index_base}/mget"))
+      .json(&mget)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: MgetResponse = res.json().await.unwrap();
+    assert_eq!(body.docs.len(), 1);
+    assert!(body.docs[0].found);
+    assert_eq!(body.docs[0]._source.as_ref().unwrap()["body"], "seed");
 
     handle.abort();
     let _ = handle.await;

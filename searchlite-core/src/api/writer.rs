@@ -41,7 +41,7 @@ pub struct IndexWriter {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WriterCheckpoint {
+pub struct WriterCheckpoint {
   wal_len: u64,
   pending_len: usize,
 }
@@ -157,8 +157,7 @@ impl IndexWriter {
 
   /// Capture the current WAL length and pending-op count so callers can roll back
   /// only the work done after the checkpoint.
-  #[allow(dead_code)]
-  fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
+  pub fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
     self.checkpoint_locked()
@@ -166,8 +165,7 @@ impl IndexWriter {
 
   /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
   /// earlier queued work.
-  #[allow(dead_code)]
-  fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
+  pub fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
     self.rollback_to_locked(checkpoint)
