@@ -140,6 +140,7 @@
             { "$ref": "#/$defs/histogram_agg" },
             { "$ref": "#/$defs/date_histogram_agg" },
             { "$ref": "#/$defs/filter_agg" },
+            { "$ref": "#/$defs/nested_agg" },
             { "$ref": "#/$defs/composite_agg" },
             { "$ref": "#/$defs/stats_agg" },
             { "$ref": "#/$defs/value_count_agg" },
@@ -238,6 +239,16 @@
       "properties": {
         "type": { "const": "filter" },
         "filter": { "type": "object", "description": "Any filter AST node." },
+        "sampling": { "$ref": "#/$defs/sampling" },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "nested_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "nested" },
+        "path": { "type": "string" },
         "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }

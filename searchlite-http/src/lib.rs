@@ -2361,6 +2361,126 @@ mod tests {
     let _ = handle.await;
   }
 
+  #[tokio::test]
+  async fn http_supports_nested_aggregations() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-nested-aggs");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema: Schema = serde_json::from_value(json!({
+      "doc_id_field": "_id",
+      "text_fields": [
+        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
+      ],
+      "keyword_fields": [],
+      "numeric_fields": [],
+      "nested_fields": [
+        {
+          "name": "images",
+          "nullable": false,
+          "fields": [
+            { "type": "keyword", "name": "illustrator", "stored": true, "indexed": true, "fast": true, "nullable": false }
+          ]
+        }
+      ],
+      "vector_fields": []
+    }))
+    .unwrap();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = "{\"_id\":\"1\",\"body\":\"Rust search\",\"images\":[{\"illustrator\":\"alice\"},{\"illustrator\":\"bob\"}]}\n\
+                  {\"_id\":\"2\",\"body\":\"Rust faceting\",\"images\":[{\"illustrator\":\"alice\"}]}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let aggs: BTreeMap<String, Aggregation> = serde_json::from_value(json!({
+      "illustrators": {
+        "type": "nested",
+        "path": "images",
+        "aggs": {
+          "names": { "type": "terms", "field": "images.illustrator", "size": 5 }
+        }
+      }
+    }))
+    .unwrap();
+    let request = SearchRequest {
+      query: Query::String("rust".into()),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let res = client
+      .post(format!("{index_base}/search"))
+      .json(&request)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: SearchResult = res.json().await.unwrap();
+    let nested = body
+      .aggregations
+      .get("illustrators")
+      .expect("nested aggregation");
+    match nested {
+      AggregationResponse::Nested {
+        doc_count,
+        aggregations,
+        ..
+      } => {
+        assert_eq!(*doc_count, 3);
+        if let Some(AggregationResponse::Terms { buckets, .. }) = aggregations.get("names") {
+          assert_eq!(buckets[0].key, json!("alice"));
+          assert_eq!(buckets[0].doc_count, 2);
+        } else {
+          panic!("expected nested names terms aggregation");
+        }
+      }
+      _ => panic!("expected nested aggregation response"),
+    }
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
   #[cfg(feature = "vectors")]
   #[tokio::test]
   async fn http_supports_vector_search() {

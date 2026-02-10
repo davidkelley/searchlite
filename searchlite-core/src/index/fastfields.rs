@@ -837,6 +837,37 @@ impl FastFieldsReader {
     }
   }
 
+  pub fn nested_str_values_at<'a>(
+    &'a self,
+    field: &str,
+    doc_id: DocId,
+    object_idx: usize,
+  ) -> Vec<&'a str> {
+    match self.fields.get(field) {
+      Some(Column::StrNested {
+        dict,
+        doc_offsets,
+        object_offsets,
+        values,
+      }) => {
+        if let Some((obj_start, _obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          let absolute_idx = obj_start.saturating_add(object_idx);
+          if let Some((start, end)) = object_range(object_offsets, absolute_idx) {
+            values[start..end]
+              .iter()
+              .filter_map(|idx| dict.get(*idx as usize).map(|s| s.as_str()))
+              .collect()
+          } else {
+            Vec::new()
+          }
+        } else {
+          Vec::new()
+        }
+      }
+      _ => Vec::new(),
+    }
+  }
+
   pub fn nested_i64_values(&self, field: &str, doc_id: DocId) -> Vec<Vec<i64>> {
     match self.fields.get(field) {
       Some(Column::I64Nested {

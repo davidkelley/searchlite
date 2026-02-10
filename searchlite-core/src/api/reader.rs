@@ -2819,7 +2819,7 @@ impl IndexReader {
       bail!("search_after cannot be combined with from; use one pagination method");
     }
     if let Some(collapse) = req.collapse.as_ref() {
-      ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse")?;
+      ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse", None)?;
     }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
     let score_fast_path =
@@ -4112,68 +4112,100 @@ fn to_execution_profile(stats: &QueryStats) -> ExecutionProfile {
 }
 
 fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) -> Result<()> {
+  validate_aggregations_in_scope(schema, aggs, None, false)
+}
+
+fn validate_aggregations_in_scope(
+  schema: &Schema,
+  aggs: &BTreeMap<String, Aggregation>,
+  scope_path: Option<&str>,
+  inside_nested: bool,
+) -> Result<()> {
   for (name, agg) in aggs.iter() {
+    if inside_nested {
+      match agg {
+        Aggregation::Terms(_) | Aggregation::Nested(_) => {}
+        _ => {
+          return Err(
+            AggregationError::InvalidConfig {
+              reason: format!(
+                "aggregation `{name}` of type `{}` is not supported inside nested aggregations",
+                aggregation_kind_name(agg)
+              ),
+            }
+            .into(),
+          );
+        }
+      }
+    }
     match agg {
       Aggregation::Terms(t) => {
-        ensure_keyword_fast(schema, &t.field, name)?;
+        ensure_keyword_fast(schema, &t.field, name, scope_path)?;
         validate_sampling(name, &t.sampling)?;
-        validate_aggregations(schema, &t.aggs)?;
+        validate_aggregations_in_scope(schema, &t.aggs, scope_path, inside_nested)?;
       }
       Aggregation::SignificantTerms(t) => {
-        ensure_keyword_fast(schema, &t.field, name)?;
+        ensure_keyword_fast(schema, &t.field, name, scope_path)?;
         validate_sampling(name, &t.sampling)?;
-        validate_aggregations(schema, &t.aggs)?;
+        validate_aggregations_in_scope(schema, &t.aggs, scope_path, inside_nested)?;
       }
       Aggregation::RareTerms(r) => {
-        ensure_keyword_fast(schema, &r.field, name)?;
+        ensure_keyword_fast(schema, &r.field, name, scope_path)?;
         validate_sampling(name, &r.sampling)?;
-        validate_aggregations(schema, &r.aggs)?;
+        validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
       Aggregation::Range(r) => {
-        ensure_numeric_fast(schema, &r.field, name)?;
+        ensure_numeric_fast(schema, &r.field, name, scope_path)?;
         validate_sampling(name, &r.sampling)?;
-        validate_aggregations(schema, &r.aggs)?;
+        validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
       Aggregation::DateRange(r) => {
-        ensure_numeric_fast(schema, &r.field, name)?;
+        ensure_numeric_fast(schema, &r.field, name, scope_path)?;
         validate_sampling(name, &r.sampling)?;
-        validate_aggregations(schema, &r.aggs)?;
+        validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
       Aggregation::Histogram(h) => {
-        ensure_numeric_fast(schema, &h.field, name)?;
+        ensure_numeric_fast(schema, &h.field, name, scope_path)?;
         validate_histogram_config(name, h)?;
         validate_sampling(name, &h.sampling)?;
-        validate_aggregations(schema, &h.aggs)?;
+        validate_aggregations_in_scope(schema, &h.aggs, scope_path, inside_nested)?;
       }
       Aggregation::DateHistogram(h) => {
-        ensure_numeric_fast(schema, &h.field, name)?;
+        ensure_numeric_fast(schema, &h.field, name, scope_path)?;
         validate_date_histogram_config(name, h)?;
         validate_sampling(name, &h.sampling)?;
-        validate_aggregations(schema, &h.aggs)?;
+        validate_aggregations_in_scope(schema, &h.aggs, scope_path, inside_nested)?;
       }
       Aggregation::Stats(m) | Aggregation::ExtendedStats(m) | Aggregation::ValueCount(m) => {
-        ensure_numeric_fast(schema, &m.field, name)?
+        ensure_numeric_fast(schema, &m.field, name, scope_path)?
       }
-      Aggregation::Percentiles(p) => ensure_numeric_fast(schema, &p.field, name)?,
-      Aggregation::PercentileRanks(p) => ensure_numeric_fast(schema, &p.field, name)?,
-      Aggregation::Cardinality(c) => ensure_keyword_or_numeric_fast(schema, &c.field, name)?,
+      Aggregation::Percentiles(p) => ensure_numeric_fast(schema, &p.field, name, scope_path)?,
+      Aggregation::PercentileRanks(p) => ensure_numeric_fast(schema, &p.field, name, scope_path)?,
+      Aggregation::Cardinality(c) => {
+        ensure_keyword_or_numeric_fast(schema, &c.field, name, scope_path)?
+      }
       Aggregation::Filter(f) => {
         validate_sampling(name, &f.sampling)?;
-        validate_aggregations(schema, &f.aggs)?;
+        validate_aggregations_in_scope(schema, &f.aggs, scope_path, inside_nested)?;
+      }
+      Aggregation::Nested(n) => {
+        let nested_path = ensure_nested_path(schema, &n.path, name, scope_path)?;
+        validate_sampling(name, &n.sampling)?;
+        validate_aggregations_in_scope(schema, &n.aggs, Some(&nested_path), true)?;
       }
       Aggregation::Composite(c) => {
         for source in c.sources.iter() {
           match source {
             crate::api::types::CompositeSource::Terms { field, .. } => {
-              ensure_keyword_fast(schema, field, name)?
+              ensure_keyword_fast(schema, field, name, scope_path)?
             }
             crate::api::types::CompositeSource::Histogram { field, .. } => {
-              ensure_numeric_fast(schema, field, name)?
+              ensure_numeric_fast(schema, field, name, scope_path)?
             }
           }
         }
         validate_sampling(name, &c.sampling)?;
-        validate_aggregations(schema, &c.aggs)?;
+        validate_aggregations_in_scope(schema, &c.aggs, scope_path, inside_nested)?;
       }
       Aggregation::BucketSort(_)
       | Aggregation::AvgBucket(_)
@@ -4190,71 +4222,168 @@ fn validate_aggregations(schema: &Schema, aggs: &BTreeMap<String, Aggregation>) 
   Ok(())
 }
 
-fn ensure_keyword_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
-  if let Some(def) = schema.keyword_fields.iter().find(|f| f.name == field) {
-    if def.fast {
-      Ok(())
+fn path_is_within(base_path: &str, candidate: &str) -> bool {
+  candidate == base_path
+    || candidate
+      .strip_prefix(base_path)
+      .map(|suffix| suffix.starts_with('.'))
+      .unwrap_or(false)
+}
+
+fn resolve_scoped_path(scope_path: Option<&str>, maybe_relative: &str) -> String {
+  if let Some(scope_path) = scope_path {
+    if path_is_within(scope_path, maybe_relative) {
+      maybe_relative.to_string()
     } else {
-      Err(
-        AggregationError::MissingFastField {
-          field: field.to_string(),
-        }
-        .into(),
-      )
+      format!("{scope_path}.{maybe_relative}")
     }
+  } else {
+    maybe_relative.to_string()
+  }
+}
+
+fn aggregation_kind_name(agg: &Aggregation) -> &'static str {
+  match agg {
+    Aggregation::Terms(_) => "terms",
+    Aggregation::SignificantTerms(_) => "significant_terms",
+    Aggregation::RareTerms(_) => "rare_terms",
+    Aggregation::Range(_) => "range",
+    Aggregation::DateRange(_) => "date_range",
+    Aggregation::Histogram(_) => "histogram",
+    Aggregation::DateHistogram(_) => "date_histogram",
+    Aggregation::Filter(_) => "filter",
+    Aggregation::Nested(_) => "nested",
+    Aggregation::Composite(_) => "composite",
+    Aggregation::Stats(_) => "stats",
+    Aggregation::ExtendedStats(_) => "extended_stats",
+    Aggregation::ValueCount(_) => "value_count",
+    Aggregation::Cardinality(_) => "cardinality",
+    Aggregation::Percentiles(_) => "percentiles",
+    Aggregation::PercentileRanks(_) => "percentile_ranks",
+    Aggregation::TopHits(_) => "top_hits",
+    Aggregation::BucketSort(_) => "bucket_sort",
+    Aggregation::AvgBucket(_) => "avg_bucket",
+    Aggregation::SumBucket(_) => "sum_bucket",
+    Aggregation::Derivative(_) => "derivative",
+    Aggregation::MovingAvg(_) => "moving_avg",
+    Aggregation::BucketScript(_) => "bucket_script",
+  }
+}
+
+fn ensure_nested_path(
+  schema: &Schema,
+  path: &str,
+  agg: &str,
+  scope_path: Option<&str>,
+) -> Result<String> {
+  let resolved_path = resolve_scoped_path(scope_path, path);
+  let prefix = format!("{resolved_path}.");
+  if schema
+    .resolved_fields()
+    .iter()
+    .any(|field| field.path.starts_with(&prefix))
+  {
+    Ok(resolved_path)
   } else {
     Err(
       AggregationError::UnsupportedFieldType {
         agg: agg.to_string(),
-        field: field.to_string(),
-        expected: "fast keyword field".to_string(),
+        field: resolved_path,
+        expected: "nested path".to_string(),
       }
       .into(),
     )
   }
 }
 
-fn ensure_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
-  if let Some(def) = schema.numeric_fields.iter().find(|f| f.name == field) {
-    if def.fast {
-      return Ok(());
-    }
-    return Err(
-      AggregationError::MissingFastField {
-        field: field.to_string(),
+fn ensure_keyword_fast(
+  schema: &Schema,
+  field: &str,
+  agg: &str,
+  scope_path: Option<&str>,
+) -> Result<()> {
+  let resolved = resolve_scoped_path(scope_path, field);
+  if let Some(def) = schema.field_meta(&resolved) {
+    if matches!(def.kind, crate::index::manifest::FieldKind::Keyword) {
+      if def.fast {
+        return Ok(());
       }
-      .into(),
-    );
+      return Err(
+        AggregationError::MissingFastField {
+          field: resolved.to_string(),
+        }
+        .into(),
+      );
+    }
   }
   Err(
     AggregationError::UnsupportedFieldType {
       agg: agg.to_string(),
-      field: field.to_string(),
+      field: resolved,
+      expected: "fast keyword field".to_string(),
+    }
+    .into(),
+  )
+}
+
+fn ensure_numeric_fast(
+  schema: &Schema,
+  field: &str,
+  agg: &str,
+  scope_path: Option<&str>,
+) -> Result<()> {
+  let resolved = resolve_scoped_path(scope_path, field);
+  if let Some(def) = schema.field_meta(&resolved) {
+    if matches!(def.kind, crate::index::manifest::FieldKind::Numeric) {
+      if def.fast {
+        return Ok(());
+      }
+      return Err(
+        AggregationError::MissingFastField {
+          field: resolved.to_string(),
+        }
+        .into(),
+      );
+    }
+  }
+  Err(
+    AggregationError::UnsupportedFieldType {
+      agg: agg.to_string(),
+      field: resolved,
       expected: "fast numeric field".to_string(),
     }
     .into(),
   )
 }
 
-fn ensure_keyword_or_numeric_fast(schema: &Schema, field: &str, agg: &str) -> Result<()> {
-  if schema
-    .keyword_fields
-    .iter()
-    .any(|f| f.name == field && f.fast)
-  {
-    return Ok(());
-  }
-  if schema
-    .numeric_fields
-    .iter()
-    .any(|f| f.name == field && f.fast)
-  {
-    return Ok(());
+fn ensure_keyword_or_numeric_fast(
+  schema: &Schema,
+  field: &str,
+  agg: &str,
+  scope_path: Option<&str>,
+) -> Result<()> {
+  let resolved = resolve_scoped_path(scope_path, field);
+  if let Some(def) = schema.field_meta(&resolved) {
+    let kind_ok = matches!(
+      def.kind,
+      crate::index::manifest::FieldKind::Keyword | crate::index::manifest::FieldKind::Numeric
+    );
+    if kind_ok && def.fast {
+      return Ok(());
+    }
+    if kind_ok {
+      return Err(
+        AggregationError::MissingFastField {
+          field: resolved.to_string(),
+        }
+        .into(),
+      );
+    }
   }
   Err(
     AggregationError::UnsupportedFieldType {
       agg: agg.to_string(),
-      field: field.to_string(),
+      field: resolved,
       expected: "fast keyword or numeric field".to_string(),
     }
     .into(),
