@@ -2,3 +2,4 @@ target
 /examples/**/idx
 .tmp
 .worktrees/
+docs/plans/

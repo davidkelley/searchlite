@@ -15,3 +15,12 @@ pub enum AggregationError {
   #[error("invalid aggregation configuration: {reason}")]
   InvalidConfig { reason: String },
 }
+
+#[derive(Debug, Error)]
+pub enum PatchError {
+  #[error("document not found")]
+  DocumentNotFound,
+
+  #[error("vector fields are not supported for updates")]
+  VectorFieldsUnsupported,
+}

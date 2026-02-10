@@ -256,7 +256,7 @@ Flags/env:
 - `--require-existing-index`: fail fast at startup if the manifest is missing.
 - `--max-body-bytes`, `--max-concurrency`, `--request-timeout-secs`, `--shutdown-grace-secs`, `--refresh-on-commit`: resource limits and shutdown behavior.
 
-All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/indexes/{name}/add`, `/indexes/{name}/bulk`, or `/indexes/{name}/delete` are queued in the writer and become durable/searchable only after calling `/indexes/{name}/commit` (optionally followed by `/indexes/{name}/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
+All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/indexes/{name}/add`, `/indexes/{name}/bulk`, `/indexes/{name}/update`, `/indexes/{name}/_bulk_update`, or `/indexes/{name}/delete` are queued in the writer and become durable/searchable only after calling `/indexes/{name}/commit` (optionally followed by `/indexes/{name}/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
 
 ### Example requests
 
@@ -283,6 +283,23 @@ curl -XPOST http://localhost:8080/indexes/default/commit
 curl -XPOST http://localhost:8080/indexes/default/bulk \
   -H 'Content-Type: application/json' \
   -d '{"docs":[{"_id":"1","body":"Rust search"},{"_id":"2","body":"More docs"}]}'
+```
+
+- Update a single document (set/unset; not supported for vector fields):
+
+```bash
+curl -XPOST http://localhost:8080/indexes/default/update \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"1","set":{"available":8},"unset":["metadata.alt"]}'
+# {"accepted":true}
+```
+
+- Bulk update (NDJSON pairs, best-effort):
+
+```bash
+curl -XPOST http://localhost:8080/indexes/default/_bulk_update \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary $'{"update":{"_id":"1"}}\n{"set":{"available":8}}\n{"update":{"_id":"missing"}}\n{"set":{"available":0}}\n'
 ```
 
 - Search + highlight + collapse + aggregations:

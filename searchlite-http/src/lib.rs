@@ -22,6 +22,7 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
 };
+use searchlite_core::api::PatchError;
 use searchlite_core::api::{MultiSearchResponse, SearchResult};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
@@ -541,6 +542,61 @@ struct DeleteRequest {
   ids: Vec<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct UpdateRequest {
+  id: String,
+  #[serde(default)]
+  set: BTreeMap<String, serde_json::Value>,
+  #[serde(default)]
+  unset: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct UpdateResponse {
+  accepted: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdateAction {
+  update: BulkUpdateActionMeta,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdateActionMeta {
+  #[serde(rename = "_id")]
+  id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BulkUpdatePatch {
+  #[serde(default)]
+  set: BTreeMap<String, serde_json::Value>,
+  #[serde(default)]
+  unset: Vec<String>,
+}
+
+#[derive(Debug)]
+enum BulkUpdateMsg {
+  Batch(Vec<(String, BulkUpdatePatch)>),
+  Commit,
+  Abort,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BulkUpdateItem {
+  id: String,
+  status: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BulkUpdateResponse {
+  updated: u64,
+  failed: u64,
+  items: Vec<BulkUpdateItem>,
+}
+
 impl HttpError {
   fn bad_request(kind: &'static str, reason: impl Into<String>) -> Self {
     Self {
@@ -624,6 +680,8 @@ fn router(state: Arc<AppState>, args: &ServeArgs) -> Router {
     .route("/indexes/:name/init", post(init_index))
     .route("/indexes/:name/add", post(add_ndjson))
     .route("/indexes/:name/bulk", post(bulk_ingest))
+    .route("/indexes/:name/update", post(update_document))
+    .route("/indexes/:name/_bulk_update", post(bulk_update))
     .route("/indexes/:name/delete", post(delete_documents))
     .route("/indexes/:name/commit", post(commit))
     .route("/indexes/:name/refresh", post(refresh))
@@ -1071,6 +1129,386 @@ async fn delete_documents(
   }))
 }
 
+async fn update_document(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  headers: HeaderMap,
+  payload: Result<Json<UpdateRequest>, JsonRejection>,
+) -> ApiResult<Json<UpdateResponse>> {
+  let body = parse_json(payload)?;
+  if body.set.is_empty() && body.unset.is_empty() {
+    return Err(HttpError::bad_request(
+      "missing_patch",
+      "update must include at least one set or unset field",
+    ));
+  }
+  if let Err(err) = validate_doc_id(&body.id) {
+    return Err(HttpError::bad_request(
+      "invalid_id",
+      format!("invalid document id: {}", err),
+    ));
+  }
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
+
+  let writer_lock = managed.writer_lock.clone();
+  tokio::task::spawn_blocking(move || {
+    let _writer_guard = writer_lock.blocking_lock();
+    let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
+      let msg = e.to_string().to_lowercase();
+      let status = if msg.contains("write key") || msg.contains("unauthorized") {
+        if write_key.is_some() {
+          StatusCode::FORBIDDEN
+        } else {
+          StatusCode::UNAUTHORIZED
+        }
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      HttpError::from_anyhow("writer_open", status, e)
+    })?;
+    if let Err(err) = writer.apply_patch(&body.id, &body.set, &body.unset) {
+      if let Some(PatchError::DocumentNotFound) = err.downcast_ref::<PatchError>() {
+        return Err(HttpError::not_found("document_not_found", err.to_string()));
+      }
+      return Err(HttpError::bad_request("update_failed", err.to_string()));
+    }
+    Ok(Json(UpdateResponse { accepted: true }))
+  })
+  .await
+  .map_err(|err| {
+    HttpError::from_anyhow(
+      "update_join",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      anyhow::anyhow!(err.to_string()),
+    )
+  })?
+}
+
+async fn bulk_update(
+  State(state): State<Arc<AppState>>,
+  Path(index_name): Path<String>,
+  headers: HeaderMap,
+  body: Body,
+) -> ApiResult<Json<BulkUpdateResponse>> {
+  let managed = state.registry().resolve(&index_name)?;
+  let index = managed.require_index().await?;
+  let manifest = index.manifest();
+  let write_key = extract_write_key(&headers);
+  if write_key.is_none() && write_key_required(&manifest) {
+    return Err(HttpError::from_anyhow(
+      "write_key_required",
+      StatusCode::UNAUTHORIZED,
+      anyhow::anyhow!("write key required"),
+    ));
+  }
+
+  let mapped_stream = body
+    .into_data_stream()
+    .map(|chunk| chunk.map_err(io::Error::other));
+  let mut reader = StreamReader::new(mapped_stream);
+  let mut buf = String::new();
+  let mut line_number = 0usize;
+  let mut pending_action: Option<String> = None;
+
+  async fn await_writer_or_default(
+    writer_task: &mut Option<tokio::task::JoinHandle<Result<BulkUpdateResponse, HttpError>>>,
+    default: HttpError,
+  ) -> HttpError {
+    if let Some(handle) = writer_task.take() {
+      match handle.await {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => default,
+        Err(join_err) => HttpError::from_anyhow(
+          "bulk_update_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(join_err.to_string()),
+        ),
+      }
+    } else {
+      default
+    }
+  }
+
+  let (tx, rx) = mpsc::channel::<BulkUpdateMsg>(INGEST_CHANNEL_BUFFER_BATCHES);
+  let mut rx_slot = Some(rx);
+  let mut writer_task: Option<tokio::task::JoinHandle<Result<BulkUpdateResponse, HttpError>>> =
+    None;
+  let write_key_clone = write_key.clone();
+
+  let ensure_writer_task =
+    |rx_slot: &mut Option<mpsc::Receiver<BulkUpdateMsg>>,
+     writer_task: &mut Option<tokio::task::JoinHandle<Result<BulkUpdateResponse, HttpError>>>| {
+      if writer_task.is_some() {
+        return;
+      }
+      let Some(rx) = rx_slot.take() else {
+        return;
+      };
+      let writer_lock = managed.writer_lock.clone();
+      let index_ref = index.clone();
+      let write_key = write_key_clone.clone();
+      let handle = tokio::task::spawn_blocking(move || -> Result<BulkUpdateResponse, HttpError> {
+        let _writer_guard = writer_lock.blocking_lock();
+        let mut writer = index_ref
+          .writer_with_key(write_key.as_deref())
+          .map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            let status = if msg.contains("write key") || msg.contains("unauthorized") {
+              if write_key.is_some() {
+                StatusCode::FORBIDDEN
+              } else {
+                StatusCode::UNAUTHORIZED
+              }
+            } else {
+              StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpError::from_anyhow("writer_open", status, e)
+          })?;
+        let checkpoint = writer.checkpoint().map_err(|e| {
+          HttpError::from_anyhow(
+            "bulk_update_checkpoint",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e,
+          )
+        })?;
+        let mut updated = 0u64;
+        let mut failed = 0u64;
+        let mut items: Vec<BulkUpdateItem> = Vec::new();
+        let mut rx = rx;
+        while let Some(msg) = rx.blocking_recv() {
+          match msg {
+            BulkUpdateMsg::Batch(batch) => {
+              for (id, patch) in batch {
+                match writer.apply_patch(&id, &patch.set, &patch.unset) {
+                  Ok(()) => {
+                    updated = updated.saturating_add(1);
+                    items.push(BulkUpdateItem {
+                      id,
+                      status: StatusCode::OK.as_u16(),
+                      error: None,
+                    });
+                  }
+                  Err(err) => {
+                    failed = failed.saturating_add(1);
+                    let status = if matches!(
+                      err.downcast_ref::<PatchError>(),
+                      Some(PatchError::DocumentNotFound)
+                    ) {
+                      StatusCode::NOT_FOUND.as_u16()
+                    } else {
+                      StatusCode::BAD_REQUEST.as_u16()
+                    };
+                    items.push(BulkUpdateItem {
+                      id,
+                      status,
+                      error: Some(err.to_string()),
+                    });
+                  }
+                }
+              }
+            }
+            BulkUpdateMsg::Commit => {
+              return Ok(BulkUpdateResponse {
+                updated,
+                failed,
+                items,
+              });
+            }
+            BulkUpdateMsg::Abort => {
+              if let Err(rollback_err) = writer.rollback_to(checkpoint) {
+                error!(
+                  error = ?rollback_err,
+                  "failed to rollback bulk update request scope"
+                );
+              }
+              return Ok(BulkUpdateResponse {
+                updated,
+                failed,
+                items,
+              });
+            }
+          }
+        }
+        if let Err(rollback_err) = writer.rollback_to(checkpoint) {
+          error!(
+            error = ?rollback_err,
+            "failed to rollback bulk update request scope after channel closure"
+          );
+        }
+        Ok(BulkUpdateResponse {
+          updated,
+          failed,
+          items,
+        })
+      });
+      *writer_task = Some(handle);
+    };
+
+  let mut updates = Vec::with_capacity(NDJSON_BATCH_SIZE);
+
+  let ingest_result: ApiResult<()> = async {
+    loop {
+      buf.clear();
+      let read = reader
+        .read_line(&mut buf)
+        .await
+        .map_err(|e| HttpError::from_anyhow("read_body", StatusCode::BAD_REQUEST, e.into()))?;
+      if read == 0 {
+        break;
+      }
+      line_number += 1;
+      let trimmed = buf.trim();
+      if trimmed.is_empty() {
+        continue;
+      }
+
+      if pending_action.is_none() {
+        let action: BulkUpdateAction = serde_json::from_str(trimmed).map_err(|e| {
+          HttpError::bad_request(
+            "invalid_bulk_update",
+            format!("invalid update action on NDJSON line {}: {e}", line_number),
+          )
+        })?;
+        if let Err(err) = validate_doc_id(&action.update.id) {
+          return Err(HttpError::bad_request(
+            "invalid_bulk_update",
+            format!(
+              "invalid update action on NDJSON line {}: invalid document id: {}",
+              line_number, err
+            ),
+          ));
+        }
+        pending_action = Some(action.update.id);
+      } else {
+        let patch: BulkUpdatePatch = serde_json::from_str(trimmed).map_err(|e| {
+          HttpError::bad_request(
+            "invalid_bulk_update",
+            format!("invalid update body on NDJSON line {}: {e}", line_number),
+          )
+        })?;
+        let id = pending_action
+          .take()
+          .expect("pending action must exist for update body");
+        updates.push((id, patch));
+
+        if updates.len() >= NDJSON_BATCH_SIZE {
+          ensure_writer_task(&mut rx_slot, &mut writer_task);
+          let batch = std::mem::replace(&mut updates, Vec::with_capacity(NDJSON_BATCH_SIZE));
+          if tx.send(BulkUpdateMsg::Batch(batch)).await.is_err() {
+            let writer_err = await_writer_or_default(
+              &mut writer_task,
+              HttpError::from_anyhow(
+                "bulk_update_worker_closed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("bulk update worker terminated early"),
+              ),
+            )
+            .await;
+            return Err(writer_err);
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+  .await;
+
+  if let Err(err) = ingest_result {
+    if writer_task.is_some() {
+      let _ = tx.send(BulkUpdateMsg::Abort).await;
+    }
+    drop(tx);
+    if let Some(handle) = writer_task.take() {
+      let _ = handle.await;
+    }
+    return Err(err);
+  }
+
+  if pending_action.is_some() {
+    if writer_task.is_some() {
+      let _ = tx.send(BulkUpdateMsg::Abort).await;
+    }
+    drop(tx);
+    if let Some(handle) = writer_task.take() {
+      let _ = handle.await;
+    }
+    return Err(HttpError::bad_request(
+      "invalid_bulk_update",
+      "update action missing corresponding body line",
+    ));
+  }
+
+  if !updates.is_empty() {
+    ensure_writer_task(&mut rx_slot, &mut writer_task);
+    if tx.send(BulkUpdateMsg::Batch(updates)).await.is_err() {
+      let writer_err = await_writer_or_default(
+        &mut writer_task,
+        HttpError::from_anyhow(
+          "bulk_update_worker_closed",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("bulk update worker terminated early"),
+        ),
+      )
+      .await;
+      return Err(writer_err);
+    }
+  }
+
+  if writer_task.is_none() {
+    drop(tx);
+    return Ok(Json(BulkUpdateResponse {
+      updated: 0,
+      failed: 0,
+      items: Vec::new(),
+    }));
+  }
+
+  if tx.send(BulkUpdateMsg::Commit).await.is_err() {
+    let writer_err = await_writer_or_default(
+      &mut writer_task,
+      HttpError::from_anyhow(
+        "bulk_update_worker_closed",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!("bulk update worker terminated early"),
+      ),
+    )
+    .await;
+    return Err(writer_err);
+  }
+
+  drop(tx);
+  let response = match writer_task.take() {
+    Some(handle) => match handle.await {
+      Ok(Ok(resp)) => resp,
+      Ok(Err(err)) => return Err(err),
+      Err(err) => {
+        return Err(HttpError::from_anyhow(
+          "bulk_update_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!(err.to_string()),
+        ))
+      }
+    },
+    None => BulkUpdateResponse {
+      updated: 0,
+      failed: 0,
+      items: Vec::new(),
+    },
+  };
+
+  Ok(Json(response))
+}
+
 fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
   // Opening a reader reloads searchers; the returned reader can be dropped
   // immediately when only a refresh side effect is desired.
@@ -1315,8 +1753,12 @@ async fn multi_search(
   Path(index_name): Path<String>,
   payload: Result<Json<MultiSearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<MultiSearchResponse>> {
-  let mut body = parse_json(payload)?;
-  if body.searches.is_empty() {
+  let MultiSearchRequest {
+    searches,
+    parallel,
+    max_concurrency,
+  } = parse_json(payload)?;
+  if searches.is_empty() {
     return Err(HttpError::bad_request(
       "missing_searches",
       "searches array must contain at least one search request",
@@ -1367,27 +1809,28 @@ async fn multi_search(
     }
     Ok(())
   };
-  for req in body.searches.iter() {
+  for req in searches.iter() {
     validate_search(req)?;
   }
+  #[cfg(feature = "vectors")]
+  let mut searches = searches;
+  #[cfg(not(feature = "vectors"))]
+  let searches = searches;
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
-    for req in body.searches.iter_mut() {
+    for req in searches.iter_mut() {
       req
         .max_global_vector_candidates
         .get_or_insert(managed.max_vector_candidates);
     }
   }
   let index = managed.require_index().await?;
-  let parallel = body.parallel;
-  let max_concurrency = body
-    .max_concurrency
+  let max_concurrency = max_concurrency
     .unwrap_or(DEFAULT_MULTI_SEARCH_MAX_CONCURRENCY)
     .clamp(1, HARD_MULTI_SEARCH_MAX_CONCURRENCY);
 
   if !parallel {
-    let searches = body.searches.clone();
     let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<MultiSearchResponse> {
       let reader = index.reader()?;
       let mut results = Vec::with_capacity(searches.len());
@@ -1412,7 +1855,6 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
-  let searches = body.searches.clone();
   let idx = index.clone();
   let semaphore = Arc::new(Semaphore::new(max_concurrency));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
@@ -1684,7 +2126,6 @@ mod tests {
       .await
       .unwrap();
     assert!(res.status().is_success());
-
     // add docs
     let ndjson =
       "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another doc\"}\n";
@@ -2187,6 +2628,225 @@ mod tests {
     assert!(!body.docs[1].found);
     assert!(body.docs[2].found);
     assert!(body.docs[3].found);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_update_document() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-update");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "doc-1", "body": "hello" } ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let update = serde_json::json!({
+      "id": "doc-1",
+      "set": { "body": "updated" },
+      "unset": []
+    });
+    let res = client
+      .post(format!("{index_base}/update"))
+      .json(&update)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["accepted"], true);
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let mget = serde_json::json!({ "ids": ["doc-1"], "return_stored": true });
+    let res = client
+      .post(format!("{index_base}/mget"))
+      .json(&mget)
+      .send()
+      .await
+      .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["docs"][0]["_source"]["body"], "updated");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_supports_bulk_update_best_effort() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "doc-1", "body": "hello" } ]
+    });
+    client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = [
+      r#"{"update":{"_id":"doc-1"}}"#,
+      r#"{"set":{"body":"updated"}}"#,
+      r#"{"update":{"_id":"missing"}}"#,
+      r#"{"set":{"body":"nope"}}"#,
+      "",
+    ]
+    .join("\n");
+
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["updated"], 1);
+    assert_eq!(body["failed"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn bulk_update_abort_preserves_preexisting_pending_writes() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update-abort-preserve");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    // Queue a write from another request and leave it pending (no commit yet).
+    let bulk = serde_json::json!({
+      "docs": [ { "_id": "seed", "body": "seed" } ]
+    });
+    let res = client
+      .post(format!("{index_base}/bulk"))
+      .json(&bulk)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+
+    // Force writer task startup (first full batch), then trigger abort with a trailing action line.
+    let mut ndjson = String::new();
+    for i in 0..NDJSON_BATCH_SIZE {
+      ndjson.push_str(r#"{"update":{"_id":"seed"}}"#);
+      ndjson.push('\n');
+      ndjson.push_str(&format!(r#"{{"set":{{"body":"bulk-{i}"}}}}"#));
+      ndjson.push('\n');
+    }
+    ndjson.push_str(r#"{"update":{"_id":"seed"}}"#);
+    ndjson.push('\n');
+
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let err: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(err.error.r#type, "invalid_bulk_update");
+
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let mget = serde_json::json!({ "ids": ["seed"], "return_stored": true });
+    let res = client
+      .post(format!("{index_base}/mget"))
+      .json(&mget)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::OK);
+    let body: MgetResponse = res.json().await.unwrap();
+    assert_eq!(body.docs.len(), 1);
+    assert!(body.docs[0].found);
+    assert_eq!(body.docs[0]._source.as_ref().unwrap()["body"], "seed");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn http_bulk_update_rejects_invalid_id() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-bulk-update-invalid-id");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    let schema = Schema::default_text_body();
+    client
+      .post(format!("{index_base}/init"))
+      .json(&schema)
+      .send()
+      .await
+      .unwrap();
+
+    let ndjson = "{\"update\":{\"_id\":\"bad\\u0001\"}}\n{\"set\":{\"body\":\"updated\"}}\n";
+    let res = client
+      .post(format!("{index_base}/_bulk_update"))
+      .body(ndjson)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_bulk_update");
 
     handle.abort();
     let _ = handle.await;

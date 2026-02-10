@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,8 +8,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
+use crate::api::errors::PatchError;
+use crate::api::reader::IndexReader;
 use crate::api::types::Document;
-use crate::index::manifest::{Manifest, Schema};
+use crate::index::manifest::{Manifest, NestedField, NestedProperty, Schema};
 use crate::index::segment::{SegmentFileMeta, SegmentWriter};
 use crate::index::wal::{Wal, WalEntry};
 use crate::index::InnerIndex;
@@ -28,18 +31,27 @@ enum PendingOp {
   Delete { doc_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchReaderStamp {
+  committed_at: String,
+  segment_fingerprint: u64,
+}
+
 pub struct IndexWriter {
   inner: Arc<InnerIndex>,
   wal: Wal,
   pending_ops: Vec<PendingOp>,
+  pending_latest: HashMap<String, Option<Document>>,
   schema: Schema,
   live_docs: HashMap<String, DocAddress>,
   live_generation: u32,
   write_binding: Option<Vec<u8>>,
+  patch_reader: Option<IndexReader>,
+  patch_reader_stamp: Option<PatchReaderStamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WriterCheckpoint {
+pub struct WriterCheckpoint {
   wal_len: u64,
   pending_len: usize,
 }
@@ -141,22 +153,25 @@ impl IndexWriter {
         WalEntry::WriteBinding(_) => {}
       }
     }
+    let pending_latest = pending_latest_from_ops(&pending_ops);
     drop(_guard);
     Ok(Self {
       inner,
       wal,
       pending_ops,
+      pending_latest,
       schema,
       live_docs,
       live_generation,
       write_binding,
+      patch_reader: None,
+      patch_reader_stamp: None,
     })
   }
 
   /// Capture the current WAL length and pending-op count so callers can roll back
   /// only the work done after the checkpoint.
-  #[allow(dead_code)]
-  fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
+  pub fn checkpoint(&mut self) -> Result<WriterCheckpoint> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
     self.checkpoint_locked()
@@ -164,8 +179,7 @@ impl IndexWriter {
 
   /// Truncate WAL and pending_ops back to a prior checkpoint without dropping
   /// earlier queued work.
-  #[allow(dead_code)]
-  fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
+  pub fn rollback_to(&mut self, checkpoint: WriterCheckpoint) -> Result<()> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
     self.rollback_to_locked(checkpoint)
@@ -188,7 +202,48 @@ impl IndexWriter {
       self
         .pending_ops
         .push(PendingOp::Delete { doc_id: id.clone() });
+      self.pending_latest.insert(id.clone(), None);
     }
+    Ok(())
+  }
+
+  pub fn apply_patch(
+    &mut self,
+    doc_id: &str,
+    set: &BTreeMap<String, serde_json::Value>,
+    unset: &[String],
+  ) -> Result<()> {
+    let inner = self.inner.clone();
+    let _guard = inner.writer_lock.lock();
+    ensure_patch_safe(&self.schema)?;
+    validate_patch_fields(&self.schema, doc_id, set, unset)?;
+    let mut doc = match pending_doc_for_patch(&self.pending_latest, doc_id) {
+      Some(Some(doc)) => doc,
+      Some(None) => return Err(PatchError::DocumentNotFound.into()),
+      None => load_document_for_patch(
+        inner.clone(),
+        &mut self.patch_reader,
+        &mut self.patch_reader_stamp,
+        doc_id,
+      )?
+      .ok_or(PatchError::DocumentNotFound)?,
+    };
+    let mut value = document_to_value(&doc)?;
+    let literal_top_level_paths = literal_top_level_dotted_paths(&self.schema);
+    for path in unset.iter() {
+      unset_path_with_literals(&mut value, path, Some(&literal_top_level_paths))?;
+    }
+    for (path, val) in set.iter() {
+      set_path_with_literals(
+        &mut value,
+        path,
+        val.clone(),
+        Some(&literal_top_level_paths),
+      )?;
+    }
+    doc = value_to_document(value)?;
+    self.schema.validate_document(&doc)?;
+    self.add_document_locked(&doc)?;
     Ok(())
   }
 
@@ -315,6 +370,8 @@ impl IndexWriter {
       if !new_segments.is_empty() {
         let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
       }
+      self.patch_reader = None;
+      self.patch_reader_stamp = None;
       return Err(e);
     }
     {
@@ -323,6 +380,9 @@ impl IndexWriter {
     }
     self.wal.truncate()?;
     self.pending_ops.clear();
+    self.pending_latest.clear();
+    self.patch_reader = None;
+    self.patch_reader_stamp = None;
     self.live_docs = live_docs;
     self.live_generation = new_generation;
     Ok(())
@@ -331,6 +391,9 @@ impl IndexWriter {
   pub fn rollback(&mut self) -> Result<()> {
     let _guard = self.inner.writer_lock.lock();
     self.pending_ops.clear();
+    self.pending_latest.clear();
+    self.patch_reader = None;
+    self.patch_reader_stamp = None;
     self.wal.truncate()?;
     Ok(())
   }
@@ -361,6 +424,7 @@ impl IndexWriter {
     self.wal.truncate_to(checkpoint.wal_len)?;
     if self.pending_ops.len() > checkpoint.pending_len {
       self.pending_ops.truncate(checkpoint.pending_len);
+      self.pending_latest = pending_latest_from_ops(&self.pending_ops);
     }
     Ok(())
   }
@@ -373,6 +437,9 @@ impl IndexWriter {
       doc_id: doc_id.clone(),
       doc: doc.clone(),
     });
+    self
+      .pending_latest
+      .insert(doc_id.clone(), Some(doc.clone()));
     let add_count = self
       .pending_ops
       .iter()
@@ -416,6 +483,307 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
   Ok(doc_id.to_string())
 }
 
+fn load_document_for_patch(
+  inner: Arc<InnerIndex>,
+  patch_reader: &mut Option<IndexReader>,
+  patch_reader_stamp: &mut Option<PatchReaderStamp>,
+  doc_id: &str,
+) -> Result<Option<Document>> {
+  let current_stamp = {
+    let manifest = inner.manifest.read();
+    patch_reader_stamp_for_manifest(&manifest)
+  };
+  if patch_reader.is_none() || patch_reader_stamp.as_ref() != Some(&current_stamp) {
+    *patch_reader = Some(IndexReader::open(inner.clone())?);
+    *patch_reader_stamp = Some(current_stamp);
+  }
+  let Some(reader) = patch_reader.as_mut() else {
+    bail!("patch reader unavailable");
+  };
+  let mut docs = reader.mget(&[doc_id.to_string()], true)?;
+  let Some(found) = docs.pop() else {
+    return Ok(None);
+  };
+  if !found.found {
+    return Ok(None);
+  }
+  let source = found
+    ._source
+    .ok_or_else(|| anyhow!("stored fields are unavailable for document {doc_id}"))?;
+  value_to_document(source).map(Some)
+}
+
+fn patch_reader_stamp_for_manifest(manifest: &Manifest) -> PatchReaderStamp {
+  let mut hasher = DefaultHasher::new();
+  manifest.segments.len().hash(&mut hasher);
+  for seg in manifest.segments.iter() {
+    seg.id.hash(&mut hasher);
+    seg.generation.hash(&mut hasher);
+    seg.doc_count.hash(&mut hasher);
+    seg.max_doc_id.hash(&mut hasher);
+    seg.blockmax.hash(&mut hasher);
+    seg.deleted_docs.hash(&mut hasher);
+    seg.paths.terms.hash(&mut hasher);
+    seg.paths.postings.hash(&mut hasher);
+    seg.paths.docstore.hash(&mut hasher);
+    seg.paths.fast.hash(&mut hasher);
+    seg.paths.meta.hash(&mut hasher);
+    #[cfg(feature = "vectors")]
+    seg.paths.vector_dir.hash(&mut hasher);
+  }
+  PatchReaderStamp {
+    committed_at: manifest.committed_at.clone(),
+    segment_fingerprint: hasher.finish(),
+  }
+}
+
+fn pending_latest_from_ops(pending_ops: &[PendingOp]) -> HashMap<String, Option<Document>> {
+  let mut latest = HashMap::new();
+  for op in pending_ops.iter() {
+    match op {
+      PendingOp::Add { doc_id: id, doc } => {
+        latest.insert(id.clone(), Some(doc.clone()));
+      }
+      PendingOp::Delete { doc_id: id } => {
+        latest.insert(id.clone(), None);
+      }
+    }
+  }
+  latest
+}
+
+fn pending_doc_for_patch(
+  pending_latest: &HashMap<String, Option<Document>>,
+  doc_id: &str,
+) -> Option<Option<Document>> {
+  pending_latest.get(doc_id).cloned()
+}
+
+fn ensure_patch_safe(schema: &Schema) -> Result<()> {
+  #[cfg(feature = "vectors")]
+  if !schema.vector_fields.is_empty() {
+    return Err(PatchError::VectorFieldsUnsupported.into());
+  }
+  for field in schema.resolved_fields().into_iter() {
+    if (field.indexed || field.fast) && !field.stored {
+      bail!(
+        "cannot update documents: field `{}` is indexed/fast but not stored",
+        field.path
+      );
+    }
+  }
+  Ok(())
+}
+
+fn validate_patch_fields(
+  schema: &Schema,
+  doc_id: &str,
+  set: &BTreeMap<String, serde_json::Value>,
+  unset: &[String],
+) -> Result<()> {
+  if set.is_empty() && unset.is_empty() {
+    bail!("update must include at least one of set or unset");
+  }
+  validate_doc_id(doc_id)?;
+  let doc_id_field = schema.doc_id_field();
+  let patchable_paths = patchable_schema_paths(schema);
+  for path in set.keys().chain(unset.iter()) {
+    if path == doc_id_field {
+      bail!("cannot update doc_id_field `{}`", doc_id_field);
+    }
+    if !patchable_paths.contains(path) {
+      bail!("unknown field {path}");
+    }
+  }
+  Ok(())
+}
+
+fn patchable_schema_paths(schema: &Schema) -> HashSet<String> {
+  let mut paths: HashSet<String> = schema
+    .resolved_fields()
+    .into_iter()
+    .map(|field| field.path)
+    .collect();
+  for nested in schema.nested_fields.iter() {
+    collect_nested_patchable_paths(nested, None, &mut paths);
+  }
+  paths
+}
+
+fn collect_nested_patchable_paths(
+  nested: &NestedField,
+  prefix: Option<&str>,
+  out: &mut HashSet<String>,
+) {
+  let mut path = String::new();
+  if let Some(parent) = prefix {
+    path.push_str(parent);
+    path.push('.');
+  }
+  path.push_str(&nested.name);
+  out.insert(path.clone());
+  for property in nested.fields.iter() {
+    if let NestedProperty::Object(object) = property {
+      collect_nested_patchable_paths(object, Some(&path), out);
+    }
+  }
+}
+
+fn literal_top_level_dotted_paths(schema: &Schema) -> HashSet<String> {
+  let mut out = HashSet::new();
+  for field in schema
+    .text_fields
+    .iter()
+    .map(|field| field.name.as_str())
+    .chain(
+      schema
+        .keyword_fields
+        .iter()
+        .map(|field| field.name.as_str()),
+    )
+    .chain(
+      schema
+        .numeric_fields
+        .iter()
+        .map(|field| field.name.as_str()),
+    )
+  {
+    if field.contains('.') {
+      out.insert(field.to_string());
+    }
+  }
+  out
+}
+
+fn document_to_value(doc: &Document) -> Result<serde_json::Value> {
+  let mut map = serde_json::Map::new();
+  for (k, v) in doc.fields.iter() {
+    map.insert(k.clone(), v.clone());
+  }
+  Ok(serde_json::Value::Object(map))
+}
+
+fn value_to_document(value: serde_json::Value) -> Result<Document> {
+  let Some(obj) = value.as_object() else {
+    bail!("document must be a JSON object");
+  };
+  let mut fields = BTreeMap::new();
+  for (k, v) in obj.iter() {
+    fields.insert(k.clone(), v.clone());
+  }
+  Ok(Document { fields })
+}
+
+#[cfg(test)]
+fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) -> Result<()> {
+  set_path_with_literals(root, path, value, None)
+}
+
+fn set_path_with_literals(
+  root: &mut serde_json::Value,
+  path: &str,
+  value: serde_json::Value,
+  literal_paths: Option<&HashSet<String>>,
+) -> Result<()> {
+  if path.is_empty() {
+    bail!("path must not be empty");
+  }
+  if path.split('.').any(|part| part.is_empty()) {
+    bail!("path must not contain empty path segment");
+  }
+  if literal_paths.is_some_and(|paths| paths.contains(path)) {
+    let Some(map) = root.as_object_mut() else {
+      bail!("path {path} cannot traverse non-object");
+    };
+    map.insert(path.to_string(), value);
+    return Ok(());
+  }
+  let parts: Vec<&str> = path.split('.').collect();
+  set_path_parts(root, &parts, path, &value)
+}
+
+fn set_path_parts(
+  current: &mut serde_json::Value,
+  parts: &[&str],
+  path: &str,
+  value: &serde_json::Value,
+) -> Result<()> {
+  let Some((part, rest)) = parts.split_first() else {
+    return Ok(());
+  };
+  match current {
+    serde_json::Value::Object(map) => {
+      if rest.is_empty() {
+        map.insert((*part).to_string(), value.clone());
+        return Ok(());
+      }
+      let entry = map
+        .entry(*part)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+      set_path_parts(entry, rest, path, value)
+    }
+    serde_json::Value::Array(items) => {
+      for item in items.iter_mut() {
+        set_path_parts(item, parts, path, value)?;
+      }
+      Ok(())
+    }
+    _ => bail!("path {path} cannot traverse non-object"),
+  }
+}
+
+#[cfg(test)]
+fn unset_path(root: &mut serde_json::Value, path: &str) -> Result<()> {
+  unset_path_with_literals(root, path, None)
+}
+
+fn unset_path_with_literals(
+  root: &mut serde_json::Value,
+  path: &str,
+  literal_paths: Option<&HashSet<String>>,
+) -> Result<()> {
+  if path.is_empty() {
+    bail!("path must not be empty");
+  }
+  if path.split('.').any(|part| part.is_empty()) {
+    bail!("path must not contain empty path segment");
+  }
+  if literal_paths.is_some_and(|paths| paths.contains(path)) {
+    let Some(map) = root.as_object_mut() else {
+      bail!("path {path} cannot traverse non-object");
+    };
+    map.remove(path);
+    return Ok(());
+  }
+  let parts: Vec<&str> = path.split('.').collect();
+  unset_path_parts(root, &parts, path)
+}
+
+fn unset_path_parts(current: &mut serde_json::Value, parts: &[&str], path: &str) -> Result<()> {
+  let Some((part, rest)) = parts.split_first() else {
+    return Ok(());
+  };
+  match current {
+    serde_json::Value::Object(map) => {
+      if rest.is_empty() {
+        map.remove(*part);
+        return Ok(());
+      }
+      let Some(next) = map.get_mut(*part) else {
+        return Ok(());
+      };
+      unset_path_parts(next, rest, path)
+    }
+    serde_json::Value::Array(items) => {
+      for item in items.iter_mut() {
+        unset_path_parts(item, parts, path)?;
+      }
+      Ok(())
+    }
+    _ => bail!("path {path} cannot traverse non-object"),
+  }
+}
+
 fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<String, DocAddress>> {
   let mut map = HashMap::new();
   for seg in manifest.segments.iter() {
@@ -449,6 +817,7 @@ fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<Str
 
 #[cfg(test)]
 mod tests {
+  use std::collections::BTreeMap;
   use std::path::PathBuf;
   use std::sync::atomic::{AtomicBool, Ordering};
   use std::sync::Arc;
@@ -457,7 +826,9 @@ mod tests {
   use parking_lot::{Mutex, RwLock};
 
   use super::PendingOp;
-  use crate::api::types::{Document, IndexOptions, Schema, StorageType};
+  use crate::api::types::{
+    Document, IndexOptions, KeywordField, NestedField, NestedProperty, Schema, StorageType,
+  };
   use crate::index::{directory, manifest::Manifest, wal::Wal, Index, InnerIndex};
   use crate::storage::{InMemoryStorage, Storage};
   use tempfile::tempdir;
@@ -473,6 +844,35 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
+  }
+
+  fn nested_schema_for_patch() -> Schema {
+    let mut schema = Schema::default_text_body();
+    schema.nested_fields = vec![NestedField {
+      name: "comment".into(),
+      fields: vec![
+        NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        }),
+        NestedProperty::Object(NestedField {
+          name: "reply".into(),
+          fields: vec![NestedProperty::Keyword(KeywordField {
+            name: "author".into(),
+            stored: true,
+            indexed: true,
+            fast: false,
+            nullable: false,
+          })],
+          nullable: false,
+        }),
+      ],
+      nullable: false,
+    }];
+    schema
   }
 
   struct FailingManifestStorage {
@@ -892,5 +1292,336 @@ mod tests {
     let manifest = idx.manifest();
     assert_eq!(manifest.segments.len(), 1);
     assert_eq!(manifest.segments[0].doc_count, 1);
+  }
+
+  #[test]
+  fn validate_patch_fields_accepts_nested_roots() {
+    let schema = nested_schema_for_patch();
+    let mut set = BTreeMap::new();
+    set.insert(
+      "comment".to_string(),
+      serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+    );
+    set.insert(
+      "comment.reply".to_string(),
+      serde_json::json!({ "author": "carol" }),
+    );
+    super::validate_patch_fields(&schema, "doc-1", &set, &[]).unwrap();
+  }
+
+  #[test]
+  fn validate_patch_fields_rejects_unknown_nested_roots() {
+    let schema = nested_schema_for_patch();
+    let mut set = BTreeMap::new();
+    set.insert("comment.missing".to_string(), serde_json::json!("nope"));
+    let err = super::validate_patch_fields(&schema, "doc-1", &set, &[]).unwrap_err();
+    assert!(err.to_string().contains("unknown field comment.missing"));
+  }
+
+  #[test]
+  fn validate_patch_fields_rejects_literal_dotted_parent_path() {
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "a.b".into(),
+      stored: true,
+      indexed: true,
+      fast: false,
+      nullable: false,
+    });
+    let mut set = BTreeMap::new();
+    set.insert("a".to_string(), serde_json::json!("nope"));
+    let err = super::validate_patch_fields(&schema, "doc-1", &set, &[]).unwrap_err();
+    assert!(err.to_string().contains("unknown field a"));
+  }
+
+  #[test]
+  fn apply_patch_allows_replacing_nested_root() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert(
+        "comment".to_string(),
+        serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }]),
+      );
+      writer.apply_patch("1", &set, &[]).unwrap();
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    assert_eq!(
+      docs[0]._source.as_ref().unwrap()["comment"],
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }])
+    );
+  }
+
+  #[test]
+  fn apply_patch_updates_dotted_paths_through_nested_arrays() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([
+                { "author": "alice", "reply": { "author": "bob" } },
+                { "author": "carol", "reply": { "author": "dave" } }
+              ]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert("comment.reply.author".to_string(), serde_json::json!("eve"));
+      writer.apply_patch("1", &set, &[]).unwrap();
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["comment"][0]["reply"]["author"], "eve");
+    assert_eq!(source["comment"][1]["reply"]["author"], "eve");
+  }
+
+  #[test]
+  fn apply_patch_reuses_fresh_committed_state_across_commits() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([{ "author": "alice", "reply": { "author": "bob" } }]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let mut writer = idx.writer().unwrap();
+    let mut first = BTreeMap::new();
+    first.insert(
+      "comment".to_string(),
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }]),
+    );
+    writer.apply_patch("1", &first, &[]).unwrap();
+    writer.commit().unwrap();
+    let mut second = BTreeMap::new();
+    second.insert("body".to_string(), serde_json::json!("after"));
+    writer.apply_patch("1", &second, &[]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["body"], "after");
+    assert_eq!(
+      source["comment"],
+      serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }])
+    );
+  }
+
+  #[test]
+  fn apply_patch_refreshes_reader_after_external_commit() {
+    let dir = tempdir().unwrap();
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "status".into(),
+      stored: true,
+      indexed: true,
+      fast: false,
+      nullable: false,
+    });
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("first")),
+            ("status".into(), serde_json::json!("old")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("2")),
+            ("body".into(), serde_json::json!("second")),
+            ("status".into(), serde_json::json!("old")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let mut writer = idx.writer().unwrap();
+    let mut warm_reader = BTreeMap::new();
+    warm_reader.insert("body".to_string(), serde_json::json!("writer-a-first"));
+    writer.apply_patch("1", &warm_reader, &[]).unwrap();
+
+    {
+      let mut other_writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert("status".to_string(), serde_json::json!("updated-by-other"));
+      other_writer.apply_patch("2", &set, &[]).unwrap();
+      other_writer.commit().unwrap();
+    }
+
+    let mut second_patch = BTreeMap::new();
+    second_patch.insert("body".to_string(), serde_json::json!("writer-a-second"));
+    writer.apply_patch("2", &second_patch, &[]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["2".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["status"], "updated-by-other");
+    assert_eq!(source["body"], "writer-a-second");
+  }
+
+  #[test]
+  fn apply_patch_treats_dotted_top_level_field_as_literal_key() {
+    let dir = tempdir().unwrap();
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "a.b".into(),
+      stored: true,
+      indexed: true,
+      fast: false,
+      nullable: true,
+    });
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            ("a.b".into(), serde_json::json!("old")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert("a.b".to_string(), serde_json::json!("new"));
+      writer.apply_patch("1", &set, &[]).unwrap();
+      writer.commit().unwrap();
+    }
+
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["a.b"], "new");
+    assert!(source.get("a").is_none());
+  }
+
+  #[test]
+  fn set_path_rejects_empty_segments() {
+    let invalid_paths = ["a..b", ".field", "field."];
+    for path in invalid_paths.iter() {
+      let mut value = serde_json::json!({});
+      let err = super::set_path(&mut value, path, serde_json::json!(1)).unwrap_err();
+      assert!(err.to_string().contains("empty path segment"));
+    }
+  }
+
+  #[test]
+  fn unset_path_rejects_empty_segments() {
+    let invalid_paths = ["a..b", ".field", "field."];
+    for path in invalid_paths.iter() {
+      let mut value = serde_json::json!({ "field": { "x": 1 } });
+      let err = super::unset_path(&mut value, path).unwrap_err();
+      assert!(err.to_string().contains("empty path segment"));
+    }
+  }
+
+  #[test]
+  fn set_path_traverses_arrays() {
+    let mut value = serde_json::json!({
+      "comment": [
+        { "reply": { "author": "alice" } },
+        { "reply": { "author": "bob" } }
+      ]
+    });
+    super::set_path(&mut value, "comment.reply.author", serde_json::json!("eve")).unwrap();
+    assert_eq!(value["comment"][0]["reply"]["author"], "eve");
+    assert_eq!(value["comment"][1]["reply"]["author"], "eve");
+  }
+
+  #[test]
+  fn unset_path_traverses_arrays() {
+    let mut value = serde_json::json!({
+      "comment": [
+        { "reply": { "author": "alice", "score": 1 } },
+        { "reply": { "author": "bob", "score": 2 } }
+      ]
+    });
+    super::unset_path(&mut value, "comment.reply.author").unwrap();
+    assert!(value["comment"][0]["reply"].get("author").is_none());
+    assert!(value["comment"][1]["reply"].get("author").is_none());
+    assert_eq!(value["comment"][0]["reply"]["score"], 1);
+    assert_eq!(value["comment"][1]["reply"]["score"], 2);
   }
 }
