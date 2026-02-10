@@ -554,28 +554,38 @@ fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) 
   if path.split('.').any(|part| part.is_empty()) {
     bail!("path must not contain empty path segment");
   }
-  let mut parts = path.split('.').peekable();
-  let mut current = root;
-  while let Some(part) = parts.next() {
-    let is_last = parts.peek().is_none();
-    match current {
-      serde_json::Value::Object(map) => {
-        if is_last {
-          map.insert(part.to_string(), value);
-          return Ok(());
-        }
-        let entry = map
-          .entry(part)
-          .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if !entry.is_object() {
-          bail!("path {path} cannot traverse non-object");
-        }
-        current = entry;
+  let parts: Vec<&str> = path.split('.').collect();
+  set_path_parts(root, &parts, path, &value)
+}
+
+fn set_path_parts(
+  current: &mut serde_json::Value,
+  parts: &[&str],
+  path: &str,
+  value: &serde_json::Value,
+) -> Result<()> {
+  let Some((part, rest)) = parts.split_first() else {
+    return Ok(());
+  };
+  match current {
+    serde_json::Value::Object(map) => {
+      if rest.is_empty() {
+        map.insert((*part).to_string(), value.clone());
+        return Ok(());
       }
-      _ => bail!("path {path} cannot traverse non-object"),
+      let entry = map
+        .entry(*part)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+      set_path_parts(entry, rest, path, value)
     }
+    serde_json::Value::Array(items) => {
+      for item in items.iter_mut() {
+        set_path_parts(item, parts, path, value)?;
+      }
+      Ok(())
+    }
+    _ => bail!("path {path} cannot traverse non-object"),
   }
-  Ok(())
 }
 
 fn unset_path(root: &mut serde_json::Value, path: &str) -> Result<()> {
@@ -585,28 +595,33 @@ fn unset_path(root: &mut serde_json::Value, path: &str) -> Result<()> {
   if path.split('.').any(|part| part.is_empty()) {
     bail!("path must not contain empty path segment");
   }
-  let mut parts = path.split('.').peekable();
-  let mut current = root;
-  while let Some(part) = parts.next() {
-    let is_last = parts.peek().is_none();
-    match current {
-      serde_json::Value::Object(map) => {
-        if is_last {
-          map.remove(part);
-          return Ok(());
-        }
-        let Some(next) = map.get_mut(part) else {
-          return Ok(());
-        };
-        if !next.is_object() {
-          bail!("path {path} cannot traverse non-object");
-        }
-        current = next;
+  let parts: Vec<&str> = path.split('.').collect();
+  unset_path_parts(root, &parts, path)
+}
+
+fn unset_path_parts(current: &mut serde_json::Value, parts: &[&str], path: &str) -> Result<()> {
+  let Some((part, rest)) = parts.split_first() else {
+    return Ok(());
+  };
+  match current {
+    serde_json::Value::Object(map) => {
+      if rest.is_empty() {
+        map.remove(*part);
+        return Ok(());
       }
-      _ => bail!("path {path} cannot traverse non-object"),
+      let Some(next) = map.get_mut(*part) else {
+        return Ok(());
+      };
+      unset_path_parts(next, rest, path)
     }
+    serde_json::Value::Array(items) => {
+      for item in items.iter_mut() {
+        unset_path_parts(item, parts, path)?;
+      }
+      Ok(())
+    }
+    _ => bail!("path {path} cannot traverse non-object"),
   }
-  Ok(())
 }
 
 fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<String, DocAddress>> {
@@ -1187,6 +1202,48 @@ mod tests {
   }
 
   #[test]
+  fn apply_patch_updates_dotted_paths_through_nested_arrays() {
+    let dir = tempdir().unwrap();
+    let schema = nested_schema_for_patch();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("before")),
+            (
+              "comment".into(),
+              serde_json::json!([
+                { "author": "alice", "reply": { "author": "bob" } },
+                { "author": "carol", "reply": { "author": "dave" } }
+              ]),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert("comment.reply.author".to_string(), serde_json::json!("eve"));
+      writer.apply_patch("1", &set, &[]).unwrap();
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["1".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["comment"][0]["reply"]["author"], "eve");
+    assert_eq!(source["comment"][1]["reply"]["author"], "eve");
+  }
+
+  #[test]
   fn set_path_rejects_empty_segments() {
     let invalid_paths = ["a..b", ".field", "field."];
     for path in invalid_paths.iter() {
@@ -1204,5 +1261,33 @@ mod tests {
       let err = super::unset_path(&mut value, path).unwrap_err();
       assert!(err.to_string().contains("empty path segment"));
     }
+  }
+
+  #[test]
+  fn set_path_traverses_arrays() {
+    let mut value = serde_json::json!({
+      "comment": [
+        { "reply": { "author": "alice" } },
+        { "reply": { "author": "bob" } }
+      ]
+    });
+    super::set_path(&mut value, "comment.reply.author", serde_json::json!("eve")).unwrap();
+    assert_eq!(value["comment"][0]["reply"]["author"], "eve");
+    assert_eq!(value["comment"][1]["reply"]["author"], "eve");
+  }
+
+  #[test]
+  fn unset_path_traverses_arrays() {
+    let mut value = serde_json::json!({
+      "comment": [
+        { "reply": { "author": "alice", "score": 1 } },
+        { "reply": { "author": "bob", "score": 2 } }
+      ]
+    });
+    super::unset_path(&mut value, "comment.reply.author").unwrap();
+    assert!(value["comment"][0]["reply"].get("author").is_none());
+    assert!(value["comment"][1]["reply"].get("author").is_none());
+    assert_eq!(value["comment"][0]["reply"]["score"], 1);
+    assert_eq!(value["comment"][1]["reply"]["score"], 2);
   }
 }
