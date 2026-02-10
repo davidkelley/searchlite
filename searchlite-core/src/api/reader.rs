@@ -23,7 +23,9 @@ use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
 use crate::api::AggregationError;
 use crate::index::fastfields::{doc_length_key, FastFieldsReader};
 use crate::index::highlight::{highlight_fragments, make_snippet, HighlightOptions};
-use crate::index::manifest::{FieldKind, Manifest, Schema, SchemaAnalyzers};
+use crate::index::manifest::{
+  FieldKind, Manifest, NestedField, NestedProperty, Schema, SchemaAnalyzers,
+};
 use crate::index::postings::{PostingEntry, PostingsReader};
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
@@ -46,6 +48,7 @@ use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
   ScoredTerm,
 };
+use crate::util::path_scope::resolve_optional_scoped_path;
 use crate::util::regex::anchored_regex;
 #[cfg(feature = "vectors")]
 use crate::vectors::hnsw::DEFAULT_EF_SEARCH;
@@ -4222,26 +4225,6 @@ fn validate_aggregations_in_scope(
   Ok(())
 }
 
-fn path_is_within(base_path: &str, candidate: &str) -> bool {
-  candidate == base_path
-    || candidate
-      .strip_prefix(base_path)
-      .map(|suffix| suffix.starts_with('.'))
-      .unwrap_or(false)
-}
-
-fn resolve_scoped_path(scope_path: Option<&str>, maybe_relative: &str) -> String {
-  if let Some(scope_path) = scope_path {
-    if path_is_within(scope_path, maybe_relative) {
-      maybe_relative.to_string()
-    } else {
-      format!("{scope_path}.{maybe_relative}")
-    }
-  } else {
-    maybe_relative.to_string()
-  }
-}
-
 fn aggregation_kind_name(agg: &Aggregation) -> &'static str {
   match agg {
     Aggregation::Terms(_) => "terms",
@@ -4270,19 +4253,48 @@ fn aggregation_kind_name(agg: &Aggregation) -> &'static str {
   }
 }
 
+fn find_nested_child<'a>(nested: &'a NestedField, segment: &str) -> Option<&'a NestedField> {
+  nested.fields.iter().find_map(|field| match field {
+    NestedProperty::Object(obj) if obj.name == segment => Some(obj),
+    _ => None,
+  })
+}
+
+fn schema_has_nested_path(schema: &Schema, path: &str) -> bool {
+  let mut parts = path.split('.');
+  let Some(first) = parts.next() else {
+    return false;
+  };
+  if first.is_empty() {
+    return false;
+  }
+  let Some(mut current) = schema
+    .nested_fields
+    .iter()
+    .find(|nested| nested.name == first)
+  else {
+    return false;
+  };
+  for segment in parts {
+    if segment.is_empty() {
+      return false;
+    }
+    let Some(next) = find_nested_child(current, segment) else {
+      return false;
+    };
+    current = next;
+  }
+  true
+}
+
 fn ensure_nested_path(
   schema: &Schema,
   path: &str,
   agg: &str,
   scope_path: Option<&str>,
 ) -> Result<String> {
-  let resolved_path = resolve_scoped_path(scope_path, path);
-  let prefix = format!("{resolved_path}.");
-  if schema
-    .resolved_fields()
-    .iter()
-    .any(|field| field.path.starts_with(&prefix))
-  {
+  let resolved_path = resolve_optional_scoped_path(scope_path, path);
+  if schema_has_nested_path(schema, &resolved_path) {
     Ok(resolved_path)
   } else {
     Err(
@@ -4302,7 +4314,7 @@ fn ensure_keyword_fast(
   agg: &str,
   scope_path: Option<&str>,
 ) -> Result<()> {
-  let resolved = resolve_scoped_path(scope_path, field);
+  let resolved = resolve_optional_scoped_path(scope_path, field);
   if let Some(def) = schema.field_meta(&resolved) {
     if matches!(def.kind, crate::index::manifest::FieldKind::Keyword) {
       if def.fast {
@@ -4332,7 +4344,7 @@ fn ensure_numeric_fast(
   agg: &str,
   scope_path: Option<&str>,
 ) -> Result<()> {
-  let resolved = resolve_scoped_path(scope_path, field);
+  let resolved = resolve_optional_scoped_path(scope_path, field);
   if let Some(def) = schema.field_meta(&resolved) {
     if matches!(def.kind, crate::index::manifest::FieldKind::Numeric) {
       if def.fast {
@@ -4362,7 +4374,7 @@ fn ensure_keyword_or_numeric_fast(
   agg: &str,
   scope_path: Option<&str>,
 ) -> Result<()> {
-  let resolved = resolve_scoped_path(scope_path, field);
+  let resolved = resolve_optional_scoped_path(scope_path, field);
   if let Some(def) = schema.field_meta(&resolved) {
     let kind_ok = matches!(
       def.kind,

@@ -342,6 +342,57 @@ fn nested_aggregation_rejects_unknown_path() {
 }
 
 #[test]
+fn nested_aggregation_rejects_dotted_non_nested_prefix_path() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "metadata.key".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "bad": {
+        "type": "nested",
+        "path": "metadata",
+        "aggs": {
+          "names": { "type": "terms", "field": "metadata.key", "size": 5 }
+        }
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("nested path"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
 fn nested_aggregation_rejects_unsupported_child_aggregation() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();

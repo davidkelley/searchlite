@@ -22,6 +22,7 @@ use crate::index::segment::SegmentReader;
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
 use crate::query::sort::{SortKey, SortPlan};
+use crate::util::path_scope::resolve_scoped_path;
 use crate::DocId;
 use tdigest::TDigest;
 
@@ -148,7 +149,7 @@ impl Sampler {
     hasher.write_u32(segment_ord);
     hasher.write_u32(doc_id);
     if let Some(obj) = object_idx {
-      hasher.write_usize(obj);
+      hasher.write_u64(obj as u64);
     }
     hasher.finish()
   }
@@ -723,22 +724,6 @@ impl AggregationSegmentCollector for SegmentAggregationCollector<'_> {
 struct NestedCollectScope<'a> {
   path: &'a str,
   object_idx: usize,
-}
-
-fn path_is_within(base_path: &str, candidate: &str) -> bool {
-  candidate == base_path
-    || candidate
-      .strip_prefix(base_path)
-      .map(|suffix| suffix.starts_with('.'))
-      .unwrap_or(false)
-}
-
-fn resolve_scoped_path(base_path: &str, maybe_relative: &str) -> String {
-  if path_is_within(base_path, maybe_relative) {
-    maybe_relative.to_string()
-  } else {
-    format!("{base_path}.{maybe_relative}")
-  }
 }
 
 pub(crate) enum AggregationNode<'a> {
@@ -2912,14 +2897,11 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
       pipeline,
       sampled,
     } => {
-      let mut bucket_resp = finalize_bucket(bucket);
-      let mut bucket_list = vec![bucket_resp.clone()];
+      let mut bucket_list = vec![finalize_bucket(bucket)];
       let mut aggregations = apply_pipeline_aggs(&pipeline, &mut bucket_list);
-      if let Some(mut b) = bucket_list.pop() {
-        for (name, agg) in std::mem::take(&mut b.aggregations) {
-          aggregations.insert(name, agg);
-        }
-        bucket_resp = b;
+      let mut bucket_resp = bucket_list.pop().expect("nested bucket response");
+      for (name, agg) in std::mem::take(&mut bucket_resp.aggregations) {
+        aggregations.insert(name, agg);
       }
       AggregationResponse::Nested {
         doc_count: bucket_resp.doc_count,

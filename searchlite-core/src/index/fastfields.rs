@@ -850,7 +850,10 @@ impl FastFieldsReader {
         object_offsets,
         values,
       }) => {
-        if let Some((obj_start, _obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          if object_idx >= obj_end.saturating_sub(obj_start) {
+            return Vec::new();
+          }
           let absolute_idx = obj_start.saturating_add(object_idx);
           if let Some((start, end)) = object_range(object_offsets, absolute_idx) {
             values[start..end]
@@ -1604,5 +1607,33 @@ mod tests {
     assert!(parents.iter().all(|p| p.is_none()));
     let reply_parents = reader.nested_parents("comment.reply", 0);
     assert_eq!(reply_parents, vec![Some(0)]);
+  }
+
+  #[test]
+  fn nested_str_values_at_stays_within_doc_object_range() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast-nested-range.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+
+    writer.set(
+      "comment.author",
+      1,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["bob".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+    assert_eq!(
+      reader.nested_str_values_at("comment.author", 0, 0),
+      Vec::<&str>::new()
+    );
+    assert_eq!(
+      reader.nested_str_values_at("comment.author", 1, 0),
+      vec!["bob"]
+    );
   }
 }
