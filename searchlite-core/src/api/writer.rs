@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,6 +31,12 @@ enum PendingOp {
   Delete { doc_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchReaderStamp {
+  committed_at: String,
+  segment_fingerprint: u64,
+}
+
 pub struct IndexWriter {
   inner: Arc<InnerIndex>,
   wal: Wal,
@@ -40,6 +47,7 @@ pub struct IndexWriter {
   live_generation: u32,
   write_binding: Option<Vec<u8>>,
   patch_reader: Option<IndexReader>,
+  patch_reader_stamp: Option<PatchReaderStamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +165,7 @@ impl IndexWriter {
       live_generation,
       write_binding,
       patch_reader: None,
+      patch_reader_stamp: None,
     })
   }
 
@@ -211,8 +220,13 @@ impl IndexWriter {
     let mut doc = match pending_doc_for_patch(&self.pending_latest, doc_id) {
       Some(Some(doc)) => doc,
       Some(None) => return Err(PatchError::DocumentNotFound.into()),
-      None => load_document_for_patch(inner.clone(), &mut self.patch_reader, doc_id)?
-        .ok_or(PatchError::DocumentNotFound)?,
+      None => load_document_for_patch(
+        inner.clone(),
+        &mut self.patch_reader,
+        &mut self.patch_reader_stamp,
+        doc_id,
+      )?
+      .ok_or(PatchError::DocumentNotFound)?,
     };
     let mut value = document_to_value(&doc)?;
     for path in unset.iter() {
@@ -351,6 +365,7 @@ impl IndexWriter {
         let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
       }
       self.patch_reader = None;
+      self.patch_reader_stamp = None;
       return Err(e);
     }
     {
@@ -361,6 +376,7 @@ impl IndexWriter {
     self.pending_ops.clear();
     self.pending_latest.clear();
     self.patch_reader = None;
+    self.patch_reader_stamp = None;
     self.live_docs = live_docs;
     self.live_generation = new_generation;
     Ok(())
@@ -370,6 +386,8 @@ impl IndexWriter {
     let _guard = self.inner.writer_lock.lock();
     self.pending_ops.clear();
     self.pending_latest.clear();
+    self.patch_reader = None;
+    self.patch_reader_stamp = None;
     self.wal.truncate()?;
     Ok(())
   }
@@ -462,9 +480,20 @@ fn doc_id_from_document(schema: &Schema, doc: &Document) -> Result<String> {
 fn load_document_for_patch(
   inner: Arc<InnerIndex>,
   patch_reader: &mut Option<IndexReader>,
+  patch_reader_stamp: &mut Option<PatchReaderStamp>,
   doc_id: &str,
 ) -> Result<Option<Document>> {
-  let reader = patch_reader.get_or_insert(IndexReader::open(inner)?);
+  let current_stamp = {
+    let manifest = inner.manifest.read();
+    patch_reader_stamp_for_manifest(&manifest)
+  };
+  if patch_reader.is_none() || patch_reader_stamp.as_ref() != Some(&current_stamp) {
+    *patch_reader = Some(IndexReader::open(inner.clone())?);
+    *patch_reader_stamp = Some(current_stamp);
+  }
+  let Some(reader) = patch_reader.as_mut() else {
+    bail!("patch reader unavailable");
+  };
   let mut docs = reader.mget(&[doc_id.to_string()], true)?;
   let Some(found) = docs.pop() else {
     return Ok(None);
@@ -476,6 +505,30 @@ fn load_document_for_patch(
     ._source
     .ok_or_else(|| anyhow!("stored fields are unavailable for document {doc_id}"))?;
   value_to_document(source).map(Some)
+}
+
+fn patch_reader_stamp_for_manifest(manifest: &Manifest) -> PatchReaderStamp {
+  let mut hasher = DefaultHasher::new();
+  manifest.segments.len().hash(&mut hasher);
+  for seg in manifest.segments.iter() {
+    seg.id.hash(&mut hasher);
+    seg.generation.hash(&mut hasher);
+    seg.doc_count.hash(&mut hasher);
+    seg.max_doc_id.hash(&mut hasher);
+    seg.blockmax.hash(&mut hasher);
+    seg.deleted_docs.hash(&mut hasher);
+    seg.paths.terms.hash(&mut hasher);
+    seg.paths.postings.hash(&mut hasher);
+    seg.paths.docstore.hash(&mut hasher);
+    seg.paths.fast.hash(&mut hasher);
+    seg.paths.meta.hash(&mut hasher);
+    #[cfg(feature = "vectors")]
+    seg.paths.vector_dir.hash(&mut hasher);
+  }
+  PatchReaderStamp {
+    committed_at: manifest.committed_at.clone(),
+    segment_fingerprint: hasher.finish(),
+  }
 }
 
 fn pending_latest_from_ops(pending_ops: &[PendingOp]) -> HashMap<String, Option<Document>> {
@@ -1313,6 +1366,72 @@ mod tests {
       source["comment"],
       serde_json::json!([{ "author": "eve", "reply": { "author": "mallory" } }])
     );
+  }
+
+  #[test]
+  fn apply_patch_refreshes_reader_after_external_commit() {
+    let dir = tempdir().unwrap();
+    let mut schema = Schema::default_text_body();
+    schema.keyword_fields.push(KeywordField {
+      name: "status".into(),
+      stored: true,
+      indexed: true,
+      fast: false,
+      nullable: false,
+    });
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("first")),
+            ("status".into(), serde_json::json!("old")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("2")),
+            ("body".into(), serde_json::json!("second")),
+            ("status".into(), serde_json::json!("old")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let mut writer = idx.writer().unwrap();
+    let mut warm_reader = BTreeMap::new();
+    warm_reader.insert("body".to_string(), serde_json::json!("writer-a-first"));
+    writer.apply_patch("1", &warm_reader, &[]).unwrap();
+
+    {
+      let mut other_writer = idx.writer().unwrap();
+      let mut set = BTreeMap::new();
+      set.insert("status".to_string(), serde_json::json!("updated-by-other"));
+      other_writer.apply_patch("2", &set, &[]).unwrap();
+      other_writer.commit().unwrap();
+    }
+
+    let mut second_patch = BTreeMap::new();
+    second_patch.insert("body".to_string(), serde_json::json!("writer-a-second"));
+    writer.apply_patch("2", &second_patch, &[]).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let docs = reader.mget(&["2".to_string()], true).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found);
+    let source = docs[0]._source.as_ref().unwrap();
+    assert_eq!(source["status"], "updated-by-other");
+    assert_eq!(source["body"], "writer-a-second");
   }
 
   #[test]
