@@ -449,6 +449,143 @@ fn nested_aggregation_rejects_unsupported_child_aggregation() {
 }
 
 #[test]
+fn nested_terms_reject_descendant_fields_in_nested_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "comment".into(),
+      fields: vec![
+        searchlite_core::api::types::NestedProperty::Keyword(nested_keyword("author")),
+        searchlite_core::api::types::NestedProperty::Object(
+          searchlite_core::api::types::NestedField {
+            name: "reply".into(),
+            fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+              nested_keyword("tag"),
+            )],
+            nullable: false,
+          },
+        ),
+      ],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "comments": {
+        "type": "nested",
+        "path": "comment",
+        "aggs": {
+          "bad_terms": {
+            "type": "terms",
+            "field": "reply.tag",
+            "size": 10
+          }
+        }
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err
+      .to_string()
+      .contains("direct child of nested scope `comment`"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
+fn nested_aggregation_rejects_non_direct_child_nested_path_in_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "comment".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Object(
+        searchlite_core::api::types::NestedField {
+          name: "reply".into(),
+          fields: vec![searchlite_core::api::types::NestedProperty::Object(
+            searchlite_core::api::types::NestedField {
+              name: "vote".into(),
+              fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+                nested_keyword("tag"),
+              )],
+              nullable: false,
+            },
+          )],
+          nullable: false,
+        },
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "comments": {
+        "type": "nested",
+        "path": "comment",
+        "aggs": {
+          "bad_nested": {
+            "type": "nested",
+            "path": "reply.vote",
+            "aggs": {
+              "tags": { "type": "terms", "field": "tag", "size": 10 }
+            }
+          }
+        }
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err
+      .to_string()
+      .contains("direct child of nested scope `comment`"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
 fn nested_sub_aggregation_binds_to_parent_object() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();

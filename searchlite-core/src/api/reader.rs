@@ -4144,6 +4144,10 @@ fn validate_aggregations_in_scope(
     match agg {
       Aggregation::Terms(t) => {
         ensure_keyword_fast(schema, &t.field, name, scope_path)?;
+        if let (true, Some(scope_path)) = (inside_nested, scope_path) {
+          let resolved_field = resolve_optional_scoped_path(Some(scope_path), &t.field);
+          ensure_direct_scoped_child(scope_path, &resolved_field, name, "field")?;
+        }
         validate_sampling(name, &t.sampling)?;
         validate_aggregations_in_scope(schema, &t.aggs, scope_path, inside_nested)?;
       }
@@ -4193,6 +4197,9 @@ fn validate_aggregations_in_scope(
       }
       Aggregation::Nested(n) => {
         let nested_path = ensure_nested_path(schema, &n.path, name, scope_path)?;
+        if let Some(scope_path) = scope_path {
+          ensure_direct_scoped_child(scope_path, &nested_path, name, "path")?;
+        }
         validate_sampling(name, &n.sampling)?;
         validate_aggregations_in_scope(schema, &n.aggs, Some(&nested_path), true)?;
       }
@@ -4302,6 +4309,30 @@ fn ensure_nested_path(
         agg: agg.to_string(),
         field: resolved_path,
         expected: "nested path".to_string(),
+      }
+      .into(),
+    )
+  }
+}
+
+fn ensure_direct_scoped_child(
+  scope_path: &str,
+  resolved_path: &str,
+  agg: &str,
+  target: &str,
+) -> Result<()> {
+  let direct_child = resolved_path
+    .rsplit_once('.')
+    .map(|(parent, _)| parent == scope_path)
+    .unwrap_or(false);
+  if direct_child {
+    Ok(())
+  } else {
+    Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "aggregation `{agg}` {target} `{resolved_path}` must be a direct child of nested scope `{scope_path}`"
+        ),
       }
       .into(),
     )
