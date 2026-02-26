@@ -4146,7 +4146,14 @@ fn validate_aggregations_in_scope(
         ensure_keyword_fast(schema, &t.field, name, scope_path)?;
         if let (true, Some(scope_path)) = (inside_nested, scope_path) {
           let resolved_field = resolve_optional_scoped_path(Some(scope_path), &t.field);
-          ensure_direct_scoped_child(scope_path, &resolved_field, name, "field")?;
+          ensure_direct_scoped_child(
+            schema,
+            scope_path,
+            &resolved_field,
+            name,
+            "field",
+            DirectScopedChildKind::LeafField,
+          )?;
         }
         validate_sampling(name, &t.sampling)?;
         validate_aggregations_in_scope(schema, &t.aggs, scope_path, inside_nested)?;
@@ -4198,7 +4205,14 @@ fn validate_aggregations_in_scope(
       Aggregation::Nested(n) => {
         let nested_path = ensure_nested_path(schema, &n.path, name, scope_path)?;
         if let Some(scope_path) = scope_path {
-          ensure_direct_scoped_child(scope_path, &nested_path, name, "path")?;
+          ensure_direct_scoped_child(
+            schema,
+            scope_path,
+            &nested_path,
+            name,
+            "path",
+            DirectScopedChildKind::NestedPath,
+          )?;
         }
         validate_sampling(name, &n.sampling)?;
         validate_aggregations_in_scope(schema, &n.aggs, Some(&nested_path), true)?;
@@ -4260,70 +4274,76 @@ fn aggregation_kind_name(agg: &Aggregation) -> &'static str {
   }
 }
 
-fn find_nested_child<'a>(nested: &'a NestedField, segment: &str) -> Option<&'a NestedField> {
-  nested.fields.iter().find_map(|field| match field {
-    NestedProperty::Object(obj) if obj.name == segment => Some(obj),
-    _ => None,
-  })
+fn nested_path(prefix: Option<&str>, name: &str) -> String {
+  if let Some(prefix) = prefix {
+    format!("{prefix}.{name}")
+  } else {
+    name.to_string()
+  }
 }
 
-fn find_nested_property<'a>(nested: &'a NestedField, segment: &str) -> Option<&'a NestedProperty> {
-  nested.fields.iter().find(|field| field.name() == segment)
+fn find_nested_by_path<'a>(schema: &'a Schema, target: &str) -> Option<&'a NestedField> {
+  for nested in schema.nested_fields.iter() {
+    if let Some(found) = find_nested_by_path_in(nested, None, target) {
+      return Some(found);
+    }
+  }
+  None
+}
+
+fn find_nested_by_path_in<'a>(
+  nested: &'a NestedField,
+  prefix: Option<&str>,
+  target: &str,
+) -> Option<&'a NestedField> {
+  let current = nested_path(prefix, &nested.name);
+  if current == target {
+    return Some(nested);
+  }
+  for field in nested.fields.iter() {
+    if let NestedProperty::Object(obj) = field {
+      if let Some(found) = find_nested_by_path_in(obj, Some(&current), target) {
+        return Some(found);
+      }
+    }
+  }
+  None
 }
 
 fn schema_has_nested_path(schema: &Schema, path: &str) -> bool {
-  let mut parts = path.split('.');
-  let Some(first) = parts.next() else {
-    return false;
-  };
-  if first.is_empty() {
-    return false;
-  }
-  let Some(mut current) = schema
-    .nested_fields
-    .iter()
-    .find(|nested| nested.name == first)
-  else {
-    return false;
-  };
-  for segment in parts {
-    if segment.is_empty() {
-      return false;
-    }
-    let Some(next) = find_nested_child(current, segment) else {
-      return false;
-    };
-    current = next;
-  }
-  true
+  find_nested_by_path(schema, path).is_some()
 }
 
 fn schema_has_nested_leaf_field(schema: &Schema, field: &str) -> bool {
-  let mut parts = field.split('.').peekable();
-  let Some(first) = parts.next() else {
-    return false;
-  };
-  if first.is_empty() {
-    return false;
-  }
-  let Some(mut current) = schema
+  schema
     .nested_fields
     .iter()
-    .find(|nested| nested.name == first)
-  else {
-    return false;
-  };
-  while let Some(segment) = parts.next() {
-    if segment.is_empty() {
-      return false;
-    }
-    let Some(prop) = find_nested_property(current, segment) else {
-      return false;
-    };
-    match prop {
-      NestedProperty::Object(next) => current = next,
-      NestedProperty::Text(_) | NestedProperty::Keyword(_) | NestedProperty::Numeric(_) => {
-        return parts.peek().is_none()
+    .any(|nested| nested_has_leaf_field(nested, None, field))
+}
+
+fn nested_has_leaf_field(nested: &NestedField, prefix: Option<&str>, target: &str) -> bool {
+  let current = nested_path(prefix, &nested.name);
+  for field in nested.fields.iter() {
+    match field {
+      NestedProperty::Object(obj) => {
+        if nested_has_leaf_field(obj, Some(&current), target) {
+          return true;
+        }
+      }
+      NestedProperty::Text(f) => {
+        if nested_path(Some(&current), &f.name) == target {
+          return true;
+        }
+      }
+      NestedProperty::Keyword(f) => {
+        if nested_path(Some(&current), &f.name) == target {
+          return true;
+        }
+      }
+      NestedProperty::Numeric(f) => {
+        if nested_path(Some(&current), &f.name) == target {
+          return true;
+        }
       }
     }
   }
@@ -4351,16 +4371,27 @@ fn ensure_nested_path(
   }
 }
 
+enum DirectScopedChildKind {
+  LeafField,
+  NestedPath,
+}
+
 fn ensure_direct_scoped_child(
+  schema: &Schema,
   scope_path: &str,
   resolved_path: &str,
   agg: &str,
   target: &str,
+  kind: DirectScopedChildKind,
 ) -> Result<()> {
-  let direct_child = resolved_path
-    .rsplit_once('.')
-    .map(|(parent, _)| parent == scope_path)
-    .unwrap_or(false);
+  let direct_child = match kind {
+    DirectScopedChildKind::LeafField => {
+      scope_has_direct_child_leaf_field(schema, scope_path, resolved_path)
+    }
+    DirectScopedChildKind::NestedPath => {
+      scope_has_direct_child_nested_path(schema, scope_path, resolved_path)
+    }
+  };
   if direct_child {
     Ok(())
   } else {
@@ -4373,6 +4404,32 @@ fn ensure_direct_scoped_child(
       .into(),
     )
   }
+}
+
+fn scope_has_direct_child_leaf_field(schema: &Schema, scope_path: &str, target_path: &str) -> bool {
+  let Some(scope) = find_nested_by_path(schema, scope_path) else {
+    return false;
+  };
+  scope.fields.iter().any(|field| match field {
+    NestedProperty::Text(f) => nested_path(Some(scope_path), &f.name) == target_path,
+    NestedProperty::Keyword(f) => nested_path(Some(scope_path), &f.name) == target_path,
+    NestedProperty::Numeric(f) => nested_path(Some(scope_path), &f.name) == target_path,
+    NestedProperty::Object(_) => false,
+  })
+}
+
+fn scope_has_direct_child_nested_path(
+  schema: &Schema,
+  scope_path: &str,
+  target_path: &str,
+) -> bool {
+  let Some(scope) = find_nested_by_path(schema, scope_path) else {
+    return false;
+  };
+  scope.fields.iter().any(|field| match field {
+    NestedProperty::Object(obj) => nested_path(Some(scope_path), &obj.name) == target_path,
+    _ => false,
+  })
 }
 
 fn ensure_keyword_fast(

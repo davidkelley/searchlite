@@ -442,6 +442,55 @@ fn root_terms_aggregation_rejects_nested_keyword_field_without_nested_scope() {
 }
 
 #[test]
+fn root_terms_aggregation_rejects_dotted_nested_keyword_field_without_nested_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("source.name"),
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "bad": {
+        "type": "terms",
+        "field": "images.source.name",
+        "size": 5
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("fast keyword field"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
 fn root_numeric_aggregation_rejects_nested_numeric_field_without_nested_scope() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
@@ -539,6 +588,212 @@ fn collapse_rejects_nested_keyword_field_without_nested_scope() {
     err.to_string().contains("fast keyword field"),
     "unexpected error: {err}"
   );
+}
+
+#[test]
+fn nested_terms_accept_direct_child_dotted_keyword_name() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("source.name"),
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "img-1",
+        vec![
+          ("body", json!("rust nested faceting")),
+          (
+            "images",
+            json!([
+              { "source.name": "alice" },
+              { "source.name": "bob" }
+            ]),
+          ),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "images_nested": {
+        "type": "nested",
+        "path": "images",
+        "aggs": {
+          "names": {
+            "type": "terms",
+            "field": "source.name",
+            "size": 10
+          }
+        }
+      }
+    }
+  }))
+  .unwrap();
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+  let nested = resp
+    .aggregations
+    .get("images_nested")
+    .expect("images nested aggregation");
+  if let searchlite_core::api::types::AggregationResponse::Nested {
+    doc_count,
+    aggregations,
+    ..
+  } = nested
+  {
+    assert_eq!(*doc_count, 2);
+    if let Some(searchlite_core::api::types::AggregationResponse::Terms { buckets, .. }) =
+      aggregations.get("names")
+    {
+      assert_eq!(buckets.len(), 2);
+      assert_eq!(buckets[0].key, json!("alice"));
+      assert_eq!(buckets[0].doc_count, 1);
+      assert_eq!(buckets[1].key, json!("bob"));
+      assert_eq!(buckets[1].doc_count, 1);
+    } else {
+      panic!("expected terms aggregation for dotted child name");
+    }
+  } else {
+    panic!("expected nested aggregation response");
+  }
+}
+
+#[test]
+fn nested_aggregation_accepts_direct_child_dotted_object_name() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "comment".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Object(
+        searchlite_core::api::types::NestedField {
+          name: "reply.vote".into(),
+          fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+            nested_keyword("tag"),
+          )],
+          nullable: false,
+        },
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "nested-1",
+        vec![
+          ("body", json!("rust nested reply votes")),
+          (
+            "comment",
+            json!([
+              {
+                "reply.vote": [{ "tag": "up" }]
+              }
+            ]),
+          ),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "comments": {
+        "type": "nested",
+        "path": "comment",
+        "aggs": {
+          "votes": {
+            "type": "nested",
+            "path": "reply.vote",
+            "aggs": {
+              "tags": { "type": "terms", "field": "tag", "size": 10 }
+            }
+          }
+        }
+      }
+    }
+  }))
+  .unwrap();
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+  let comments = resp
+    .aggregations
+    .get("comments")
+    .expect("comments nested aggregation");
+  let votes =
+    if let searchlite_core::api::types::AggregationResponse::Nested { aggregations, .. } = comments
+    {
+      aggregations.get("votes").expect("votes nested agg")
+    } else {
+      panic!("expected comments nested aggregation");
+    };
+  if let searchlite_core::api::types::AggregationResponse::Nested {
+    doc_count,
+    aggregations,
+    ..
+  } = votes
+  {
+    assert_eq!(*doc_count, 1);
+    if let Some(searchlite_core::api::types::AggregationResponse::Terms { buckets, .. }) =
+      aggregations.get("tags")
+    {
+      assert_eq!(buckets.len(), 1);
+      assert_eq!(buckets[0].key, json!("up"));
+      assert_eq!(buckets[0].doc_count, 1);
+    } else {
+      panic!("expected tags terms aggregation");
+    }
+  } else {
+    panic!("expected votes nested aggregation");
+  }
 }
 
 #[test]
