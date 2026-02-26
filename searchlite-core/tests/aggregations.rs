@@ -301,6 +301,104 @@ fn nested_terms_aggregation_respects_outer_filters() {
 }
 
 #[test]
+fn nested_terms_aggregation_skips_null_entries_in_nullable_arrays() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("illustrator"),
+      )],
+      nullable: true,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "img-1",
+        vec![
+          ("body", json!("rust nested faceting")),
+          ("images", json!([null, { "illustrator": "alice" }])),
+        ],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "img-2",
+        vec![
+          ("body", json!("rust nested faceting")),
+          ("images", json!([null, null])),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust nested",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "illustrators": {
+        "type": "nested",
+        "path": "images",
+        "aggs": {
+          "names": {
+            "type": "terms",
+            "field": "images.illustrator",
+            "size": 10
+          }
+        }
+      }
+    }
+  }))
+  .unwrap();
+
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+  let nested = resp
+    .aggregations
+    .get("illustrators")
+    .expect("nested aggregation");
+  if let searchlite_core::api::types::AggregationResponse::Nested {
+    doc_count,
+    aggregations,
+    ..
+  } = nested
+  {
+    assert_eq!(*doc_count, 1);
+    if let Some(searchlite_core::api::types::AggregationResponse::Terms { buckets, .. }) =
+      aggregations.get("names")
+    {
+      assert_eq!(buckets.len(), 1);
+      assert_eq!(buckets[0].key, json!("alice"));
+      assert_eq!(buckets[0].doc_count, 1);
+    } else {
+      panic!("expected names terms aggregation");
+    }
+  } else {
+    panic!("expected nested aggregation response");
+  }
+}
+
+#[test]
 fn nested_aggregation_rejects_unknown_path() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();

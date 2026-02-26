@@ -221,7 +221,21 @@ fn collect_nested(
     }
     serde_json::Value::Array(arr) => {
       let base_count = *collected.nested_counts.get(prefix).unwrap_or(&0);
-      let next_count = base_count.saturating_add(arr.len());
+      let mut non_null_count = 0usize;
+      for v in arr.iter() {
+        if v.is_null() {
+          if nested.nullable {
+            continue;
+          }
+          bail!("nested field {prefix} cannot be null");
+        }
+        if !v.is_object() {
+          bail!("nested field {prefix} must contain objects");
+        }
+        non_null_count = non_null_count.saturating_add(1);
+      }
+
+      let next_count = base_count.saturating_add(non_null_count);
       collected
         .nested_counts
         .insert(prefix.to_string(), next_count);
@@ -233,26 +247,17 @@ fn collect_nested(
       if entry.len() < base_count {
         entry.resize(base_count, usize::MAX);
       }
-      entry.extend(std::iter::repeat_n(parent, arr.len()));
-      for (idx, v) in arr.iter().enumerate() {
+      entry.extend(std::iter::repeat_n(parent, non_null_count));
+      let mut object_idx = base_count;
+      for v in arr.iter() {
         if v.is_null() {
-          if nested.nullable {
-            continue;
-          }
-          bail!("nested field {prefix} cannot be null");
+          continue;
         }
         let map = v
           .as_object()
           .ok_or_else(|| anyhow!("nested field {prefix} must contain objects"))?;
-        collect_nested_object(
-          schema,
-          nested,
-          map,
-          prefix,
-          base_count.saturating_add(idx),
-          collected,
-          resolved,
-        )?;
+        collect_nested_object(schema, nested, map, prefix, object_idx, collected, resolved)?;
+        object_idx = object_idx.saturating_add(1);
       }
     }
     serde_json::Value::Object(map) => {
