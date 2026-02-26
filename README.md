@@ -380,10 +380,11 @@ curl -XGET  http://localhost:8080/indexes/default/stats     # doc/segment counts
 
 - Field requirements: `terms`/`significant_terms`/`rare_terms` need a fast keyword field; `range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
 - Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided and use a bounded t-digest estimator (exact mode for small buckets); `percentile_ranks` report the percent of values at or below each supplied `values` entry.
-- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `significant_terms` adds `background_filter` + `size`/`min_doc_count`; `rare_terms` favors low-frequency keys with `max_doc_count`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page. Bucket aggs accept optional `sampling` with either `size` or `probability` plus a deterministic `seed`.
+- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `significant_terms` adds `background_filter` + `size`/`min_doc_count`; `rare_terms` favors low-frequency keys with `max_doc_count`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `nested` scopes child aggregations to objects under a nested `path` and returns `{doc_count, aggregations}` for that nested scope (child aggs currently support `terms` and further `nested` blocks); `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page. Bucket aggs accept optional `sampling` with either `size` or `probability` plus a deterministic `seed`.
 - Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree; `derivative` and `moving_avg` operate on histogram/date_histogram buckets with `gap_policy` (`skip`/`insert_zeros`) and optional `unit`/`predict`; `bucket_script` evaluates a lightweight arithmetic expression over one or more `buckets_path` values (including `_count` for bucket doc counts).
 - Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
 - Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`). Aggregations with `sampling` return approximate counts and mark responses with `sampled: true`.
+- Nested aggregation cost is query-time only: index write/read performance is unchanged unless a request includes nested aggs. Runtime cost grows with matched docs, nested objects per doc, and bucket cardinality; keep nested arrays bounded, add outer filters, and use `sampling` or flattened facet fields if nested cardinality becomes a hotspot.
 
 #### Filter, composite, and pipeline aggregation examples
 
@@ -425,6 +426,35 @@ cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file 
 ```
 
 `composite` returns an `after_key` so you can page deterministically across buckets by sending that object back as `after` in the next request. Pipeline aggregations operate on the current bucket tree: `bucket_sort` reorders/truncates buckets, while `avg_bucket`/`sum_bucket` read metrics via dot-separated `buckets_path` selectors.
+
+#### Nested facet example (metadata key/value pairs)
+
+Use a `nested` bucket when facets must bind fields from the same nested object (for example, metadata `key` + `value` pairs). The example below keeps `"Category"` values separate from `"Color"` values.
+
+```bash
+cat > /tmp/aggs-nested.json <<'EOF'
+{
+  "metadata_nested": {
+    "type": "nested",
+    "path": "metadata",
+    "aggs": {
+      "by_key": {
+        "type": "terms",
+        "field": "key",
+        "size": 10,
+        "aggs": {
+          "by_value": { "type": "terms", "field": "value", "size": 10 }
+        }
+      }
+    }
+  }
+}
+EOF
+
+cargo run -p searchlite-cli -- search "$INDEX" --q "image" --limit 0 --aggs-file /tmp/aggs-nested.json
+```
+
+If you need deeper nesting, place another `nested` bucket under a parent bucket and use a child-relative path (for example, `"path": "reply"` inside a parent nested `"path": "comment"` scope).
 
 #### Significance, smoothing, and sampling examples
 

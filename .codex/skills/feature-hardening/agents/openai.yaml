@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feature Hardening"
+  short_description: "Harden feature changes with edge-case checks"
+  default_prompt: "Harden the current feature changes by updating the invariant matrix, adding edge-case tests, and running the full quality gate."

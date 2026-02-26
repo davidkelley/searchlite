@@ -10,10 +10,10 @@ use crate::api::types::{
   BucketScriptAggregation, BucketSortAggregation, BucketSortSpec, CardinalityResponse,
   CompositeAggregation, CompositeSource, DateHistogramAggregation, DateRangeAggregation,
   DerivativeAggregation, Filter, FilterAggregation, GapPolicy, HistogramAggregation,
-  MovingAvgAggregation, MovingAvgResponse, OptionalBucketMetricResponse, PercentileRanksResponse,
-  PercentilesResponse, RangeAggregation, RareTermsAggregation, SignificantBucketResponse,
-  SignificantTermsAggregation, SortOrder, StatsResponse, TermsAggregation, TopHit,
-  TopHitsAggregation, TopHitsResponse, ValueCountResponse,
+  MovingAvgAggregation, MovingAvgResponse, NestedAggregation, OptionalBucketMetricResponse,
+  PercentileRanksResponse, PercentilesResponse, RangeAggregation, RareTermsAggregation,
+  SignificantBucketResponse, SignificantTermsAggregation, SortOrder, StatsResponse,
+  TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse, ValueCountResponse,
 };
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
@@ -22,6 +22,7 @@ use crate::index::segment::SegmentReader;
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
 use crate::query::sort::{SortKey, SortPlan};
+use crate::util::path_scope::resolve_scoped_path;
 use crate::DocId;
 use tdigest::TDigest;
 
@@ -91,6 +92,19 @@ impl Sampler {
   }
 
   fn accept(&mut self, segment_ord: u32, doc_id: DocId) -> bool {
+    self.accept_with_object(segment_ord, doc_id, None)
+  }
+
+  fn accept_object(&mut self, segment_ord: u32, doc_id: DocId, object_idx: usize) -> bool {
+    self.accept_with_object(segment_ord, doc_id, Some(object_idx))
+  }
+
+  fn accept_with_object(
+    &mut self,
+    segment_ord: u32,
+    doc_id: DocId,
+    object_idx: Option<usize>,
+  ) -> bool {
     match self.mode {
       SamplingMode::None => true,
       SamplingMode::Probability(p) => {
@@ -100,7 +114,7 @@ impl Sampler {
         if p >= 1.0 {
           return true;
         }
-        let value = self.sample_value(segment_ord, doc_id);
+        let value = self.sample_value_with_object(segment_ord, doc_id, object_idx);
         let threshold = (p * (u64::MAX as f64)) as u64;
         value < threshold
       }
@@ -119,11 +133,24 @@ impl Sampler {
     !matches!(self.mode, SamplingMode::None)
   }
 
+  #[cfg(test)]
   fn sample_value(&self, segment_ord: u32, doc_id: DocId) -> u64 {
+    self.sample_value_with_object(segment_ord, doc_id, None)
+  }
+
+  fn sample_value_with_object(
+    &self,
+    segment_ord: u32,
+    doc_id: DocId,
+    object_idx: Option<usize>,
+  ) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write_u64(self.seed);
     hasher.write_u32(segment_ord);
     hasher.write_u32(doc_id);
+    if let Some(obj) = object_idx {
+      hasher.write_u64(obj as u64);
+    }
     hasher.finish()
   }
 }
@@ -432,6 +459,11 @@ pub enum AggregationIntermediate {
     pipeline: BTreeMap<String, Aggregation>,
     sampled: bool,
   },
+  Nested {
+    bucket: BucketIntermediate,
+    pipeline: BTreeMap<String, Aggregation>,
+    sampled: bool,
+  },
   Composite {
     buckets: Vec<BucketIntermediate>,
     size: usize,
@@ -688,6 +720,12 @@ impl AggregationSegmentCollector for SegmentAggregationCollector<'_> {
   }
 }
 
+#[derive(Clone, Copy)]
+struct NestedCollectScope<'a> {
+  path: &'a str,
+  object_idx: usize,
+}
+
 pub(crate) enum AggregationNode<'a> {
   Terms(Box<TermsCollector<'a>>),
   SignificantTerms(Box<SignificantTermsCollector<'a>>),
@@ -704,6 +742,7 @@ pub(crate) enum AggregationNode<'a> {
   Percentiles(Box<PercentilesCollector<'a>>),
   PercentileRanks(Box<PercentileRanksCollector<'a>>),
   Filter(Box<FilterCollector<'a>>),
+  Nested(Box<NestedCollector<'a>>),
   Composite(Box<CompositeCollector<'a>>),
 }
 
@@ -745,6 +784,7 @@ impl<'a> AggregationNode<'a> {
         AggregationNode::PercentileRanks(Box::new(PercentileRanksCollector::new(ctx, p)))
       }
       Aggregation::Filter(f) => AggregationNode::Filter(Box::new(FilterCollector::new(ctx, f))),
+      Aggregation::Nested(n) => AggregationNode::Nested(Box::new(NestedCollector::new(ctx, n))),
       Aggregation::Composite(c) => {
         AggregationNode::Composite(Box::new(CompositeCollector::new(ctx, c)))
       }
@@ -760,8 +800,12 @@ impl<'a> AggregationNode<'a> {
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
+    self.collect_scoped(doc_id, score, None);
+  }
+
+  fn collect_scoped(&mut self, doc_id: DocId, score: f32, scope: Option<&NestedCollectScope<'_>>) {
     match self {
-      AggregationNode::Terms(inner) => inner.collect(doc_id, score),
+      AggregationNode::Terms(inner) => inner.collect_scoped(doc_id, score, scope),
       AggregationNode::SignificantTerms(inner) => inner.collect(doc_id, score),
       AggregationNode::RareTerms(inner) => inner.collect(doc_id, score),
       AggregationNode::Range(inner) => inner.collect(doc_id, score),
@@ -776,6 +820,7 @@ impl<'a> AggregationNode<'a> {
       AggregationNode::Percentiles(inner) => inner.collect(doc_id, score),
       AggregationNode::PercentileRanks(inner) => inner.collect(doc_id, score),
       AggregationNode::Filter(inner) => inner.collect(doc_id, score),
+      AggregationNode::Nested(inner) => inner.collect_scoped(doc_id, score, scope),
       AggregationNode::Composite(inner) => inner.collect(doc_id, score),
     }
   }
@@ -801,6 +846,7 @@ impl<'a> AggregationNode<'a> {
         AggregationIntermediate::PercentileRanks(inner.finish())
       }
       AggregationNode::Filter(inner) => inner.finish(),
+      AggregationNode::Nested(inner) => inner.finish(),
       AggregationNode::Composite(inner) => inner.finish(),
     }
   }
@@ -891,11 +937,26 @@ impl<'a> TermsCollector<'a> {
     }
   }
 
-  fn collect(&mut self, doc_id: DocId, score: f32) {
-    if !self.sampler.accept(self.ctx.segment_ord, doc_id) {
+  fn collect_scoped(&mut self, doc_id: DocId, score: f32, scope: Option<&NestedCollectScope<'_>>) {
+    let sampled = if let Some(scope) = scope {
+      self
+        .sampler
+        .accept_object(self.ctx.segment_ord, doc_id, scope.object_idx)
+    } else {
+      self.sampler.accept(self.ctx.segment_ord, doc_id)
+    };
+    if !sampled {
       return;
     }
-    let values = self.ctx.fast_fields.str_values(&self.field, doc_id);
+    let values = if let Some(scope) = scope {
+      let scoped_field = resolve_scoped_path(scope.path, &self.field);
+      self
+        .ctx
+        .fast_fields
+        .nested_str_values_at(&scoped_field, doc_id, scope.object_idx)
+    } else {
+      self.ctx.fast_fields.str_values(&self.field, doc_id)
+    };
     if !values.is_empty() {
       let mut seen = HashSet::new();
       for val in values.into_iter().filter(|v| seen.insert(*v)) {
@@ -904,7 +965,7 @@ impl<'a> TermsCollector<'a> {
         });
         bucket.doc_count += 1;
         for child in bucket.aggs.values_mut() {
-          child.collect(doc_id, score);
+          child.collect_scoped(doc_id, score, scope);
         }
       }
       if !seen.is_empty() {
@@ -925,7 +986,7 @@ impl<'a> TermsCollector<'a> {
     };
     bucket.doc_count += 1;
     for child in bucket.aggs.values_mut() {
-      child.collect(doc_id, score);
+      child.collect_scoped(doc_id, score, scope);
     }
   }
 
@@ -1686,6 +1747,85 @@ impl<'a> FilterCollector<'a> {
   }
 }
 
+pub(crate) struct NestedCollector<'a> {
+  path: String,
+  bucket: BucketState<'a>,
+  pipeline_aggs: BTreeMap<String, Aggregation>,
+  sampler: Sampler,
+  ctx: AggregationContext<'a>,
+}
+
+impl<'a> NestedCollector<'a> {
+  fn new(ctx: AggregationContext<'a>, agg: &NestedAggregation) -> Self {
+    let (sub_aggs, pipeline_aggs) = split_pipeline_aggs(&agg.aggs);
+    Self {
+      path: agg.path.clone(),
+      bucket: BucketState {
+        key: serde_json::Value::Null,
+        doc_count: 0,
+        aggs: build_children(&ctx, &sub_aggs),
+      },
+      pipeline_aggs,
+      sampler: Sampler::new(agg.sampling.as_ref()),
+      ctx,
+    }
+  }
+
+  fn collect_scoped(
+    &mut self,
+    doc_id: DocId,
+    score: f32,
+    parent_scope: Option<&NestedCollectScope<'_>>,
+  ) {
+    let resolved_path = if let Some(parent_scope) = parent_scope {
+      resolve_scoped_path(parent_scope.path, &self.path)
+    } else {
+      self.path.clone()
+    };
+    let object_count = self
+      .ctx
+      .fast_fields
+      .nested_object_count(&resolved_path, doc_id);
+    if object_count == 0 {
+      return;
+    }
+    let parents = parent_scope.map(|_| self.ctx.fast_fields.nested_parents(&resolved_path, doc_id));
+    for object_idx in 0..object_count {
+      if let (Some(scope), Some(parents)) = (parent_scope, parents.as_ref()) {
+        if parents.get(object_idx).and_then(|p| *p) != Some(scope.object_idx) {
+          continue;
+        }
+      }
+      if !self
+        .sampler
+        .accept_object(self.ctx.segment_ord, doc_id, object_idx)
+      {
+        continue;
+      }
+      self.bucket.doc_count += 1;
+      let scope = NestedCollectScope {
+        path: &resolved_path,
+        object_idx,
+      };
+      for child in self.bucket.aggs.values_mut() {
+        child.collect_scoped(doc_id, score, Some(&scope));
+      }
+    }
+  }
+
+  fn finish(self) -> AggregationIntermediate {
+    AggregationIntermediate::Nested {
+      bucket: BucketIntermediate {
+        key: serde_json::Value::Null,
+        doc_count: self.bucket.doc_count,
+        aggs: finalize_children(self.bucket.aggs),
+      },
+      pipeline: self.pipeline_aggs,
+      sampled: self.sampler.sampled(),
+    }
+  }
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CompositeKey {
   parts: Vec<CompositeKeyPart>,
@@ -2334,6 +2474,34 @@ fn merge_intermediate_in_place(
       *target_sampled |= incoming_sampled;
     }
     (
+      AggregationIntermediate::Nested {
+        bucket: target_bucket,
+        pipeline: target_pipeline,
+        sampled: target_sampled,
+      },
+      AggregationIntermediate::Nested {
+        bucket: incoming_bucket,
+        pipeline: incoming_pipeline,
+        sampled: incoming_sampled,
+      },
+    ) => {
+      target_bucket.doc_count += incoming_bucket.doc_count;
+      for (name, agg) in incoming_bucket.aggs.into_iter() {
+        match target_bucket.aggs.entry(name) {
+          BTreeEntry::Vacant(entry) => {
+            entry.insert(agg);
+          }
+          BTreeEntry::Occupied(mut entry) => {
+            merge_intermediate_in_place(entry.get_mut(), agg);
+          }
+        }
+      }
+      if target_pipeline.is_empty() {
+        *target_pipeline = incoming_pipeline;
+      }
+      *target_sampled |= incoming_sampled;
+    }
+    (
       AggregationIntermediate::Composite {
         buckets: target_buckets,
         size: target_size,
@@ -2719,6 +2887,23 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
         bucket_resp = b;
       }
       AggregationResponse::Filter {
+        doc_count: bucket_resp.doc_count,
+        aggregations,
+        sampled,
+      }
+    }
+    AggregationIntermediate::Nested {
+      bucket,
+      pipeline,
+      sampled,
+    } => {
+      let mut bucket_list = vec![finalize_bucket(bucket)];
+      let mut aggregations = apply_pipeline_aggs(&pipeline, &mut bucket_list);
+      let mut bucket_resp = bucket_list.pop().expect("nested bucket response");
+      for (name, agg) in std::mem::take(&mut bucket_resp.aggregations) {
+        aggregations.insert(name, agg);
+      }
+      AggregationResponse::Nested {
         doc_count: bucket_resp.doc_count,
         aggregations,
         sampled,

@@ -220,46 +220,57 @@ fn collect_nested(
       bail!("nested field {prefix} cannot be null");
     }
     serde_json::Value::Array(arr) => {
-      collected
-        .nested_counts
-        .insert(prefix.to_string(), arr.len());
-      if let Some(p) = parent_idx {
-        let entry = collected
-          .nested_parents
-          .entry(prefix.to_string())
-          .or_insert_with(|| vec![usize::MAX; arr.len()]);
-        if entry.len() < arr.len() {
-          entry.resize(arr.len(), usize::MAX);
-        }
-        for slot in entry.iter_mut().take(arr.len()) {
-          *slot = p;
-        }
-      } else {
-        collected
-          .nested_parents
-          .entry(prefix.to_string())
-          .or_insert_with(|| vec![usize::MAX; arr.len()]);
-      }
-      for (idx, v) in arr.iter().enumerate() {
+      let base_count = *collected.nested_counts.get(prefix).unwrap_or(&0);
+      let mut non_null_count = 0usize;
+      for v in arr.iter() {
         if v.is_null() {
           if nested.nullable {
             continue;
           }
           bail!("nested field {prefix} cannot be null");
         }
+        if !v.is_object() {
+          bail!("nested field {prefix} must contain objects");
+        }
+        non_null_count = non_null_count.saturating_add(1);
+      }
+
+      let next_count = base_count.saturating_add(non_null_count);
+      collected
+        .nested_counts
+        .insert(prefix.to_string(), next_count);
+      let parent = parent_idx.unwrap_or(usize::MAX);
+      let entry = collected
+        .nested_parents
+        .entry(prefix.to_string())
+        .or_default();
+      if entry.len() < base_count {
+        entry.resize(base_count, usize::MAX);
+      }
+      entry.extend(std::iter::repeat_n(parent, non_null_count));
+      let mut object_idx = base_count;
+      for v in arr.iter() {
+        if v.is_null() {
+          continue;
+        }
         let map = v
           .as_object()
           .ok_or_else(|| anyhow!("nested field {prefix} must contain objects"))?;
-        collect_nested_object(schema, nested, map, prefix, idx, collected, resolved)?;
+        collect_nested_object(schema, nested, map, prefix, object_idx, collected, resolved)?;
+        object_idx = object_idx.saturating_add(1);
       }
     }
     serde_json::Value::Object(map) => {
-      collected.nested_counts.insert(prefix.to_string(), 1);
+      let base_count = *collected.nested_counts.get(prefix).unwrap_or(&0);
+      collected
+        .nested_counts
+        .insert(prefix.to_string(), base_count.saturating_add(1));
       collected
         .nested_parents
         .entry(prefix.to_string())
-        .or_insert_with(|| vec![parent_idx.unwrap_or(usize::MAX)]);
-      collect_nested_object(schema, nested, map, prefix, 0, collected, resolved)?;
+        .or_default()
+        .push(parent_idx.unwrap_or(usize::MAX));
+      collect_nested_object(schema, nested, map, prefix, base_count, collected, resolved)?;
     }
     _ => bail!("nested field {prefix} must be object or array"),
   }

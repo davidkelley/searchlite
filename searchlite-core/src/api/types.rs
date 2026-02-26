@@ -751,6 +751,15 @@ pub struct FilterAggregation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NestedAggregation {
+  pub path: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sampling: Option<AggregationSampling>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub aggs: BTreeMap<String, Aggregation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompositeAggregation {
   pub sources: Vec<CompositeSource>,
   pub size: usize,
@@ -902,6 +911,7 @@ pub enum Aggregation {
   Histogram(Box<HistogramAggregation>),
   DateHistogram(Box<DateHistogramAggregation>),
   Filter(Box<FilterAggregation>),
+  Nested(Box<NestedAggregation>),
   Composite(Box<CompositeAggregation>),
   Stats(MetricAggregation),
   ExtendedStats(MetricAggregation),
@@ -1173,6 +1183,13 @@ pub enum AggregationResponse {
     sampled: bool,
   },
   Filter {
+    doc_count: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    aggregations: BTreeMap<String, AggregationResponse>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sampled: bool,
+  },
+  Nested {
     doc_count: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     aggregations: BTreeMap<String, AggregationResponse>,
