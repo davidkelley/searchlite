@@ -393,6 +393,155 @@ fn nested_aggregation_rejects_dotted_non_nested_prefix_path() {
 }
 
 #[test]
+fn root_terms_aggregation_rejects_nested_keyword_field_without_nested_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("illustrator"),
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "bad": {
+        "type": "terms",
+        "field": "images.illustrator",
+        "size": 5
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("fast keyword field"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
+fn root_numeric_aggregation_rejects_nested_numeric_field_without_nested_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Numeric(
+        NumericField {
+          name: "score".into(),
+          i64: false,
+          fast: true,
+          stored: true,
+          nullable: false,
+        },
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "bad": {
+        "type": "stats",
+        "field": "images.score"
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("fast numeric field"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
+fn collapse_rejects_nested_keyword_field_without_nested_scope() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("illustrator"),
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 1,
+    "return_hits": true,
+    "collapse": {
+      "field": "images.illustrator"
+    },
+    "aggs": {}
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("fast keyword field"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
 fn nested_aggregation_rejects_unsupported_child_aggregation() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
