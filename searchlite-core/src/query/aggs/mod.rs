@@ -859,6 +859,8 @@ pub(crate) struct TermsCollector<'a> {
   min_doc_count: u64,
   missing: Option<serde_json::Value>,
   missing_key: Option<String>,
+  // Cache the resolved field for the active nested scope to avoid per-hit string allocation.
+  scoped_field_cache: Option<(String, String)>,
   buckets: HashMap<BucketKey<'a>, BucketState<'a>>,
   sub_aggs: BTreeMap<String, Aggregation>,
   pipeline_aggs: BTreeMap<String, Aggregation>,
@@ -915,6 +917,7 @@ impl<'a> TermsCollector<'a> {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
       }),
+      scoped_field_cache: None,
       buckets: HashMap::new(),
       sub_aggs,
       pipeline_aggs,
@@ -949,11 +952,25 @@ impl<'a> TermsCollector<'a> {
       return;
     }
     let values = if let Some(scope) = scope {
-      let scoped_field = resolve_scoped_path(scope.path, &self.field);
+      let should_refresh = match self.scoped_field_cache.as_ref() {
+        Some((cached_scope, _)) => cached_scope.as_str() != scope.path,
+        None => true,
+      };
+      if should_refresh {
+        self.scoped_field_cache = Some((
+          scope.path.to_string(),
+          resolve_scoped_path(scope.path, &self.field),
+        ));
+      }
+      let scoped_field = self
+        .scoped_field_cache
+        .as_ref()
+        .map(|(_, field)| field.as_str())
+        .expect("scoped field cache initialized");
       self
         .ctx
         .fast_fields
-        .nested_str_values_at(&scoped_field, doc_id, scope.object_idx)
+        .nested_str_values_at(scoped_field, doc_id, scope.object_idx)
     } else {
       self.ctx.fast_fields.str_values(&self.field, doc_id)
     };

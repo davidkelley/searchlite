@@ -1188,13 +1188,14 @@ fn expand_term_groups(
   let mut term_groups = Vec::with_capacity(groups.len());
   for group in groups.iter() {
     let group_fields = if matches!(group.mode, TermGroupMode::CrossFields) {
-      Some(Arc::new(
-        group
-          .fields
-          .iter()
-          .map(|spec| spec.field.clone())
-          .collect::<Vec<_>>(),
-      ))
+      let mut deduped = Vec::with_capacity(group.fields.len());
+      let mut seen = HashSet::new();
+      for spec in group.fields.iter() {
+        if seen.insert(spec.field.as_str()) {
+          deduped.push(spec.field.clone());
+        }
+      }
+      Some(Arc::new(deduped))
     } else {
       None
     };
@@ -4184,14 +4185,7 @@ fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
 }
 
 fn cross_fields_cache_key(fields: &[String]) -> String {
-  let mut dedup = Vec::new();
-  let mut seen = HashSet::new();
-  for field in fields.iter() {
-    if seen.insert(field.clone()) {
-      dedup.push(field.clone());
-    }
-  }
-  dedup.join("\u{1f}")
+  fields.join("\u{1f}")
 }
 
 fn cross_fields_stats_for(
@@ -4207,11 +4201,7 @@ fn cross_fields_stats_for(
   } else {
     let mut total = 0.0_f32;
     let mut count = 0usize;
-    let mut seen = HashSet::new();
     for field in fields.iter() {
-      if !seen.insert(field.clone()) {
-        continue;
-      }
       total += seg.avg_field_length(field);
       count += 1;
     }
@@ -4228,11 +4218,7 @@ fn cross_fields_stats_for(
   }
   let mut combined = vec![0.0_f32; seg.meta.doc_count as usize];
   let mut contributing = 0usize;
-  let mut seen = HashSet::new();
   for field in fields.iter() {
-    if !seen.insert(field.clone()) {
-      continue;
-    }
     if let Some(lengths) = field_lengths_for(field_lengths_cache, field, seg) {
       contributing += 1;
       for (idx, len) in lengths.iter().enumerate().take(combined.len()) {
@@ -4524,6 +4510,19 @@ fn nested_has_leaf_field(nested: &NestedField, prefix: Option<&str>, target: &st
   false
 }
 
+fn top_level_field_kind_and_fast(schema: &Schema, field: &str) -> Option<(FieldKind, bool)> {
+  if schema.text_fields.iter().any(|f| f.name == field) {
+    return Some((FieldKind::Text, false));
+  }
+  if let Some(f) = schema.keyword_fields.iter().find(|f| f.name == field) {
+    return Some((FieldKind::Keyword, f.fast));
+  }
+  if let Some(f) = schema.numeric_fields.iter().find(|f| f.name == field) {
+    return Some((FieldKind::Numeric, f.fast));
+  }
+  None
+}
+
 fn ensure_nested_path(
   schema: &Schema,
   path: &str,
@@ -4613,18 +4612,41 @@ fn ensure_keyword_fast(
   scope_path: Option<&str>,
 ) -> Result<()> {
   let resolved = resolve_optional_scoped_path(scope_path, field);
-  if scope_path.is_none() && schema_has_nested_leaf_field(schema, &resolved) {
-    return Err(
-      AggregationError::UnsupportedFieldType {
-        agg: agg.to_string(),
-        field: resolved,
-        expected: "fast keyword field".to_string(),
+  if scope_path.is_none() {
+    if let Some((kind, fast)) = top_level_field_kind_and_fast(schema, &resolved) {
+      if matches!(kind, FieldKind::Keyword) {
+        if fast {
+          return Ok(());
+        }
+        return Err(
+          AggregationError::MissingFastField {
+            field: resolved.to_string(),
+          }
+          .into(),
+        );
       }
-      .into(),
-    );
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast keyword field".to_string(),
+        }
+        .into(),
+      );
+    }
+    if schema_has_nested_leaf_field(schema, &resolved) {
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast keyword field".to_string(),
+        }
+        .into(),
+      );
+    }
   }
   if let Some(def) = schema.field_meta(&resolved) {
-    if matches!(def.kind, crate::index::manifest::FieldKind::Keyword) {
+    if matches!(def.kind, FieldKind::Keyword) {
       if def.fast {
         return Ok(());
       }
@@ -4635,6 +4657,14 @@ fn ensure_keyword_fast(
         .into(),
       );
     }
+    return Err(
+      AggregationError::UnsupportedFieldType {
+        agg: agg.to_string(),
+        field: resolved,
+        expected: "fast keyword field".to_string(),
+      }
+      .into(),
+    );
   }
   Err(
     AggregationError::UnsupportedFieldType {
@@ -4653,18 +4683,41 @@ fn ensure_numeric_fast(
   scope_path: Option<&str>,
 ) -> Result<()> {
   let resolved = resolve_optional_scoped_path(scope_path, field);
-  if scope_path.is_none() && schema_has_nested_leaf_field(schema, &resolved) {
-    return Err(
-      AggregationError::UnsupportedFieldType {
-        agg: agg.to_string(),
-        field: resolved,
-        expected: "fast numeric field".to_string(),
+  if scope_path.is_none() {
+    if let Some((kind, fast)) = top_level_field_kind_and_fast(schema, &resolved) {
+      if matches!(kind, FieldKind::Numeric) {
+        if fast {
+          return Ok(());
+        }
+        return Err(
+          AggregationError::MissingFastField {
+            field: resolved.to_string(),
+          }
+          .into(),
+        );
       }
-      .into(),
-    );
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast numeric field".to_string(),
+        }
+        .into(),
+      );
+    }
+    if schema_has_nested_leaf_field(schema, &resolved) {
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast numeric field".to_string(),
+        }
+        .into(),
+      );
+    }
   }
   if let Some(def) = schema.field_meta(&resolved) {
-    if matches!(def.kind, crate::index::manifest::FieldKind::Numeric) {
+    if matches!(def.kind, FieldKind::Numeric) {
       if def.fast {
         return Ok(());
       }
@@ -4675,6 +4728,14 @@ fn ensure_numeric_fast(
         .into(),
       );
     }
+    return Err(
+      AggregationError::UnsupportedFieldType {
+        agg: agg.to_string(),
+        field: resolved,
+        expected: "fast numeric field".to_string(),
+      }
+      .into(),
+    );
   }
   Err(
     AggregationError::UnsupportedFieldType {
@@ -4693,21 +4754,41 @@ fn ensure_keyword_or_numeric_fast(
   scope_path: Option<&str>,
 ) -> Result<()> {
   let resolved = resolve_optional_scoped_path(scope_path, field);
-  if scope_path.is_none() && schema_has_nested_leaf_field(schema, &resolved) {
-    return Err(
-      AggregationError::UnsupportedFieldType {
-        agg: agg.to_string(),
-        field: resolved,
-        expected: "fast keyword or numeric field".to_string(),
+  if scope_path.is_none() {
+    if let Some((kind, fast)) = top_level_field_kind_and_fast(schema, &resolved) {
+      if matches!(kind, FieldKind::Keyword | FieldKind::Numeric) {
+        if fast {
+          return Ok(());
+        }
+        return Err(
+          AggregationError::MissingFastField {
+            field: resolved.to_string(),
+          }
+          .into(),
+        );
       }
-      .into(),
-    );
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast keyword or numeric field".to_string(),
+        }
+        .into(),
+      );
+    }
+    if schema_has_nested_leaf_field(schema, &resolved) {
+      return Err(
+        AggregationError::UnsupportedFieldType {
+          agg: agg.to_string(),
+          field: resolved,
+          expected: "fast keyword or numeric field".to_string(),
+        }
+        .into(),
+      );
+    }
   }
   if let Some(def) = schema.field_meta(&resolved) {
-    let kind_ok = matches!(
-      def.kind,
-      crate::index::manifest::FieldKind::Keyword | crate::index::manifest::FieldKind::Numeric
-    );
+    let kind_ok = matches!(def.kind, FieldKind::Keyword | FieldKind::Numeric);
     if kind_ok && def.fast {
       return Ok(());
     }
@@ -4719,6 +4800,14 @@ fn ensure_keyword_or_numeric_fast(
         .into(),
       );
     }
+    return Err(
+      AggregationError::UnsupportedFieldType {
+        agg: agg.to_string(),
+        field: resolved,
+        expected: "fast keyword or numeric field".to_string(),
+      }
+      .into(),
+    );
   }
   Err(
     AggregationError::UnsupportedFieldType {

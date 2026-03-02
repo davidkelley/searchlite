@@ -590,10 +590,153 @@ fn root_terms_aggregation_rejects_dotted_nested_keyword_field_without_nested_sco
 }
 
 #[test]
+fn root_terms_aggregation_allows_literal_dotted_top_level_keyword_field() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "images.source.name".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Keyword(
+        nested_keyword("source.name"),
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "img-1",
+        vec![
+          ("body", json!("rust")),
+          ("images.source.name", json!("top-level")),
+          ("images", json!([{ "source.name": "nested-only" }])),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "top": {
+        "type": "terms",
+        "field": "images.source.name",
+        "size": 10
+      }
+    }
+  }))
+  .unwrap();
+  let res = idx.reader().unwrap().search(&req);
+  assert!(res.is_ok(), "unexpected error: {}", res.unwrap_err());
+}
+
+#[test]
 fn root_numeric_aggregation_rejects_nested_numeric_field_without_nested_scope() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  schema
+    .nested_fields
+    .push(searchlite_core::api::types::NestedField {
+      name: "images".into(),
+      fields: vec![searchlite_core::api::types::NestedProperty::Numeric(
+        NumericField {
+          name: "score".into(),
+          i64: false,
+          fast: true,
+          stored: true,
+          nullable: false,
+        },
+      )],
+      nullable: false,
+    });
+  let idx = IndexBuilder::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "img-1",
+        vec![
+          ("body", json!("rust")),
+          ("images", json!([{ "score": 99.0 }])),
+        ],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let req: SearchRequest = serde_json::from_value(json!({
+    "query": "rust",
+    "limit": 0,
+    "return_hits": false,
+    "aggs": {
+      "bad": {
+        "type": "stats",
+        "field": "images.score"
+      }
+    }
+  }))
+  .unwrap();
+  let err = idx.reader().unwrap().search(&req).unwrap_err();
+  assert!(
+    err.to_string().contains("fast numeric field"),
+    "unexpected error: {err}"
+  );
+}
+
+#[test]
+fn root_numeric_aggregation_allows_literal_dotted_top_level_numeric_field() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "images.score".into(),
+    i64: false,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
   schema
     .nested_fields
     .push(searchlite_core::api::types::NestedField {
@@ -629,18 +772,15 @@ fn root_numeric_aggregation_rejects_nested_numeric_field_without_nested_scope() 
     "limit": 0,
     "return_hits": false,
     "aggs": {
-      "bad": {
+      "score_stats": {
         "type": "stats",
         "field": "images.score"
       }
     }
   }))
   .unwrap();
-  let err = idx.reader().unwrap().search(&req).unwrap_err();
-  assert!(
-    err.to_string().contains("fast numeric field"),
-    "unexpected error: {err}"
-  );
+  let res = idx.reader().unwrap().search(&req);
+  assert!(res.is_ok(), "unexpected error: {}", res.unwrap_err());
 }
 
 #[test]
