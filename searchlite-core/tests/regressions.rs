@@ -41,6 +41,7 @@ fn base_request(query: &str, filter: Option<Filter>) -> SearchRequest {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]

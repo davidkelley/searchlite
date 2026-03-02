@@ -258,6 +258,7 @@ fn nested_terms_aggregation_respects_outer_filters() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]
@@ -1507,6 +1508,7 @@ fn terms_and_stats_aggregations() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1617,6 +1619,7 @@ fn significant_terms_respects_deletions() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -1705,6 +1708,7 @@ fn aggregation_requires_fast_field() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -1799,6 +1803,7 @@ fn histogram_bucket_generation() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1896,6 +1901,7 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2007,6 +2013,7 @@ fn range_aggregation_counts() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2116,6 +2123,7 @@ fn date_range_missing_and_keyed() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2219,6 +2227,7 @@ fn extended_stats_and_value_count_include_missing() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2338,6 +2347,7 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2455,6 +2465,7 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2575,6 +2586,7 @@ fn terms_size_applied_after_merge() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2682,6 +2694,7 @@ fn filter_aggregation_counts_and_sub_aggs() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -2785,6 +2798,7 @@ fn composite_aggregation_paginates() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -2903,6 +2917,7 @@ fn cardinality_and_percentiles_metrics() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -3053,6 +3068,7 @@ fn bucket_sort_and_avg_bucket_pipeline() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -3178,6 +3194,7 @@ fn significant_and_rare_terms() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]
@@ -3317,6 +3334,7 @@ fn derivative_and_moving_avg_pipeline() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]
@@ -3451,6 +3469,7 @@ fn pipeline_missing_metric_path_with_gap_policy_inserts_zeros() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]

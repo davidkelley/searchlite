@@ -97,6 +97,7 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -176,6 +177,7 @@ fn histogram_requires_positive_interval() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -276,6 +278,7 @@ fn nested_terms_stats_aggregation() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -367,6 +370,7 @@ fn date_histogram_rejects_invalid_config() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -426,6 +430,7 @@ fn date_histogram_rejects_invalid_config() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -503,6 +508,7 @@ fn top_hits_returns_requested_docs() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -607,6 +613,7 @@ fn top_hits_applies_sort_spec() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -717,6 +724,7 @@ fn date_histogram_calendar_month_interval() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 

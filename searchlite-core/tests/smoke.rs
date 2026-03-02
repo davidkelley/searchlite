@@ -37,6 +37,7 @@ fn base_search_request(query: &str) -> SearchRequest {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -144,6 +145,7 @@ fn index_and_search() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -516,6 +518,7 @@ fn upsert_and_delete_by_id() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -613,6 +616,7 @@ fn cursor_paginates_ordered_hits() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -677,6 +681,78 @@ fn total_hits_estimate_counts_across_pages() {
 }
 
 #[test]
+fn track_total_hits_returns_exact_count_for_wand() {
+  let mut docs = vec![doc("doc-0", vec![("body", json!("rare common"))])];
+  for idx in 1..=40 {
+    docs.push(doc(
+      &format!("doc-{idx}"),
+      vec![("body", json!("common common common"))],
+    ));
+  }
+  let (_tmp, idx) = build_index_with_docs(docs);
+  let reader = idx.reader().unwrap();
+
+  let mut req = base_search_request("rare common");
+  req.limit = 1;
+  req.execution = ExecutionStrategy::Wand;
+
+  let estimated = reader.search(&req).unwrap().total_hits_estimate;
+
+  let mut exact_req = req.clone();
+  exact_req.track_total_hits = Some(true);
+  let exact = reader.search(&exact_req).unwrap().total_hits_estimate;
+
+  let mut baseline = req.clone();
+  baseline.execution = ExecutionStrategy::Bm25;
+  let bm25_total = reader.search(&baseline).unwrap().total_hits_estimate;
+
+  assert_eq!(exact, bm25_total);
+  assert_eq!(exact, 41);
+  assert!(estimated <= exact);
+}
+
+#[test]
+fn track_total_hits_with_zero_limit_counts_all_matches() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("apple tart"))]),
+    doc("doc-2", vec![("body", json!("apple pie recipe"))]),
+    doc("doc-3", vec![("body", json!("green apple salad"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("apple");
+  req.limit = 0;
+  req.return_hits = false;
+  req.track_total_hits = Some(true);
+
+  let res = reader.search(&req).unwrap();
+  assert!(res.hits.is_empty());
+  assert_eq!(res.total_hits_estimate, 3);
+}
+
+#[test]
+fn track_total_hits_keeps_cursor_totals_exact() {
+  let (_tmp, idx) = build_index_with_docs(vec![
+    doc("doc-1", vec![("body", json!("apple tart"))]),
+    doc("doc-2", vec![("body", json!("apple pie recipe"))]),
+    doc("doc-3", vec![("body", json!("green apple salad"))]),
+  ]);
+  let reader = idx.reader().unwrap();
+  let mut req = base_search_request("apple");
+  req.limit = 2;
+  req.track_total_hits = Some(true);
+
+  let first = reader.search(&req).unwrap();
+  assert_eq!(first.hits.len(), 2);
+  assert_eq!(first.total_hits_estimate, 3);
+  let cursor = first.next_cursor.clone().expect("cursor for second page");
+
+  req.cursor = Some(cursor);
+  let second = reader.search(&req).unwrap();
+  assert_eq!(second.hits.len(), 1);
+  assert_eq!(second.total_hits_estimate, 3);
+}
+
+#[test]
 fn cursor_rejects_invalid_hex() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
@@ -716,6 +792,7 @@ fn cursor_rejects_invalid_hex() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -776,6 +853,7 @@ fn cursor_rejects_when_limit_zero() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -843,6 +921,7 @@ fn cursor_rejects_excessive_advance() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -904,6 +983,7 @@ fn cursor_rejects_mismatched_position() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -992,6 +1072,7 @@ fn cursor_orders_stably_across_segments() {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -1111,6 +1192,7 @@ fn in_memory_storage_keeps_disk_clean() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1247,6 +1329,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1417,6 +1500,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1514,6 +1598,7 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -1628,6 +1713,7 @@ fn highlight_configuration_applies_tags() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]

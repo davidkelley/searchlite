@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::util::regex::anchored_regex;
 use anyhow::{bail, Result};
@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use crate::api::query::{parse_query, ParsedQuery};
 use crate::api::types::{
   FieldSpec, Filter, FunctionBoostMode, FunctionScoreMode, FunctionSpec, MatchOperator,
-  MinimumShouldMatch, MultiMatchType, Query, QueryNode, RankFeatureModifier,
+  MinimumShouldMatch, MultiMatchFuzziness, MultiMatchType, Query, QueryNode, RankFeatureModifier,
 };
 
 const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
@@ -70,11 +70,8 @@ pub(crate) struct TermGroupSpec {
   pub expansion: TermExpansion,
   pub boost: f32,
   pub score: bool,
-  // NOTE: `mode` is set during planning to distinguish PerField vs CrossFields grouping,
-  // but scoring currently assumes PerField. CrossFields-aware scoring will consume this
-  // in a future iteration; until then we keep it and silence unused warnings.
-  #[allow(dead_code)]
   pub mode: TermGroupMode,
+  pub fuzziness: Option<MultiMatchFuzziness>,
   pub leaf: Option<usize>,
 }
 
@@ -308,6 +305,7 @@ impl<'a> QueryPlanBuilder<'a> {
             boost * node_boost,
             score,
             TermGroupMode::PerField,
+            None,
             leaf,
           );
           term_groups.push(idx);
@@ -332,6 +330,7 @@ impl<'a> QueryPlanBuilder<'a> {
             boost * node_boost,
             false,
             TermGroupMode::PerField,
+            None,
             None,
           );
           not_term_groups.push(idx);
@@ -368,26 +367,29 @@ impl<'a> QueryPlanBuilder<'a> {
         query,
         fields,
         match_type,
+        fuzziness,
         tie_breaker,
         operator,
         minimum_should_match,
         boost: node_boost,
       } => {
         let node_boost = validate_boost(node_boost)?;
+        let fuzziness = validate_multi_match_fuzziness(fuzziness)?;
         let op = operator.clone().unwrap_or(MatchOperator::Or);
         let parsed = parse_query(query);
         let required = resolve_minimum_should_match(minimum_should_match, parsed.terms.len(), op)?;
         let tie = validate_tie_breaker(tie_breaker)?;
         let (field_specs, group_leaf, scorer, mode) = match match_type {
           MultiMatchType::BestFields => {
+            let normalized = normalize_multi_match_fields(fields.as_slice())?;
             let mut leaves = Vec::new();
             let mut specs = Vec::new();
-            for spec in fields.iter() {
+            for (field, boost) in normalized.into_iter() {
               let leaf = self.alloc_leaf();
               leaves.push(ScoreExpr::Leaf(leaf));
               specs.push(FieldSpecInternal {
-                field: spec.field.clone(),
-                boost: validate_boost(&spec.boost)?,
+                field,
+                boost,
                 leaf: Some(leaf),
               });
             }
@@ -423,6 +425,7 @@ impl<'a> QueryPlanBuilder<'a> {
             boost * node_boost,
             score,
             mode.clone(),
+            fuzziness.clone(),
             group_leaf,
           );
           term_groups.push(idx);
@@ -436,6 +439,7 @@ impl<'a> QueryPlanBuilder<'a> {
             boost * node_boost,
             false,
             mode.clone(),
+            fuzziness.clone(),
             None,
           );
           not_term_groups.push(idx);
@@ -519,6 +523,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost * node_boost,
           score,
           TermGroupMode::PerField,
+          None,
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
@@ -549,6 +554,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost * node_boost,
           score,
           TermGroupMode::PerField,
+          None,
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
@@ -579,6 +585,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost * node_boost,
           score,
           TermGroupMode::PerField,
+          None,
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
@@ -610,6 +617,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost * node_boost,
           score,
           TermGroupMode::PerField,
+          None,
           leaf,
         );
         let scorer = leaf.map(ScoreExpr::Leaf);
@@ -808,6 +816,7 @@ impl<'a> QueryPlanBuilder<'a> {
     boost: f32,
     score: bool,
     mode: TermGroupMode,
+    fuzziness: Option<MultiMatchFuzziness>,
     leaf: Option<usize>,
   ) -> usize {
     let idx = self.term_groups.len();
@@ -818,6 +827,7 @@ impl<'a> QueryPlanBuilder<'a> {
       boost,
       score,
       mode,
+      fuzziness,
       leaf,
     });
     idx
@@ -858,33 +868,67 @@ fn validate_tie_breaker(tie: &Option<f32>) -> Result<f32> {
   Ok(value)
 }
 
+fn validate_multi_match_fuzziness(
+  fuzziness: &Option<MultiMatchFuzziness>,
+) -> Result<Option<MultiMatchFuzziness>> {
+  let Some(fuzziness) = fuzziness else {
+    return Ok(None);
+  };
+  match fuzziness {
+    MultiMatchFuzziness::Auto => Ok(Some(MultiMatchFuzziness::Auto)),
+    MultiMatchFuzziness::Edits(value) => {
+      if *value > 2 {
+        bail!("multi_match fuzziness edit distance must be between 0 and 2");
+      }
+      Ok(Some(MultiMatchFuzziness::Edits(*value)))
+    }
+  }
+}
+
 fn normalize_fields(
   fields: Option<&[FieldSpec]>,
   default_fields: &[String],
   leaf: Option<usize>,
 ) -> Result<Vec<FieldSpecInternal>> {
   match fields {
-    Some(specs) => specs
-      .iter()
-      .map(|spec| {
-        Ok(FieldSpecInternal {
-          field: spec.field.clone(),
-          boost: validate_boost(&spec.boost)?,
-          leaf,
-        })
-      })
-      .collect(),
-    None => Ok(
-      default_fields
-        .iter()
-        .map(|field| FieldSpecInternal {
-          field: field.clone(),
-          boost: 1.0,
-          leaf,
-        })
+    Some(specs) => Ok(
+      normalize_multi_match_fields(specs)?
+        .into_iter()
+        .map(|(field, boost)| FieldSpecInternal { field, boost, leaf })
         .collect(),
     ),
+    None => {
+      let mut seen = HashSet::new();
+      Ok(
+        default_fields
+          .iter()
+          .filter(|field| seen.insert((*field).clone()))
+          .map(|field| FieldSpecInternal {
+            field: field.clone(),
+            boost: 1.0,
+            leaf,
+          })
+          .collect(),
+      )
+    }
   }
+}
+
+fn normalize_multi_match_fields(fields: &[FieldSpec]) -> Result<Vec<(String, f32)>> {
+  let mut out: Vec<(String, f32)> = Vec::new();
+  let mut by_field: HashMap<String, usize> = HashMap::new();
+  for spec in fields.iter() {
+    let boost = validate_boost(&spec.boost)?;
+    if let Some(existing) = by_field.get(&spec.field).copied() {
+      if boost > out[existing].1 {
+        out[existing].1 = boost;
+      }
+      continue;
+    }
+    by_field.insert(spec.field.clone(), out.len());
+    out.push((spec.field.clone(), boost));
+  }
+  Ok(out)
 }
 
 fn resolve_minimum_should_match(
@@ -977,6 +1021,7 @@ mod tests {
           },
         ],
         match_type: MultiMatchType::BestFields,
+        fuzziness: None,
         tie_breaker: None,
         operator: None,
         minimum_should_match: None,

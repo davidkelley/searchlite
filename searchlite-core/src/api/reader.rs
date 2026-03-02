@@ -15,8 +15,8 @@ use crate::analysis::analyzer::Analyzer;
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, CollapseRequest, DateHistogramAggregation,
   DecayFunction, Filter, FunctionBoostMode, FunctionScoreMode, FuzzyOptions, HistogramAggregation,
-  IndexOptions, MgetDoc, Query, RankFeatureModifier, RescoreMode, RescoreRequest, SearchRequest,
-  SortOrder, SuggestOption, SuggestRequest, SuggestResult,
+  IndexOptions, MgetDoc, MultiMatchFuzziness, Query, RankFeatureModifier, RescoreMode,
+  RescoreRequest, SearchRequest, SortOrder, SuggestOption, SuggestRequest, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -36,7 +36,7 @@ use crate::query::filters::{passes_filter, passes_filters};
 use crate::query::phrase::matches_phrase;
 use crate::query::planner::{
   build_query_plan, PhraseSpec, QueryMatcher, ScoreExpr, ScoreNode, ScorePlan, TermExpansion,
-  TermGroupSpec,
+  TermGroupMode, TermGroupSpec,
 };
 use crate::query::score_functions::{
   apply_boost_mode, combine_function_scores, compile_functions, CompiledFunction,
@@ -1039,7 +1039,10 @@ struct QualifiedTerm {
   key: String,
   weight: f32,
   leaf: usize,
+  group_fields: Option<Arc<Vec<String>>>,
 }
+
+type WeightedTermEntry = (String, f32, usize, Option<Arc<Vec<String>>>);
 
 #[derive(Clone, Debug)]
 struct TermMatchGroup {
@@ -1111,6 +1114,30 @@ fn distance_weight(distance: usize) -> f32 {
   1.0 / (distance as f32 + 1.0)
 }
 
+fn auto_fuzziness_max_edits(term: &str) -> u8 {
+  match term.chars().count() {
+    0..=2 => 0,
+    3..=5 => 1,
+    _ => 2,
+  }
+}
+
+fn resolve_multi_match_fuzzy_options(
+  multi_match_fuzziness: Option<&MultiMatchFuzziness>,
+  request_fuzzy: Option<&FuzzyOptions>,
+  term: &str,
+) -> Option<FuzzyOptions> {
+  let Some(fuzziness) = multi_match_fuzziness else {
+    return request_fuzzy.cloned();
+  };
+  let mut options = request_fuzzy.cloned().unwrap_or_default();
+  options.max_edits = match fuzziness {
+    MultiMatchFuzziness::Auto => auto_fuzziness_max_edits(term),
+    MultiMatchFuzziness::Edits(value) => (*value).min(2),
+  };
+  Some(options)
+}
+
 fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
   let a_len = a.chars().count();
   let b_chars: SmallVec<[char; 32]> = b.chars().collect();
@@ -1153,13 +1180,24 @@ fn bounded_levenshtein(a: &str, b: &str, max_edits: usize) -> Option<usize> {
 fn expand_term_groups(
   segments: &[SegmentReader],
   groups: &[TermGroupSpec],
-  fuzzy: Option<&FuzzyOptions>,
+  request_fuzzy: Option<&FuzzyOptions>,
   analysis: &SchemaAnalyzers,
   schema: &Schema,
 ) -> Result<(Vec<QualifiedTerm>, Vec<TermMatchGroup>)> {
   let mut qualified_terms = Vec::new();
   let mut term_groups = Vec::with_capacity(groups.len());
   for group in groups.iter() {
+    let group_fields = if matches!(group.mode, TermGroupMode::CrossFields) {
+      Some(Arc::new(
+        group
+          .fields
+          .iter()
+          .map(|spec| spec.field.clone())
+          .collect::<Vec<_>>(),
+      ))
+    } else {
+      None
+    };
     let mut keys = Vec::new();
     let mut seen_keys = HashSet::new();
     for field in group.fields.iter() {
@@ -1181,6 +1219,8 @@ fn expand_term_groups(
               if !seen_tokens.insert(token.clone()) {
                 continue;
               }
+              let term_fuzzy =
+                resolve_multi_match_fuzzy_options(group.fuzziness.as_ref(), request_fuzzy, &token);
               let (scored, mut expanded_keys) = expand_term_for_group(
                 segments,
                 &field.field,
@@ -1188,8 +1228,9 @@ fn expand_term_groups(
                 weight,
                 group.score,
                 target_leaf,
-                fuzzy,
+                term_fuzzy.as_ref(),
                 &group.expansion,
+                group_fields.clone(),
               )?;
               if group.score {
                 qualified_terms.extend(scored);
@@ -1204,6 +1245,8 @@ fn expand_term_groups(
         }
         FieldKind::Keyword => {
           let term = group.term.to_ascii_lowercase();
+          let term_fuzzy =
+            resolve_multi_match_fuzzy_options(group.fuzziness.as_ref(), request_fuzzy, &term);
           let (scored, mut expanded_keys) = expand_term_for_group(
             segments,
             &field.field,
@@ -1211,8 +1254,9 @@ fn expand_term_groups(
             weight,
             group.score,
             target_leaf,
-            fuzzy,
+            term_fuzzy.as_ref(),
             &group.expansion,
+            group_fields.clone(),
           )?;
           if group.score {
             qualified_terms.extend(scored);
@@ -1258,6 +1302,7 @@ fn expand_term_for_group(
   leaf: Option<usize>,
   fuzzy: Option<&FuzzyOptions>,
   expansion: &TermExpansion,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
   match expansion {
     TermExpansion::Exact => {
@@ -1268,13 +1313,21 @@ fn expand_term_for_group(
         return Ok((Vec::new(), vec![build_term_key(field, term)]));
       };
       let Some(fuzzy) = fuzzy else {
-        return Ok(expand_term_exact(field, term, boost, leaf));
+        return Ok(expand_term_exact(field, term, boost, leaf, group_fields));
       };
       let max_edits = fuzzy.max_edits.min(2) as usize;
       if max_edits == 0 {
-        return Ok(expand_term_exact(field, term, boost, leaf));
+        return Ok(expand_term_exact(field, term, boost, leaf, group_fields));
       }
-      Ok(expand_term_fuzzy(segments, field, term, boost, leaf, fuzzy))
+      Ok(expand_term_fuzzy(
+        segments,
+        field,
+        term,
+        boost,
+        leaf,
+        fuzzy,
+        group_fields,
+      ))
     }
     TermExpansion::Prefix { max_expansions } => Ok(expand_prefix(
       segments,
@@ -1284,16 +1337,32 @@ fn expand_term_for_group(
       score,
       leaf,
       *max_expansions,
+      group_fields,
     )),
-    TermExpansion::Wildcard { max_expansions } => {
-      expand_wildcard(segments, field, term, boost, score, leaf, *max_expansions)
-    }
-    TermExpansion::Regex { max_expansions } => {
-      expand_regex(segments, field, term, boost, score, leaf, *max_expansions)
-    }
+    TermExpansion::Wildcard { max_expansions } => expand_wildcard(
+      segments,
+      field,
+      term,
+      boost,
+      score,
+      leaf,
+      *max_expansions,
+      group_fields,
+    ),
+    TermExpansion::Regex { max_expansions } => expand_regex(
+      segments,
+      field,
+      term,
+      boost,
+      score,
+      leaf,
+      *max_expansions,
+      group_fields,
+    ),
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_prefix(
   segments: &[SegmentReader],
   field: &str,
@@ -1302,6 +1371,7 @@ fn expand_prefix(
   score: bool,
   leaf: Option<usize>,
   max_expansions: usize,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
   if max_expansions == 0 {
     return (Vec::new(), Vec::new());
@@ -1332,6 +1402,7 @@ fn expand_prefix(
             key: key.clone(),
             weight: boost,
             leaf: idx,
+            group_fields: group_fields.clone(),
           });
         }
       }
@@ -1362,6 +1433,7 @@ fn build_wildcard_regex(pattern: &str) -> Result<Regex> {
   Regex::new(&buf).map_err(|e| anyhow::anyhow!("invalid wildcard `{pattern}`: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_wildcard(
   segments: &[SegmentReader],
   field: &str,
@@ -1370,6 +1442,7 @@ fn expand_wildcard(
   score: bool,
   leaf: Option<usize>,
   max_expansions: usize,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
   if max_expansions == 0 {
     return Ok((Vec::new(), Vec::new()));
@@ -1405,6 +1478,7 @@ fn expand_wildcard(
             key: key.clone(),
             weight: boost,
             leaf: idx,
+            group_fields: group_fields.clone(),
           });
         }
       }
@@ -1452,6 +1526,7 @@ fn regex_literal_prefix(pattern: &str) -> String {
   prefix
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_regex(
   segments: &[SegmentReader],
   field: &str,
@@ -1460,6 +1535,7 @@ fn expand_regex(
   score: bool,
   leaf: Option<usize>,
   max_expansions: usize,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> Result<(Vec<QualifiedTerm>, Vec<String>)> {
   if max_expansions == 0 {
     return Ok((Vec::new(), Vec::new()));
@@ -1495,6 +1571,7 @@ fn expand_regex(
             key: key.clone(),
             weight: boost,
             leaf: idx,
+            group_fields: group_fields.clone(),
           });
         }
       }
@@ -1510,6 +1587,7 @@ fn expand_term_exact(
   term: &str,
   boost: f32,
   leaf: usize,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
   let key = build_term_key(field, term);
   (
@@ -1519,6 +1597,7 @@ fn expand_term_exact(
       key: key.clone(),
       weight: boost,
       leaf,
+      group_fields,
     }],
     vec![key],
   )
@@ -1531,6 +1610,7 @@ fn expand_term_fuzzy(
   boost: f32,
   leaf: usize,
   fuzzy: &FuzzyOptions,
+  group_fields: Option<Arc<Vec<String>>>,
 ) -> (Vec<QualifiedTerm>, Vec<String>) {
   let term_len = term.chars().count();
   let exact_key = build_term_key(field, term);
@@ -1540,6 +1620,7 @@ fn expand_term_fuzzy(
     key: exact_key.clone(),
     weight: boost * distance_weight(0),
     leaf,
+    group_fields: group_fields.clone(),
   }];
   let mut keys = vec![exact_key.clone()];
   if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
@@ -1585,6 +1666,7 @@ fn expand_term_fuzzy(
           key: key.clone(),
           weight: boost * distance_weight(distance),
           leaf,
+          group_fields: group_fields.clone(),
         });
         keys.push(key.clone());
         expansions += 1;
@@ -2370,8 +2452,10 @@ impl IndexReader {
     cursor_state: Option<CursorState>,
     plan: &VectorPlan,
   ) -> Result<SearchResult> {
-    let score_fast_path =
-      sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
+    let track_total_hits = req.track_total_hits.unwrap_or(false);
+    let score_fast_path = !track_total_hits
+      && sort_plan.is_score_only()
+      && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
     let cursor_key = cursor_state.as_ref().map(|c| c.key.clone());
     let cursor_returned = cursor_state
       .as_ref()
@@ -2825,8 +2909,10 @@ impl IndexReader {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse", None)?;
     }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
-    let score_fast_path =
-      sort_plan.is_score_only() && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
+    let track_total_hits = req.track_total_hits.unwrap_or(false);
+    let score_fast_path = !track_total_hits
+      && sort_plan.is_score_only()
+      && matches!(sort_plan.primary_order(), Some(SortOrder::Desc));
     let manifest_generation = self
       .manifest
       .segments
@@ -3431,30 +3517,50 @@ impl IndexReader {
       );
     }
     let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
-    let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
+    let mut term_weights: HashMap<String, WeightedTermEntry> = HashMap::new();
     for term in qualified_terms.iter() {
-      let entry =
-        term_weights
-          .entry(term.key.clone())
-          .or_insert((term.field.clone(), 0.0, term.leaf));
+      let entry = term_weights.entry(term.key.clone()).or_insert((
+        term.field.clone(),
+        0.0,
+        term.leaf,
+        term.group_fields.clone(),
+      ));
       debug_assert_eq!(
         entry.2, term.leaf,
         "Inconsistent leaf for term key {} (expected {}, got {})",
         term.key, entry.2, term.leaf
       );
       entry.1 += term.weight;
+      if entry.3.is_none() && term.group_fields.is_some() {
+        entry.3 = term.group_fields.clone();
+      }
     }
 
     let docs = seg.live_docs() as f32;
     let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+    let mut cross_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+    let mut cross_avgdl_cache: HashMap<String, f32> = HashMap::new();
     let mut terms: Vec<ScoredTerm> = Vec::new();
-    for (key, (field, weight, leaf)) in term_weights.into_iter() {
+    for (key, (field, weight, leaf, group_fields)) in term_weights.into_iter() {
       if let Some(postings) = seg.postings(&key) {
-        let doc_lengths = field_lengths_for(&mut field_lengths_cache, &field, seg);
+        let (avgdl, doc_lengths) = if let Some(fields) = group_fields.as_deref() {
+          cross_fields_stats_for(
+            &mut field_lengths_cache,
+            &mut cross_lengths_cache,
+            &mut cross_avgdl_cache,
+            fields,
+            seg,
+          )
+        } else {
+          (
+            seg.avg_field_length(&field),
+            field_lengths_for(&mut field_lengths_cache, &field, seg),
+          )
+        };
         terms.push(ScoredTerm {
           postings,
           weight,
-          avgdl: seg.avg_field_length(&field),
+          avgdl,
           docs,
           k1: self.options.bm25_k1,
           b: self.options.bm25_b,
@@ -4075,6 +4181,74 @@ fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
   let entries = postings.entries();
   let idx = entries.binary_search_by_key(&doc_id, |e| e.doc_id).ok()?;
   Some(entries.get(idx)?.term_freq as f32)
+}
+
+fn cross_fields_cache_key(fields: &[String]) -> String {
+  let mut dedup = Vec::new();
+  let mut seen = HashSet::new();
+  for field in fields.iter() {
+    if seen.insert(field.clone()) {
+      dedup.push(field.clone());
+    }
+  }
+  dedup.join("\u{1f}")
+}
+
+fn cross_fields_stats_for(
+  field_lengths_cache: &mut HashMap<String, Arc<Vec<f32>>>,
+  cross_lengths_cache: &mut HashMap<String, Arc<Vec<f32>>>,
+  cross_avgdl_cache: &mut HashMap<String, f32>,
+  fields: &[String],
+  seg: &SegmentReader,
+) -> (f32, Option<Arc<Vec<f32>>>) {
+  let key = cross_fields_cache_key(fields);
+  let avgdl = if let Some(value) = cross_avgdl_cache.get(&key).copied() {
+    value
+  } else {
+    let mut total = 0.0_f32;
+    let mut count = 0usize;
+    let mut seen = HashSet::new();
+    for field in fields.iter() {
+      if !seen.insert(field.clone()) {
+        continue;
+      }
+      total += seg.avg_field_length(field);
+      count += 1;
+    }
+    let value = if count == 0 {
+      1.0
+    } else {
+      total / count as f32
+    };
+    cross_avgdl_cache.insert(key.clone(), value);
+    value
+  };
+  if let Some(lengths) = cross_lengths_cache.get(&key) {
+    return (avgdl, Some(lengths.clone()));
+  }
+  let mut combined = vec![0.0_f32; seg.meta.doc_count as usize];
+  let mut contributing = 0usize;
+  let mut seen = HashSet::new();
+  for field in fields.iter() {
+    if !seen.insert(field.clone()) {
+      continue;
+    }
+    if let Some(lengths) = field_lengths_for(field_lengths_cache, field, seg) {
+      contributing += 1;
+      for (idx, len) in lengths.iter().enumerate().take(combined.len()) {
+        combined[idx] += *len;
+      }
+    }
+  }
+  if contributing > 1 {
+    let denom = contributing as f32;
+    for len in combined.iter_mut() {
+      *len /= denom;
+    }
+  }
+  let arc = Arc::new(combined);
+  cross_lengths_cache.insert(key, arc.clone());
+  (avgdl, Some(arc))
 }
 
 fn field_lengths_for(
@@ -4848,6 +5022,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -4883,6 +5058,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5000,6 +5176,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5094,6 +5271,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5128,6 +5306,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5205,6 +5384,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5240,6 +5420,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
         #[cfg(feature = "vectors")]
@@ -5410,6 +5591,7 @@ mod tests {
           },
         ],
         match_type: MultiMatchType::BestFields,
+        fuzziness: None,
         tie_breaker: None,
         operator: Some(MatchOperator::Or),
         minimum_should_match: None,
@@ -5451,12 +5633,14 @@ mod tests {
     };
     assert!(evaluator.matches(doc2));
     assert!(evaluator.matches(doc4));
-    let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
+    let mut term_weights: HashMap<String, WeightedTermEntry> = HashMap::new();
     for term in qualified_terms.iter() {
-      let entry =
-        term_weights
-          .entry(term.key.clone())
-          .or_insert((term.field.clone(), 0.0, term.leaf));
+      let entry = term_weights.entry(term.key.clone()).or_insert((
+        term.field.clone(),
+        0.0,
+        term.leaf,
+        term.group_fields.clone(),
+      ));
       debug_assert_eq!(
         entry.2, term.leaf,
         "Inconsistent leaf for term key {} (expected {}, got {})",
@@ -5466,7 +5650,7 @@ mod tests {
     }
     let docs = seg.live_docs() as f32;
     let mut scored_terms = Vec::new();
-    for (key, (field, weight, leaf)) in term_weights.into_iter() {
+    for (key, (field, weight, leaf, _group_fields)) in term_weights.into_iter() {
       if let Some(postings) = seg.postings(&key) {
         scored_terms.push(ScoredTerm {
           postings,
@@ -5532,6 +5716,7 @@ mod tests {
             },
           ],
           match_type: MultiMatchType::BestFields,
+          fuzziness: None,
           tie_breaker: None,
           operator: Some(MatchOperator::Or),
           minimum_should_match: None,
@@ -5551,6 +5736,7 @@ mod tests {
         execution: ExecutionStrategy::Wand,
         bmw_block_size: None,
         fuzzy: None,
+        track_total_hits: None,
         #[cfg(feature = "vectors")]
         vector_query: None,
 
@@ -5910,6 +6096,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       vector_query: None,
       vector_filter: None,
       return_stored: false,

@@ -184,6 +184,7 @@ fn bench_terms_aggregation(c: &mut Criterion) {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -246,6 +247,7 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -330,6 +332,7 @@ fn bench_nested_terms_aggregation(c: &mut Criterion) {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]

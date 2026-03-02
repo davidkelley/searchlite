@@ -2162,6 +2162,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -2307,6 +2308,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -2434,6 +2436,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -2552,6 +2555,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       vector_query: None,
       vector_filter: None,
       return_stored: true,
@@ -2675,6 +2679,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       vector_query: None,
       vector_filter: None,
       return_stored: true,
@@ -3119,6 +3124,7 @@ mod tests {
           execution: ExecutionStrategy::Wand,
           bmw_block_size: None,
           fuzzy: None,
+          track_total_hits: None,
           #[cfg(feature = "vectors")]
           vector_query: None,
           #[cfg(feature = "vectors")]
@@ -3149,6 +3155,7 @@ mod tests {
           execution: ExecutionStrategy::Wand,
           bmw_block_size: None,
           fuzzy: None,
+          track_total_hits: None,
           #[cfg(feature = "vectors")]
           vector_query: None,
           #[cfg(feature = "vectors")]
@@ -3303,6 +3310,41 @@ mod tests {
     assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
     let body: ErrorResponse = res.json().await.unwrap();
     assert_eq!(body.error.r#type, "invalid_cursor");
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn invalid_multi_match_fuzziness_returns_bad_request() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-invalid-fuzziness")).await;
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let invalid = json!({
+      "query": {
+        "type": "multi_match",
+        "query": "rust",
+        "fields": ["body"],
+        "fuzziness": 3
+      },
+      "return_stored": true
+    });
+    let res = client
+      .post(format!("{index_base}/search"))
+      .json(&invalid)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let body: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(body.error.r#type, "invalid_request");
+    assert!(!body.error.reason.is_empty());
     handle.abort();
     let _ = handle.await;
   }
@@ -3621,6 +3663,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
