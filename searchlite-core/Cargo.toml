@@ -59,3 +59,11 @@ tempfile = "3.8.1"
 [lib]
 name = "searchlite_core"
 path = "src/lib.rs"
+
+[[bench]]
+name = "aggs"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false

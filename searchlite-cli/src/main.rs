@@ -439,6 +439,7 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
     execution: parse_execution(&execution),
     bmw_block_size,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: request_vector_query,
     #[cfg(feature = "vectors")]
@@ -672,6 +673,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -714,6 +716,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]
@@ -777,6 +780,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
       #[cfg(feature = "vectors")]

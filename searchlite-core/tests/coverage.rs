@@ -113,6 +113,7 @@ fn search_with_phrase_filters_and_compaction() {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -128,6 +129,98 @@ pub enum MultiMatchType {
   CrossFields,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiMatchFuzziness {
+  Auto,
+  Edits(u8),
+}
+
+impl Serialize for MultiMatchFuzziness {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      Self::Auto => serializer.serialize_str("AUTO"),
+      Self::Edits(value) => serializer.serialize_u8(*value),
+    }
+  }
+}
+
+struct MultiMatchFuzzinessVisitor;
+
+impl<'de> Visitor<'de> for MultiMatchFuzzinessVisitor {
+  type Value = MultiMatchFuzziness;
+
+  fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("`AUTO` (string) or an integer edit distance between 0 and 2")
+  }
+
+  fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    if value.eq_ignore_ascii_case("auto") {
+      return Ok(MultiMatchFuzziness::Auto);
+    }
+    let parsed = value.parse::<u8>().map_err(|_| {
+      E::invalid_value(
+        Unexpected::Str(value),
+        &"`AUTO` (string) or an integer edit distance between 0 and 2",
+      )
+    })?;
+    if parsed > 2 {
+      return Err(E::invalid_value(
+        Unexpected::Unsigned(parsed as u64),
+        &"an integer edit distance between 0 and 2",
+      ));
+    }
+    Ok(MultiMatchFuzziness::Edits(parsed))
+  }
+
+  fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    self.visit_str(value.as_str())
+  }
+
+  fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    if value > 2 {
+      return Err(E::invalid_value(
+        Unexpected::Unsigned(value),
+        &"an integer edit distance between 0 and 2",
+      ));
+    }
+    Ok(MultiMatchFuzziness::Edits(value as u8))
+  }
+
+  fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    if !(0..=2).contains(&value) {
+      return Err(E::invalid_value(
+        Unexpected::Signed(value),
+        &"an integer edit distance between 0 and 2",
+      ));
+    }
+    Ok(MultiMatchFuzziness::Edits(value as u8))
+  }
+}
+
+impl<'de> Deserialize<'de> for MultiMatchFuzziness {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    deserializer.deserialize_any(MultiMatchFuzzinessVisitor)
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum MinimumShouldMatch {
@@ -243,6 +336,8 @@ pub enum QueryNode {
     fields: Vec<FieldSpec>,
     #[serde(default)]
     match_type: MultiMatchType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fuzziness: Option<MultiMatchFuzziness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tie_breaker: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,6 +524,8 @@ pub struct SearchRequest {
   pub bmw_block_size: Option<usize>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fuzzy: Option<FuzzyOptions>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub track_total_hits: Option<bool>,
   #[cfg(feature = "vectors")]
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vector_query: Option<VectorQuerySpec>,
@@ -484,6 +581,8 @@ struct SearchRequestHelper {
   pub bmw_block_size: Option<usize>,
   #[serde(default)]
   pub fuzzy: Option<FuzzyOptions>,
+  #[serde(default)]
+  pub track_total_hits: Option<bool>,
   #[cfg(feature = "vectors")]
   #[serde(default)]
   pub vector_query: Option<VectorQuerySpec>,
@@ -531,6 +630,7 @@ impl<'de> Deserialize<'de> for SearchRequest {
       execution: helper.execution,
       bmw_block_size: helper.bmw_block_size,
       fuzzy: helper.fuzzy,
+      track_total_hits: helper.track_total_hits,
       #[cfg(feature = "vectors")]
       vector_query: helper.vector_query,
       #[cfg(feature = "vectors")]

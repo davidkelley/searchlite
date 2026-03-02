@@ -85,6 +85,7 @@ fn base_request(query: Query, limit: usize) -> SearchRequest {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
     #[cfg(feature = "vectors")]

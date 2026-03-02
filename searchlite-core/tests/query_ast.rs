@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 
 use searchlite_core::api::types::{
-  Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Query, QueryNode, Schema,
-  SearchRequest, StorageType,
+  Document, ExecutionStrategy, IndexOptions, KeywordField, MultiMatchFuzziness, NumericField,
+  Query, QueryNode, Schema, SearchRequest, StorageType,
 };
 use searchlite_core::api::{Filter, Index, SearchResult};
+use serde_json::json;
 use tempfile::TempDir;
 
 fn doc(id: &str, body: &str, lang: &str, year: i64) -> Document {
@@ -111,6 +112,7 @@ fn request(query: impl Into<Query>) -> SearchRequest {
     execution: ExecutionStrategy::Wand,
     bmw_block_size: None,
     fuzzy: None,
+    track_total_hits: None,
     #[cfg(feature = "vectors")]
     vector_query: None,
 
@@ -255,4 +257,66 @@ fn query_string_negated_only_matches() {
     .map(String::from)
     .collect();
   assert_eq!(got, expected);
+}
+
+#[test]
+fn multi_match_fuzziness_parses_auto_and_numeric() {
+  let auto: QueryNode = serde_json::from_value(json!({
+    "type": "multi_match",
+    "query": "rust",
+    "fields": ["body"],
+    "fuzziness": "AUTO"
+  }))
+  .unwrap();
+  match auto {
+    QueryNode::MultiMatch { fuzziness, .. } => {
+      assert!(matches!(fuzziness, Some(MultiMatchFuzziness::Auto)))
+    }
+    _ => panic!("expected multi_match"),
+  }
+
+  let numeric: QueryNode = serde_json::from_value(json!({
+    "type": "multi_match",
+    "query": "rust",
+    "fields": ["body"],
+    "fuzziness": 1
+  }))
+  .unwrap();
+  match numeric {
+    QueryNode::MultiMatch { fuzziness, .. } => {
+      assert!(matches!(fuzziness, Some(MultiMatchFuzziness::Edits(1))))
+    }
+    _ => panic!("expected multi_match"),
+  }
+}
+
+#[test]
+fn multi_match_fuzziness_rejects_out_of_range_value() {
+  let err = serde_json::from_value::<QueryNode>(json!({
+    "type": "multi_match",
+    "query": "rust",
+    "fields": ["body"],
+    "fuzziness": 3
+  }))
+  .unwrap_err();
+  let msg = err.to_string();
+  assert!(msg.contains("between 0 and 2"), "error: {msg}");
+}
+
+#[test]
+fn fuzziness_on_non_multi_match_query_is_ignored() {
+  let term: QueryNode = serde_json::from_value(json!({
+    "type": "term",
+    "field": "body",
+    "value": "rust",
+    "fuzziness": "AUTO"
+  }))
+  .unwrap();
+  match term {
+    QueryNode::Term { field, value, .. } => {
+      assert_eq!(field, "body");
+      assert_eq!(value, "rust");
+    }
+    _ => panic!("expected term query"),
+  }
 }
