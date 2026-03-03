@@ -1,7 +1,7 @@
 # Feature Hardening Matrix: issue-92-auto-commit-refresh-indexes
 
 - Branch: feat/issue-92-auto-commit-refresh-indexes
-- Last updated: 2026-03-02 16:29:04Z
+- Last updated: 2026-03-03 09:30:45Z
 
 ## Scope
 - [x] Implement issue #92 behavior:
@@ -15,8 +15,9 @@
 
 ## Changed Files
 <!-- BEGIN_CHANGED_FILES -->
-- `searchlite-http/src/lib.rs`
 - `docs/feature-hardening/issue-92-auto-commit-refresh-indexes/matrix.md`
+- `openapi.yaml`
+- `searchlite-http/src/lib.rs`
 <!-- END_CHANGED_FILES -->
 
 ## Invariant Matrix
@@ -29,10 +30,10 @@
 | Runtime commit | Pending writes + `auto_commit_secs>0` | Writes become durable/visible without explicit `/commit` | integration | `searchlite-http/src/lib.rs::auto_commit_persists_pending_writes` | done |
 | Runtime commit | Manual `/commit` overlaps timer tick | No deadlock; writer serialization preserved | integration | `searchlite-http/src/lib.rs` concurrency test | todo |
 | Runtime refresh | `auto_refresh_secs=0` | No periodic refresh task runs | unit/integration | `searchlite-http/src/lib.rs` task wiring tests | todo |
-| Runtime refresh | Commit marker unchanged since last refresh | Timer skips refresh to avoid thrash | unit | `searchlite-http/src/lib.rs::auto_refresh_skips_when_commit_unchanged` | todo |
+| Runtime refresh | Commit marker unchanged since last refresh | Timer skips refresh to avoid thrash | unit | `searchlite-http/src/lib.rs::refresh_guard_skips_unchanged_commit_marker` | done |
 | Runtime refresh | Commit marker advances | Refresh executes once and marker updates | unit/integration | `searchlite-http/src/lib.rs::auto_refresh_runs_after_commit_change` | todo |
 | API contract | `GET /indexes` for initialized index | Returns `exists=true`, `committed_at`, `doc_count`, timer/config flags | integration | `searchlite-http/src/lib.rs::list_indexes_exposes_runtime_metadata` | done |
-| API contract | `GET /indexes` for uninitialized mount | Returns `exists=false` with nullable runtime stats fields | integration | `searchlite-http/src/lib.rs` endpoint tests | todo |
+| API contract | `GET /indexes` for uninitialized mount | Returns `exists=false` with nullable runtime stats fields | integration | `searchlite-http/src/lib.rs::list_indexes_exposes_runtime_metadata` | done |
 | Security/redaction | `/indexes` response contents | No write-key hash/salt/segment binding fields exposed | regression | `searchlite-http/src/lib.rs::indexes_endpoint_redacts_sensitive_metadata` | todo |
 
 ## Adversarial Cases

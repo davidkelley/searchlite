@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,9 @@ pub fn parse_index_spec(raw: &str) -> Result<IndexSpec, String> {
       return Err(format!("index option `{option}` must be KEY=VALUE"));
     };
     let key = raw_key.trim();
+    if key.is_empty() {
+      return Err("index option key cannot be empty".into());
+    }
     let value = raw_value.trim();
     if value.is_empty() {
       return Err(format!(
@@ -234,6 +238,7 @@ struct ManagedIndex {
   max_vector_candidates: usize,
   index: Arc<tokio::sync::RwLock<Option<Arc<Index>>>>,
   writer_lock: Arc<tokio::sync::Mutex<()>>,
+  auto_commit_enabled: Arc<AtomicBool>,
 }
 
 impl ManagedIndex {
@@ -256,6 +261,7 @@ impl ManagedIndex {
       max_vector_candidates,
       index: Arc::new(tokio::sync::RwLock::new(None)),
       writer_lock: Arc::new(tokio::sync::Mutex::new(())),
+      auto_commit_enabled: Arc::new(AtomicBool::new(true)),
     }
   }
 
@@ -333,7 +339,8 @@ impl ManagedIndex {
       if let Some(index) = self.index.read().await.as_ref().cloned() {
         let manifest = index.manifest();
         committed_at = Some(manifest.committed_at.clone());
-        doc_count = Some(manifest_live_doc_count(&manifest));
+        let (live_docs, _) = manifest_doc_counts(&manifest);
+        doc_count = Some(live_docs);
       } else {
         let path = self.path.clone();
         let (loaded_committed_at, loaded_doc_count) = tokio::task::spawn_blocking(move || {
@@ -342,10 +349,8 @@ impl ManagedIndex {
             .with_context(|| format!("reading manifest metadata at {:?}", manifest_path))?;
           let manifest: Manifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing manifest metadata at {:?}", manifest_path))?;
-          Ok::<(String, u64), anyhow::Error>((
-            manifest.committed_at.clone(),
-            manifest_live_doc_count(&manifest),
-          ))
+          let (live_docs, _) = manifest_doc_counts(&manifest);
+          Ok::<(String, u64), anyhow::Error>((manifest.committed_at.clone(), live_docs))
         })
         .await
         .map_err(|err| {
@@ -376,11 +381,22 @@ impl ManagedIndex {
   }
 
   async fn auto_commit_once(&self) -> anyhow::Result<bool> {
+    if !self.auto_commit_enabled.load(Ordering::Relaxed) {
+      return Ok(false);
+    }
     let index = match self.require_index().await {
       Ok(index) => index,
       Err(err) if err.kind == "index_missing" => return Ok(false),
       Err(err) => anyhow::bail!("{}: {}", err.kind, err.reason),
     };
+    let manifest = index.manifest();
+    if write_key_required(&manifest) {
+      self.auto_commit_enabled.store(false, Ordering::Relaxed);
+      anyhow::bail!(
+        "auto-commit disabled for index `{}` because it requires a write key",
+        self.name
+      );
+    }
     let writer_lock = self.writer_lock.clone();
     let refresh_on_commit = self.refresh_on_commit;
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
@@ -397,6 +413,38 @@ impl ManagedIndex {
     })
     .await
     .map_err(|err| anyhow::anyhow!(err.to_string()))?
+  }
+
+  async fn committed_at_marker(&self) -> anyhow::Result<Option<String>> {
+    let index = match self.require_index().await {
+      Ok(index) => index,
+      Err(err) if err.kind == "index_missing" => return Ok(None),
+      Err(err) => anyhow::bail!("{}: {}", err.kind, err.reason),
+    };
+    Ok(Some(index.manifest().committed_at))
+  }
+
+  async fn auto_refresh_once(
+    &self,
+    last_refreshed_committed_at: &mut Option<String>,
+  ) -> anyhow::Result<bool> {
+    let index = match self.require_index().await {
+      Ok(index) => index,
+      Err(err) if err.kind == "index_missing" => return Ok(false),
+      Err(err) => anyhow::bail!("{}: {}", err.kind, err.reason),
+    };
+    let current_committed_at = index.manifest().committed_at;
+    if !should_refresh(
+      last_refreshed_committed_at.as_deref(),
+      current_committed_at.as_str(),
+    ) {
+      return Ok(false);
+    }
+    tokio::task::spawn_blocking(move || trigger_reader_refresh(&index))
+      .await
+      .map_err(|err| anyhow::anyhow!(err.to_string()))??;
+    *last_refreshed_committed_at = Some(current_committed_at);
+    Ok(true)
   }
 }
 
@@ -513,9 +561,15 @@ impl IndexRegistry {
   }
 
   async fn list_indexes(&self) -> ApiResult<Vec<IndexDescriptor>> {
-    let mut items = Vec::with_capacity(self.indexes.len());
+    let mut tasks = FuturesUnordered::new();
     for idx in self.indexes.values() {
-      items.push(idx.describe().await?);
+      let managed = idx.clone();
+      tasks.push(async move { managed.describe().await });
+    }
+
+    let mut items = Vec::with_capacity(self.indexes.len());
+    while let Some(item) = tasks.next().await {
+      items.push(item?);
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(items)
@@ -547,42 +601,97 @@ struct MaintenanceRuntime {
 }
 
 impl MaintenanceRuntime {
-  fn spawn(registry: Arc<IndexRegistry>) -> Arc<Self> {
+  fn spawn(registry: Arc<IndexRegistry>) -> anyhow::Result<Arc<Self>> {
     let (shutdown_tx, _) = watch::channel(false);
     let mut handles = Vec::new();
     for managed in registry.indexes.values() {
-      if managed.auto_commit_interval_secs == 0 {
-        continue;
-      }
-      let managed = managed.clone();
-      let interval_secs = managed.auto_commit_interval_secs;
-      let mut shutdown_rx = shutdown_tx.subscribe();
-      let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-        // Skip the immediate first tick so the first run happens after one full interval.
-        ticker.tick().await;
-        loop {
-          tokio::select! {
-            changed = shutdown_rx.changed() => {
-              if changed.is_err() || *shutdown_rx.borrow() {
-                break;
+      if managed.auto_commit_interval_secs > 0 {
+        Self::validate_auto_commit_support(managed)?;
+        let managed = managed.clone();
+        let interval_secs = managed.auto_commit_interval_secs;
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let handle = tokio::spawn(async move {
+          let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+          // Skip the immediate first tick so the first run happens after one full interval.
+          ticker.tick().await;
+          loop {
+            tokio::select! {
+              changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                  break;
+                }
               }
-            }
-            _ = ticker.tick() => {
-              if let Err(err) = managed.auto_commit_once().await {
-                error!(index = %managed.name, error = ?err, "auto-commit tick failed");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+              _ = ticker.tick() => {
+                if let Err(err) = managed.auto_commit_once().await {
+                  error!(index = %managed.name, error = ?err, "auto-commit tick failed");
+                  if !managed.auto_commit_enabled.load(Ordering::Relaxed) {
+                    break;
+                  }
+                  tokio::time::sleep(Duration::from_secs(1)).await;
+                }
               }
             }
           }
-        }
-      });
-      handles.push(handle);
+        });
+        handles.push(handle);
+      }
+
+      if managed.auto_refresh_interval_secs > 0 {
+        let managed = managed.clone();
+        let interval_secs = managed.auto_refresh_interval_secs;
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let handle = tokio::spawn(async move {
+          let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+          let mut last_refreshed_committed_at = match managed.committed_at_marker().await {
+            Ok(marker) => marker,
+            Err(err) => {
+              error!(index = %managed.name, error = ?err, "auto-refresh initialization failed");
+              None
+            }
+          };
+          // Skip the immediate first tick so the first run happens after one full interval.
+          ticker.tick().await;
+          loop {
+            tokio::select! {
+              changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                  break;
+                }
+              }
+              _ = ticker.tick() => {
+                if let Err(err) = managed.auto_refresh_once(&mut last_refreshed_committed_at).await {
+                  error!(index = %managed.name, error = ?err, "auto-refresh tick failed");
+                  tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+              }
+            }
+          }
+        });
+        handles.push(handle);
+      }
     }
-    Arc::new(Self {
+    Ok(Arc::new(Self {
       shutdown_tx,
       handles,
-    })
+    }))
+  }
+
+  fn validate_auto_commit_support(managed: &ManagedIndex) -> anyhow::Result<()> {
+    if !managed.manifest_exists() {
+      return Ok(());
+    }
+    let manifest_path = Manifest::manifest_path(&managed.path);
+    let bytes = std::fs::read(&manifest_path)
+      .with_context(|| format!("reading manifest metadata at {:?}", manifest_path))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes)
+      .with_context(|| format!("parsing manifest metadata at {:?}", manifest_path))?;
+    if write_key_required(&manifest) {
+      anyhow::bail!(
+        "index `{}` requires a write key; disable auto-commit for this index or remove write-key protection",
+        managed.name
+      );
+    }
+    Ok(())
   }
 }
 
@@ -608,9 +717,9 @@ impl AppState {
   }
 }
 
-fn build_app_state(registry: Arc<IndexRegistry>) -> Arc<AppState> {
-  let maintenance = MaintenanceRuntime::spawn(registry.clone());
-  Arc::new(AppState::new(registry, maintenance))
+fn build_app_state(registry: Arc<IndexRegistry>) -> anyhow::Result<Arc<AppState>> {
+  let maintenance = MaintenanceRuntime::spawn(registry.clone())?;
+  Ok(Arc::new(AppState::new(registry, maintenance)))
 }
 
 /// Number of NDJSON batches buffered between reader and writer; small to bound memory while
@@ -862,7 +971,7 @@ impl IntoResponse for HttpError {
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
   let registry = Arc::new(IndexRegistry::from_args(&args)?);
   registry.bootstrap_all().await?;
-  let state = build_app_state(registry.clone());
+  let state = build_app_state(registry.clone())?;
   let listener = TcpListener::bind(args.bind)
     .await
     .with_context(|| format!("binding to {}", args.bind))?;
@@ -1731,14 +1840,21 @@ fn trigger_reader_refresh(index: &Index) -> anyhow::Result<()> {
   index.reader().map(|_| ())
 }
 
-fn manifest_live_doc_count(manifest: &Manifest) -> u64 {
+fn should_refresh(last_refreshed_committed_at: Option<&str>, current_committed_at: &str) -> bool {
+  !matches!(
+    last_refreshed_committed_at,
+    Some(previous) if previous == current_committed_at
+  )
+}
+
+fn manifest_doc_counts(manifest: &Manifest) -> (u64, u64) {
   let mut total_docs = 0u64;
   let mut deleted_docs = 0u64;
   for seg in manifest.segments.iter() {
     total_docs = total_docs.saturating_add(seg.doc_count as u64);
     deleted_docs = deleted_docs.saturating_add(seg.deleted_docs.len() as u64);
   }
-  total_docs.saturating_sub(deleted_docs)
+  (total_docs.saturating_sub(deleted_docs), deleted_docs)
 }
 
 async fn commit(
@@ -2175,12 +2291,9 @@ async fn stats(
     .map_err(|err| {
       HttpError::from_anyhow("stats_failed", StatusCode::INTERNAL_SERVER_ERROR, err)
     })?;
-  let mut deleted_docs = 0u64;
-  for seg in manifest.segments.iter() {
-    deleted_docs = deleted_docs.saturating_add(seg.deleted_docs.len() as u64);
-  }
+  let (live_docs, deleted_docs) = manifest_doc_counts(&manifest);
   Ok(Json(StatsResponse {
-    documents: manifest_live_doc_count(&manifest),
+    documents: live_docs,
     deleted_documents: deleted_docs,
     segments: manifest.segments.len(),
     committed_at: manifest.committed_at.clone(),
@@ -2262,7 +2375,8 @@ mod tests {
   use searchlite_core::api::types::VectorQuery;
   use searchlite_core::api::types::{
     Aggregation, AggregationResponse, CollapseRequest, ExecutionStrategy, HighlightField,
-    HighlightRequest, MgetResponse, MultiSearchRequest, Query, SuggestRequest,
+    HighlightRequest, IndexOptions, MgetResponse, MultiSearchRequest, Query, StorageType,
+    SuggestRequest,
   };
   use searchlite_core::api::MultiSearchResponse;
   #[cfg(feature = "vectors")]
@@ -2307,7 +2421,7 @@ mod tests {
     let args = default_args(index);
     let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
     registry.bootstrap_all().await.unwrap();
-    let state = build_app_state(registry);
+    let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
@@ -2523,7 +2637,7 @@ mod tests {
     args.indexes[0].auto_commit_interval_secs = Some(1);
     let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
     registry.bootstrap_all().await.unwrap();
-    let state = build_app_state(registry);
+    let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
@@ -2562,6 +2676,65 @@ mod tests {
 
     handle.abort();
     let _ = handle.await;
+  }
+
+  #[test]
+  fn refresh_guard_skips_unchanged_commit_marker() {
+    assert!(!should_refresh(
+      Some("2026-03-03T00:00:00Z"),
+      "2026-03-03T00:00:00Z"
+    ));
+    assert!(should_refresh(
+      Some("2026-03-03T00:00:00Z"),
+      "2026-03-03T00:00:01Z"
+    ));
+    assert!(should_refresh(None, "2026-03-03T00:00:00Z"));
+  }
+
+  #[tokio::test]
+  async fn auto_refresh_only_index_starts_maintenance_task() {
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-auto-refresh-only");
+    let mut args = default_args(index_path);
+    args.indexes[0].auto_commit_interval_secs = Some(0);
+    args.indexes[0].auto_refresh_interval_secs = Some(1);
+
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    let state = build_app_state(registry).unwrap();
+    assert_eq!(state._maintenance.handles.len(), 1);
+  }
+
+  #[tokio::test]
+  async fn auto_commit_rejects_write_key_protected_existing_index() {
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-write-key");
+    let opts = IndexOptions {
+      path: index_path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: DEFAULT_K1,
+      bm25_b: DEFAULT_B,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    };
+    IndexBuilder::create_with_write_key(
+      &index_path,
+      Schema::default_text_body(),
+      opts,
+      Some("server-secret"),
+    )
+    .unwrap();
+
+    let mut args = default_args(index_path);
+    args.indexes[0].auto_commit_interval_secs = Some(1);
+    let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
+    registry.bootstrap_all().await.unwrap();
+    match build_app_state(registry) {
+      Ok(_) => panic!("expected startup error for write-key protected auto-commit index"),
+      Err(err) => assert!(err.to_string().contains("requires a write key")),
+    }
   }
 
   #[tokio::test]
@@ -2932,7 +3105,7 @@ mod tests {
     args.max_vector_candidates = 1;
     let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
     registry.bootstrap_all().await.unwrap();
-    let state = build_app_state(registry);
+    let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
@@ -3742,7 +3915,7 @@ mod tests {
     args.max_body_bytes = 512;
     let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
     registry.bootstrap_all().await.unwrap();
-    let state = build_app_state(registry);
+    let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
@@ -4292,7 +4465,7 @@ mod tests {
     }];
     let registry = Arc::new(IndexRegistry::from_args(&args).unwrap());
     registry.bootstrap_all().await.unwrap();
-    let state = build_app_state(registry);
+    let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
     let base = format!("http://{}", addr);
@@ -4383,6 +4556,12 @@ mod tests {
   fn parse_index_spec_rejects_invalid_runtime_override_value() {
     let err = parse_index_spec("items:/data/items,auto_commit=abc").unwrap_err();
     assert!(err.contains("must be a non-negative integer"));
+  }
+
+  #[test]
+  fn parse_index_spec_rejects_empty_runtime_override_key() {
+    let err = parse_index_spec("items:/data/items,=10").unwrap_err();
+    assert!(err.contains("index option key cannot be empty"));
   }
 
   #[test]
