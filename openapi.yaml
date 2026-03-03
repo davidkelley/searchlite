@@ -451,7 +451,32 @@ components:
           type: string
         path:
           type: string
-      required: [name, path]
+        exists:
+          type: boolean
+        committed_at:
+          type: string
+          nullable: true
+        doc_count:
+          type: integer
+          format: int64
+          nullable: true
+        auto_commit_secs:
+          type: integer
+          format: int64
+        auto_refresh_secs:
+          type: integer
+          format: int64
+        refresh_on_commit:
+          type: boolean
+      required:
+        [
+          name,
+          path,
+          exists,
+          auto_commit_secs,
+          auto_refresh_secs,
+          refresh_on_commit,
+        ]
     AliasDescriptor:
       type: object
       properties:
