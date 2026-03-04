@@ -541,7 +541,7 @@ components:
     MgetDoc:
       type: object
       properties:
-        id:
+        doc_id:
           type: string
         found:
           type: boolean
@@ -549,7 +549,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-      required: [id, found]
+      required: [doc_id, found]
     MgetResponse:
       type: object
       properties:

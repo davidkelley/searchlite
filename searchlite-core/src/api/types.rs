@@ -665,7 +665,6 @@ pub struct MgetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MgetDoc {
-  #[serde(rename = "id")]
   pub doc_id: String,
   pub found: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1402,4 +1401,24 @@ fn default_limit() -> usize {
 
 fn default_return_stored() -> bool {
   false
+}
+
+#[cfg(test)]
+mod tests {
+  use super::MgetDoc;
+
+  #[test]
+  fn mget_doc_serializes_doc_id_field_name() {
+    let doc = MgetDoc {
+      doc_id: "doc-1".to_string(),
+      found: true,
+      _source: None,
+    };
+    let serialized = serde_json::to_value(doc).unwrap();
+    assert_eq!(
+      serialized.get("doc_id"),
+      Some(&serde_json::Value::String("doc-1".to_string()))
+    );
+    assert!(serialized.get("id").is_none());
+  }
 }
