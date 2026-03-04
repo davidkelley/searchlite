@@ -1,0 +1,28 @@
+[package]
+name = "integration"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+vectors = ["searchlite-core/vectors", "searchlite-http/vectors"]
+gpu = ["searchlite-core/gpu", "searchlite-http/gpu"]
+zstd = ["searchlite-core/zstd", "searchlite-http/zstd"]
+ffi = ["searchlite-core/ffi"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "time"] }
+reqwest = { version = "0.11.27", features = ["json", "rustls-tls", "blocking"] }
+portpicker = "0.1.1"
+searchlite-core = { path = "../searchlite-core", package = "searchlite-core" }
+searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+predicates = "3.1.2"

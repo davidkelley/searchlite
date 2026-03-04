@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "integration",
   "searchlite-core",
   "searchlite-cli",
   "searchlite-ffi",
