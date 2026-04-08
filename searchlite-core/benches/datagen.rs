@@ -404,13 +404,22 @@ pub fn generate_schema() -> Schema {
         search_as_you_type: None,
       },
     ],
-    keyword_fields: vec![KeywordField {
-      name: "category".to_string(),
-      stored: true,
-      indexed: true,
-      fast: true,
-      nullable: false,
-    }],
+    keyword_fields: vec![
+      KeywordField {
+        name: "category".to_string(),
+        stored: true,
+        indexed: true,
+        fast: true,
+        nullable: false,
+      },
+      KeywordField {
+        name: "created_at".to_string(),
+        stored: true,
+        indexed: false,
+        fast: false,
+        nullable: false,
+      },
+    ],
     numeric_fields: vec![
       NumericField {
         name: "price".to_string(),

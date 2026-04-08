@@ -1,1058 +1,89 @@
-# searchlite
+<p align="center">
+  <h1 align="center">searchlite</h1>
+  <p align="center">
+    <strong>The SQLite of search.</strong>
+    <br />
+    An embedded full-text search engine for Rust. No JVM, no cluster, no external
+    process &mdash; just add a crate and search. WAL-backed durability, BM25
+    relevance with WAND/BMW pruning, aggregations, filters, highlights, and
+    fuzzy matching out of the box.
+  </p>
+</p>
 
-Embedded, SQLite-flavored search engine with one or more on-disk indexes and an ergonomic Rust API, CLI, and optional C FFI.
+<p align="center">
+  <a href="https://crates.io/crates/searchlite-core"><img src="https://img.shields.io/crates/v/searchlite-core.svg" alt="crates.io" /></a>
+  <a href="https://github.com/davidkelley/searchlite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license" /></a>
+  <a href="https://github.com/davidkelley/searchlite/actions"><img src="https://img.shields.io/github/actions/workflow/status/davidkelley/searchlite/ci.yml?branch=main" alt="CI" /></a>
+</p>
 
-**Crates**
+---
 
-- `searchlite-core`: indexing, storage, and retrieval (BM25 + block-level maxima, boolean/phrase matching, filters, optional vectors/GPU rerank stubs).
-- `searchlite-cli`: CLI for init/add/commit/search/inspect/compact.
-- `searchlite-ffi`: optional C ABI (enable with the `ffi` feature).
-- `searchlite-wasm`: experimental wasm bindings with an IndexedDB-backed `Storage` implementation (threaded wasm needs `wasm-bindgen-rayon`; you must configure COOP/COEP yourself).
+## Try it
 
-**Core capabilities**
+You don't need Rust installed to try Searchlite. Pick whichever path is fastest for you:
 
-- Single-writer, multi-reader index backed by a WAL and atomic manifest updates.
-- BM25 scoring (`k1=0.9`, `b=0.4` by default) with phrase matching and configurable multi-field highlighting.
-- Block-level max scores per term (WAND/BMW pruning) for faster exact top-k.
-- Filesystem-backed by default; toggle to an in-memory index for ephemeral workloads.
-- Stored/fast fields for filters and snippets; optional `vectors`, `gpu`, `zstd`, and `ffi` feature flags.
-
-**Durability**
-
-- Segment files, docstores, manifests, and vector indexes are fsync’d on write; the WAL is truncated only after those files are flushed and the manifest is synced.
-- Crash window: if the process dies after the manifest is persisted but before the WAL is truncated, WAL replay will reapply the last batch, creating an extra generation for the same docs (no data loss; compaction cleans it up).
-- Manifest writes use atomic rename plus directory fsync; in-memory storage skips fsync as it is meant for ephemeral use.
-
-## Install the CLI
-
-Prebuilt binaries are published on every GitHub release:
+### One-line install (macOS / Linux)
 
 ```bash
 curl -fsSL https://searchlite.dev/install | sh
 ```
 
-- Set `SEARCHLITE_VERSION` to pin a tag (e.g., `v0.4.0`), `SEARCHLITE_INSTALL_DIR` to override the destination, and `SEARCHLITE_BIN_NAME` to change the installed name (defaults to `searchlite`).
-- Supported targets match release artifacts: `x86_64`/`aarch64` for Linux/macOS, and Windows via Git Bash/WSL (downloads the `.zip` and installs `searchlite.exe`).
-- The script downloads from GitHub releases (`searchlite-cli-<target>.{tar.gz,zip}`) and falls back to `~/.local/bin` if `/usr/local/bin` is not writable.
-
-## Container quickstart
-
-Easiest way to try searchlite: run the published container, mounting a local data directory and exposing the HTTP API on port 8080.
+Then create an index, add some documents, and search:
 
 ```bash
-docker run --rm -p 8080:8080 -v "$PWD:/data" ghcr.io/davidkelley/searchlite:latest http --index default:/data --bind 0.0.0.0:8080
+# Create an index with a minimal schema
+searchlite init /tmp/myindex schema.json
+
+# Add documents (newline-delimited JSON)
+searchlite add /tmp/myindex docs.jsonl
+searchlite commit /tmp/myindex
+
+# Search
+searchlite search /tmp/myindex --q "rust search" --limit 5
 ```
 
-## Development setup
-
-- Rust toolchain is pinned to `1.92.0` (`rust-toolchain.toml`); install `rustfmt`/`clippy` if missing.
-- Build everything with `cargo build --all --all-features` (or `just build`).
-- Code quality: `cargo fmt --all`, `cargo clippy --all --all-features -- -D warnings`.
-- The CLI runs directly from the workspace: `cargo run -p searchlite-cli -- <subcommand> <index> ...` (e.g., `cargo run -p searchlite-cli -- init /tmp/idx schema.json`).
-
-## Testing & benchmarks
-
-- Tests: `cargo test --all --all-features` (or `just test`).
-- Benches (Criterion): `cargo bench -p searchlite-core` (or `just bench`).
-- Smoketest the CLI by running a small end-to-end flow (see examples below).
-
-## Schema and documents
-
-Schema lives in `schema.json` (example below). Text fields control analysis pipelines and storage, keyword/numeric fields support filters and fast-field access.
-
-```json
-{
-  "doc_id_field": "_id",
-  "analyzers": [
-    {
-      "name": "english",
-      "tokenizer": "default",
-      "filters": [{ "stopwords": "en" }, { "stemmer": "english" }]
-    },
-    {
-      "name": "title_prefix",
-      "tokenizer": "default",
-      "filters": [{ "edge_ngram": { "min": 1, "max": 5 } }]
-    }
-  ],
-  "text_fields": [
-    { "name": "body", "analyzer": "english", "stored": true, "indexed": true },
-    {
-      "name": "title",
-      "analyzer": "title_prefix",
-      "search_analyzer": "english",
-      "stored": true,
-      "indexed": true
-    }
-  ],
-  "keyword_fields": [
-    { "name": "lang", "stored": true, "indexed": true, "fast": true }
-  ],
-  "numeric_fields": [{ "name": "year", "i64": true, "fast": true }],
-  "nested_fields": [
-    {
-      "name": "comment",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "author",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        }
-      ]
-    }
-  ],
-  "vector_fields": []
-}
-```
-
-If you omit `analyzers`, Searchlite injects the built-in `default` analyzer (ASCII lowercase + alphanumeric tokenization) and `tokenizer` stays a supported alias for `analyzer`. Available tokenizers: `default`, `unicode` (NFKC + case-folded words), and `whitespace`. Token filters include `lowercase`, `stopwords` (built-in `en` or an explicit list), `stemmer` (English), `synonyms` (`from`/`to` lists expanded at the same position), and `edge_ngram` (`min`/`max`).
-
-`stored` fields are returned when `--return-stored`/`return_stored` is enabled. `fast` fields are memory-mapped for filters; numeric ranges and keyword predicates are expressed via the JSON `filter` AST (see examples below). Nested objects are flattened into dotted field names (e.g., `comment.author`); you can either filter on the dotted path directly or wrap a clause with the `Nested` filter in the JSON API.
-Nested filters are evaluated per object, and stored nested values preserve their original structure while omitting unstored fields.
-
-Every document must include a string primary key under `doc_id_field` (defaults to `_id`). Skip listing that id in your `text_fields`/`keyword_fields`/`numeric_fields`; it is stored automatically, returned on hits, and used for upsert/delete semantics.
-
-## CLI workflow examples
-
-Set an index location once:
+### Docker (zero install)
 
 ```bash
-INDEX=/tmp/searchlite_idx
+docker run --rm -p 8080:8080 -v "$PWD:/data" \
+  ghcr.io/davidkelley/searchlite:latest \
+  http --index default:/data --bind 0.0.0.0:8080
 ```
 
-## CLI commands
-
-Use `cargo run -p searchlite-cli -- <command> ...` to invoke the CLI. Each command maps to a lifecycle step:
-
-- `init <index> <schema>`: creates a new index directory and writes the schema manifest so the index is ready to accept documents.
-- `add <index> <doc.jsonl>`: upserts newline-delimited JSON documents (keyed by `doc_id_field`) into the writer buffer; changes are not visible to readers until you run `commit`.
-- `update <index> <doc.jsonl>`: alias for `add` to emphasize upsert semantics.
-- `delete <index> <ids.txt>`: queues deletions by id (one id per line, matching `doc_id_field`), applied on `commit`.
-- `commit <index>`: flushes buffered documents, writes new segment files, and updates the manifest so searches can see the newly added data.
-- `search <index> [options]`: executes a query, returning JSON hits (and optional aggregations) using either CLI flags or a full request payload.
-- `inspect <index>`: prints the current manifest and segment metadata to help debug index contents and state.
-- `compact <index>`: merges segments to reduce fragmentation and improve search performance.
-
-Documents without the required id (`doc_id_field`) will be rejected. Upserts are effective on commit; deletes hide older documents immediately after commit and are dropped on the next compaction.
-
-- Create an index from a schema:
+Then query over HTTP:
 
 ```bash
-cargo run -p searchlite-cli -- init "$INDEX" schema.json
-```
-
-- Add a single document (newline-delimited JSON):
-
-```bash
-cat > /tmp/one.jsonl <<'EOF'
-{"_id":"doc-1","body":"Rust is a systems programming language","lang":"en","year":2024}
-EOF
-cargo run -p searchlite-cli -- add "$INDEX" /tmp/one.jsonl
-cargo run -p searchlite-cli -- commit "$INDEX"
-```
-
-- Add multiple documents (uses the included sample):
-
-```bash
-cargo run -p searchlite-cli -- add "$INDEX" docs.jsonl
-cargo run -p searchlite-cli -- commit "$INDEX"
-```
-
-- Query the index (structured query + filters, stored fields, snippets):
-
-```bash
-cat > /tmp/request.json <<'EOF'
-{
-  "query": {
-    "type": "query_string",
-    "query": "rust language",
-    "fields": ["body","title"]
-  },
-  "filter": {
-    "And": [
-      { "KeywordEq": { "field": "lang", "value": "en" } },
-      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
-    ]
-  },
-  "limit": 5,
-  "return_stored": true,
-  "highlight_field": "body"
-}
-EOF
-cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
-```
-
-- Typo-tolerant search (fuzzy matching):
-
-```bash
-cat > /tmp/request.json <<'EOF'
-{
-  "query": {
-    "type": "query_string",
-    "query": "body:rusk"
-  },
-  "fuzzy": { "max_edits": 1, "prefix_length": 1, "max_expansions": 20, "min_length": 3 },
-  "limit": 5,
-  "return_stored": true
-}
-EOF
-cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/request.json
-```
-
-Aggregations use Elasticsearch-style JSON and require `fast` fields on the target keyword/numeric columns. Results are emitted as a single JSON blob containing `hits` and `aggregations`.
-
-```bash
-cat > /tmp/aggs.json <<'EOF'
-{
-  "langs": { "type": "terms", "field": "lang", "size": 5 },
-  "views_stats": { "type": "stats", "field": "year" }
-}
-EOF
-
-cargo run -p searchlite-cli -- search \
-  --index "$INDEX" \
-  --q "rust" \
-  --limit 0 \
-  --aggs-file /tmp/aggs.json
-```
-
-If you prefer inline JSON, pass `--aggs '{"langs":{"type":"terms","field":"lang"}}'`.
-
-### Sorting
-
-- Provide a `sort` array in the search request (or via `--sort "field:order,other_field:asc"` in the CLI). Each entry looks like `{"field":"year","order":"desc"}`; `_score` is also allowed.
-- Sort targets must be fast keyword or numeric fields; the default order is ascending (descending for `_score`).
-- Multi-valued fields use the minimum value for ascending sorts and the maximum for descending sorts; documents missing the field are placed last.
-- Ordering is stable and tiebroken by segment/doc id so cursor pagination works reliably.
-
-## HTTP Service
-
-#### WARNING
-
-This HTTP service provides no authentication, authorization, or rate limiting. Do not expose it directly to untrusted networks; front it with your own proxy or API gateway that enforces access control and rate limits.
-
-Run the bundled HTTP server for one or more indexes (available directly from the CLI):
-
-```bash
-searchlite http --index /tmp/searchlite_idx --bind 0.0.0.0:8080
-# Or via cargo without installing first (mount one or more NAME:PATH pairs):
-cargo run -p searchlite-cli -- http --index default:/tmp/searchlite_idx --bind 0.0.0.0:8080
-# Env-style config is supported too (comma-delimited map):
-SEARCHLITE_INDEX_MAP=default:/tmp/searchlite_idx \
-SEARCHLITE_BIND_ADDR=0.0.0.0:8080 \
-SEARCHLITE_MAX_BODY_BYTES=$((50*1024*1024)) \
-cargo run -p searchlite-cli -- http --refresh-on-commit
-```
-
-The standalone `searchlite-http` binary remains available; both entrypoints share the same flags.
-
-Flags/env:
-
-- `--index` / `SEARCHLITE_INDEX_MAP`: repeatable NAME:PATH mounts (comma-delimited for env).
-- `--alias` / `SEARCHLITE_INDEX_ALIASES`: optional ALIAS:TARGET indirections.
-- `--bind` / `SEARCHLITE_BIND_ADDR`: listen address (default `127.0.0.1:8080`).
-- `--require-existing-index`: fail fast at startup if the manifest is missing.
-- `--max-body-bytes`, `--max-concurrency`, `--request-timeout-secs`, `--shutdown-grace-secs`, `--refresh-on-commit`: resource limits and shutdown behavior.
-
-All errors return `{"error":{"type":"...","reason":"..."}}`. No auth or rate limiting is provided; front it with your own proxy. Writes issued via `/indexes/{name}/add`, `/indexes/{name}/bulk`, `/indexes/{name}/update`, `/indexes/{name}/_bulk_update`, or `/indexes/{name}/delete` are queued in the writer and become durable/searchable only after calling `/indexes/{name}/commit` (optionally followed by `/indexes/{name}/refresh` depending on your staleness needs). The full API surface is documented in `openapi.yaml`.
-
-### Example requests
-
-- Init (fails if the index already exists):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/init \
+curl -s http://localhost:8080/indexes/default/search \
   -H 'Content-Type: application/json' \
-  --data-binary @schema.json
+  -d '{"query": "rust search", "limit": 5}'
 ```
 
-- Stream writes:
+### As a Rust crate
 
-```bash
-curl -XPOST http://localhost:8080/indexes/default/add \
-  -H 'Content-Type: application/x-ndjson' \
-  --data-binary @docs.ndjson
-curl -XPOST http://localhost:8080/indexes/default/commit
+```toml
+[dependencies]
+searchlite-core = "0.5"
 ```
-
-- JSON bulk ingest:
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/bulk \
-  -H 'Content-Type: application/json' \
-  -d '{"docs":[{"_id":"1","body":"Rust search"},{"_id":"2","body":"More docs"}]}'
-```
-
-- Update a single document (set/unset; not supported for vector fields):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/update \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"1","set":{"available":8},"unset":["metadata.alt"]}'
-# {"accepted":true}
-```
-
-- Bulk update (NDJSON pairs, best-effort):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/_bulk_update \
-  -H 'Content-Type: application/x-ndjson' \
-  --data-binary $'{"update":{"_id":"1"}}\n{"set":{"available":8}}\n{"update":{"_id":"missing"}}\n{"set":{"available":0}}\n'
-```
-
-- Search + highlight + collapse + aggregations:
-
-```bash
-cat > /tmp/search.json <<'EOF'
-{
-  "query": { "type": "query_string", "query": "rust" },
-  "limit": 5,
-  "return_stored": true,
-  "highlight_field": "body",
-  "collapse": { "field": "lang" },
-  "aggs": { "langs": { "type": "terms", "field": "lang", "size": 5 } },
-  "suggest": {
-    "complete": { "type": "completion", "field": "body", "prefix": "ru", "size": 3 }
-  }
-}
-EOF
-curl -XPOST http://localhost:8080/indexes/default/search \
-  -H 'Content-Type: application/json' \
-  --data-binary @/tmp/search.json
-```
-
-- Offset pagination (`from`/`size`):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"rust","from":10,"size":5}'
-```
-
-- `search_after` pagination (use the `next_search_after` value from the prior page):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"rust","sort":[{"field":"year","order":"asc"}],"size":5,"search_after":[2024,"doc-42",0]}'
-```
-
-- Multi-get by id:
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/mget \
-  -H 'Content-Type: application/json' \
-  -d '{"ids":["1","2"],"return_stored":true}'
-```
-
-Pagination limits: `from + size` must be <= 1000; `mget` supports up to 1024 ids. Pagination modes are mutually exclusive (cursor, search_after, or from/size).
-
-- Vector-only query (when built with `--features vectors`):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":{"type":"vector","field":"embedding","vector":[1.0,0.0],"k":5,"alpha":0.0},"limit":5,"return_stored":true}'
-```
-
-- Multiple vector clauses (blends candidates across fields/queries):
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":{"type":"bool","should":[{"type":"vector","field":"vec_a","vector":[1,0,0],"alpha":0.0,"k":20},{"type":"vector","field":"vec_b","vector":[0,1,0],"alpha":0.0,"k":20}]},"candidate_size":100,"limit":20,"return_stored":true}'
-```
-
-- Numeric boosts: `{"type":"rank_feature","field":"popularity","modifier":"sqrt"}` and a guarded script score: `{"type":"script_score","query":{"type":"match_all"},"script":"_score + popularity * weight","params":{"weight":0.1}}`.
-
-- Maintenance endpoints:
-
-```bash
-curl -XPOST http://localhost:8080/indexes/default/refresh   # lightweight reader reload
-curl -XPOST http://localhost:8080/indexes/default/compact   # merge segments
-curl -XGET  http://localhost:8080/indexes/default/inspect   # manifest + segments
-curl -XGET  http://localhost:8080/indexes/default/stats     # doc/segment counts
-```
-
-### Aggregations quick reference
-
-- Field requirements: `terms`/`significant_terms`/`rare_terms` need a fast keyword field; `range`/`histogram`/`date_histogram`/`percentiles`/`percentile_ranks` need fast numeric fields (date histograms accept numeric millis or RFC3339 strings stored as fast numeric); `cardinality` works with fast keyword or numeric fields; `top_hits` has no field requirement but returns stored fields/snippets when enabled.
-- Metric semantics: `stats`/`extended_stats` aggregate over all field values; multi-valued fields contribute each entry (bucket `doc_count` stays per-document while `count` is per-value). `value_count` counts values (plus `missing` fills) rather than documents-with-values. `cardinality` hashes values (exact for small sets) with optional `precision_threshold` and `missing`; `percentiles` default to `[1,5,25,50,75,95,99]` unless `percents` is provided and use a bounded t-digest estimator (exact mode for small buckets); `percentile_ranks` report the percent of values at or below each supplied `values` entry.
-- Bucket options: `terms` supports `size`, `shard_size`, `min_doc_count`, and nested `aggs`; `significant_terms` adds `background_filter` + `size`/`min_doc_count`; `rare_terms` favors low-frequency keys with `max_doc_count`; `range`/`date_range` accept `key`, `from`, `to`, `keyed`; `histogram` supports `interval`, `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `date_histogram` supports `calendar_interval` (day/week/month/quarter/year) or `fixed_interval` (e.g., `1d`, `12h`), optional `offset`, `min_doc_count`, `extended_bounds`, `hard_bounds`, `missing`; `filter` wraps any filter AST node into a single bucket with sub-aggs; `nested` scopes child aggregations to objects under a nested `path` and returns `{doc_count, aggregations}` for that nested scope (child aggs currently support `terms` and further `nested` blocks); `composite` paginates deterministic buckets across multiple sources (`terms`/`histogram`) and returns `after_key` for the next page. Bucket aggs accept optional `sampling` with either `size` or `probability` plus a deterministic `seed`.
-- Pipeline options: `bucket_sort` reorders/truncates buckets via `sort`/`from`/`size`; `avg_bucket` and `sum_bucket` read a `buckets_path` (e.g., `"histogram.stats.avg"`) from the parent bucket tree; `derivative` and `moving_avg` operate on histogram/date_histogram buckets with `gap_policy` (`skip`/`insert_zeros`) and optional `unit`/`predict`; `bucket_script` evaluates a lightweight arithmetic expression over one or more `buckets_path` values (including `_count` for bucket doc counts).
-- Top hits: `{"type":"top_hits","size":N,"from":M,"fields":["field1",...],"highlight_field":"body"}` returns sorted hits per bucket with `total` and optional snippets.
-- Aggregations run over all matched documents (not just top-k); when `--limit 0` the search skips hit ranking and only returns `aggregations` (cursors are not supported with `--limit 0`). Aggregations with `sampling` return approximate counts and mark responses with `sampled: true`.
-- Nested aggregation cost is query-time only: index write/read performance is unchanged unless a request includes nested aggs. Runtime cost grows with matched docs, nested objects per doc, and bucket cardinality; keep nested arrays bounded, add outer filters, and use `sampling` or flattened facet fields if nested cardinality becomes a hotspot.
-
-#### Filter, composite, and pipeline aggregation examples
-
-```bash
-cat > /tmp/aggs-advanced.json <<'EOF'
-{
-  "rust_only": {
-    "type": "filter",
-    "filter": { "KeywordEq": { "field": "lang", "value": "rust" } },
-    "aggs": { "tags": { "type": "terms", "field": "tag", "size": 3 } }
-  },
-  "by_lang_year": {
-    "type": "composite",
-    "size": 2,
-    "sources": [
-      { "type": "terms", "name": "lang", "field": "lang" },
-      { "type": "histogram", "name": "year", "field": "year", "interval": 5 }
-    ],
-    "aggs": {
-      "latency_p95": { "type": "percentiles", "field": "latency_ms", "percents": [50, 95] },
-      "bucket_order": { "type": "bucket_sort", "sort": [ { "_count": "desc" } ], "size": 2 }
-    }
-  },
-  "by_tag": {
-    "type": "terms",
-    "field": "tag",
-    "aggs": {
-      "score_stats": { "type": "stats", "field": "score" },
-      "sorted": { "type": "bucket_sort", "sort": [ { "score_stats.avg": "desc" } ], "size": 3 },
-      "avg_scores": { "type": "avg_bucket", "buckets_path": "score_stats.avg" }
-    }
-  },
-  "unique_authors": { "type": "cardinality", "field": "author" },
-  "slow_ranks": { "type": "percentile_ranks", "field": "latency_ms", "values": [100, 500] }
-}
-EOF
-
-cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file /tmp/aggs-advanced.json
-```
-
-`composite` returns an `after_key` so you can page deterministically across buckets by sending that object back as `after` in the next request. Pipeline aggregations operate on the current bucket tree: `bucket_sort` reorders/truncates buckets, while `avg_bucket`/`sum_bucket` read metrics via dot-separated `buckets_path` selectors.
-
-#### Nested facet example (metadata key/value pairs)
-
-Use a `nested` bucket when facets must bind fields from the same nested object (for example, metadata `key` + `value` pairs). The example below keeps `"Category"` values separate from `"Color"` values.
-
-```bash
-cat > /tmp/aggs-nested.json <<'EOF'
-{
-  "metadata_nested": {
-    "type": "nested",
-    "path": "metadata",
-    "aggs": {
-      "by_key": {
-        "type": "terms",
-        "field": "key",
-        "size": 10,
-        "aggs": {
-          "by_value": { "type": "terms", "field": "value", "size": 10 }
-        }
-      }
-    }
-  }
-}
-EOF
-
-cargo run -p searchlite-cli -- search "$INDEX" --q "image" --limit 0 --aggs-file /tmp/aggs-nested.json
-```
-
-If you need deeper nesting, place another `nested` bucket under a parent bucket and use a child-relative path (for example, `"path": "reply"` inside a parent nested `"path": "comment"` scope).
-
-#### Significance, smoothing, and sampling examples
-
-```bash
-cat > /tmp/aggs-sampling.json <<'EOF'
-{
-  "sig_tags": {
-    "type": "significant_terms",
-    "field": "tag",
-    "size": 5,
-    "background_filter": { "KeywordEq": { "field": "lang", "value": "en" } }
-  },
-  "rare_langs": {
-    "type": "rare_terms",
-    "field": "lang",
-    "max_doc_count": 1,
-    "sampling": { "probability": 0.35, "seed": 42 }
-  },
-  "by_day": {
-    "type": "date_histogram",
-    "field": "timestamp_ms",
-    "fixed_interval": "1d",
-    "sampling": { "size": 5000, "seed": 7 },
-    "aggs": {
-      "latency": { "type": "stats", "field": "latency_ms" },
-      "trend": { "type": "derivative", "buckets_path": "latency.avg", "gap_policy": "skip", "unit": 86400000 },
-      "smooth": { "type": "moving_avg", "buckets_path": "latency.avg", "window": 3, "predict": 1 },
-      "efficiency": {
-        "type": "bucket_script",
-        "buckets_path": { "avg": "latency.avg", "trend": "trend.value" },
-        "script": "avg / (trend + 1)"
-      }
-    }
-  }
-}
-EOF
-
-cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 0 --aggs-file /tmp/aggs-sampling.json
-```
-
-Responses include `sampled: true` when sampling is active; counts/percentiles become approximate while ordering remains deterministic for a fixed seed. Percentiles and percentile_ranks use a bounded t-digest estimator and switch to exact calculations for small buckets.
-
-### Field collapsing and inner hits
-
-Collapse results by a fast keyword field to return one top hit per group, with optional `inner_hits` to see more from each group. The overall hit count still reflects all matching documents; responses also include `total_groups`.
-
-```json
-{
-  "query": "rust systems",
-  "sort": [
-    { "field": "published_at", "order": "desc" },
-    { "field": "_score", "order": "desc" }
-  ],
-  "collapse": {
-    "field": "author",
-    "inner_hits": {
-      "size": 3,
-      "from": 0,
-      "sort": [{ "field": "_score", "order": "desc" }]
-    }
-  },
-  "limit": 10,
-  "return_stored": true
-}
-```
-
-The first hit per group follows the request sort and is stable within the group. `inner_hits` return additional hits per group (sorted independently if you supply `sort` on `inner_hits`).
-
-### Highlighting
-
-Multi-field highlighting is configurable per field with custom tags and fragment sizes. Hits include a `highlights` map when configured, while the legacy `highlight_field` still emits a single snippet for backward compatibility.
-
-```json
-{
-  "query": "rust systems",
-  "highlight": {
-    "fields": {
-      "body": {
-        "pre_tag": "<em>",
-        "post_tag": "</em>",
-        "fragment_size": 120,
-        "number_of_fragments": 2
-      },
-      "title": {
-        "pre_tag": "<b>",
-        "post_tag": "</b>",
-        "fragment_size": 60,
-        "number_of_fragments": 1
-      }
-    }
-  },
-  "return_stored": true
-}
-```
-
-Highlighting uses the field's search analyzer (including synonyms and edge n-grams) to find matches, is phrase-aware, and centers fragments around the first match.
-
-The `query_string` node (and legacy string queries) supports `field:term`, phrases in quotes (`"field:exact phrase"`), and negation with a leading `-term`.
-
-- You can also pass the full search payload as JSON (same shape used by the upcoming HTTP service):
-
-```bash
-cat > /tmp/search_request.json <<'EOF'
-{
-  "query": {
-    "type": "query_string",
-    "query": "rust language",
-    "fields": null
-  },
-  "filter": {
-    "And": [
-      { "KeywordEq": { "field": "lang", "value": "en" } },
-      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } }
-    ]
-  },
-  "limit": 5,
-  "sort": [
-    { "field": "year", "order": "desc" }
-  ],
-  "execution": "wand",
-  "bmw_block_size": null,
-  "return_stored": true,
-  "highlight_field": "body"
-}
-EOF
-cargo run -p searchlite-cli -- search "$INDEX" --request /tmp/search_request.json
-```
-
-Use `--request-stdin` to read the payload from standard input. When a JSON request is supplied, individual CLI flags (like `--q`, `--filter`, etc.) are ignored.
-
-Legacy support: `query` may still be a string; structured query nodes remain the preferred shape.
-
-### Search request JSON shape (extras)
-
-Beyond the basics (`query`/`filter`/`sort`/`limit`), the request supports:
-
-- `aggs`: map of aggregation specs. New options include filter buckets (`{"type":"filter","filter":{...},"aggs":{...}}`), composite buckets (`{"type":"composite","sources":[{"type":"terms","name":"lang","field":"lang"},{"type":"histogram","name":"year","field":"year","interval":5}],"size":10,"after":{...},"aggs":{...}}`), and metric/pipeline aggs (`cardinality`, `percentiles`, `percentile_ranks`, `bucket_sort`, `avg_bucket`, `sum_bucket`). Pipeline `buckets_path` values walk the parent bucket tree with dot-separated paths like `"by_tag.score_stats.avg"`.
-- `collapse`: `{ "field": "author", "inner_hits": { "size": 3, "from": 0, "sort": [{ "field": "_score", "order": "desc" }] } }` groups results by a fast keyword field and keeps the top hit per group; responses include `total_groups` plus optional `inner_hits` per group.
-- `highlight`: `{ "fields": { "body": { "pre_tag": "<em>", "post_tag": "</em>", "fragment_size": 160, "number_of_fragments": 2 } } }` adds a `highlights` map to hits. The legacy `highlight_field` string still returns a single snippet when you only need a default highlight.
-- A reference JSON Schema for search requests lives at `search-request.schema.json` in the repo root to help clients validate payloads.
-
-### Prefix, wildcard, and regex queries
-
-The structured query AST now supports dictionary-driven expansion without changing analyzer behavior:
-
-```json
-{ "query": { "type": "prefix", "field": "title", "value": "rus", "max_expansions": 50 } }
-{ "query": { "type": "wildcard", "field": "title", "value": "r*st", "max_expansions": 100 } }
-{ "query": { "type": "regex", "field": "title", "value": "r(ust|uby)", "max_expansions": 100 } }
-```
-
-Each node analyzes the input with the field's search analyzer, expands against the segment term dictionary (capped by `max_expansions` per segment), and ORs the resulting terms for scoring. `boost` is accepted on each node to influence scoring weight.
-
-### Suggestions
-
-Search requests can include an optional `suggest` map for completion-style term suggestions:
-
-```json
-{
-  "query": { "type": "match_all" },
-  "limit": 0,
-  "return_stored": false,
-  "suggest": {
-    "title_suggest": {
-      "type": "completion",
-      "field": "title",
-      "prefix": "ru",
-      "size": 5,
-      "fuzzy": {
-        "max_edits": 1,
-        "prefix_length": 1,
-        "max_expansions": 20,
-        "min_length": 2
-      }
-    }
-  }
-}
-```
-
-The response embeds deterministic suggestions keyed by name:
-
-```json
-"suggest": {
-  "title_suggest": {
-    "options": [
-      { "text": "rust", "score": 42.0, "doc_freq": 3 },
-      { "text": "ruby", "score": 21.0, "doc_freq": 1 }
-    ]
-  }
-}
-```
-
-### Search-as-you-type
-
-Text fields can opt into automatic edge n-gram indexing with `search_as_you_type` while keeping the search analyzer unchanged:
-
-```json
-{
-  "name": "title",
-  "analyzer": "default",
-  "stored": true,
-  "indexed": true,
-  "search_as_you_type": { "min_gram": 1, "max_gram": 10 }
-}
-```
-
-Queries over that field (including `query_string` and `prefix`) will match partial prefixes such as `"ru"` against `"rustacean"`. You can also roll your own by defining an analyzer with an `edge_ngram` filter and wiring it as the index analyzer while keeping a normal search analyzer.
-
-## Multi-field Relevance Queries
-
-- `multi_match` supports `best_fields` (max score with optional `tie_breaker`), `most_fields` (sum across fields), and `cross_fields` (treat fields as one blended field). `fields` accepts `FieldSpec` entries so you can boost fields without string parsing (e.g., `{"field":"title","boost":2.0}`), and `minimum_should_match` accepts counts or percentages.
-- `dis_max` picks the best-scoring child query and blends the rest via `tie_breaker`.
-- `phrase` now accepts `slop` (positions of wiggle room) for near-match phrases.
-
-Example multi-field query with boosts:
-
-```json
-{
-  "query": {
-    "type": "multi_match",
-    "query": "rust search",
-    "match_type": "best_fields",
-    "fields": [{ "field": "title", "boost": 2.0 }, { "field": "body" }],
-    "operator": "or",
-    "tie_breaker": 0.2,
-    "minimum_should_match": "75%"
-  },
-  "limit": 5
-}
-```
-
-Blend multiple queries with `dis_max`:
-
-```json
-{
-  "query": {
-    "type": "dis_max",
-    "tie_breaker": 0.4,
-    "queries": [
-      { "type": "term", "field": "title", "value": "rust" },
-      { "type": "term", "field": "body", "value": "rust" }
-    ]
-  }
-}
-```
-
-Phrase slop example (allows one gap between terms):
-
-```json
-{
-  "query": {
-    "type": "phrase",
-    "field": "body",
-    "terms": ["rust", "search"],
-    "slop": 1
-  }
-}
-```
-
-## Custom scoring and reranking
-
-- `constant_score` wraps a filter-only query and returns a fixed score (default 1.0) when the filter matches.
-- `function_score` lets you blend deterministic functions with the base BM25 score. Functions can be filtered, combined with `score_mode`, and merged with the base score via `boost_mode`.
-- `decay` functions (exp/gauss/linear) are available inside `function_score` for distance-based scoring on numeric fast fields; configure `origin`, `scale`, optional `offset`, and `decay` (default 0.5).
-
-```json
-{
-  "query": {
-    "type": "function_score",
-    "query": { "type": "match_all" },
-    "functions": [
-      {
-        "type": "weight",
-        "weight": 2.0,
-        "filter": { "KeywordEq": { "field": "lang", "value": "en" } }
-      },
-      {
-        "type": "decay",
-        "field": "age_days",
-        "origin": 0,
-        "scale": 30,
-        "offset": 0,
-        "decay": 0.5,
-        "function": "linear"
-      },
-      {
-        "type": "field_value_factor",
-        "field": "popularity",
-        "factor": 0.25,
-        "modifier": "log1p",
-        "missing": 0.0
-      }
-    ],
-    "score_mode": "sum",
-    "boost_mode": "sum",
-    "max_boost": 5.0,
-    "min_score": 0.5
-  },
-  "limit": 5
-}
-```
-
-Constant score example:
-
-```json
-{
-  "query": {
-    "type": "constant_score",
-    "filter": { "KeywordEq": { "field": "lang", "value": "en" } },
-    "boost": 2.5
-  }
-}
-```
-
-Rescore the top window after the initial rank (ordering outside the window is unchanged):
-
-```json
-{
-  "query": { "type": "query_string", "query": "rust search" },
-  "limit": 10,
-  "rescore": {
-    "window_size": 50,
-    "query": {
-      "type": "phrase",
-      "field": "body",
-      "terms": ["rust", "search"],
-      "slop": 1
-    },
-    "score_mode": "total"
-  }
-}
-```
-
-Debugging aids:
-
-- `explain: true` returns per-hit score breakdowns, including function contributions and any rescore adjustments.
-- `profile: true` attaches execution stats (`candidates_examined`, `scored_docs`, postings advances) and timing buckets (`search_ms`, `rescore_ms`).
-- Both flags are off by default to avoid overhead.
-
-## Filters: examples
-
-Filters operate on fast fields (`fast: true` in the schema). Keyword filters are case-insensitive; numeric ranges are inclusive. Nested filters bind to the same nested object (parent/child lineage).
-
-### Basic keyword equality
-
-```json
-{
-  "filter": { "KeywordEq": { "field": "lang", "value": "en" } }
-}
-```
-
-### Keyword membership (`IN`)
-
-```json
-{
-  "filter": { "KeywordIn": { "field": "lang", "values": ["en", "fr"] } }
-}
-```
-
-### Numeric ranges (i64 and f64)
-
-```json
-{
-  "filter": {
-    "And": [
-      { "I64Range": { "field": "year", "min": 2018, "max": 2024 } },
-      { "F64Range": { "field": "score", "min": 0.25, "max": 0.9 } }
-    ]
-  }
-}
-```
-
-### Multi-valued fast fields
-
-If your document has `tags: ["rust", "search"]` and `tags` is a fast keyword field:
-
-```json
-{
-  "filter": { "KeywordEq": { "field": "tags", "value": "rust" } }
-}
-```
-
-Any value in the multi-valued column can satisfy the clause.
-
-### Nested objects (single level)
-
-Schema excerpt:
-
-```json
-{
-  "nested_fields": [
-    {
-      "name": "comment",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "author",
-          "fast": true,
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "keyword",
-          "name": "tag",
-          "fast": true,
-          "stored": true,
-          "indexed": true
-        }
-      ]
-    }
-  ]
-}
-```
-
-Filter: match documents with any comment whose author is `alice` and tag is `rust`:
-
-```json
-{
-  "filter": {
-    "And": [
-      {
-        "Nested": {
-          "path": "comment",
-          "filter": {
-            "KeywordEq": { "field": "author", "value": "alice" }
-          }
-        }
-      },
-      {
-        "Nested": {
-          "path": "comment",
-          "filter": {
-            "KeywordEq": { "field": "tag", "value": "rust" }
-          }
-        }
-      }
-    ]
-  }
-}
-```
-
-Because nested filters are scoped to the same object, this only passes when a single `comment` object has both `author=alice` and `tag=rust`.
-
-### Deeply nested hierarchy
-
-Schema excerpt:
-
-```json
-{
-  "nested_fields": [
-    {
-      "name": "comment",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "author",
-          "fast": true,
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "object",
-          "name": "reply",
-          "fields": [
-            {
-              "type": "keyword",
-              "name": "tag",
-              "fast": true,
-              "stored": true,
-              "indexed": true
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-Filter: require a comment with `author=bob` that has a reply tagged `y` (parent-child binding is enforced):
-
-```json
-{
-  "filter": {
-    "And": [
-      {
-        "Nested": {
-          "path": "comment",
-          "filter": {
-            "KeywordEq": { "field": "author", "value": "bob" }
-          }
-        }
-      },
-      {
-        "Nested": {
-          "path": "comment",
-          "filter": {
-            "Nested": {
-              "path": "reply",
-              "filter": {
-                "KeywordEq": { "field": "tag", "value": "y" }
-              }
-            }
-          }
-        }
-      }
-    ]
-  }
-}
-```
-
-The inner `Nested` is evaluated only against replies belonging to the same `comment` object that satisfies the outer `Nested`.
-
-### Numeric fields inside nested objects
-
-Filter on nested numeric properties alongside keywords:
-
-```json
-{
-  "filter": {
-    "And": [
-      {
-        "Nested": {
-          "path": "review",
-          "filter": { "KeywordEq": { "field": "user", "value": "alice" } }
-        }
-      },
-      {
-        "Nested": {
-          "path": "review",
-          "filter": { "I64Range": { "field": "rating", "min": 5, "max": 8 } }
-        }
-      },
-      {
-        "Nested": {
-          "path": "review",
-          "filter": { "F64Range": { "field": "score", "min": 0.7, "max": 0.8 } }
-        }
-      }
-    ]
-  }
-}
-```
-
-All three clauses must match the same `review` object.
-
-### Mixed nested and non-nested filters
-
-Combine a top-level numeric range with nested filters:
-
-```json
-{
-  "filter": {
-    "And": [
-      { "I64Range": { "field": "year", "min": 2020, "max": 2025 } },
-      {
-        "Nested": {
-          "path": "comment",
-          "filter": {
-            "KeywordEq": { "field": "author", "value": "alice" }
-          }
-        }
-      }
-    ]
-  }
-}
-```
-
-### Quick tips
-
-- Mark filterable fields with `"fast": true` in the schema.
-- For nested filters, wrap child clauses in `Nested` blocks; use additional nested blocks for deeper levels.
-- Stored nested fields preserve structure; unstored fields are omitted in responses.
-
-- Inspect or compact:
-
-```bash
-cargo run -p searchlite-cli -- inspect "$INDEX"
-cargo run -p searchlite-cli -- compact "$INDEX"
-```
-
-## Using the Rust API
 
 ```rust
 use searchlite_core::api::{
-    builder::IndexBuilder, Index, Filter,
-    types::{
-        Aggregation, Document, ExecutionStrategy, IndexOptions, KeywordField, NumericField, Schema,
-        QueryNode, SearchRequest, SortOrder, SortSpec, StorageType,
-    },
+    builder::IndexBuilder,
+    types::{Document, IndexOptions, KeywordField, NumericField, Schema, SearchRequest, StorageType},
+    Filter,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
-let path = PathBuf::from("./example_idx");
-let mut schema = Schema::default_text_body();
-schema.keyword_fields.push(KeywordField { name: "lang".into(), stored: true, indexed: true, fast: true });
-schema.numeric_fields.push(NumericField { name: "year".into(), i64: true, fast: true, stored: true });
+// 1. Define a schema
+let mut schema = Schema::default_text_body(); // text field "body" with default analyzer
+schema.keyword_fields.push(KeywordField {
+    name: "lang".into(), stored: true, indexed: true, fast: true,
+});
+schema.numeric_fields.push(NumericField {
+    name: "year".into(), i64: true, fast: true, stored: true,
+});
 
+// 2. Create an index
+let path = PathBuf::from("/tmp/example_idx");
 let opts = IndexOptions {
     path: path.clone(),
     create_if_missing: true,
@@ -1063,194 +94,164 @@ let opts = IndexOptions {
     #[cfg(feature = "vectors")]
     vector_defaults: None,
 };
+let index = IndexBuilder::create(&path, schema, opts)?;
 
-// Create or open the index.
-let idx = IndexBuilder::create(&path, schema, opts.clone())?;
-
-// Insert one document.
-let mut writer = idx.writer()?;
-let doc = Document { fields: [
-    ("_id".to_string(), serde_json::json!("doc-1")),
-    ("body".to_string(), serde_json::json!("Rust is fast and reliable")),
-    ("lang".to_string(), serde_json::json!("en")),
-    ("year".to_string(), serde_json::json!(2024)),
-].into_iter().collect() };
-writer.add_document(&doc)?;
-
-// Insert multiple documents in one batch.
-let more_docs = vec![
-    Document { fields: [("_id".to_string(), serde_json::json!("doc-2")), ("body".to_string(), serde_json::json!("SQLite vibes for search")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2023))].into_iter().collect() },
-    Document { fields: [("_id".to_string(), serde_json::json!("doc-3")), ("body".to_string(), serde_json::json!("Embedded search engine demo")), ("lang".to_string(), serde_json::json!("en")), ("year".to_string(), serde_json::json!(2022))].into_iter().collect() },
-];
-for d in more_docs.iter() {
-    writer.add_document(d)?;
-}
-writer.commit()?; // Flush WAL into a segment
-
-// Search the index.
-let reader = idx.reader()?;
-let results = reader.search(&SearchRequest {
-    query: QueryNode::QueryString {
-        query: "rust engine".into(),
-        fields: None,
-        boost: None,
-    }
-    .into(),
-    fields: None,
-    filter: Some(Filter::I64Range { field: "year".into(), min: 2020, max: 2025 }),
-    limit: 5,
-    sort: vec![SortSpec { field: "year".into(), order: Some(SortOrder::Desc) }],
-    cursor: None,
-    execution: ExecutionStrategy::Wand,
-    bmw_block_size: None,
-    fuzzy: None,
-    return_stored: true,
-    highlight_field: Some("body".into()),
-    aggs: [(
-        "langs".to_string(),
-        Aggregation::Terms(Box::new(searchlite_core::api::types::TermsAggregation {
-            field: "lang".into(),
-            size: Some(3),
-            shard_size: None,
-            min_doc_count: None,
-            missing: None,
-            aggs: BTreeMap::new(),
-        })),
-    )]
-    .into_iter()
-    .collect(),
-    #[cfg(feature = "vectors")]
-    vector_query: None,
-    #[cfg(feature = "vectors")]
-    vector_filter: None,
+// 3. Add documents and commit
+let mut writer = index.writer()?;
+writer.add_document(&Document {
+    fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("Rust is a fast systems language")),
+        ("lang".into(), serde_json::json!("en")),
+        ("year".into(), serde_json::json!(2024)),
+    ].into_iter().collect(),
 })?;
-for hit in results.hits {
-    println!("doc {} score {:.3} fields {:?}", hit.doc_id, hit.score, hit.fields);
+writer.commit()?;
+
+// 4. Search
+let reader = index.reader()?;
+let results = reader.search(
+    &SearchRequest::new("rust language")
+        .with_limit(10)
+        .with_filter(Filter::KeywordEq { field: "lang".into(), value: "en".into() })
+        .with_return_stored(true)
+        .with_highlight_field("body"),
+)?;
+
+for hit in &results.hits {
+    println!("{} (score: {:.2})", hit.doc_id, hit.score);
 }
 ```
 
-Search responses include a `next_cursor` when additional hits remain.
+---
 
-- JSON/SDK: send that value in the `cursor` field to fetch the next page without computing offsets.
-- CLI: `cargo run -p searchlite-cli -- search "$INDEX" --q "rust" --limit 5 --cursor "$NEXT_CURSOR"`.
-- FFI: pass the cursor string to the `cursor` argument.
-- Cursors are opaque and bounded (up to ~50k returned hits) to avoid unbounded memory use; very deep pagination returns an error instead of over-consuming resources.
+## Features
 
-`Index::open(opts)` opens an existing index; `Index::compact()` rewrites all segments into one. WAL-backed writers queue documents until `commit` is called; `rollback` drops uncommitted changes.
+- **BM25 scoring** &mdash; tunable relevance with WAND/BMW pruning for fast exact top-K, even over millions of documents
+- **Rich query DSL** &mdash; bool, phrase, fuzzy, prefix, wildcard, regex, multi-match, function scores, and rescoring
+- **Filters** &mdash; narrow results by keyword, numeric range, nested objects, or boolean combinations without affecting relevance
+- **Aggregations** &mdash; build faceted navigation, dashboards, and analytics with terms, histograms, stats, percentiles, and pipelines
+- **Highlighting** &mdash; show users why a result matched with multi-field, phrase-aware snippet extraction
+- **Nested documents** &mdash; model arrays of objects (reviews, comments, metadata) with per-object filtering and aggregation
+- **Field collapsing** &mdash; deduplicate results by author, publisher, or any keyword field, with inner hits for "more like this"
+- **Pagination** &mdash; cursor-based, search_after, and offset modes for any result set size
+- **Optional vector search** &mdash; HNSW approximate nearest neighbors with hybrid BM25+vector blending for semantic search
+- **WAL durability** &mdash; crash-safe writes with atomic manifest, fsync, and WAL replay. No data loss, ever
 
-### Query execution modes
+---
 
-- `execution`: choose `"bm25"` (full evaluation), `"wand"` (exact WAND pruning), or `"bmw"` (block-max WAND). Default is `wand`.
-- `bmw_block_size`: optional block size when using BMW pruning.
+## Performance
 
-The CLI exposes `--execution` and `--bmw-block-size` on `search`. A small synthetic benchmark that compares the strategies lives in `searchlite-core/examples/pruning.rs` (`cargo run -p searchlite-core --example pruning`).
+Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times are Criterion medians; your hardware will vary. See [BENCHMARKS.md](BENCHMARKS.md) for methodology and full results.
 
-### Vector search
+| Benchmark | Docs | Median |
+|---|---|---|
+| Index 100K docs | 100,000 | **4.21 s** (~23,700 docs/sec) |
+| Single-term search | 100,000 | **4.26 ms** |
+| Bool AND search | 100,000 | **6.25 ms** |
+| Filtered search | 100,000 | **4.42 ms** |
+| Terms aggregation | 100,000 | **8.29 ms** |
 
-- Define vector fields in the schema (requires the `vectors` feature):
+---
 
-```json
-{
-  "vector_fields": [{ "name": "embedding", "dim": 2, "metric": "Cosine" }]
-}
+## Multi-platform
+
+| Platform | Crate | Status |
+|---|---|---|
+| **Rust** | [`searchlite-core`](searchlite-core/) | Stable &mdash; full API |
+| **CLI** | [`searchlite-cli`](searchlite-cli/) | Stable &mdash; init, add, commit, search, compact |
+| **HTTP** | [`searchlite-http`](searchlite-http/) | Stable &mdash; REST API over one or more indexes |
+| **C FFI** | [`searchlite-ffi`](searchlite-ffi/) | Stable &mdash; shared library + C header |
+| **WASM** | [`searchlite-wasm`](searchlite-wasm/) | Experimental &mdash; IndexedDB-backed, browser search |
+
+---
+
+## Architecture
+
+```
+                     ┌──────────────┐
+                     │  IndexWriter │
+                     └──────┬───────┘
+                            │ add_document()
+                            ▼
+                     ┌──────────────┐
+                     │     WAL      │  ← append-only, fsync'd
+                     └──────┬───────┘
+                            │ commit()
+                  ┌─────────┴─────────┐
+                  ▼                   ▼
+           ┌────────────┐     ┌────────────┐
+           │  Segment 0 │     │  Segment 1 │  ...
+           │  (postings, │     │  (postings, │
+           │   docstore, │     │   docstore, │
+           │   fast cols)│     │   fast cols)│
+           └─────────────┘     └─────────────┘
+                  │                   │
+                  └─────────┬─────────┘
+                            ▼
+                     ┌──────────────┐
+                     │   Manifest   │  ← atomic rename + dir fsync
+                     └──────┬───────┘
+                            │ reader()
+                            ▼
+                     ┌──────────────┐
+                     │  IndexReader │  ← search(), mget(), multi_search()
+                     └──────────────┘
 ```
 
-- Vector-only: set the query node to a vector clause. Missing vectors are skipped.
+- **Segments** are immutable inverted indexes with block-max postings (128-doc blocks for WAND/BMW).
+- **Fast fields** are memory-mapped columnar stores for zero-copy filter evaluation.
+- **Tiered merge policy** automatically merges small segments on commit; `compact()` rewrites everything into one segment.
+- **Crash safety**: if the process dies mid-commit, WAL replay recreates the segment on next open. No data loss.
 
-```json
-{
-  "query": {
-    "type": "vector",
-    "field": "embedding",
-    "vector": [1.0, 0.0],
-    "k": 3,
-    "alpha": 0.0
-  }
-}
-```
+---
 
-- Hybrid: combine a text query with a legacy `vector_query` tuple to blend BM25 and vector similarity. `alpha=1.0` uses BM25 only; `alpha=0.0` uses vector similarity only.
+## Documentation
 
-```json
-{
-  "query": {
-    "type": "query_string",
-    "query": "rust",
-    "boost": null,
-    "fields": null
-  },
-  "limit": 5,
-  "vector_query": ["embedding", [1.0, 0.0], 0.25]
-}
-```
+| Topic | Link |
+|---|---|
+| Getting started (CLI) | [docs/quickstart.md](docs/quickstart.md) |
+| Rust API guide | [docs/rust-api.md](docs/rust-api.md) |
+| Schema and fields | [docs/schema.md](docs/schema.md) |
+| CLI reference | [docs/cli.md](docs/cli.md) |
+| HTTP service | [docs/http.md](docs/http.md) |
+| Query DSL | [docs/queries.md](docs/queries.md) |
+| Filters | [docs/filters.md](docs/filters.md) |
+| Aggregations | [docs/aggregations.md](docs/aggregations.md) |
+| Collapsing and highlighting | [docs/collapsing-and-highlighting.md](docs/collapsing-and-highlighting.md) |
+| Vector search | [docs/vectors.md](docs/vectors.md) |
+| In-memory indexes | [docs/in-memory.md](docs/in-memory.md) |
+| WASM bindings | [docs/wasm.md](docs/wasm.md) |
+| C FFI | [docs/ffi.md](docs/ffi.md) |
+| Write-key protection | [docs/write-key.md](docs/write-key.md) |
+| Feature flags | [docs/feature-flags.md](docs/feature-flags.md) |
+| Benchmarks | [BENCHMARKS.md](BENCHMARKS.md) |
+| Architecture deep-dive | [docs/intro.md](docs/intro.md) |
+| Binding behaviors | [docs/bindings.md](docs/bindings.md) |
 
-- `vector_query` also accepts an object form to tune ANN parameters: `{ "field": "embedding", "vector": [1.0, 0.0], "alpha": 0.25, "k": 20, "candidate_size": 40, "ef_search": 40 }`. The tuple form still works for compatibility.
-- Per-field HNSW settings can be set on `vector_fields` via `hnsw: { "m": 16, "ef_construction": 64 }`; defaults are used when omitted.
+---
 
-- Tunables (vector queries):
-  - `k`: number of neighbors to retrieve (defaults to `limit`).
-  - `candidate_size`: optional oversampling during ANN search.
-  - `ef_search`: ANN beam width (defaults to a sensible value if omitted).
-  - `vector_filter`: optional filter applied during vector candidate selection.
-- Responses include `vector_score` when vector search runs; `_score` is the blended score.
-- Cosine vectors are normalized automatically; vectors with the wrong dimension are rejected.
-- ANN is approximate (HNSW); raise `candidate_size`/`ef_search` for higher recall.
-
-### In-memory indexes
-
-For ephemeral or test-heavy scenarios, set `storage: StorageType::InMemory` in `IndexOptions`. The API and search behavior stay the same, but no files are created on disk. (The CLI currently uses filesystem storage only.)
-
-### WASM
-
-#### Builds and targets
-
-- Install `wasm-pack` (e.g., `brew install wasm-pack` or `cargo install wasm-pack`) before building.
-- Threaded wasm needs atomics/bulk-memory and build-std; `searchlite-wasm/rust-toolchain.toml` pins a nightly with `rust-src` and the wasm target, and `searchlite-wasm/.cargo/config.toml` sets the required rustflags/build-std. Rustup will fetch the nightly toolchain automatically when you build this crate.
-- Default build for browsers and module workers (ESM): `wasm-pack build searchlite-wasm --target web --release`.
-- Classic workers / `importScripts` need a separate build: `wasm-pack build searchlite-wasm --target no-modules --release` (or `--target bundler` if you want a bundler to wrap it).
-- Threaded build (requires COOP/COEP + SharedArrayBuffer): `wasm-pack build searchlite-wasm --target web --release -- --features threads`.
-
-#### Choosing the right build
-
-- **Browser window + module workers**: use the `--target web` build; this is a single build that works in both environments.
-- **Classic web worker / service worker (no modules)**: use `--target no-modules` (or `--target bundler`) because `importScripts` cannot load ES modules.
-- **Threads**: build with `--features threads` and serve with COOP/COEP headers; this is a separate build and is not available in service workers.
-
-#### Running the demo
-
-- For the default (non-threaded) demo build, serve the `searchlite-wasm` crate directory over HTTP (any static file server without special headers is fine, e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080`).
-- For the threaded build (`--features threads`), serve with COOP/COEP headers so `SharedArrayBuffer` works (e.g., `cd searchlite-wasm && npx http-server -c-1 --cors -p 8080 -H "Cross-Origin-Opener-Policy: same-origin" -H "Cross-Origin-Embedder-Policy: require-corp"`).
-- Open `http://localhost:8080/index.html`. The bundled page imports `pkg/searchlite_wasm.js`, initializes the module, and provides a lightweight schema/upload/search demo in the browser.
-
-#### API usage
-
-- Instantiate from JS with `await Searchlite.init("demo-db", JSON.stringify(schema), "indexeddb")` (default) or `"memory"` for ephemeral indexes. `init` reopens existing indexes with the same name and validates schemas; mismatches return an error.
-- Prefer `add_documents([...])` for bulk ingest and call `commit()` to flush everything to the manifest.
-
-### FFI + WASM lifecycle
-
-- Ingest APIs now queue documents; call `commit` (`searchlite_commit` in FFI, `commit()` in WASM) to make them searchable.
-- Searches default to `return_stored: false`; set it explicitly (or pass `true` as the third argument to the WASM `search` helper) when you need stored fields.
-- Use the full request helpers for advanced queries: `searchlite_search_request` (FFI) and `search_request_value`/`search_request` (WASM).
-- See `docs/bindings.md` for a quick reference of binding behaviors.
-
-## Building the C library
-
-Build the FFI crate to generate a shared library and header for C or other language bindings.
+## Development
 
 ```bash
-# Release build (macOS dylib, Linux .so, Windows .dll + Rust rlib)
-cargo build -p searchlite-ffi --release --features ffi
+# Build
+cargo build --all --all-features        # or: just build
 
-# Enable optional capabilities on the library:
-# cargo build -p searchlite-ffi --release --features "ffi,vectors,zstd"
+# Test
+cargo test --all --all-features         # or: just test
+
+# Benchmark
+cargo bench -p searchlite-core          # or: just bench
+
+# Lint
+cargo fmt --all
+cargo clippy --all --all-features -- -D warnings
 ```
 
-Artifacts land in `target/release` (e.g., `libsearchlite_ffi.dylib` or `libsearchlite_ffi.so`) and the C header is at `searchlite-ffi/searchlite.h`.
+Rust toolchain is pinned to **1.92.0** (`rust-toolchain.toml`). CI runs across 5 toolchains (1.88.0, 1.92.0, stable, beta, nightly).
 
-## Feature flags
+---
 
-- `vectors`: store/query vector fields; search requests can blend BM25 with vector similarity.
-- `gpu`: stub GPU reranker hooks.
-- `zstd`: compress stored fields.
-- `ffi`: build the C FFI surface (`searchlite-ffi` crate, also exposed on the CLI).
+## License
+
+MIT
