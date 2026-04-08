@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use searchlite_core::api::types::Document;
 
 pub(crate) fn value_to_document(value: serde_json::Value) -> napi::Result<Document> {
-  let obj = value.as_object().ok_or_else(|| {
-    napi::Error::new(napi::Status::InvalidArg, "document must be a JSON object")
-  })?;
+  let obj = value
+    .as_object()
+    .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "document must be a JSON object"))?;
   let mut fields = BTreeMap::new();
   for (k, v) in obj.iter() {
     fields.insert(k.clone(), v.clone());

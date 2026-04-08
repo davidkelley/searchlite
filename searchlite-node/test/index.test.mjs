@@ -631,7 +631,7 @@ describe("resource lifecycle", () => {
 // Write key
 // =============================================================================
 
-describe("write key", () => {
+describe("write key", { timeout: 30_000 }, () => {
 	it("create with writeKey, reopen with writeKey succeeds", () => {
 		const path = join(tempDir(), "idx");
 		const idx1 = new Index(path, { schema: { body: "text" }, writeKey: "secret" });

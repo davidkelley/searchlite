@@ -53,10 +53,7 @@ impl Index {
 
       let provided_schema: Option<Schema> = match &opts.schema {
         Some(val) => Some(serde_json::from_value(val.clone()).map_err(|e| {
-          napi::Error::new(
-            napi::Status::InvalidArg,
-            format!("invalid schema: {e}"),
-          )
+          napi::Error::new(napi::Status::InvalidArg, format!("invalid schema: {e}"))
         })?),
         None => None,
       };
@@ -69,8 +66,7 @@ impl Index {
           let existing = index.manifest().schema;
           let existing_json =
             serde_json::to_value(&existing).map_err(|e| to_napi_error(e.into()))?;
-          let provided_json =
-            serde_json::to_value(schema).map_err(|e| to_napi_error(e.into()))?;
+          let provided_json = serde_json::to_value(schema).map_err(|e| to_napi_error(e.into()))?;
           if existing_json != provided_json {
             return Err(napi::Error::new(
               napi::Status::InvalidArg,
@@ -84,13 +80,8 @@ impl Index {
         index
       } else if let Some(schema) = provided_schema {
         // Index does not exist — create with schema
-        CoreIndex::create_with_write_key(
-          &path_buf,
-          schema,
-          core_opts,
-          opts.write_key.as_deref(),
-        )
-        .map_err(to_napi_error)?
+        CoreIndex::create_with_write_key(&path_buf, schema, core_opts, opts.write_key.as_deref())
+          .map_err(to_napi_error)?
       } else {
         // No schema, no existing index — error
         return Err(napi::Error::new(
@@ -226,9 +217,10 @@ impl Index {
 
   #[napi]
   pub fn close(&self) -> napi::Result<()> {
-    let mut guard = self.inner.lock().map_err(|_| {
-      napi::Error::new(napi::Status::GenericFailure, "index lock poisoned")
-    })?;
+    let mut guard = self
+      .inner
+      .lock()
+      .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "index lock poisoned"))?;
     guard.take();
     Ok(())
   }
@@ -236,12 +228,13 @@ impl Index {
 
 impl Index {
   fn with_index<T>(&self, f: impl FnOnce(&CoreIndex) -> napi::Result<T>) -> napi::Result<T> {
-    let guard = self.inner.lock().map_err(|_| {
-      napi::Error::new(napi::Status::GenericFailure, "index lock poisoned")
-    })?;
-    let index = guard.as_ref().ok_or_else(|| {
-      napi::Error::new(napi::Status::GenericFailure, "index is closed")
-    })?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "index lock poisoned"))?;
+    let index = guard
+      .as_ref()
+      .ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "index is closed"))?;
     f(index)
   }
 }
