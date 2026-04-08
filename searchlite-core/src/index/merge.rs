@@ -55,9 +55,9 @@ impl TieredMergePolicy {
       return Vec::new();
     }
 
-    // Group segments into tiers. The floor tier covers everything up to
-    // floor_segment_docs. Each subsequent tier spans 10x the previous
-    // tier boundary.
+    // Group segments into tiers. The floor tier covers segments with fewer
+    // than floor_segment_docs live docs (exclusive boundary). Each
+    // subsequent tier spans 10x the previous tier boundary.
     let mut tiers: Vec<Vec<&SegmentMeta>> = Vec::new();
     let mut tier_max = self.floor_segment_docs.max(1) as u64;
 

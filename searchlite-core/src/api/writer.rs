@@ -408,7 +408,15 @@ impl IndexWriter {
   ///
   /// The existing `commit()` behaviour is preserved unchanged; this method
   /// simply adds an optional post-commit merge step.
+  /// Commit and optionally merge. For write-key-protected indexes, use
+  /// `commit_with_merge_and_key` instead.
   pub fn commit_with_merge(&mut self, merge: bool) -> Result<()> {
+    if merge && self.write_binding.is_some() {
+      bail!(
+        "this index requires a write key for merge; \
+         use commit_with_merge_and_key(merge, Some(key)) instead"
+      );
+    }
     self.commit_with_merge_and_key(merge, None)
   }
 

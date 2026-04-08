@@ -263,7 +263,7 @@ impl Index {
     let manifest_snapshot = self.inner.manifest.read().clone();
     ensure_compact_safe(&manifest_snapshot.schema)?;
 
-    // Identify which segments participate in the merge.
+    // Identify which segments participate in the merge (dedup input IDs).
     let merge_set: std::collections::HashSet<&str> =
       segment_ids.iter().map(|s| s.as_str()).collect();
     let merge_metas: Vec<&crate::index::manifest::SegmentMeta> = manifest_snapshot
@@ -275,11 +275,11 @@ impl Index {
       // Nothing useful to merge.
       return Ok(());
     }
-    // Verify all requested segment IDs exist.
-    if merge_metas.len() != segment_ids.len() {
+    // Verify all unique requested segment IDs exist.
+    if merge_metas.len() != merge_set.len() {
       bail!(
         "some segment IDs not found in manifest (requested {}, found {})",
-        segment_ids.len(),
+        merge_set.len(),
         merge_metas.len()
       );
     }
