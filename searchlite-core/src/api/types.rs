@@ -620,7 +620,7 @@ impl SearchRequest {
     self
   }
 
-  /// Add aggregations to the search request.
+  /// Set the aggregations for the search request.
   pub fn with_aggs(mut self, aggs: BTreeMap<String, Aggregation>) -> Self {
     self.aggs = aggs;
     self

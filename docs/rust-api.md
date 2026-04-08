@@ -310,7 +310,7 @@ let results = reader.multi_search(&[
     SearchRequest::new("best sellers").with_limit(5),
     SearchRequest::new("new arrivals")
         .with_limit(5)
-        .with_sort(vec![SortSpec { field: "created_at".into(), order: Some(SortOrder::Desc) }]),
+        .with_sort(vec![SortSpec { field: "price".into(), order: Some(SortOrder::Desc) }]),
 ])?;
 
 let main_results = &results[0];

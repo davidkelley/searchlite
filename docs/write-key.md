@@ -51,16 +51,16 @@ key is never persisted.
 ```bash
 curl -XPOST http://localhost:8080/indexes/secure/init \
   -H 'Content-Type: application/json' \
-  -H 'X-Searchlite-Write-Key: my-secret-key' \
+  -H 'x-write-key: my-secret-key' \
   --data-binary @schema.json
 ```
 
 ### CLI
 
-The CLI passes the write key via environment variable:
+The CLI accepts the write key via the `--write-key` flag:
 
 ```bash
-SEARCHLITE_WRITE_KEY=my-secret-key searchlite init /tmp/secure-idx schema.json
+searchlite init /tmp/secure-idx schema.json --write-key my-secret-key
 ```
 
 ---
@@ -88,16 +88,16 @@ Calling `index.writer()` (without a key) on a key-protected index returns an err
 
 ### HTTP API
 
-Include the `X-Searchlite-Write-Key` header on write endpoints:
+Include the `x-write-key` header on write endpoints:
 
 ```bash
 curl -XPOST http://localhost:8080/indexes/secure/add \
-  -H 'X-Searchlite-Write-Key: my-secret-key' \
+  -H 'x-write-key: my-secret-key' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @docs.ndjson
 
 curl -XPOST http://localhost:8080/indexes/secure/commit \
-  -H 'X-Searchlite-Write-Key: my-secret-key'
+  -H 'x-write-key: my-secret-key'
 ```
 
 **Read operations (search, mget, inspect, stats) never require a write key.**

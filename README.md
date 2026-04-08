@@ -1,20 +1,19 @@
-<p align="center">
-  <h1 align="center">searchlite</h1>
-  <p align="center">
-    <strong>The SQLite of search.</strong>
-    <br />
-    An embedded full-text search engine for Rust. No JVM, no cluster, no external
-    process &mdash; just add a crate and search. WAL-backed durability, BM25
-    relevance with WAND/BMW pruning, aggregations, filters, highlights, and
-    fuzzy matching out of the box.
-  </p>
-</p>
+<div align="center">
 
-<p align="center">
-  <a href="https://crates.io/crates/searchlite-core"><img src="https://img.shields.io/crates/v/searchlite-core.svg" alt="crates.io" /></a>
-  <a href="https://github.com/davidkelley/searchlite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license" /></a>
-  <a href="https://github.com/davidkelley/searchlite/actions"><img src="https://img.shields.io/github/actions/workflow/status/davidkelley/searchlite/ci.yml?branch=main" alt="CI" /></a>
-</p>
+# searchlite
+
+**The SQLite of search.**
+
+An embedded full-text search engine for Rust. No JVM, no cluster, no external
+process &mdash; just add a crate and search. WAL-backed durability, BM25
+relevance with WAND/BMW pruning, aggregations, filters, highlights, and
+fuzzy matching out of the box.
+
+[![crates.io](https://img.shields.io/crates/v/searchlite-core.svg)](https://crates.io/crates/searchlite-core)
+[![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/davidkelley/searchlite/blob/main/LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/davidkelley/searchlite/ci.yml?branch=main)](https://github.com/davidkelley/searchlite/actions)
+
+</div>
 
 ---
 
