@@ -57,6 +57,9 @@ export function expandSchema(input: Record<string, unknown>): CoreSchema {
 		return input as unknown as CoreSchema;
 	}
 
+	if (input.doc_id_field !== undefined && typeof input.doc_id_field !== "string") {
+		throw new Error("doc_id_field must be a string");
+	}
 	const docIdField = (input.doc_id_field as string) ?? "_id";
 	const textFields: CoreSchema["text_fields"] = [];
 	const keywordFields: CoreSchema["keyword_fields"] = [];
@@ -174,11 +177,10 @@ const FilterSchema: z.ZodType = z.union([
 	z.object({ Not: z.lazy(() => FilterSchema) }),
 ]);
 
-const SortSpecSchema = z.union([
-	z.string(),
-	z.record(z.string(), z.union([z.literal("asc"), z.literal("desc")])),
-	z.record(z.string(), z.object({ order: z.enum(["asc", "desc"]) })),
-]);
+const SortSpecSchema = z.object({
+	field: z.string(),
+	order: z.enum(["asc", "desc"]).optional(),
+});
 
 export const SearchRequestSchema = z.object({
 	query: z.union([z.string(), z.record(z.string(), z.unknown())]),
@@ -190,6 +192,8 @@ export const SearchRequestSchema = z.object({
 	sort: z.array(SortSpecSchema).optional(),
 	cursor: z.string().optional(),
 	searchAfter: z.array(z.unknown()).optional(),
+	candidateSize: z.number().int().positive().optional(),
+	bmwBlockSize: z.number().int().positive().optional(),
 	execution: z.enum(["wand", "bmw", "bm25"]).optional(),
 	fuzzy: z
 		.object({
@@ -268,4 +272,7 @@ export type NumericFieldDef = {
 
 export type FieldDefinition = FieldShorthand | TextFieldDef | KeywordFieldDef | NumericFieldDef;
 
-export type SchemaDefinition = Record<string, FieldDefinition>;
+export type SchemaDefinition = Record<string, FieldDefinition> & {
+	doc_id_field?: string;
+	analyzers?: unknown[];
+};

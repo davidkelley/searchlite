@@ -280,7 +280,7 @@ index.search({
 
   // Filtering & sorting
   filter: { ... },                   // pre-scoring filter (see Filters)
-  sort: [{ price: 'asc' }],         // sort by field values
+  sort: [{ field: 'price', order: 'asc' }], // sort by field values
 
   // Features
   fuzzy: { maxEdits: 1 },            // fuzzy matching
@@ -522,14 +522,14 @@ Sort results by field values instead of relevance:
 
 ```javascript
 // Simple ascending
-index.search({ query: 'headphones', sort: [{ price: 'asc' }] });
+index.search({ query: 'headphones', sort: [{ field: 'price', order: 'asc' }] });
 
 // Multiple sort fields
 index.search({
   query: 'headphones',
   sort: [
-    { year: 'desc' },
-    { price: 'asc' },
+    { field: 'year', order: 'desc' },
+    { field: 'price', order: 'asc' },
   ],
 });
 ```

@@ -164,5 +164,11 @@ describe("expandSchema", () => {
 		it("rejects non-object input", () => {
 			expect(() => expandSchema(null)).toThrowError(/schema must be an object/);
 		});
+
+		it("rejects non-string doc_id_field", () => {
+			expect(() => expandSchema({ doc_id_field: 123, title: "text" })).toThrowError(
+				/doc_id_field must be a string/,
+			);
+		});
 	});
 });

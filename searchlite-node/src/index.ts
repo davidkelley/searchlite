@@ -226,8 +226,8 @@ export class Index {
 
 	close(): void {
 		if (this.#closed) return;
-		this.#closed = true;
 		this.#native.close();
+		this.#closed = true;
 	}
 
 	[Symbol.dispose](): void {
