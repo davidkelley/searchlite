@@ -16,6 +16,7 @@ use crate::index::segment::{SegmentFileMeta, SegmentWriter};
 use crate::index::wal::{Wal, WalEntry};
 use crate::index::InnerIndex;
 use crate::util::doc_id::validate_doc_id;
+#[cfg(feature = "write-key")]
 use crate::util::write_key::{binding_for_uuid, verify_binding, verify_write_key};
 use crate::DocId;
 
@@ -62,6 +63,7 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     let wal_path = crate::index::directory::wal_path(&inner.path);
     let (wal_binding, pending_entries) = Wal::last_pending_ops(inner.storage.as_ref(), &wal_path)?;
+    #[allow(unused_mut)]
     let mut wal = inner.wal()?;
     let manifest = inner.manifest.read().clone();
     let schema = manifest.schema.clone();
@@ -71,9 +73,11 @@ impl IndexWriter {
       .map(|s| s.generation)
       .max()
       .unwrap_or(0);
+    #[allow(unused_mut)]
     let mut write_binding: Option<Vec<u8>> = None;
 
     let mut segments_binding: Vec<Vec<u8>> = Vec::new();
+    #[allow(unused_mut)]
     let mut binding_required = manifest.write_key.is_some() || wal_binding.is_some();
     for seg in manifest.segments.iter() {
       if let Some(b64) = seg.write_binding_b64.as_deref() {
@@ -116,28 +120,38 @@ impl IndexWriter {
       }
     }
     if binding_required {
-      let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
-      if let Some(meta) = manifest.write_key.as_ref() {
-        verify_write_key(key, meta)?;
-      }
-      let candidate = binding_for_uuid(key, &manifest.uuid);
-      if let Some(b) = wal_binding.as_ref() {
-        if !verify_binding(b, &candidate) {
-          bail!("write key does not match WAL binding; index may be tampered");
+      #[cfg(feature = "write-key")]
+      {
+        let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
+        if let Some(meta) = manifest.write_key.as_ref() {
+          verify_write_key(key, meta)?;
+        }
+        let candidate = binding_for_uuid(key, &manifest.uuid);
+        if let Some(b) = wal_binding.as_ref() {
+          if !verify_binding(b, &candidate) {
+            bail!("write key does not match WAL binding; index may be tampered");
+          }
+        }
+        for seg_binding in segments_binding.iter() {
+          if !verify_binding(seg_binding, &candidate) {
+            bail!("write key does not match segment binding; index may be tampered");
+          }
+        }
+        if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
+          bail!(
+            "write key metadata missing but bindings exist; index metadata was likely tampered"
+          );
+        }
+        write_binding = Some(candidate.clone());
+        if wal_binding.is_none() {
+          wal.append_binding(&candidate)?;
+          wal.sync()?;
         }
       }
-      for seg_binding in segments_binding.iter() {
-        if !verify_binding(seg_binding, &candidate) {
-          bail!("write key does not match segment binding; index may be tampered");
-        }
-      }
-      if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
-        bail!("write key metadata missing but bindings exist; index metadata was likely tampered");
-      }
-      write_binding = Some(candidate.clone());
-      if wal_binding.is_none() {
-        wal.append_binding(&candidate)?;
-        wal.sync()?;
+      #[cfg(not(feature = "write-key"))]
+      {
+        let _ = write_key;
+        crate::util::write_key::require_write_key_feature()?;
       }
     }
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
@@ -385,6 +399,53 @@ impl IndexWriter {
     self.patch_reader_stamp = None;
     self.live_docs = live_docs;
     self.live_generation = new_generation;
+    Ok(())
+  }
+
+  /// Commit pending changes and optionally evaluate the tiered merge policy
+  /// afterwards. When `merge` is `true`, any merge candidates identified by
+  /// `TieredMergePolicy::default()` are merged inline before returning.
+  ///
+  /// The existing `commit()` behaviour is preserved unchanged; this method
+  /// simply adds an optional post-commit merge step.
+  /// Commit and optionally merge. For write-key-protected indexes, use
+  /// `commit_with_merge_and_key` instead.
+  pub fn commit_with_merge(&mut self, merge: bool) -> Result<()> {
+    if merge && self.write_binding.is_some() {
+      bail!(
+        "this index requires a write key for merge; \
+         use commit_with_merge_and_key(merge, Some(key)) instead"
+      );
+    }
+    self.commit_with_merge_and_key(merge, None)
+  }
+
+  /// Commit pending operations and optionally run a tiered merge pass.
+  ///
+  /// `write_key` must be provided for write-key-protected indexes so that
+  /// the post-commit merge can verify and bind segments correctly.
+  pub fn commit_with_merge_and_key(&mut self, merge: bool, write_key: Option<&str>) -> Result<()> {
+    self.commit()?;
+    if merge {
+      let manifest = self.inner.manifest.read().clone();
+      let policy = crate::index::merge::TieredMergePolicy::default();
+      let merge_groups = policy.find_merges(&manifest.segments);
+      for group in merge_groups {
+        let idx = crate::index::Index {
+          inner: self.inner.clone(),
+        };
+        idx.merge_segments(&group, write_key)?;
+      }
+      // Refresh live_docs and generation after the merge.
+      let new_manifest = self.inner.manifest.read().clone();
+      self.live_generation = new_manifest
+        .segments
+        .iter()
+        .map(|s| s.generation)
+        .max()
+        .unwrap_or(0);
+      self.live_docs = load_live_docs(self.inner.as_ref(), &new_manifest)?;
+    }
     Ok(())
   }
 
@@ -1191,6 +1252,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "write-key")]
   fn write_key_enforced_for_writer_open() {
     let dir = tempdir().unwrap();
     let schema = Schema::default_text_body();

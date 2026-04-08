@@ -13,6 +13,7 @@ vectors = ["bytemuck", "bincode"]
 gpu = []
 zstd = ["dep:zstd"]
 ffi = []
+write-key = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:subtle"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -36,11 +37,11 @@ rust-stemmers = { workspace = true }
 regex = { workspace = true }
 tdigest = { workspace = true }
 log = { workspace = true }
-argon2 = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
+argon2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 base64 = { workspace = true }
-subtle = { workspace = true }
+subtle = { workspace = true, optional = true }
 rand = { workspace = true }
 
 zstd = { version = "0.13.1", optional = true }
@@ -66,4 +67,8 @@ harness = false
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "scale"
 harness = false
