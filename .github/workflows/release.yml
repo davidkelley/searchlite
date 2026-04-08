@@ -46,6 +46,7 @@ jobs:
           ln -sf ../Cargo.lock "$prev_dir/searchlite-cli/Cargo.lock"
           ln -sf ../Cargo.lock "$prev_dir/searchlite-ffi/Cargo.lock"
           ln -sf ../Cargo.lock "$prev_dir/searchlite-wasm/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-node/Cargo.lock"
 
           echo "path=$prev_dir/Cargo.toml" >> "$GITHUB_OUTPUT"
       - name: Configure git user
@@ -96,6 +97,7 @@ jobs:
           ln -sf ../Cargo.lock "$prev_dir/searchlite-cli/Cargo.lock"
           ln -sf ../Cargo.lock "$prev_dir/searchlite-ffi/Cargo.lock"
           ln -sf ../Cargo.lock "$prev_dir/searchlite-wasm/Cargo.lock"
+          ln -sf ../Cargo.lock "$prev_dir/searchlite-node/Cargo.lock"
 
           echo "path=$prev_dir/Cargo.toml" >> "$GITHUB_OUTPUT"
       - name: Configure git user

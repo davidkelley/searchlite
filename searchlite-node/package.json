@@ -1,0 +1,62 @@
+{
+	"name": "searchlite-js",
+	"version": "0.1.5",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"napi": {
+		"binaryName": "searchlite",
+		"targets": [
+			"x86_64-apple-darwin",
+			"aarch64-apple-darwin",
+			"x86_64-unknown-linux-gnu",
+			"aarch64-unknown-linux-gnu",
+			"x86_64-pc-windows-msvc"
+		]
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/davidkelley/searchlite.git",
+		"directory": "searchlite-node"
+	},
+	"homepage": "https://github.com/davidkelley/searchlite/tree/main/searchlite-node#readme",
+	"bugs": "https://github.com/davidkelley/searchlite/issues",
+	"keywords": ["search", "full-text", "index", "native", "rust", "napi", "embedded"],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"require": "./dist/index.js"
+		}
+	},
+	"dependencies": {
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1",
+		"@napi-rs/cli": "^3",
+		"@swc/cli": "^0.6",
+		"@swc/core": "^1",
+		"@types/node": "^25.5.2",
+		"typescript": "^5",
+		"vitest": "^3"
+	},
+	"engines": {
+		"node": ">= 18"
+	},
+	"scripts": {
+		"artifacts": "napi artifacts",
+		"build:native": "napi build --platform --release",
+		"build:native:debug": "napi build --platform",
+		"build:ts": "swc src -d dist --strip-leading-paths && tsc",
+		"build": "npm run build:native && npm run build:ts",
+		"build:debug": "npm run build:native:debug && npm run build:ts",
+		"prepublishOnly": "napi prepublish -t npm",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"typecheck": "tsc",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write ."
+	},
+	"files": ["dist", "LICENSE", "*.node"]
+}
