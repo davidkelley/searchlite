@@ -71,6 +71,12 @@ impl TieredMergePolicy {
           // No segments in this tier range, advance to the next tier.
           tier_max = tier_max.saturating_mul(10);
           if tier_max > self.max_merged_segment_docs as u64 {
+            // Remaining segments all exceed the previous tier boundary
+            // but are still below max_merged_segment_docs (they passed
+            // the eligibility filter). Include them as the final tier.
+            if !remaining.is_empty() {
+              tiers.push(remaining.to_vec());
+            }
             break;
           }
         }
@@ -233,5 +239,25 @@ mod tests {
     let merges = policy.find_merges(&segments);
     assert_eq!(merges.len(), 1);
     assert!(merges[0].contains(&"mostly_deleted".to_string()));
+  }
+
+  #[test]
+  fn merges_segments_in_upper_tier_when_lower_tiers_empty() {
+    // All segments sit above the floor tier. Advancing through empty lower
+    // tiers must still include them in the final tier so overflow is detected.
+    let policy = TieredMergePolicy {
+      segments_per_tier: 2,
+      max_merge_at_once: 5,
+      floor_segment_docs: 100,
+      max_merged_segment_docs: 5_000_000,
+    };
+    // 4 segments at ~120K docs each — above floor (100) and above 1K, 10K
+    // tiers. They should land in the 100K tier and overflow (4 > 2).
+    let segments: Vec<_> = (0..4)
+      .map(|i| make_segment(&format!("s{i}"), 120_000))
+      .collect();
+    let merges = policy.find_merges(&segments);
+    assert_eq!(merges.len(), 1, "should detect overflow in upper tier");
+    assert_eq!(merges[0].len(), 4);
   }
 }

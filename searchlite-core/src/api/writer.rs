@@ -409,24 +409,24 @@ impl IndexWriter {
   /// The existing `commit()` behaviour is preserved unchanged; this method
   /// simply adds an optional post-commit merge step.
   pub fn commit_with_merge(&mut self, merge: bool) -> Result<()> {
+    self.commit_with_merge_and_key(merge, None)
+  }
+
+  /// Commit pending operations and optionally run a tiered merge pass.
+  ///
+  /// `write_key` must be provided for write-key-protected indexes so that
+  /// the post-commit merge can verify and bind segments correctly.
+  pub fn commit_with_merge_and_key(&mut self, merge: bool, write_key: Option<&str>) -> Result<()> {
     self.commit()?;
     if merge {
       let manifest = self.inner.manifest.read().clone();
       let policy = crate::index::merge::TieredMergePolicy::default();
       let merge_groups = policy.find_merges(&manifest.segments);
       for group in merge_groups {
-        // Build a temporary Index handle to call merge_segments which
-        // acquires the writer lock internally.
         let idx = crate::index::Index {
           inner: self.inner.clone(),
         };
-        // Pass the write key if we have a binding (meaning a write key was
-        // used to open this writer). merge_segments will derive and verify
-        // the key itself; we cannot recover the original key string from the
-        // binding, so callers needing write-key support should use the
-        // lower-level `Index::merge_segments` directly. For the common
-        // non-write-key case this just passes None.
-        idx.merge_segments(&group, None)?;
+        idx.merge_segments(&group, write_key)?;
       }
       // Refresh live_docs and generation after the merge.
       let new_manifest = self.inner.manifest.read().clone();
