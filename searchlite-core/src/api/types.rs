@@ -551,6 +551,100 @@ pub struct SearchRequest {
   pub profile: bool,
 }
 
+impl SearchRequest {
+  /// Create a new search request with sensible defaults.
+  ///
+  /// Sets `limit` to 10, `execution` to WAND, and all optional fields to
+  /// `None` / empty. Use the `with_*` builder methods to customise.
+  pub fn new(query: impl Into<Query>) -> Self {
+    Self {
+      query: query.into(),
+      fields: None,
+      filter: None,
+      limit: 10,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::default(),
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  /// Set the maximum number of hits to return.
+  pub fn with_limit(mut self, limit: usize) -> Self {
+    self.limit = limit;
+    self
+  }
+
+  /// Add a post-query filter.
+  pub fn with_filter(mut self, filter: Filter) -> Self {
+    self.filter = Some(filter);
+    self
+  }
+
+  /// Return stored field values in each hit.
+  pub fn with_return_stored(mut self, return_stored: bool) -> Self {
+    self.return_stored = return_stored;
+    self
+  }
+
+  /// Enable single-field highlighting (legacy shorthand).
+  pub fn with_highlight_field(mut self, field: impl Into<String>) -> Self {
+    self.highlight_field = Some(field.into());
+    self
+  }
+
+  /// Enable multi-field highlighting.
+  pub fn with_highlight(mut self, highlight: HighlightRequest) -> Self {
+    self.highlight = Some(highlight);
+    self
+  }
+
+  /// Add aggregations to the search request.
+  pub fn with_aggs(mut self, aggs: BTreeMap<String, Aggregation>) -> Self {
+    self.aggs = aggs;
+    self
+  }
+
+  /// Enable fuzzy matching with the given options.
+  pub fn with_fuzzy(mut self, fuzzy: FuzzyOptions) -> Self {
+    self.fuzzy = Some(fuzzy);
+    self
+  }
+
+  /// Set sort order.
+  pub fn with_sort(mut self, sort: Vec<SortSpec>) -> Self {
+    self.sort = sort;
+    self
+  }
+
+  /// Skip the first `n` results (offset pagination).
+  pub fn with_from(mut self, from: usize) -> Self {
+    self.from = from;
+    self
+  }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SearchRequestHelper {
   pub query: Query,
