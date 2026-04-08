@@ -13,6 +13,7 @@ use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::SegmentWriter;
 use crate::index::wal::Wal;
 use crate::storage::{FsStorage, InMemoryStorage, Storage};
+#[cfg(feature = "write-key")]
 use crate::util::write_key::derive_write_key_meta;
 
 pub mod codec;
@@ -21,6 +22,7 @@ pub mod docstore;
 pub mod fastfields;
 pub mod highlight;
 pub mod manifest;
+pub mod merge;
 pub mod postings;
 pub mod segment;
 pub mod terms;
@@ -73,9 +75,18 @@ impl Index {
     opts.path = path.to_path_buf();
     schema.validate_config()?;
     ensure_root(storage.as_ref(), path)?;
+    #[allow(unused_mut)]
     let mut manifest = Manifest::new(schema);
     if let Some(key) = write_key {
-      manifest.write_key = Some(derive_write_key_meta(key, None)?);
+      #[cfg(feature = "write-key")]
+      {
+        manifest.write_key = Some(derive_write_key_meta(key, None)?);
+      }
+      #[cfg(not(feature = "write-key"))]
+      {
+        let _ = key;
+        crate::util::write_key::require_write_key_feature()?;
+      }
     }
     manifest.store(storage.as_ref(), &Manifest::manifest_path(path))?;
     let inner = Arc::new(InnerIndex {
@@ -140,6 +151,7 @@ impl Index {
     let reader = self.reader()?;
     let manifest_snapshot = reader.manifest.clone();
     ensure_compact_safe(&manifest_snapshot.schema)?;
+    #[allow(unused_mut)]
     let mut write_binding: Option<Vec<u8>> = None;
     let mut seg_bindings: Vec<Vec<u8>> = manifest_snapshot
       .segments
@@ -167,17 +179,25 @@ impl Index {
       }
     }
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
-      let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
-      if let Some(meta) = manifest_snapshot.write_key.as_ref() {
-        crate::util::write_key::verify_write_key(key, meta)?;
-      }
-      let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
-      for seg_binding in seg_bindings.iter() {
-        if !crate::util::write_key::verify_binding(seg_binding, &binding) {
-          bail!("write key does not match segment binding; index may be tampered");
+      #[cfg(feature = "write-key")]
+      {
+        let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
+        if let Some(meta) = manifest_snapshot.write_key.as_ref() {
+          crate::util::write_key::verify_write_key(key, meta)?;
         }
+        let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
+        for seg_binding in seg_bindings.iter() {
+          if !crate::util::write_key::verify_binding(seg_binding, &binding) {
+            bail!("write key does not match segment binding; index may be tampered");
+          }
+        }
+        write_binding = Some(binding);
       }
-      write_binding = Some(binding);
+      #[cfg(not(feature = "write-key"))]
+      {
+        let _ = write_key;
+        crate::util::write_key::require_write_key_feature()?;
+      }
     }
     if manifest_snapshot.segments.len() <= 1 {
       return Ok(());
@@ -227,6 +247,167 @@ impl Index {
     )?;
     drop(manifest_guard);
     cleanup_segments(inner.storage.as_ref(), &old_segments)?;
+    Ok(())
+  }
+
+  /// Merge a specific set of segments into a single new segment.
+  ///
+  /// Unlike `compact`, this only touches the listed segments and leaves the
+  /// rest of the index untouched. Deleted documents within the merged
+  /// segments are excluded from the output.
+  pub fn merge_segments(&self, segment_ids: &[String], write_key: Option<&str>) -> Result<()> {
+    if segment_ids.is_empty() {
+      return Ok(());
+    }
+    let _writer_guard = self.inner.writer_lock.lock();
+    let manifest_snapshot = self.inner.manifest.read().clone();
+    ensure_compact_safe(&manifest_snapshot.schema)?;
+
+    // Identify which segments participate in the merge.
+    let merge_set: std::collections::HashSet<&str> =
+      segment_ids.iter().map(|s| s.as_str()).collect();
+    let merge_metas: Vec<&crate::index::manifest::SegmentMeta> = manifest_snapshot
+      .segments
+      .iter()
+      .filter(|s| merge_set.contains(s.id.as_str()))
+      .collect();
+    if merge_metas.len() < 2 {
+      // Nothing useful to merge.
+      return Ok(());
+    }
+    // Verify all requested segment IDs exist.
+    if merge_metas.len() != segment_ids.len() {
+      bail!(
+        "some segment IDs not found in manifest (requested {}, found {})",
+        segment_ids.len(),
+        merge_metas.len()
+      );
+    }
+
+    // Handle write-key bindings.
+    #[allow(unused_mut)]
+    let mut write_binding: Option<Vec<u8>> = None;
+    let mut seg_bindings: Vec<Vec<u8>> = merge_metas
+      .iter()
+      .filter_map(|s| s.write_binding_b64.as_deref())
+      .map(|b64| {
+        BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment write_binding_b64: {e}"))
+      })
+      .collect::<Result<Vec<_>>>()?;
+    for seg in merge_metas.iter() {
+      let bytes = self
+        .inner
+        .storage
+        .read_to_end(Path::new(&seg.paths.meta))
+        .map_err(|e| anyhow!("failed to read segment meta {}: {e}", seg.id))?;
+      let seg_meta: crate::index::segment::SegmentFileMeta = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("failed to parse segment meta {}: {e}", seg.id))?;
+      if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
+        let decoded = BASE64
+          .decode(b64)
+          .map_err(|e| anyhow!("invalid base64 in segment metadata write_binding_b64: {e}"))?;
+        seg_bindings.push(decoded);
+      }
+    }
+    if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
+      #[cfg(feature = "write-key")]
+      {
+        let key = write_key.ok_or_else(|| anyhow!("write key required for merge"))?;
+        if let Some(meta) = manifest_snapshot.write_key.as_ref() {
+          crate::util::write_key::verify_write_key(key, meta)?;
+        }
+        let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
+        for seg_binding in seg_bindings.iter() {
+          if !crate::util::write_key::verify_binding(seg_binding, &binding) {
+            bail!("write key does not match segment binding; index may be tampered");
+          }
+        }
+        write_binding = Some(binding);
+      }
+      #[cfg(not(feature = "write-key"))]
+      {
+        let _ = write_key;
+        crate::util::write_key::require_write_key_feature()?;
+      }
+    }
+
+    // Open segment readers for the merge set only.
+    let inner = &self.inner;
+    let schema = manifest_snapshot.schema.clone();
+    let readers: Vec<crate::index::segment::SegmentReader> = merge_metas
+      .iter()
+      .map(|seg| {
+        crate::index::segment::SegmentReader::open(
+          inner.storage.clone(),
+          (*seg).clone(),
+          inner.options.enable_positions,
+        )
+      })
+      .collect::<Result<Vec<_>>>()?;
+
+    let generation = manifest_snapshot
+      .segments
+      .iter()
+      .map(|s| s.generation)
+      .max()
+      .unwrap_or(0)
+      + 1;
+
+    // Build an iterator over live docs from the merge segments.
+    let docs = readers.iter().flat_map(|seg| {
+      (0..seg.meta.doc_count).filter_map(move |doc_id| {
+        if seg.is_deleted(doc_id) {
+          return None;
+        }
+        Some(seg.get_doc(doc_id).and_then(|doc_json| {
+          let map = doc_json.as_object().ok_or_else(|| {
+            anyhow!(
+              "document {doc_id} in segment {} is not an object",
+              seg.meta.id
+            )
+          })?;
+          let fields = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+          Ok(crate::api::types::Document { fields })
+        }))
+      })
+    });
+
+    let writer = SegmentWriter::new(
+      &inner.path,
+      &schema,
+      inner.options.enable_positions,
+      cfg!(feature = "zstd"),
+      inner.storage.clone(),
+      write_binding.clone(),
+    );
+    let new_seg = writer.write_segment_from_iter(docs, generation)?;
+
+    // Build new manifest: keep non-merged segments, append the new merged one.
+    let old_merged_segments: Vec<crate::index::manifest::SegmentMeta> = manifest_snapshot
+      .segments
+      .iter()
+      .filter(|s| merge_set.contains(s.id.as_str()))
+      .cloned()
+      .collect();
+    let mut manifest_guard = inner.manifest.write();
+    manifest_guard.segments = manifest_snapshot
+      .segments
+      .iter()
+      .filter(|s| !merge_set.contains(s.id.as_str()))
+      .cloned()
+      .collect();
+    manifest_guard.segments.push(new_seg);
+    manifest_guard.committed_at = Utc::now().to_rfc3339();
+    manifest_guard.store(
+      inner.storage.as_ref(),
+      &Manifest::manifest_path(&inner.path),
+    )?;
+    drop(manifest_guard);
+
+    // Clean up old segment files.
+    cleanup_segments(inner.storage.as_ref(), &old_merged_segments)?;
     Ok(())
   }
 
@@ -365,6 +546,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "write-key")]
   fn compaction_requires_write_key_even_if_manifest_tampered() {
     use std::fs;
 
@@ -442,5 +624,176 @@ mod tests {
 
     // With correct key, compaction should succeed.
     idx_tampered.compact_with_key(Some(key)).unwrap();
+  }
+
+  #[test]
+  fn tiered_merge_selects_small_segments() {
+    use crate::index::merge::TieredMergePolicy;
+    use crate::index::manifest::{SegmentMeta, SegmentPaths};
+    use std::collections::HashMap;
+
+    let make_seg = |id: &str, doc_count: u32| -> SegmentMeta {
+      SegmentMeta {
+        id: id.to_string(),
+        generation: 1,
+        paths: SegmentPaths {
+          terms: String::new(),
+          postings: String::new(),
+          docstore: String::new(),
+          fast: String::new(),
+          meta: String::new(),
+          #[cfg(feature = "vectors")]
+          vector_dir: None,
+        },
+        doc_count,
+        max_doc_id: doc_count,
+        blockmax: false,
+        deleted_docs: Vec::new(),
+        avg_field_lengths: HashMap::new(),
+        checksums: HashMap::new(),
+        write_binding_b64: None,
+      }
+    };
+
+    let policy = TieredMergePolicy {
+      segments_per_tier: 3,
+      max_merge_at_once: 5,
+      floor_segment_docs: 1_000,
+      max_merged_segment_docs: 5_000_000,
+    };
+
+    // 6 small segments in the floor tier, threshold is 3.
+    let segments: Vec<_> = (0..6)
+      .map(|i| make_seg(&format!("s{i}"), 100 + i * 10))
+      .collect();
+    let merges = policy.find_merges(&segments);
+    assert_eq!(merges.len(), 1, "expected exactly one merge group");
+    assert_eq!(merges[0].len(), 5, "expected max_merge_at_once segments");
+    // The selected segments should be the 5 smallest.
+    assert_eq!(merges[0][0], "s0");
+    assert_eq!(merges[0][4], "s4");
+
+    // Fewer than segments_per_tier => no merge.
+    let small: Vec<_> = (0..3)
+      .map(|i| make_seg(&format!("s{i}"), 50))
+      .collect();
+    assert!(policy.find_merges(&small).is_empty());
+  }
+
+  #[test]
+  fn merge_segments_preserves_search() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Create 5 segments, each with one document.
+    let words = ["alpha", "bravo", "charlie", "delta", "echo"];
+    for (i, word) in words.iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 5);
+
+    // Pick the first 3 segments to merge.
+    let seg_ids: Vec<String> = idx
+      .manifest()
+      .segments
+      .iter()
+      .take(3)
+      .map(|s| s.id.clone())
+      .collect();
+    idx.merge_segments(&seg_ids, None).unwrap();
+
+    // Should now have 3 segments: 1 merged + 2 untouched.
+    let manifest = idx.manifest();
+    assert_eq!(manifest.segments.len(), 3);
+
+    // All 5 documents should still be searchable.
+    let reader = idx.reader().unwrap();
+    for word in &words {
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": word.to_string(),
+        "limit": 10,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(
+        result.total_hits_estimate, 1,
+        "expected 1 hit for '{word}', got {}",
+        result.total_hits_estimate
+      );
+    }
+  }
+
+  #[test]
+  fn commit_with_merge_reduces_segments() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Insert enough segments to trigger a merge with a low threshold.
+    // Default segments_per_tier is 10, floor_segment_docs is 1000.
+    // We'll create 12 segments with small doc counts (< 1000 each).
+    for i in 0..12 {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(format!("word{i}"))),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 12);
+
+    // Now do one more commit_with_merge(true) that should trigger auto merge.
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("_id".into(), serde_json::json!("doc_final")),
+          ("body".into(), serde_json::json!("final")),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    writer.commit_with_merge(true).unwrap();
+
+    // After auto merge, segment count should have decreased.
+    let final_count = idx.manifest().segments.len();
+    assert!(
+      final_count < 13,
+      "expected fewer than 13 segments after auto merge, got {final_count}"
+    );
+
+    // All 13 documents should still be searchable via match_all.
+    let reader = idx.reader().unwrap();
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": { "type": "match_all" },
+      "limit": 20,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+    let result = reader.search(&req).unwrap();
+    assert_eq!(
+      result.total_hits_estimate, 13,
+      "expected all 13 docs after merge, got {}",
+      result.total_hits_estimate
+    );
   }
 }
