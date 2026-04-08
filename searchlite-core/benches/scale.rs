@@ -35,7 +35,7 @@ fn build_index(count: usize, segments: usize, seed: u64) -> (Index, tempfile::Te
   };
   let idx = IndexBuilder::create(&path, schema, opts).unwrap();
 
-  let chunk_size = (count + segments - 1) / segments; // ceil division
+  let chunk_size = count.div_ceil(segments);
   for chunk in docs.chunks(chunk_size) {
     let mut writer = idx.writer().unwrap();
     for doc in chunk {

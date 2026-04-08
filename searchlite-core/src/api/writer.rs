@@ -137,8 +137,7 @@ impl IndexWriter {
             bail!("write key does not match segment binding; index may be tampered");
           }
         }
-        if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty())
-        {
+        if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
           bail!(
             "write key metadata missing but bindings exist; index metadata was likely tampered"
           );

@@ -628,8 +628,8 @@ mod tests {
 
   #[test]
   fn tiered_merge_selects_small_segments() {
-    use crate::index::merge::TieredMergePolicy;
     use crate::index::manifest::{SegmentMeta, SegmentPaths};
+    use crate::index::merge::TieredMergePolicy;
     use std::collections::HashMap;
 
     let make_seg = |id: &str, doc_count: u32| -> SegmentMeta {
@@ -674,9 +674,7 @@ mod tests {
     assert_eq!(merges[0][4], "s4");
 
     // Fewer than segments_per_tier => no merge.
-    let small: Vec<_> = (0..3)
-      .map(|i| make_seg(&format!("s{i}"), 50))
-      .collect();
+    let small: Vec<_> = (0..3).map(|i| make_seg(&format!("s{i}"), 50)).collect();
     assert!(policy.find_merges(&small).is_empty());
   }
 

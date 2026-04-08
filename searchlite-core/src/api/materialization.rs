@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use crate::api::pagination::encode_search_after_token;
 use crate::api::reader::{Hit, IndexReader, RankedHit};
 use crate::api::types::{CollapseRequest, SearchRequest};
-use crate::index::highlight::{highlight_fragments, HighlightOptions, make_snippet};
+use crate::index::highlight::{highlight_fragments, make_snippet, HighlightOptions};
 use crate::query::sort::SortPlan;
 
 use super::phrase::normalize_phrase_terms;

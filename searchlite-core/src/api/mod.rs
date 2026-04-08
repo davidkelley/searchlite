@@ -1,9 +1,9 @@
 pub mod builder;
 pub mod errors;
-pub mod query;
 mod materialization;
 mod pagination;
 mod phrase;
+pub mod query;
 mod query_eval;
 pub mod reader;
 mod scoring;

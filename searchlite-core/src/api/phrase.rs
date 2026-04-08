@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 
 use smallvec::SmallVec;
 
-use crate::analysis::analyzer::Analyzer;
 use super::term_expansion::build_term_key;
+use crate::analysis::analyzer::Analyzer;
 use crate::index::manifest::{FieldKind, Schema, SchemaAnalyzers};
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
@@ -106,7 +106,9 @@ pub(crate) fn normalize_phrase_terms(
   phrases.to_vec()
 }
 
-pub(crate) fn build_phrase_term_map(phrase_specs: &[PhraseSpec]) -> BTreeMap<String, Vec<Vec<String>>> {
+pub(crate) fn build_phrase_term_map(
+  phrase_specs: &[PhraseSpec],
+) -> BTreeMap<String, Vec<Vec<String>>> {
   let mut out = BTreeMap::new();
   for phrase in phrase_specs.iter() {
     for field in phrase.fields.iter() {
@@ -155,7 +157,10 @@ pub(crate) fn build_phrase_runtimes(
     .collect()
 }
 
-pub(crate) fn build_term_doc_lists(seg: &SegmentReader, term_groups: &[TermMatchGroup]) -> TermDocLists {
+pub(crate) fn build_term_doc_lists(
+  seg: &SegmentReader,
+  term_groups: &[TermMatchGroup],
+) -> TermDocLists {
   let mut lists = Vec::new();
   let mut indices: HashMap<String, usize> = HashMap::new();
   let mut group_lists = Vec::with_capacity(term_groups.len());

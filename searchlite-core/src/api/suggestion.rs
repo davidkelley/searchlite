@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 
-use crate::api::reader::IndexReader;
 use super::term_expansion::{
-  build_term_key, bounded_levenshtein, char_prefix, distance_weight,
-  DEFAULT_SUGGEST_SCAN, MAX_SUGGEST_CANDIDATES,
+  bounded_levenshtein, build_term_key, char_prefix, distance_weight, DEFAULT_SUGGEST_SCAN,
+  MAX_SUGGEST_CANDIDATES,
 };
+use crate::api::reader::IndexReader;
 use crate::api::types::{FuzzyOptions, SuggestOption, SuggestRequest, SuggestResult};
 use crate::index::manifest::FieldKind;
 use crate::index::segment::SegmentReader;

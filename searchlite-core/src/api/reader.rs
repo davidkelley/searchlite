@@ -9,9 +9,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter, HistogramAggregation,
-  IndexOptions, MgetDoc, Query, RescoreMode,
-  RescoreRequest, SearchRequest, SortOrder, SuggestResult,
+  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
+  HistogramAggregation, IndexOptions, MgetDoc, Query, RescoreMode, RescoreRequest, SearchRequest,
+  SortOrder, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -27,9 +27,7 @@ use crate::query::aggregation::AggregationPipeline;
 use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_seconds};
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
-use crate::query::planner::{
-  build_query_plan, QueryMatcher, ScorePlan,
-};
+use crate::query::planner::{build_query_plan, QueryMatcher, ScorePlan};
 use crate::query::sort::{SortKey, SortPlan};
 use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
@@ -214,11 +212,9 @@ fn compute_hybrid_score(
 }
 
 use super::scoring::{
-  compile_score_node, evaluate_compiled_score, has_custom_scoring,
-  CompiledScoreNode,
+  compile_score_node, evaluate_compiled_score, has_custom_scoring, CompiledScoreNode,
 };
 use super::term_expansion::{expand_term_groups, QualifiedTerm, WeightedTermEntry};
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct RankedHit {
@@ -273,7 +269,6 @@ fn push_ranked(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) {
   }
 }
 
-
 #[derive(Clone, Copy)]
 enum RootFilter<'a> {
   None,
@@ -307,8 +302,6 @@ struct SegmentSearchParams<'a> {
   collect_hits: Option<&'a mut dyn FnMut(SortKey, f32)>,
   stats: Option<&'a mut QueryStats>,
 }
-
-
 
 pub(crate) use super::query_eval::QueryEvaluator;
 
@@ -2119,7 +2112,6 @@ impl IndexReader {
     }
     Ok(())
   }
-
 }
 
 fn term_freq_for_doc(postings: &PostingsReader, doc_id: DocId) -> Option<f32> {
@@ -2963,7 +2955,6 @@ mod tests {
   use crate::query::wand::{execute_top_k_with_stats_and_mode_internal, ScoreMode, ScoredTerm};
   use serde_json::json;
   use std::collections::HashSet;
-
 
   #[test]
   fn search_after_round_trips_across_pages() {
