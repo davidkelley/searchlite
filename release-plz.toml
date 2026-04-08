@@ -3,3 +3,11 @@ publish = false
 git_release_enable = true
 git_tag_enable = true
 release_always = true
+
+# Node.js addon — published to npm, not crates.io
+[[package]]
+name = "searchlite-node"
+publish = false
+release = true
+git_release_enable = true
+git_tag_enable = true

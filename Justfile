@@ -14,3 +14,18 @@ fmt:
 
 lint:
   cargo clippy --all --all-features -- -D warnings
+
+build-node:
+  cd searchlite-node && npm run build
+
+test-node:
+  cd searchlite-node && npm test
+
+lint-node:
+  cd searchlite-node && npm run lint
+
+typecheck-node:
+  cd searchlite-node && npm run typecheck
+
+check-node:
+  cd searchlite-node && npm run lint && npm run typecheck && npm test

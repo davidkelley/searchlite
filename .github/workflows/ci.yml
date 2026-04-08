@@ -36,6 +36,54 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
+  test-node:
+    name: Node.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install dependencies
+        working-directory: searchlite-node
+        run: npm install
+      - name: Build native addon
+        working-directory: searchlite-node
+        run: npm run build:native:debug
+      - name: Build TypeScript
+        working-directory: searchlite-node
+        run: npm run build:ts
+      - name: Typecheck
+        working-directory: searchlite-node
+        run: npm run typecheck
+      - name: Lint
+        working-directory: searchlite-node
+        run: npm run lint
+      - name: Test
+        working-directory: searchlite-node
+        run: npm test
+      - name: Verify package contents
+        working-directory: searchlite-node
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack-output.txt
+          if ! grep -q '\.node' /tmp/pack-output.txt; then
+            echo "::warning::No .node binary found in package — expected in release builds only"
+          fi
+          grep -q 'dist/index.js' /tmp/pack-output.txt || { echo "::error::dist/index.js missing from package"; exit 1; }
+          grep -q 'dist/index.d.ts' /tmp/pack-output.txt || { echo "::error::dist/index.d.ts missing from package"; exit 1; }
+      - name: Version sync check
+        run: |
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          node_version=$(node -p "require('./searchlite-node/package.json').version")
+          if [ "$cargo_version" != "$node_version" ]; then
+            echo "::error::Version mismatch: Cargo.toml=$cargo_version package.json=$node_version"
+            exit 1
+          fi
+
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
