@@ -37,6 +37,8 @@ pub struct UpdateFixture {
   pub id: String,
   pub set: Map<String, Value>,
   pub unset: Vec<String>,
+  /// The field name that was modified (derived from schema).
+  pub updated_field: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +80,7 @@ fn load_dataset_fixture(root: &Path, dataset: DatasetName) -> Result<DatasetFixt
   let mut seed_docs = load_jsonl_docs(dataset_dir.as_path())?;
   sanitize_seed_docs(&mut seed_docs, &schema);
   let queries = load_query_fixtures(dataset_dir.as_path())?;
-  let mutations = derive_mutations(&seed_docs, &schema.doc_id_field);
+  let mutations = derive_mutations(&seed_docs, &schema.doc_id_field, &schema);
 
   Ok(DatasetFixture {
     schema,
@@ -152,7 +154,7 @@ fn load_query_fixtures(dataset_dir: &Path) -> Result<Vec<QueryFixture>> {
   Ok(queries)
 }
 
-fn derive_mutations(seed_docs: &[Value], doc_id_field: &str) -> MutationFixtures {
+fn derive_mutations(seed_docs: &[Value], doc_id_field: &str, schema: &Schema) -> MutationFixtures {
   let mut insert_docs = Vec::new();
   let mut delete_ids = Vec::new();
 
@@ -164,6 +166,12 @@ fn derive_mutations(seed_docs: &[Value], doc_id_field: &str) -> MutationFixtures
     delete_ids.push(id);
   }
 
+  let update_field = schema
+    .text_fields
+    .first()
+    .map(|f| f.name.clone())
+    .unwrap_or_else(|| "text".to_string());
+
   let mut update_docs = Vec::new();
   if let Some(first) = seed_docs.first() {
     let id = extract_doc_id(first, doc_id_field)
@@ -171,13 +179,14 @@ fn derive_mutations(seed_docs: &[Value], doc_id_field: &str) -> MutationFixtures
       .unwrap_or_else(|| "missing-id".to_string());
     let mut set = Map::new();
     set.insert(
-      "text".to_string(),
+      update_field.clone(),
       json!(format!("integration update marker for {id}")),
     );
     update_docs.push(UpdateFixture {
       id: id.clone(),
       set,
       unset: Vec::new(),
+      updated_field: update_field,
     });
   }
 

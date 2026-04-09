@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-use std::process::Command;
+mod common;
 
 use anyhow::Result;
 use serde_json::json;
@@ -35,58 +34,17 @@ fn ndjson_docs() -> &'static str {
   "{\"_id\":\"1\",\"body\":\"rust search\"}\n{\"_id\":\"2\",\"body\":\"another doc\"}\n"
 }
 
-fn searchlite_bin() -> PathBuf {
-  if let Ok(path) = std::env::var("CARGO_BIN_EXE_searchlite") {
-    return PathBuf::from(path);
-  }
-  if let Ok(path) = std::env::var("CARGO_BIN_EXE_searchlite-cli") {
-    return PathBuf::from(path);
-  }
-
-  let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .parent()
-    .expect("workspace root")
-    .to_path_buf();
-  let candidates = [
-    workspace_root
-      .join("target")
-      .join("debug")
-      .join(if cfg!(windows) {
-        "searchlite.exe"
-      } else {
-        "searchlite"
-      }),
-    workspace_root
-      .join("target")
-      .join("debug")
-      .join(if cfg!(windows) {
-        "searchlite-cli.exe"
-      } else {
-        "searchlite-cli"
-      }),
-  ];
-  for candidate in candidates {
-    if candidate.exists() {
-      return candidate;
-    }
-  }
-
-  let status = Command::new("cargo")
-    .arg("build")
-    .arg("-p")
-    .arg("searchlite-cli")
-    .current_dir(&workspace_root)
-    .status()
-    .expect("build searchlite binary");
-  assert!(status.success(), "building searchlite-cli failed");
-  workspace_root
-    .join("target")
-    .join("debug")
-    .join(if cfg!(windows) {
-      "searchlite-cli.exe"
-    } else {
-      "searchlite-cli"
-    })
+fn assert_smoke_hits(body: &serde_json::Value, surface_name: &str) {
+  let hits = body["hits"].as_array().expect("hits array");
+  assert!(!hits.is_empty(), "{surface_name}: expected non-empty hits");
+  let doc_ids: Vec<&str> = hits
+    .iter()
+    .filter_map(|h| h["doc_id"].as_str())
+    .collect();
+  assert!(
+    doc_ids.contains(&"1"),
+    "{surface_name}: search for 'rust' should return doc_id '1' (contains 'rust search'), got: {doc_ids:?}"
+  );
 }
 
 #[test]
@@ -97,33 +55,32 @@ fn surface_smoke_core_happy_path() -> Result<()> {
   harness.add_ndjson(ndjson_docs())?;
   harness.commit()?;
   let body = harness.search(&request_json())?;
-  let hits = body["hits"].as_array().expect("hits array");
-  assert!(!hits.is_empty());
+  assert_smoke_hits(&body, "Core");
   Ok(())
 }
 
 #[test]
 fn surface_smoke_cli_happy_path() -> Result<()> {
   let dir = tempdir()?;
-  let mut harness = CliHarness::new(searchlite_bin(), dir.path().join("idx-cli"));
+  let bin = common::searchlite_bin();
+  let mut harness = CliHarness::new(bin, dir.path().join("idx-cli"));
   harness.init(&schema_json())?;
   harness.add_ndjson(ndjson_docs())?;
   harness.commit()?;
   let body = harness.search(&request_json())?;
-  let hits = body["hits"].as_array().expect("hits array");
-  assert!(!hits.is_empty());
+  assert_smoke_hits(&body, "Cli");
   Ok(())
 }
 
 #[test]
 fn surface_smoke_http_happy_path() -> Result<()> {
   let dir = tempdir()?;
-  let mut harness = HttpHarness::new(searchlite_bin(), dir.path().join("idx-http"))?;
+  let bin = common::searchlite_bin();
+  let mut harness = HttpHarness::new(bin, dir.path().join("idx-http"))?;
   harness.init(&schema_json())?;
   harness.add_ndjson(ndjson_docs())?;
   harness.commit()?;
   let body = harness.search(&request_json())?;
-  let hits = body["hits"].as_array().expect("hits array");
-  assert!(!hits.is_empty());
+  assert_smoke_hits(&body, "Http");
   Ok(())
 }

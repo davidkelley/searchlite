@@ -1,5 +1,7 @@
 mod common;
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -79,6 +81,7 @@ fn run_lifecycle_case(
     harness.refresh(),
   );
 
+  // --- Search and validate hits ---
   let mut search_req = lifecycle_request(execution);
   let first = harness.search(&search_req)?;
   let first_hits = first["hits"].as_array().cloned().unwrap_or_default();
@@ -86,7 +89,16 @@ fn run_lifecycle_case(
     !first_hits.is_empty(),
     "expected non-empty hits for {dataset_name:?}/{surface:?}/{execution}"
   );
+  // Verify doc_ids are valid non-empty strings
+  for (i, hit) in first_hits.iter().enumerate() {
+    let doc_id = hit["doc_id"].as_str();
+    assert!(
+      doc_id.is_some_and(|s| !s.is_empty()),
+      "hit[{i}] missing valid doc_id for {dataset_name:?}/{surface:?}/{execution}"
+    );
+  }
 
+  // --- search_after pagination: verify pages are disjoint ---
   if capabilities.supports_search_after {
     if let Some(token) = first
       .get("next_search_after")
@@ -98,14 +110,22 @@ fn run_lifecycle_case(
       }
       let second = harness.search(&search_req)?;
       let second_hits = second["hits"].as_array().cloned().unwrap_or_default();
-      if let (Some(a), Some(b)) = (first_hits.first(), second_hits.first()) {
-        let first_id = a["doc_id"].as_str().unwrap_or_default();
-        let second_id = b["doc_id"].as_str().unwrap_or_default();
-        assert_ne!(first_id, second_id, "search_after should advance results");
-      }
+      let first_ids: HashSet<&str> = first_hits
+        .iter()
+        .filter_map(|h| h["doc_id"].as_str())
+        .collect();
+      let second_ids: HashSet<&str> = second_hits
+        .iter()
+        .filter_map(|h| h["doc_id"].as_str())
+        .collect();
+      assert!(
+        first_ids.is_disjoint(&second_ids),
+        "search_after pages should be disjoint for {dataset_name:?}/{surface:?}/{execution}: first={first_ids:?}, second={second_ids:?}"
+      );
     }
   }
 
+  // --- mget ---
   let mget_res = harness.mget(&dataset.mutations.mget_ids, true);
   if capabilities.supports_mget {
     let body = mget_res?;
@@ -115,6 +135,7 @@ fn run_lifecycle_case(
     assert_not_supported("mget", mget_res);
   }
 
+  // --- update + verify via mget ---
   let update = dataset
     .mutations
     .update_docs
@@ -129,10 +150,31 @@ fn run_lifecycle_case(
       capabilities.supports_refresh,
       harness.refresh(),
     );
+
+    // Verify updated field contains marker via mget
+    if capabilities.supports_mget {
+      let mget_after = harness.mget(std::slice::from_ref(&update.id), true)?;
+      let docs = mget_after["docs"].as_array().expect("mget docs");
+      assert!(
+        !docs.is_empty(),
+        "mget after update should return document for {dataset_name:?}/{surface:?}/{execution}"
+      );
+      if let Some(fields) = docs[0].get("fields").and_then(Value::as_object) {
+        if let Some(field_val) = fields.get(&update.updated_field) {
+          let text = field_val.as_str().unwrap_or_default();
+          assert!(
+            text.contains("integration update marker"),
+            "updated field '{}' should contain marker for {dataset_name:?}/{surface:?}/{execution}, got: {text}",
+            update.updated_field
+          );
+        }
+      }
+    }
   } else {
     assert_not_supported("update", update_res);
   }
 
+  // --- delete + verify absence ---
   let delete_res = harness.delete_ids(&dataset.mutations.delete_ids);
   if capabilities.supports_delete {
     delete_res?;
@@ -142,10 +184,32 @@ fn run_lifecycle_case(
       capabilities.supports_refresh,
       harness.refresh(),
     );
+
+    // Search with high limit to verify deleted IDs are absent
+    let post_delete = harness.search(&json!({
+      "query": { "type": "match_all" },
+      "limit": 100,
+      "return_hits": true,
+      "track_total_hits": true,
+      "execution": execution,
+    }))?;
+    let empty = vec![];
+    let post_delete_hits = post_delete["hits"].as_array().unwrap_or(&empty);
+    let post_delete_ids: Vec<&str> = post_delete_hits
+      .iter()
+      .filter_map(|h| h["doc_id"].as_str())
+      .collect();
+    for deleted_id in &dataset.mutations.delete_ids {
+      assert!(
+        !post_delete_ids.contains(&deleted_id.as_str()),
+        "deleted doc '{deleted_id}' should be absent for {dataset_name:?}/{surface:?}/{execution}"
+      );
+    }
   } else {
     assert_not_supported("delete", delete_res);
   }
 
+  // --- stats: verify document count > 0 ---
   let stats_res = harness.stats();
   if capabilities.supports_stats {
     let stats = stats_res?;
@@ -153,10 +217,16 @@ fn run_lifecycle_case(
       stats.get("documents").is_some(),
       "stats should expose documents field"
     );
+    let doc_count = stats["documents"].as_u64().unwrap_or(0);
+    assert!(
+      doc_count > 0,
+      "stats documents should be > 0 for {dataset_name:?}/{surface:?}/{execution}"
+    );
   } else {
     assert_not_supported("stats", stats_res);
   }
 
+  // --- inspect ---
   let inspect_res = harness.inspect();
   if capabilities.supports_inspect {
     let inspect = inspect_res?;
@@ -168,13 +238,15 @@ fn run_lifecycle_case(
     assert_not_supported("inspect", inspect_res);
   }
 
+  // --- compact + verify search still works ---
   let compact_res = harness.compact();
   if capabilities.supports_compact {
     compact_res?;
     let post_compact = harness.search(&lifecycle_request(execution))?;
+    let post_compact_hits = post_compact["hits"].as_array().cloned().unwrap_or_default();
     assert!(
-      post_compact["hits"].is_array(),
-      "search should still work after compact"
+      !post_compact_hits.is_empty(),
+      "search should return hits after compact for {dataset_name:?}/{surface:?}/{execution}"
     );
   } else {
     assert_not_supported("compact", compact_res);

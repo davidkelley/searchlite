@@ -18,12 +18,17 @@ pub struct HttpHarness {
   index_base_url: String,
   client: reqwest::blocking::Client,
   child: Child,
+  stderr_path: PathBuf,
 }
 
 impl HttpHarness {
   pub fn new(bin: PathBuf, index_path: PathBuf) -> Result<Self> {
     let port = portpicker::pick_unused_port().ok_or_else(|| anyhow!("failed to pick free port"))?;
     let bind = format!("127.0.0.1:{port}");
+
+    let stderr_path = index_path.with_extension("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path)
+      .with_context(|| format!("creating stderr log at {}", stderr_path.display()))?;
 
     let mut child = Command::new(&bin)
       .arg("http")
@@ -34,7 +39,7 @@ impl HttpHarness {
       .arg("--shutdown-grace-secs")
       .arg("0")
       .stdout(Stdio::null())
-      .stderr(Stdio::null())
+      .stderr(Stdio::from(stderr_file))
       .spawn()
       .with_context(|| format!("spawning HTTP server via {}", bin.display()))?;
 
@@ -54,6 +59,7 @@ impl HttpHarness {
       index_base_url,
       client,
       child,
+      stderr_path,
     })
   }
 
@@ -102,6 +108,12 @@ impl HttpHarness {
 
   pub fn index_base_url(&self) -> &str {
     self.index_base_url.as_str()
+  }
+
+  /// Read the HTTP server's stderr log. Useful for debugging server failures.
+  #[allow(dead_code)]
+  pub fn read_stderr_log(&self) -> String {
+    std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
   }
 }
 

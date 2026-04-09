@@ -5,7 +5,7 @@ pub mod http;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SurfaceKind {
   Core,
   Http,

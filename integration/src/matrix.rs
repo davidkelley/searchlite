@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 
 use crate::fixtures::{DatasetName, ExampleFixtures};
 use crate::surfaces::SurfaceKind;
@@ -149,10 +148,15 @@ fn include_case(mode: MatrixMode, id: &str) -> bool {
   }
 }
 
+/// FNV-1a 64-bit hash — deterministic across all platforms and Rust versions,
+/// unlike `DefaultHasher` which may change between releases.
 fn stable_hash(input: &str) -> usize {
-  let mut hasher = std::collections::hash_map::DefaultHasher::new();
-  input.hash(&mut hasher);
-  hasher.finish() as usize
+  let mut hash: u64 = 0xcbf29ce484222325;
+  for byte in input.as_bytes() {
+    hash ^= *byte as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+  }
+  hash as usize
 }
 
 pub fn assert_unique_ids(cases: &[FeatureMatrixCase]) {
