@@ -39,7 +39,7 @@ You can mount multiple indexes with repeated `--index` flags (e.g., `--index pro
 
 | Flag / Env Var | Default | Purpose |
 |---|---|---|
-| `--index` / `SEARCHLITE_INDEX_MAP` | -- | NAME:PATH index mounts (repeatable; semicolon-delimited for env). Per-index overrides: `--index "items:/data,auto_commit=30,auto_refresh=10,refresh_on_commit=true"` |
+| `--index` / `SEARCHLITE_INDEX_MAP` | -- | NAME:PATH index mounts (repeatable; semicolon-delimited for env). Per-index overrides: `--index "items:/data,auto_commit=30,auto_refresh=10"` |
 | `--alias` / `SEARCHLITE_INDEX_ALIASES` | -- | ALIAS:TARGET indirections (semicolon-delimited for env) |
 | `--bind` / `SEARCHLITE_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `--require-existing-index` | false | Fail at startup if manifest is missing |

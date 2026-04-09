@@ -17,8 +17,8 @@ All FFI functions that return `c_int` use the following codes:
 | `>= 0` | Success. For add functions: document count queued. For commit: `0` = success. |
 | `-1` | Null handle or null pointer argument. |
 | `-2` | Storage or commit failure (I/O error). |
-| `-3` | Writer creation failed (not write-key related). |
-| `-4` | Writer error (generic, non-write-key). |
+| `-3` | Commit failed to obtain or use the writer (not write-key related). |
+| `-4` | Add operation failed to obtain or use the writer (not write-key related). |
 | `-5` | Invalid UTF-8 or malformed JSON in input. |
 | `-6` | Parsed JSON is not an object (e.g., array or scalar passed to single-doc add). |
 | `-8` | Write key missing or invalid UTF-8 in write key argument. |
@@ -26,7 +26,7 @@ All FFI functions that return `c_int` use the following codes:
 
 ### FFI search buffer behavior
 
-`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`). If the result exceeds `buf_cap`, the output is silently truncated to `buf_cap - 1` bytes plus a null terminator. Always compare the returned byte count against the expected result size to detect truncation.
+`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`). If the result exceeds `buf_cap`, the output is silently truncated to `buf_cap - 1` bytes plus a null terminator. Treat a returned byte count equal to `buf_cap - 1` as potentially truncated and retry with a larger buffer.
 
 ## WASM
 

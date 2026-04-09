@@ -90,7 +90,7 @@
       "required": ["window_size", "query"],
       "properties": {
         "window_size": { "type": "integer", "minimum": 1, "description": "Number of top hits to rescore." },
-        "query": { "description": "Query node used for rescoring.", "anyOf": [{ "type": "string" }, { "type": "object" }] },
+        "query": { "description": "Structured query node used for rescoring (must include a \"type\" discriminator).", "type": "object", "required": ["type"] },
         "score_mode": { "type": "string", "enum": ["total", "multiply", "sum", "max", "min"], "default": "total" }
       }
     },

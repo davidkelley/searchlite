@@ -83,10 +83,10 @@ searchlite commit "$INDEX"
 
 ## 5) Run a search
 
-Search by query string. This example looks for “search” across all indexed text fields:
+Search by query string. This example looks for "search" across all indexed text fields:
 
 ```bash
-searchlite search “$INDEX” -q “search” --return-stored
+searchlite search "$INDEX" -q "search" --return-stored
 ```
 
 You should see hits with `_score`, `_id`, and stored fields.
