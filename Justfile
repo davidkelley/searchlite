@@ -6,6 +6,12 @@ build:
 test:
   cargo test --all --all-features
 
+test-integration-quick:
+  INTEGRATION_MODE=quick cargo test -p integration --all-features
+
+test-integration-full:
+  INTEGRATION_MODE=full cargo test -p integration --all-features
+
 bench:
   cargo bench -p searchlite-core
 
