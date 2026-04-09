@@ -58,7 +58,7 @@ Walk through ingesting a small JSONL file and running your first search in minut
 
 ## Compatibility and License
 
-- Rust 1.92.0+ (CI also checks stable, beta, nightly); Linux and macOS are primary targets.
+- Rust 1.88.0+ (CI also checks 1.92.0, stable, beta, nightly); Linux and macOS are primary targets.
 - MIT licensed.
 
 ## Who Will Like It

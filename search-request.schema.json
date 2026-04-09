@@ -226,10 +226,11 @@
     "range_agg": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["field", "keyed", "ranges"],
       "properties": {
         "type": { "const": "range" },
         "field": { "type": "string" },
-        "keyed": { "type": "boolean", "default": false, "description": "Return buckets as an object keyed by range key instead of an array." },
+        "keyed": { "type": "boolean", "description": "Return buckets as an object keyed by range key instead of an array." },
         "ranges": { "type": "array", "items": { "type": "object" } },
         "missing": { "description": "Value to use when the field is absent." },
         "sampling": { "$ref": "#/$defs/sampling" },
@@ -452,10 +453,11 @@
     "date_range_agg": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["field", "keyed", "ranges"],
       "properties": {
         "type": { "const": "date_range" },
         "field": { "type": "string" },
-        "keyed": { "type": "boolean", "default": false, "description": "Return buckets as an object keyed by range key instead of an array." },
+        "keyed": { "type": "boolean", "description": "Return buckets as an object keyed by range key instead of an array." },
         "format": { "type": "string", "description": "Date format string for bucket keys." },
         "ranges": {
           "type": "array",
