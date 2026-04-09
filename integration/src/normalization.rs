@@ -66,12 +66,7 @@ pub fn normalize_search_result(value: &Value) -> Result<NormalizedSearchResult> 
   let aggregation_structure: BTreeMap<String, Value> = value
     .get("aggregations")
     .and_then(Value::as_object)
-    .map(|aggs| {
-      aggs
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-    })
+    .map(|aggs| aggs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     .unwrap_or_default();
 
   let mut aggregation_keys: Vec<String> = aggregation_structure.keys().cloned().collect();

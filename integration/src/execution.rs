@@ -21,7 +21,13 @@ pub fn execute_matrix_case(
     .queries
     .iter()
     .find(|q| q.name == case.query_name)
-    .ok_or_else(|| anyhow!("[{}] query fixture '{}' not found", case.id, case.query_name))?;
+    .ok_or_else(|| {
+      anyhow!(
+        "[{}] query fixture '{}' not found",
+        case.id,
+        case.query_name
+      )
+    })?;
 
   let request = patch_request(query, case);
 

@@ -70,7 +70,10 @@ fn adversarial_invalid_schema_rejected_across_surfaces() -> Result<()> {
       .expect_err(&format!("{surface}: invalid schema should be rejected"));
     let msg = err.to_string().to_lowercase();
     assert!(
-      msg.contains("schema") || msg.contains("pars") || msg.contains("invalid") || msg.contains("missing"),
+      msg.contains("schema")
+        || msg.contains("pars")
+        || msg.contains("invalid")
+        || msg.contains("missing"),
       "{surface}: invalid schema error should mention schema/parsing, got: {msg}"
     );
     Ok(())
@@ -86,7 +89,10 @@ fn adversarial_malformed_ndjson_rejected_across_surfaces() -> Result<()> {
       .expect_err(&format!("{surface}: malformed NDJSON should be rejected"));
     let msg = err.to_string().to_lowercase();
     assert!(
-      msg.contains("json") || msg.contains("pars") || msg.contains("invalid") || msg.contains("expected"),
+      msg.contains("json")
+        || msg.contains("pars")
+        || msg.contains("invalid")
+        || msg.contains("expected"),
       "{surface}: malformed NDJSON error should mention JSON/parsing, got: {msg}"
     );
     Ok(())
@@ -108,13 +114,18 @@ fn adversarial_pagination_conflicts_are_rejected() -> Result<()> {
     harness.init(&valid_schema())?;
     harness.add_ndjson(docs_ndjson())?;
     harness.commit()?;
-    let err = harness
-      .search(&bad_request)
-      .expect_err(&format!("{surface}: conflicting pagination should be rejected"));
+    let err = harness.search(&bad_request).expect_err(&format!(
+      "{surface}: conflicting pagination should be rejected"
+    ));
     // Use the full error chain ({err:#}) since anyhow wraps the root cause
     let msg = format!("{err:#}").to_lowercase();
     assert!(
-      msg.contains("cursor") || msg.contains("search_after") || msg.contains("pagination") || msg.contains("conflict") || msg.contains("mutually") || msg.contains("exclusive"),
+      msg.contains("cursor")
+        || msg.contains("search_after")
+        || msg.contains("pagination")
+        || msg.contains("conflict")
+        || msg.contains("mutually")
+        || msg.contains("exclusive"),
       "{surface}: pagination conflict error should mention cursor/search_after, got: {msg}"
     );
     Ok(())
@@ -159,10 +170,8 @@ fn adversarial_delete_nonexistent_ids() -> Result<()> {
     harness.add_ndjson(docs_ndjson())?;
     harness.commit()?;
     // Delete IDs that never existed — should succeed silently (idempotent)
-    let result = harness.delete_ids(&[
-      "nonexistent-aaa".to_string(),
-      "nonexistent-bbb".to_string(),
-    ]);
+    let result =
+      harness.delete_ids(&["nonexistent-aaa".to_string(), "nonexistent-bbb".to_string()]);
     if let Err(err) = &result {
       // Only accept unsupported errors (CLI may not support delete in some configs)
       assert!(

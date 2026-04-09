@@ -42,7 +42,10 @@ pub fn assert_normalized_search_parity(
   // Compare aggregation structure: keys must match, and bucket keys/types must match.
   // We do NOT require exact numeric equality since floating-point arithmetic may
   // differ slightly between the Core and HTTP surfaces.
-  if !agg_structures_compatible(&left_norm.aggregation_structure, &right_norm.aggregation_structure) {
+  if !agg_structures_compatible(
+    &left_norm.aggregation_structure,
+    &right_norm.aggregation_structure,
+  ) {
     return Err(anyhow!(
       "aggregation structure mismatch for {dataset:?}/{query_name}: left keys={:?}, right keys={:?}",
       left_norm.aggregation_keys,
@@ -160,7 +163,7 @@ fn values_structurally_compatible(left: &Value, right: &Value) -> bool {
     (Value::Bool(l), Value::Bool(r)) => l == r,
     (Value::Null, Value::Null) => true,
     (Value::Number(_), Value::Number(_)) => true, // allow numeric differences
-    _ => false, // type mismatch
+    _ => false,                                   // type mismatch
   }
 }
 
@@ -214,9 +217,7 @@ pub fn assert_search_result_properties(
   for (i, hit) in hits.iter().enumerate() {
     let doc_id = hit.get("doc_id").and_then(Value::as_str);
     if doc_id.is_none_or(|s| s.is_empty()) {
-      return Err(anyhow!(
-        "[{case_id}] hit[{i}] has missing or empty doc_id"
-      ));
+      return Err(anyhow!("[{case_id}] hit[{i}] has missing or empty doc_id"));
     }
 
     if expect_stored {

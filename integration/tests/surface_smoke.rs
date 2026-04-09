@@ -37,10 +37,7 @@ fn ndjson_docs() -> &'static str {
 fn assert_smoke_hits(body: &serde_json::Value, surface_name: &str) {
   let hits = body["hits"].as_array().expect("hits array");
   assert!(!hits.is_empty(), "{surface_name}: expected non-empty hits");
-  let doc_ids: Vec<&str> = hits
-    .iter()
-    .filter_map(|h| h["doc_id"].as_str())
-    .collect();
+  let doc_ids: Vec<&str> = hits.iter().filter_map(|h| h["doc_id"].as_str()).collect();
   assert!(
     doc_ids.contains(&"1"),
     "{surface_name}: search for 'rust' should return doc_id '1' (contains 'rust search'), got: {doc_ids:?}"

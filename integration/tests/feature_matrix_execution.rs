@@ -25,13 +25,14 @@ fn feature_matrix_execution() -> Result<()> {
   let searchlite_bin = common::searchlite_bin();
 
   if cases.is_empty() {
-    eprintln!("feature_matrix_execution: no cases to run (check INTEGRATION_MODE and shard config)");
+    eprintln!(
+      "feature_matrix_execution: no cases to run (check INTEGRATION_MODE and shard config)"
+    );
     return Ok(());
   }
 
   // Group cases by (dataset, surface) to share expensive harness setup.
-  let mut groups: BTreeMap<(DatasetName, SurfaceKind), Vec<&FeatureMatrixCase>> =
-    BTreeMap::new();
+  let mut groups: BTreeMap<(DatasetName, SurfaceKind), Vec<&FeatureMatrixCase>> = BTreeMap::new();
   for case in &cases {
     groups
       .entry((case.dataset, case.surface))
@@ -54,8 +55,8 @@ fn feature_matrix_execution() -> Result<()> {
     let mut harness = build_harness(*surface, index_path, searchlite_bin.clone())?;
 
     // Seed the index
-    let schema_json = serde_json::to_value(&dataset.schema)
-      .context("serializing schema for matrix execution")?;
+    let schema_json =
+      serde_json::to_value(&dataset.schema).context("serializing schema for matrix execution")?;
     let seed_docs = match mode {
       MatrixMode::Full => &dataset.seed_docs[..],
       MatrixMode::Quick => {
@@ -88,9 +89,13 @@ fn feature_matrix_execution() -> Result<()> {
 
       // Apply lifecycle mutations if we need to advance to a later stage
       if lifecycle_order(target_stage) > lifecycle_order(applied_stage) {
-        if let Err(err) =
-          advance_lifecycle(&mut *harness, applied_stage, target_stage, dataset, &capabilities)
-        {
+        if let Err(err) = advance_lifecycle(
+          &mut *harness,
+          applied_stage,
+          target_stage,
+          dataset,
+          &capabilities,
+        ) {
           // If we cannot advance (e.g., surface doesn't support update), skip cases at this stage
           skipped += 1;
           eprintln!(
