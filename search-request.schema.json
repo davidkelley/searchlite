@@ -53,7 +53,17 @@
     },
     "execution": { "type": "string", "enum": ["bm25", "wand", "bmw"], "default": "wand" },
     "bmw_block_size": { "type": ["integer", "null"], "minimum": 1 },
-    "fuzzy": { "type": ["object", "null"], "description": "Fuzzy matching options." },
+    "fuzzy": {
+      "type": ["object", "null"],
+      "description": "Fuzzy matching options.",
+      "additionalProperties": false,
+      "properties": {
+        "max_edits": { "type": "integer", "minimum": 0, "maximum": 2, "default": 1 },
+        "prefix_length": { "type": "integer", "minimum": 0, "default": 1 },
+        "max_expansions": { "type": "integer", "minimum": 1, "default": 50 },
+        "min_length": { "type": "integer", "minimum": 0, "default": 3 }
+      }
+    },
     "track_total_hits": {
       "type": ["boolean", "null"],
       "default": null,
@@ -73,7 +83,17 @@
       "default": {}
     },
     "suggest": { "type": "object", "description": "Completion suggest requests keyed by name.", "default": {} },
-    "rescore": { "type": ["object", "null"], "description": "Optional rescore query applied to the top window." },
+    "rescore": {
+      "type": ["object", "null"],
+      "description": "Optional rescore query applied to the top window.",
+      "additionalProperties": false,
+      "required": ["window_size", "query"],
+      "properties": {
+        "window_size": { "type": "integer", "minimum": 1, "description": "Number of top hits to rescore." },
+        "query": { "description": "Query node used for rescoring.", "anyOf": [{ "type": "string" }, { "type": "object" }] },
+        "score_mode": { "type": "string", "enum": ["total", "multiply", "sum", "max", "min"], "default": "total" }
+      }
+    },
     "explain": { "type": "boolean", "default": false },
     "profile": { "type": "boolean", "default": false }
   },
@@ -85,7 +105,7 @@
       "required": ["field"],
       "properties": {
         "field": { "type": "string", "description": "Field name or `_score`." },
-        "order": { "type": "string", "enum": ["asc", "desc"], "default": "asc" }
+        "order": { "type": "string", "enum": ["asc", "desc"], "description": "Sort direction. Omit for the field default (descending for `_score`, ascending for others)." }
       }
     },
     "highlight": {
@@ -142,6 +162,7 @@
             { "$ref": "#/$defs/significant_terms_agg" },
             { "$ref": "#/$defs/rare_terms_agg" },
             { "$ref": "#/$defs/range_agg" },
+            { "$ref": "#/$defs/date_range_agg" },
             { "$ref": "#/$defs/histogram_agg" },
             { "$ref": "#/$defs/date_histogram_agg" },
             { "$ref": "#/$defs/filter_agg" },
@@ -170,7 +191,9 @@
         "type": { "const": "terms" },
         "field": { "type": "string" },
         "size": { "type": "integer", "minimum": 0 },
+        "shard_size": { "type": "integer", "minimum": 0, "description": "Over-sample factor for more accurate term counts." },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "missing": { "description": "Value to use when the field is absent." },
         "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
@@ -206,7 +229,9 @@
       "properties": {
         "type": { "const": "range" },
         "field": { "type": "string" },
+        "keyed": { "type": "boolean", "default": false, "description": "Return buckets as an object keyed by range key instead of an array." },
         "ranges": { "type": "array", "items": { "type": "object" } },
+        "missing": { "description": "Value to use when the field is absent." },
         "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
@@ -220,6 +245,9 @@
         "interval": { "type": "number" },
         "offset": { "type": "number" },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "extended_bounds": { "$ref": "#/$defs/histogram_bounds", "description": "Force empty buckets to be emitted outside the data range." },
+        "hard_bounds": { "$ref": "#/$defs/histogram_bounds", "description": "Clip data to stay within these bounds before bucketing." },
+        "missing": { "type": "number", "description": "Value to substitute when the field is absent." },
         "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
@@ -233,7 +261,11 @@
         "calendar_interval": { "type": "string" },
         "fixed_interval": { "type": "string" },
         "offset": { "type": "string" },
+        "format": { "type": "string", "description": "Date format string for bucket keys." },
         "min_doc_count": { "type": "integer", "minimum": 0 },
+        "extended_bounds": { "$ref": "#/$defs/date_histogram_bounds", "description": "Force empty buckets outside the data range." },
+        "hard_bounds": { "$ref": "#/$defs/date_histogram_bounds", "description": "Clip data to stay within these bounds." },
+        "missing": { "type": "string", "description": "Date string to substitute when the field is absent." },
         "sampling": { "$ref": "#/$defs/sampling" },
         "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
       }
@@ -287,13 +319,18 @@
       "additionalProperties": false,
       "properties": {
         "type": { "enum": ["stats", "extended_stats"] },
-        "field": { "type": "string" }
+        "field": { "type": "string" },
+        "missing": { "description": "Value to use when the field is absent." }
       }
     },
     "value_count_agg": {
       "type": "object",
       "additionalProperties": false,
-      "properties": { "type": { "const": "value_count" }, "field": { "type": "string" } }
+      "properties": {
+        "type": { "const": "value_count" },
+        "field": { "type": "string" },
+        "missing": { "description": "Value to use when the field is absent." }
+      }
     },
     "top_hits_agg": {
       "type": "object",
@@ -303,6 +340,7 @@
         "size": { "type": "integer", "minimum": 0 },
         "from": { "type": "integer", "minimum": 0 },
         "fields": { "type": "array", "items": { "type": "string" } },
+        "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
         "highlight_field": { "type": "string" }
       }
     },
@@ -410,6 +448,49 @@
         "seed": { "type": "integer", "minimum": 0 }
       },
       "description": "Per-aggregation sampling (specify either size or probability)."
+    },
+    "date_range_agg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "date_range" },
+        "field": { "type": "string" },
+        "keyed": { "type": "boolean", "default": false, "description": "Return buckets as an object keyed by range key instead of an array." },
+        "format": { "type": "string", "description": "Date format string for bucket keys." },
+        "ranges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string" },
+              "from": { "type": "string", "description": "Start date (ISO format)." },
+              "to": { "type": "string", "description": "End date (ISO format)." }
+            }
+          }
+        },
+        "missing": { "description": "Value to use when the field is absent." },
+        "sampling": { "$ref": "#/$defs/sampling" },
+        "aggs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/aggregation" }, "default": {} }
+      }
+    },
+    "histogram_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      }
+    },
+    "date_histogram_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "string", "description": "ISO date string." },
+        "max": { "type": "string", "description": "ISO date string." }
+      }
     },
     "sort_direction": { "type": "string", "enum": ["asc", "desc"] }
   }

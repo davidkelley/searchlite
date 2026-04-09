@@ -27,8 +27,8 @@ docker run --rm -p 8080:8080 -v "$PWD:/data" \
   ghcr.io/davidkelley/searchlite:latest \
   http --index default:/data --bind 0.0.0.0:8080
 
-# Environment variables (useful in containers)
-SEARCHLITE_INDEX_MAP=default:/data \
+# Environment variables (useful in containers; semicolon-delimited)
+SEARCHLITE_INDEX_MAP="default:/data" \
 SEARCHLITE_BIND_ADDR=0.0.0.0:8080 \
 searchlite http --refresh-on-commit
 ```
@@ -39,10 +39,12 @@ You can mount multiple indexes with repeated `--index` flags (e.g., `--index pro
 
 | Flag / Env Var | Default | Purpose |
 |---|---|---|
-| `--index` / `SEARCHLITE_INDEX_MAP` | -- | NAME:PATH index mounts (repeatable, comma-delimited for env) |
-| `--alias` / `SEARCHLITE_INDEX_ALIASES` | -- | ALIAS:TARGET indirections |
+| `--index` / `SEARCHLITE_INDEX_MAP` | -- | NAME:PATH index mounts (repeatable; semicolon-delimited for env). Per-index overrides: `--index "items:/data,auto_commit=30,auto_refresh=10,refresh_on_commit=true"` |
+| `--alias` / `SEARCHLITE_INDEX_ALIASES` | -- | ALIAS:TARGET indirections (semicolon-delimited for env) |
 | `--bind` / `SEARCHLITE_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `--require-existing-index` | false | Fail at startup if manifest is missing |
+| `--auto-commit-interval-secs` / `SEARCHLITE_AUTO_COMMIT_INTERVAL_SECS` | `0` (disabled) | Global auto-commit interval. Disabled on write-key-protected indexes |
+| `--auto-refresh-interval-secs` / `SEARCHLITE_AUTO_REFRESH_INTERVAL_SECS` | `0` (disabled) | Global auto-refresh interval |
 | `--max-body-bytes` | -- | Max request body size |
 | `--max-concurrency` | -- | Max concurrent requests |
 | `--request-timeout-secs` | -- | Per-request timeout |
@@ -73,6 +75,7 @@ All errors return `{"error": {"type": "...", "reason": "..."}}`.
 | Method | Endpoint | Purpose |
 |---|---|---|
 | POST | `/indexes/{name}/search` | Full-text search with filters, aggregations, highlighting |
+| POST | `/indexes/{name}/multi_search` | Batch multiple searches in one request |
 | POST | `/indexes/{name}/mget` | Fetch documents by ID |
 
 ### Document updates
@@ -154,6 +157,25 @@ curl -XPOST http://localhost:8080/indexes/products/update \
   -H 'Content-Type: application/json' \
   -d '{"id": "product-1", "set": {"in_stock": true, "price_cents": 2499}, "unset": ["sale_label"]}'
 ```
+
+### Multi-search
+
+Batch multiple queries in one request. `parallel: true` runs them concurrently (default: sequential); `max_concurrency` caps parallelism (default 4, max 16).
+
+```bash
+curl -XPOST http://localhost:8080/indexes/products/multi_search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "searches": [
+      {"query": "wireless headphones", "limit": 5},
+      {"query": "bluetooth speakers", "limit": 3}
+    ],
+    "parallel": true,
+    "max_concurrency": 4
+  }'
+```
+
+The response wraps results in `{"results": [...]}` with one `SearchResult` per input query.
 
 ### Maintenance
 
