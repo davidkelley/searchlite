@@ -328,10 +328,7 @@ fn random_date(rng: &mut impl Rng) -> String {
 
   // Simple date calculation from days since 1970-01-01
   let (year, month, day) = days_to_ymd(days_since_epoch);
-  format!(
-    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-    year, month, day, hours, minutes, seconds
-  )
+  format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).

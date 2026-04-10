@@ -32,9 +32,9 @@ impl IndexBuilder {
     opts: IndexOptions,
   ) -> anyhow::Result<Index> {
     let data = fs::read_to_string(schema_path)
-      .with_context(|| format!("reading schema file {:?}", schema_path))?;
+      .with_context(|| format!("reading schema file {schema_path:?}"))?;
     let schema: Schema = serde_json::from_str(&data)
-      .with_context(|| format!("parsing schema file {:?}", schema_path))?;
+      .with_context(|| format!("parsing schema file {schema_path:?}"))?;
     Self::create(path, schema, opts)
   }
 

@@ -346,9 +346,9 @@ impl ManagedIndex {
         let (loaded_committed_at, loaded_doc_count) = tokio::task::spawn_blocking(move || {
           let manifest_path = Manifest::manifest_path(&path);
           let bytes = std::fs::read(&manifest_path)
-            .with_context(|| format!("reading manifest metadata at {:?}", manifest_path))?;
+            .with_context(|| format!("reading manifest metadata at {manifest_path:?}"))?;
           let manifest: Manifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing manifest metadata at {:?}", manifest_path))?;
+            .with_context(|| format!("parsing manifest metadata at {manifest_path:?}"))?;
           let (live_docs, _) = manifest_doc_counts(&manifest);
           Ok::<(String, u64), anyhow::Error>((manifest.committed_at.clone(), live_docs))
         })
@@ -523,7 +523,7 @@ impl IndexRegistry {
       cursor = target;
     }
     self.indexes.get(cursor).cloned().ok_or_else(|| {
-      HttpError::not_found("unknown_index", format!("index `{}` not registered", name))
+      HttpError::not_found("unknown_index", format!("index `{name}` not registered"))
     })
   }
 
@@ -540,19 +540,13 @@ impl IndexRegistry {
         }
         if !visited.insert(cursor.to_string()) {
           anyhow::bail!(
-            "alias cycle detected involving `{}` while validating alias `{}`",
-            cursor,
-            alias_name
+            "alias cycle detected involving `{cursor}` while validating alias `{alias_name}`"
           );
         }
         match aliases.get(cursor) {
           Some(next) => cursor = next,
           None => {
-            anyhow::bail!(
-              "alias `{}` targets unknown index or alias `{}`",
-              alias_name,
-              initial_target
-            );
+            anyhow::bail!("alias `{alias_name}` targets unknown index or alias `{initial_target}`");
           }
         }
       }
@@ -682,9 +676,9 @@ impl MaintenanceRuntime {
     }
     let manifest_path = Manifest::manifest_path(&managed.path);
     let bytes = std::fs::read(&manifest_path)
-      .with_context(|| format!("reading manifest metadata at {:?}", manifest_path))?;
+      .with_context(|| format!("reading manifest metadata at {manifest_path:?}"))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
-      .with_context(|| format!("parsing manifest metadata at {:?}", manifest_path))?;
+      .with_context(|| format!("parsing manifest metadata at {manifest_path:?}"))?;
     if write_key_required(&manifest) {
       anyhow::bail!(
         "index `{}` requires a write key; disable auto-commit for this index or remove write-key protection",
@@ -1030,8 +1024,7 @@ async fn map_413(max_body: usize, req: Request, next: Next) -> Response {
       "body_too_large",
       StatusCode::PAYLOAD_TOO_LARGE,
       anyhow::anyhow!(format!(
-        "request body exceeded configured limit of {} bytes",
-        max_body
+        "request body exceeded configured limit of {max_body} bytes"
       )),
     )
     .into_response();
@@ -1249,7 +1242,7 @@ async fn add_ndjson(
       let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
         HttpError::bad_request(
           "invalid_document",
-          format!("invalid JSON document on NDJSON line {}: {e}", line_number),
+          format!("invalid JSON document on NDJSON line {line_number}: {e}"),
         )
       })?;
 
@@ -1470,7 +1463,7 @@ async fn update_document(
   if let Err(err) = validate_doc_id(&body.id) {
     return Err(HttpError::bad_request(
       "invalid_id",
-      format!("invalid document id: {}", err),
+      format!("invalid document id: {err}"),
     ));
   }
   let managed = state.registry().resolve(&index_name)?;
@@ -1701,15 +1694,14 @@ async fn bulk_update(
         let action: BulkUpdateAction = serde_json::from_str(trimmed).map_err(|e| {
           HttpError::bad_request(
             "invalid_bulk_update",
-            format!("invalid update action on NDJSON line {}: {e}", line_number),
+            format!("invalid update action on NDJSON line {line_number}: {e}"),
           )
         })?;
         if let Err(err) = validate_doc_id(&action.update.id) {
           return Err(HttpError::bad_request(
             "invalid_bulk_update",
             format!(
-              "invalid update action on NDJSON line {}: invalid document id: {}",
-              line_number, err
+              "invalid update action on NDJSON line {line_number}: invalid document id: {err}"
             ),
           ));
         }
@@ -1718,7 +1710,7 @@ async fn bulk_update(
         let patch: BulkUpdatePatch = serde_json::from_str(trimmed).map_err(|e| {
           HttpError::bad_request(
             "invalid_bulk_update",
-            format!("invalid update body on NDJSON line {}: {e}", line_number),
+            format!("invalid update body on NDJSON line {line_number}: {e}"),
           )
         })?;
         let id = pending_action
@@ -2322,7 +2314,7 @@ fn validate_ids(ids: &[String]) -> ApiResult<()> {
     if let Err(err) = validate_doc_id(id) {
       return Err(HttpError::bad_request(
         "invalid_id",
-        format!("id at position {} is invalid: {}", idx, err),
+        format!("id at position {idx} is invalid: {err}"),
       ));
     }
   }
@@ -2424,8 +2416,8 @@ mod tests {
     let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
-    let base = format!("http://{}", addr);
-    let index_base = format!("{}/indexes/{}", base, INDEX_NAME);
+    let base = format!("http://{addr}");
+    let index_base = format!("{base}/indexes/{INDEX_NAME}");
     (client, base, index_base, handle, state, args)
   }
 
@@ -2640,7 +2632,7 @@ mod tests {
     let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state).await.unwrap();
     let client = Client::new();
-    let base = format!("http://{}", addr);
+    let base = format!("http://{addr}");
     let index_base = format!("{base}/indexes/{INDEX_NAME}");
 
     client
@@ -3108,7 +3100,7 @@ mod tests {
     let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
-    let base = format!("http://{}", addr);
+    let base = format!("http://{addr}");
     let index_base = format!("{base}/indexes/{INDEX_NAME}");
 
     let schema: Schema = serde_json::from_value(json!({
@@ -3918,7 +3910,7 @@ mod tests {
     let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
-    let base = format!("http://{}", addr);
+    let base = format!("http://{addr}");
     let index_base = format!("{base}/indexes/{INDEX_NAME}");
 
     client
@@ -4265,7 +4257,7 @@ mod tests {
     // Create 2500 documents (2 full batches + 1 partial)
     let mut ndjson = String::new();
     for i in 0..2500 {
-      ndjson.push_str(&format!("{{\"_id\":\"{}\",\"body\":\"doc {}\"}}\n", i, i));
+      ndjson.push_str(&format!("{{\"_id\":\"{i}\",\"body\":\"doc {i}\"}}\n"));
     }
 
     let res = client
@@ -4468,7 +4460,7 @@ mod tests {
     let state = build_app_state(registry).unwrap();
     let (addr, handle) = spawn_server(args.clone(), state.clone()).await.unwrap();
     let client = Client::new();
-    let base = format!("http://{}", addr);
+    let base = format!("http://{addr}");
     let index_base = format!("{base}/indexes/alias");
 
     client

@@ -988,7 +988,7 @@ impl IndexReader {
       let seg = self
         .segments
         .get(seg_ord as usize)
-        .ok_or_else(|| anyhow::anyhow!("missing segment {}", seg_ord))?;
+        .ok_or_else(|| anyhow::anyhow!("missing segment {seg_ord}"))?;
       let key = sort_plan.build_key(seg, doc_id, final_score, seg_ord);
       if let Some(cur) = cursor_key {
         let ord = key.cmp(cur);
@@ -1080,10 +1080,7 @@ impl IndexReader {
       .unwrap_or(0);
     let page_cap = from.saturating_add(req.limit);
     if req.return_hits && page_cap > MAX_PAGE_SIZE {
-      bail!(
-        "from + size exceeds max page size {}; adjust pagination",
-        MAX_PAGE_SIZE
-      );
+      bail!("from + size exceeds max page size {MAX_PAGE_SIZE}; adjust pagination");
     }
     let default_fields: Vec<String> = if let Some(fields) = &req.fields {
       fields.clone()
@@ -1560,7 +1557,7 @@ impl IndexReader {
         let seg = self
           .segments
           .get(*seg_idx)
-          .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+          .ok_or_else(|| anyhow::anyhow!("segment {seg_idx} missing for mget"))?;
         if seg.is_deleted(*doc_idx) {
           continue;
         }
@@ -1573,7 +1570,7 @@ impl IndexReader {
       let seg = self
         .segments
         .get(seg_idx)
-        .ok_or_else(|| anyhow::anyhow!("segment {} missing for mget", seg_idx))?;
+        .ok_or_else(|| anyhow::anyhow!("segment {seg_idx} missing for mget"))?;
       let source = if return_stored {
         Some(seg.get_doc(doc_idx)?)
       } else {
@@ -3688,9 +3685,7 @@ mod tests {
     assert_eq!(
       seen_matches.len(),
       5,
-      "accepted: {:?}, ranked: {:?}",
-      seen_matches,
-      ranked_ids
+      "accepted: {seen_matches:?}, ranked: {ranked_ids:?}"
     );
     let res = reader
       .search(&SearchRequest {
@@ -3745,7 +3740,7 @@ mod tests {
       })
       .unwrap();
     let ids: Vec<_> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert_eq!(ids.len(), 5, "hits: {:?}", ids);
+    assert_eq!(ids.len(), 5, "hits: {ids:?}");
   }
 
   #[test]
@@ -4104,9 +4099,7 @@ mod tests {
     let total_candidates: usize = plan.clauses.iter().map(|c| c.candidate_size).sum();
     assert!(
       total_candidates <= DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,
-      "total vector candidates {} exceeds cap {}",
-      total_candidates,
-      DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+      "total vector candidates {total_candidates} exceeds cap {DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES}"
     );
     assert!(
       plan.candidate_size <= DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,

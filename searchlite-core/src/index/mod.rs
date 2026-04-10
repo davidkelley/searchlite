@@ -115,7 +115,7 @@ impl Index {
       m.store(storage.as_ref(), &manifest_path)?;
       m
     } else {
-      bail!("index does not exist at {:?}", manifest_path);
+      bail!("index does not exist at {manifest_path:?}");
     };
     let inner = Arc::new(InnerIndex {
       path: opts.path.clone(),

@@ -83,11 +83,7 @@ impl<R: Read + Seek> DocStoreReader<R> {
     self.file.read_exact(&mut len_bytes)?;
     let len = u32::from_le_bytes(len_bytes) as usize;
     if len > MAX_DOCSTORE_BYTES {
-      bail!(
-        "stored document length {} exceeds maximum {}",
-        len,
-        MAX_DOCSTORE_BYTES
-      );
+      bail!("stored document length {len} exceeds maximum {MAX_DOCSTORE_BYTES}");
     }
     let mut buf = vec![0u8; len];
     self.file.read_exact(&mut buf)?;

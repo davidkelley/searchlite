@@ -204,7 +204,7 @@ impl FastFieldsWriter {
             }
             entries[idx] = vec![v];
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::F64(v) => {
@@ -225,7 +225,7 @@ impl FastFieldsWriter {
             }
             entries[idx] = vec![v];
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::I64List(values) => {
@@ -252,7 +252,7 @@ impl FastFieldsWriter {
             list_entries[idx] = values;
             *col = ColumnBuilder::I64List(list_entries);
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::I64Nested { object, values } => {
@@ -271,7 +271,7 @@ impl FastFieldsWriter {
             }
             doc_entries[object] = values;
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::F64List(values) => {
@@ -298,7 +298,7 @@ impl FastFieldsWriter {
             list_entries[idx] = values;
             *col = ColumnBuilder::F64List(list_entries);
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::F64Nested { object, values } => {
@@ -317,7 +317,7 @@ impl FastFieldsWriter {
             }
             doc_entries[object] = values;
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::Str(v) => {
@@ -331,7 +331,7 @@ impl FastFieldsWriter {
             let single = [v];
             builder.push(idx, &single);
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::StrList(values) => {
@@ -356,7 +356,7 @@ impl FastFieldsWriter {
             list_builder.push(idx, &values);
             *col = ColumnBuilder::StrList(list_builder);
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::StrNested { object, values } => {
@@ -366,7 +366,7 @@ impl FastFieldsWriter {
           .or_insert_with(|| ColumnBuilder::StrNested(StrNestedColumnBuilder::default()));
         match col {
           ColumnBuilder::StrNested(builder) => builder.push(idx, object, &values),
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::NestedCount { objects } => {
@@ -381,7 +381,7 @@ impl FastFieldsWriter {
             }
             counts[idx] = objects as u32;
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
       FastValue::NestedParent { object, parent } => {
@@ -400,7 +400,7 @@ impl FastFieldsWriter {
             }
             doc_entries[object] = parent as u32;
           }
-          _ => panic!("fast field type mismatch for {}", field),
+          _ => panic!("fast field type mismatch for {field}"),
         }
       }
     }

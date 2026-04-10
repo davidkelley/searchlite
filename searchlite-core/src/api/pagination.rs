@@ -72,10 +72,7 @@ impl PaginationCursor {
     let doc_id = u32::from_be_bytes(bytes[13..17].try_into().unwrap());
     let returned = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
     if returned as usize > MAX_CURSOR_ADVANCE {
-      bail!(
-        "cursor requests {} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}",
-        returned
-      );
+      bail!("cursor requests {returned} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}");
     }
     Ok(Self {
       version,
@@ -222,7 +219,7 @@ pub(crate) fn decode_search_after_token(
   let segment_ord = parse_segment_ord(seg_value)?;
   let seg = segments
     .get(segment_ord as usize)
-    .ok_or_else(|| anyhow::anyhow!("search_after segment_ord {} out of range", segment_ord))?;
+    .ok_or_else(|| anyhow::anyhow!("search_after segment_ord {segment_ord} out of range"))?;
   let doc_id_str = match doc_id_value {
     serde_json::Value::String(s) => s.clone(),
     serde_json::Value::Number(n) => n.to_string(),

@@ -192,7 +192,7 @@ impl Storage for InMemoryStorage {
 
   fn open_read(&self, path: &Path) -> Result<DynFile> {
     if !self.exists(path) {
-      return Err(anyhow!("file {:?} missing in memory storage", path));
+      return Err(anyhow!("file {path:?} missing in memory storage"));
     }
     self.open_with_mode(path, false, false)
   }
@@ -209,7 +209,7 @@ impl Storage for InMemoryStorage {
     if let Some(buf) = self.files.read().get(path) {
       return Ok(buf.read().clone());
     }
-    Err(anyhow!("file {:?} missing in memory storage", path))
+    Err(anyhow!("file {path:?} missing in memory storage"))
   }
 
   fn write_all(&self, path: &Path, data: &[u8]) -> Result<()> {

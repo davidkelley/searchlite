@@ -367,18 +367,15 @@ impl IndexWriter {
       if let Err(truncate_err) = self.wal.truncate_to(wal_len) {
         log::error!(
           "WAL rollback failed while handling commit error: \
-           unable to truncate WAL back to length {}: {}",
-          wal_len,
-          truncate_err
+           unable to truncate WAL back to length {wal_len}: {truncate_err}"
         );
       }
       if let Err(manifest_err) =
         manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path)
       {
         log::error!(
-          "Manifest rollback failed while handling commit error: {}. \
-           The on-disk manifest and WAL may be inconsistent.",
-          manifest_err
+          "Manifest rollback failed while handling commit error: {manifest_err}. \
+           The on-disk manifest and WAL may be inconsistent."
         );
       }
       if !new_segments.is_empty() {
@@ -650,7 +647,7 @@ fn validate_patch_fields(
   let patchable_paths = patchable_schema_paths(schema);
   for path in set.keys().chain(unset.iter()) {
     if path == doc_id_field {
-      bail!("cannot update doc_id_field `{}`", doc_id_field);
+      bail!("cannot update doc_id_field `{doc_id_field}`");
     }
     if !patchable_paths.contains(path) {
       bail!("unknown field {path}");
