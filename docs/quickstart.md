@@ -161,10 +161,81 @@ Keep the server bound to localhost unless you front it with a proxy or firewall.
   searchlite compact "$INDEX"
   ```
 
+## Node.js / TypeScript
+
+You can also use Searchlite directly from Node.js with native Rust performance and full TypeScript type safety. The `searchlite-js` package includes Zod-powered typed search — pass a schema to `search()` and get validated, fully-typed results back.
+
+### Prerequisites
+
+- Node.js 18+ with npm.
+
+### 1) Set up a project
+
+```bash
+mkdir searchlite-demo && cd searchlite-demo
+npm init -y
+npm install searchlite-js zod tsx typescript
+```
+
+### 2) Create `search.ts`
+
+```typescript
+import { EmbeddedIndex } from "searchlite-js";
+import { z } from "zod";
+
+// 1. Create an index with a shorthand schema
+const index = new EmbeddedIndex("./my-index", {
+  schema: {
+    title: "text",
+    body: "text",
+    lang: "keyword",
+    year: "integer",
+  },
+});
+
+// 2. Add documents and commit
+await index.addMany([
+  { _id: "1", title: "Rust Search Engine", body: "Searchlite is a fast embedded search engine.", lang: "en", year: 2024 },
+  { _id: "2", title: "SQLite Vibes", body: "Single-node search with WAL durability.", lang: "en", year: 2023 },
+  { _id: "3", title: "Edge Ready", body: "Run full-text search at the edge.", lang: "en", year: 2022 },
+]);
+await index.commit();
+
+// 3. Define a Zod schema for the fields you expect back
+const ArticleFields = z.object({
+  title: z.string(),
+  body: z.string(),
+  lang: z.string(),
+  year: z.number(),
+});
+
+// 4. Typed search — results are validated and fully typed
+const results = await index.search(ArticleFields, {
+  query: "search",
+  filter: { I64Range: { field: "year", min: 2023, max: 2025 } },
+});
+
+for (const hit of results.hits) {
+  // hit.fields is typed as { title: string; body: string; lang: string; year: number }
+  console.log(`${hit.fields.title} (${hit.fields.year}) — score: ${hit.score.toFixed(2)}`);
+}
+
+await index.close();
+```
+
+### 3) Run it
+
+```bash
+npx tsx search.ts
+```
+
+You should see matching articles with scores, filtered to 2023+.
+
 ## Next Steps
 
 - Read [Searchlite in a Nutshell](intro.md) for a high-level overview of features, limits, and operational basics.
 - See the [Schema guide](schema.md) for field types, analyzers, and nested object configuration.
 - Explore [Queries](queries.md), [Filters](filters.md), and [Aggregations](aggregations.md) for the full search DSL.
 - See [HTTP Service](http.md) for the complete REST API reference.
+- See the [Node.js bindings](../searchlite-node/README.md) for the full API reference, typed search with Zod, and TypeScript examples.
 - See [Binding Lifecycle](bindings.md) for FFI and WASM-specific details.
