@@ -16,14 +16,18 @@ COPY searchlite-cli/Cargo.toml searchlite-cli/Cargo.toml
 COPY searchlite-http/Cargo.toml searchlite-http/Cargo.toml
 COPY searchlite-ffi/Cargo.toml searchlite-ffi/Cargo.toml
 COPY searchlite-wasm/Cargo.toml searchlite-wasm/Cargo.toml
+COPY searchlite-node/Cargo.toml searchlite-node/Cargo.toml
+COPY integration/Cargo.toml integration/Cargo.toml
 
 # Create dummy source files so cargo can resolve the workspace without pulling full sources yet.
-RUN mkdir -p searchlite-core/src searchlite-cli/src searchlite-http/src searchlite-ffi/src searchlite-wasm/src \
+RUN mkdir -p searchlite-core/src searchlite-cli/src searchlite-http/src searchlite-ffi/src searchlite-wasm/src searchlite-node/src integration/src \
  && echo "fn main() {}" > searchlite-cli/src/main.rs \
  && echo "pub fn placeholder() {}" > searchlite-core/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-http/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-ffi/src/lib.rs \
- && echo "pub fn placeholder() {}" > searchlite-wasm/src/lib.rs
+ && echo "pub fn placeholder() {}" > searchlite-wasm/src/lib.rs \
+ && echo "pub fn placeholder() {}" > searchlite-node/src/lib.rs \
+ && echo "pub fn placeholder() {}" > integration/src/lib.rs
 
 RUN cargo fetch --locked
 
