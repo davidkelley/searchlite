@@ -10,7 +10,7 @@ import {
 	expandSchema,
 } from "./schemas";
 
-import type { SchemaDefinition, SearchRequest, SearchResult } from "./schemas";
+import type { SchemaDefinition, SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 
 export type {
 	FieldDefinition,
@@ -23,6 +23,8 @@ export type {
 	SearchRequest,
 	SearchResult,
 	TextFieldDef,
+	TypedHit,
+	TypedSearchResult,
 } from "./schemas";
 
 // --- Zod validation helper ---
@@ -206,18 +208,75 @@ export class Index {
 		this.#native.commit();
 	}
 
+	search<T>(schema: ZodType<T>, query: string): TypedSearchResult<T>;
+	search<T>(schema: ZodType<T>, query: SearchRequest): TypedSearchResult<T>;
 	search(query: string): SearchResult;
 	search(query: SearchRequest): SearchResult;
-	search(query: string | SearchRequest): SearchResult {
-		if (typeof query === "string") {
-			const raw = this.#native.search(query) as RawSearchResult;
-			return validate(SearchResultSchema, transformResult(raw), "search result");
+	search<T = unknown>(
+		queryOrSchema: string | SearchRequest | ZodType<T>,
+		maybeQuery?: string | SearchRequest,
+	): SearchResult | TypedSearchResult<T> {
+		let fieldsSchema: ZodType<T> | undefined;
+		let query: string | SearchRequest;
+
+		if (maybeQuery !== undefined) {
+			fieldsSchema = queryOrSchema as ZodType<T>;
+			query = maybeQuery;
+		} else {
+			query = queryOrSchema as string | SearchRequest;
 		}
 
-		const validated = validate(SearchRequestSchema, query, "search request");
-		const snaked = requestToSnake(validated);
-		const raw = this.#native.search(snaked) as RawSearchResult;
-		return validate(SearchResultSchema, transformResult(raw), "search result");
+		// Auto-set returnStored when a fields schema is provided
+		if (fieldsSchema) {
+			if (typeof query === "string") {
+				query = { query, returnStored: true };
+			} else {
+				query = { ...query, returnStored: true };
+			}
+		}
+
+		// Execute the search
+		let raw: RawSearchResult;
+		if (typeof query === "string") {
+			raw = this.#native.search(query) as RawSearchResult;
+		} else {
+			const validated = validate(SearchRequestSchema, query, "search request");
+			const snaked = requestToSnake(validated);
+			raw = this.#native.search(snaked) as RawSearchResult;
+		}
+
+		const result = validate(
+			SearchResultSchema,
+			transformResult(raw),
+			"search result",
+		) as SearchResult;
+
+		// Validate each hit's fields against the user's schema
+		if (fieldsSchema) {
+			const schema = fieldsSchema;
+			const validateHitFields = (hit: SearchResult["hits"][number], path: string): void => {
+				const parsed = schema.safeParse(hit.fields);
+				if (!parsed.success) {
+					throw new Error(
+						`Invalid fields on ${path} (docId: "${hit.docId}"):\n${prettifyError(parsed.error)}`,
+					);
+				}
+				(hit as { fields: T }).fields = parsed.data;
+
+				if (hit.innerHits) {
+					for (let j = 0; j < hit.innerHits.length; j++) {
+						validateHitFields(hit.innerHits[j], `${path}.innerHits[${j}]`);
+					}
+				}
+			};
+
+			for (let i = 0; i < result.hits.length; i++) {
+				validateHitFields(result.hits[i], `hit ${i}`);
+			}
+			return result as unknown as TypedSearchResult<T>;
+		}
+
+		return result;
 	}
 
 	compact(): void {
