@@ -1,407 +1,119 @@
 {
-  "doc_id_field": "doc_id",
-  "text_fields": [
-    {
-      "name": "text",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+  "$schema": "https://searchlite.dev/draft/2025/schema",
+  "type": "object",
+  "searchlite:docIdField": "doc_id",
+  "properties": {
+    "text": { "type": "string" },
+    "title": { "type": "string" },
+    "summary": { "type": "string" },
+    "tips": { "type": "string" },
+    "notes": { "type": "string" },
+    "changes": { "type": "string" },
+    "pros": { "type": "string" },
+    "cons": { "type": "string" },
+    "settings": { "type": "string" },
+    "known_issues": { "type": "string" },
+    "installation_steps": { "type": "string" },
+    "steps": { "type": "string" },
+    "techniques": { "type": "string" },
+    "compatibility": { "type": "string" },
+    "legal_note": { "type": "string" },
+    "doc_type": { "type": "string", "searchlite:kind": "keyword" },
+    "developer": { "type": "string", "searchlite:kind": "keyword" },
+    "publisher": { "type": "string", "searchlite:kind": "keyword" },
+    "era": { "type": "string", "searchlite:kind": "keyword" },
+    "platforms": { "type": "string", "searchlite:kind": "keyword" },
+    "genres": { "type": "string", "searchlite:kind": "keyword" },
+    "rating_board": { "type": "string", "searchlite:kind": "keyword" },
+    "region": { "type": "string", "searchlite:kind": "keyword" },
+    "language": { "type": "string", "searchlite:kind": "keyword" },
+    "source": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
+    "tags": { "type": "string", "searchlite:kind": "keyword" },
+    "keywords": { "type": "string", "searchlite:kind": "keyword" },
+    "entities": { "type": "string", "searchlite:kind": "keyword" },
+    "difficulty_estimate": { "type": "string", "searchlite:kind": "keyword" },
+    "category": { "type": "string", "searchlite:kind": "keyword" },
+    "version": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
+    "accuracy_grade": { "type": "string", "searchlite:kind": "keyword" },
+    "recommended_core": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
+    "mod_name": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
+    "created_at": { "type": "string", "searchlite:kind": "keyword" },
+    "updated_at": { "type": "string", "searchlite:kind": "keyword" },
+    "release_year": { "type": "integer", "searchlite:stored": true },
+    "review_score_out_of_10": { "type": "number", "searchlite:stored": true },
+    "target_time_minutes": { "type": "integer", "searchlite:stored": true },
+    "game": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "game_id": { "type": "string", "searchlite:kind": "keyword" },
+          "name": { "type": "string", "searchlite:kind": "keyword" },
+          "franchise": { "type": ["string", "null"], "searchlite:kind": "keyword", "searchlite:indexed": false }
+        }
+      }
     },
-    {
-      "name": "title",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "heading": { "type": "string" },
+          "content": { "type": "string" }
+        }
+      }
     },
-    {
-      "name": "summary",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "achievements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "tier": { "type": "string", "searchlite:kind": "keyword" },
+          "description": { "type": "string" }
+        }
+      }
     },
-    {
-      "name": "tips",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "estimated_hours": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "main": { "type": "integer", "searchlite:stored": true },
+          "completionist": { "type": "integer", "searchlite:stored": true }
+        }
+      }
     },
-    {
-      "name": "notes",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "tier_list": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "S": { "type": "string", "searchlite:kind": "keyword" },
+          "A": { "type": "string", "searchlite:kind": "keyword" },
+          "B": { "type": "string", "searchlite:kind": "keyword" }
+        }
+      }
     },
-    {
-      "name": "changes",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "codes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "input": { "type": "string" },
+          "effect": { "type": "string" }
+        }
+      }
     },
-    {
-      "name": "pros",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "cons",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "settings",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "known_issues",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "installation_steps",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "steps",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "techniques",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "compatibility",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
-    },
-    {
-      "name": "legal_note",
-      "tokenizer": "default",
-      "stored": true,
-      "indexed": true
+    "splits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "split": { "type": "string" },
+          "target_time_min": { "type": "integer", "searchlite:stored": true }
+        }
+      }
     }
-  ],
-  "keyword_fields": [
-    {
-      "name": "doc_id",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "doc_type",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "developer",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "publisher",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "era",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "platforms",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "genres",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "rating_board",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "region",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "language",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "source",
-      "stored": true,
-      "indexed": true,
-      "fast": false
-    },
-    {
-      "name": "tags",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "keywords",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "entities",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "difficulty_estimate",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "category",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "version",
-      "stored": true,
-      "indexed": true,
-      "fast": false
-    },
-    {
-      "name": "accuracy_grade",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "recommended_core",
-      "stored": true,
-      "indexed": true,
-      "fast": false
-    },
-    {
-      "name": "mod_name",
-      "stored": true,
-      "indexed": true,
-      "fast": false
-    },
-    {
-      "name": "created_at",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    },
-    {
-      "name": "updated_at",
-      "stored": true,
-      "indexed": true,
-      "fast": true
-    }
-  ],
-  "numeric_fields": [
-    {
-      "name": "release_year",
-      "i64": true,
-      "fast": true,
-      "stored": true
-    },
-    {
-      "name": "review_score_out_of_10",
-      "i64": false,
-      "fast": true,
-      "stored": true
-    },
-    {
-      "name": "target_time_minutes",
-      "i64": true,
-      "fast": true,
-      "stored": true
-    }
-  ],
-  "nested_fields": [
-    {
-      "name": "game",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "game_id",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        },
-        {
-          "type": "keyword",
-          "name": "name",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        },
-        {
-          "type": "keyword",
-          "name": "franchise",
-          "stored": true,
-          "indexed": false,
-          "fast": true,
-          "nullable": true
-        }
-      ]
-    },
-    {
-      "name": "sections",
-      "fields": [
-        {
-          "type": "text",
-          "name": "heading",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "text",
-          "name": "content",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        }
-      ]
-    },
-    {
-      "name": "achievements",
-      "fields": [
-        {
-          "type": "text",
-          "name": "name",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "keyword",
-          "name": "tier",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        },
-        {
-          "type": "text",
-          "name": "description",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        }
-      ]
-    },
-    {
-      "name": "estimated_hours",
-      "fields": [
-        {
-          "type": "numeric",
-          "name": "main",
-          "i64": true,
-          "fast": true,
-          "stored": true
-        },
-        {
-          "type": "numeric",
-          "name": "completionist",
-          "i64": true,
-          "fast": true,
-          "stored": true
-        }
-      ]
-    },
-    {
-      "name": "tier_list",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "S",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        },
-        {
-          "type": "keyword",
-          "name": "A",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        },
-        {
-          "type": "keyword",
-          "name": "B",
-          "stored": true,
-          "indexed": true,
-          "fast": true
-        }
-      ]
-    },
-    {
-      "name": "codes",
-      "fields": [
-        {
-          "type": "text",
-          "name": "input",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "text",
-          "name": "effect",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        }
-      ]
-    },
-    {
-      "name": "splits",
-      "fields": [
-        {
-          "type": "text",
-          "name": "split",
-          "tokenizer": "default",
-          "stored": true,
-          "indexed": true
-        },
-        {
-          "type": "numeric",
-          "name": "target_time_min",
-          "i64": true,
-          "fast": true,
-          "stored": true
-        }
-      ]
-    }
-  ],
-  "vector_fields": []
+  }
 }

@@ -27,14 +27,10 @@ fn cli_contract_search_emits_json() -> Result<()> {
   fs::write(
     &schema_path,
     serde_json::to_vec_pretty(&json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": []
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" }
+      }
     }))?,
   )?;
   let docs_path = dir.path().join("docs.jsonl");
@@ -99,14 +95,10 @@ fn cli_contract_inspect_emits_manifest_json() -> Result<()> {
   fs::write(
     &schema_path,
     serde_json::to_vec_pretty(&json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": []
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" }
+      }
     }))?,
   )?;
 

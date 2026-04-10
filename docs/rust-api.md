@@ -107,8 +107,8 @@ let doc = Document {
 writer.add_document(&doc)?;
 ```
 
-Every document must include the `_id` field (or whatever `doc_id_field` your schema
-specifies). Adding a document with an existing ID is an upsert -- the old version is
+Every document must include the `_id` field (or whatever `searchlite:docIdField` your
+schema specifies). Adding a document with an existing ID is an upsert -- the old version is
 replaced on commit.
 
 ### Batch adds (atomic)

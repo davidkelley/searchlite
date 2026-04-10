@@ -28,22 +28,16 @@ Create a schema file that defines your fields and analyzers. Save the JSON below
 
 ```json
 {
-  "doc_id_field": "_id",
-  "analyzers": [
+  "type": "object",
+  "searchlite:analyzers": [
     { "name": "english", "tokenizer": "default", "filters": [{ "stopwords": "en" }, { "stemmer": "english" }] }
   ],
-  "text_fields": [
-    { "name": "title", "analyzer": "english", "stored": true, "indexed": true },
-    { "name": "body", "analyzer": "english", "stored": true, "indexed": true }
-  ],
-  "keyword_fields": [
-    { "name": "lang", "stored": true, "indexed": true, "fast": true }
-  ],
-  "numeric_fields": [
-    { "name": "year", "i64": true, "fast": true, "stored": true }
-  ],
-  "nested_fields": [],
-  "vector_fields": []
+  "properties": {
+    "title": { "type": "string", "searchlite:analyzer": "english" },
+    "body": { "type": "string", "searchlite:analyzer": "english" },
+    "lang": { "type": "string", "searchlite:kind": "keyword" },
+    "year": { "type": "integer", "searchlite:stored": true }
+  }
 }
 ```
 

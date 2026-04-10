@@ -112,13 +112,16 @@ Schema excerpt:
 
 ```json
 {
-  "nested_fields": [{
-    "name": "review",
-    "fields": [
-      { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
-      { "type": "numeric", "name": "rating", "i64": true, "fast": true }
-    ]
-  }]
+  "review": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "author": { "type": "string", "searchlite:kind": "keyword" },
+        "rating": { "type": "integer" }
+      }
+    }
+  }
 }
 ```
 

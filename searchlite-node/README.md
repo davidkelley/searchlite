@@ -65,17 +65,25 @@ const index = new EmbeddedIndex('./products', {
 });
 ```
 
-Or use detailed definitions when you need more control:
+Or pass a full JSON Schema with `searchlite:` vocabulary keywords for complete control:
 
 ```javascript
 const index = new EmbeddedIndex('./products', {
   schema: {
-    name: { type: 'text', stored: true, indexed: true, analyzer: 'default' },
-    brand: { type: 'keyword', stored: true, fast: true },
-    price: { type: 'float', stored: true, fast: true },
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      brand: { type: 'string', 'searchlite:kind': 'keyword' },
+      price: { type: 'number', 'searchlite:stored': true },
+    },
   },
 });
 ```
+
+> **Note:** Both shorthand (`{ name: 'text' }`) and full JSON Schema formats are accepted.
+> The shorthand is a Node.js convenience -- `expandSchema()` converts it to JSON Schema
+> internally. The JSON Schema format is the canonical representation shared across all
+> searchlite clients.
 
 ### 2. Add Documents
 
@@ -264,53 +272,77 @@ Internally, methods map to [searchlite-http](../searchlite-http) endpoints:
 
 ## Schema
 
-### Field Types
+Schemas define the fields in your documents. You can use either the shorthand format
+(Node.js only) or the full JSON Schema format with `searchlite:` vocabulary keywords.
 
-| Type | Description | Defaults |
-|------|-------------|----------|
-| `'text'` | Full-text searchable with BM25 scoring | `stored: true, indexed: true, analyzer: 'default'` |
-| `'keyword'` | Exact-match filtering and aggregations | `stored: true, indexed: true, fast: true` |
-| `'integer'` | 64-bit integer, range filters | `fast: true, stored: false` |
-| `'float'` | 64-bit float, range filters | `fast: true, stored: false` |
+### Shorthand Format (Node.js only)
 
-### Detailed Field Options
+The shorthand maps field names to type strings. `expandSchema()` converts this to
+JSON Schema internally.
 
-Override any default with the detailed syntax:
+| Shorthand | JSON Schema Output | Description |
+|-----------|-------------------|-------------|
+| `'text'` | `{ type: "string" }` | Full-text searchable with BM25 scoring |
+| `'keyword'` | `{ type: "string", "searchlite:kind": "keyword" }` | Exact-match filtering and aggregations |
+| `'integer'` | `{ type: "integer" }` | 64-bit integer, range filters |
+| `'float'` | `{ type: "number" }` | 64-bit float, range filters |
+
+### JSON Schema Format
+
+The canonical format uses standard JSON Schema types with `searchlite:` vocabulary
+keywords for search-engine-specific behavior. This format is shared across all
+searchlite clients.
 
 ```javascript
 {
-  title: { type: 'text', stored: true, indexed: true, analyzer: 'default' },
-  body: { type: 'text', stored: false, indexed: true },  // indexed but not stored
-  status: { type: 'keyword', fast: true, stored: false }, // filterable but not returned
-  count: { type: 'integer', stored: true, fast: true },   // stored and fast
+  type: 'object',
+  properties: {
+    title: { type: 'string' },                                          // text (default)
+    body: { type: 'string', 'searchlite:stored': false },               // text, not stored
+    status: { type: 'string', 'searchlite:kind': 'keyword' },           // keyword
+    count: { type: 'integer', 'searchlite:stored': true },              // integer, stored
+    price: { type: 'number' },                                          // float
+    notes: { type: ['string', 'null'] },                                // nullable text
+  },
 }
 ```
 
-**Text field options:**
+### `searchlite:` Vocabulary Keywords
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `stored` | boolean | `true` | Include in stored fields for retrieval |
-| `indexed` | boolean | `true` | Include in full-text index |
-| `analyzer` | string | `'default'` | Text analysis pipeline |
-| `nullable` | boolean | `false` | Allow null values |
+These keywords extend standard JSON Schema to control search-engine behavior.
 
-**Keyword field options:**
+**For text fields** (`{ type: "string" }` without `searchlite:kind`):
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `stored` | boolean | `true` | Include in stored fields |
-| `indexed` | boolean | `true` | Include in term index |
-| `fast` | boolean | `true` | Enable fast-field for filtering and aggregations |
-| `nullable` | boolean | `false` | Allow null values |
+| Keyword | Type | Default | Description |
+|---------|------|---------|-------------|
+| `searchlite:stored` | boolean | `true` | Include in stored fields for retrieval |
+| `searchlite:indexed` | boolean | `true` | Include in full-text index |
+| `searchlite:analyzer` | string | `"default"` | Text analysis pipeline |
 
-**Numeric field options (`integer` / `float`):**
+**For keyword fields** (`{ type: "string", "searchlite:kind": "keyword" }`):
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `stored` | boolean | `false` | Include in stored fields |
-| `fast` | boolean | `true` | Enable fast-field for range filters |
-| `nullable` | boolean | `false` | Allow null values |
+| Keyword | Type | Default | Description |
+|---------|------|---------|-------------|
+| `searchlite:stored` | boolean | `true` | Include in stored fields |
+| `searchlite:indexed` | boolean | `true` | Include in term index |
+| `searchlite:fast` | boolean | `true` | Enable fast-field for filtering and aggregations |
+
+**For numeric fields** (`{ type: "integer" }` or `{ type: "number" }`):
+
+| Keyword | Type | Default | Description |
+|---------|------|---------|-------------|
+| `searchlite:stored` | boolean | `false` | Include in stored fields |
+| `searchlite:fast` | boolean | `true` | Enable fast-field for range filters |
+
+**Nullable fields:** Use a JSON Schema type array to allow null values, e.g.
+`{ type: ["string", "null"] }` or `{ type: ["integer", "null"] }`.
+
+**Index-level keywords** (on the root schema object):
+
+| Keyword | Type | Default | Description |
+|---------|------|---------|-------------|
+| `searchlite:docIdField` | string | `"_id"` | Name of the document ID field |
+| `searchlite:analyzers` | array | -- | Custom analyzer definitions |
 
 ## Search Options
 

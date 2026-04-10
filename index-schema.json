@@ -1,56 +1,64 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/davidkelley/searchlite/index-schema.json",
-  "title": "Searchlite Index Schema",
-  "description": "Defines the structure of schema.json files used to build Searchlite indexes.",
+  "$id": "https://searchlite.dev/draft/2025/schema",
+  "title": "Searchlite Index Meta-Schema",
+  "description": "Validates user-authored JSON Schema documents that use the searchlite: vocabulary to define Searchlite indexes.",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["text_fields", "keyword_fields", "numeric_fields"],
+  "required": ["type", "properties"],
   "properties": {
-    "doc_id_field": {
-      "type": "string",
-      "description": "Name of the string primary key field expected on every document.",
-      "default": "_id",
-      "minLength": 1
+    "$schema": {
+      "type": "string"
     },
-    "analyzers": {
-      "type": "array",
-      "description": "Optional custom analyzers composed of a tokenizer and token filters.",
-      "items": { "$ref": "#/$defs/analyzer" },
-      "default": []
+    "$id": {
+      "type": "string"
     },
-    "text_fields": {
-      "type": "array",
-      "description": "Top-level text fields to tokenize and index.",
-      "items": { "$ref": "#/$defs/text_field" },
-      "default": []
+    "title": {
+      "type": "string"
     },
-    "keyword_fields": {
-      "type": "array",
-      "description": "Top-level keyword fields for exact matches and filters.",
-      "items": { "$ref": "#/$defs/keyword_field" },
-      "default": []
+    "description": {
+      "type": "string"
     },
-    "numeric_fields": {
-      "type": "array",
-      "description": "Top-level numeric fields for range queries and aggregations.",
-      "items": { "$ref": "#/$defs/numeric_field" },
-      "default": []
+    "type": {
+      "const": "object"
     },
-    "nested_fields": {
-      "type": "array",
-      "description": "Nested objects whose child fields are flattened to dotted paths.",
-      "items": { "$ref": "#/$defs/nested_field" },
-      "default": []
+    "properties": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/propertySchema"
+      }
     },
-    "vector_fields": {
+    "required": {
       "type": "array",
-      "description": "Optional dense vector fields (requires the `vectors` feature).",
-      "items": { "$ref": "#/$defs/vector_field" },
-      "default": []
+      "items": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": {
+      "type": "boolean"
+    },
+    "searchlite:docIdField": {
+      "$ref": "#/$defs/searchlite:docIdField"
+    },
+    "searchlite:analyzers": {
+      "$ref": "#/$defs/searchlite:analyzers"
     }
   },
+  "additionalProperties": false,
   "$defs": {
+    "searchlite:docIdField": {
+      "type": "string",
+      "default": "_id",
+      "minLength": 1,
+      "description": "Name of the string primary key field expected on every document."
+    },
+    "searchlite:analyzers": {
+      "type": "array",
+      "description": "Custom analyzers composed of a tokenizer and token filters.",
+      "items": {
+        "$ref": "#/$defs/analyzer"
+      },
+      "default": []
+    },
     "analyzer": {
       "type": "object",
       "description": "Named analyzer consisting of a tokenizer and optional filters.",
@@ -60,30 +68,35 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "description": "Unique analyzer identifier referenced by text fields."
+          "description": "Unique analyzer identifier referenced by field schemas."
         },
         "tokenizer": {
           "type": "string",
           "minLength": 1,
-          "description": "Built-in tokenizer name (`default`, `unicode`, or `whitespace`)."
+          "description": "Built-in tokenizer name (e.g. default, unicode, whitespace)."
         },
         "filters": {
           "type": "array",
-          "items": { "$ref": "#/$defs/token_filter" },
+          "items": {
+            "$ref": "#/$defs/tokenFilter"
+          },
           "default": [],
           "description": "Ordered token filters applied after tokenization."
         }
       }
     },
-    "token_filter": {
-      "description": "Token filters applied after tokenization.",
+    "tokenFilter": {
+      "description": "A single token filter applied after tokenization.",
       "oneOf": [
         {
           "type": "object",
           "required": ["lowercase"],
           "additionalProperties": false,
           "properties": {
-            "lowercase": { "type": "boolean", "description": "Lowercase tokens using Unicode rules." }
+            "lowercase": {
+              "type": "boolean",
+              "description": "Lowercase tokens using Unicode rules."
+            }
           }
         },
         {
@@ -92,8 +105,8 @@
           "additionalProperties": false,
           "properties": {
             "stopwords": {
-              "$ref": "#/$defs/stopwords_config",
-              "description": "Built-in list name (e.g., `en`) or explicit array."
+              "$ref": "#/$defs/stopwordsConfig",
+              "description": "Built-in list name (e.g. en) or explicit array of stop words."
             }
           }
         },
@@ -104,7 +117,7 @@
           "properties": {
             "stemmer": {
               "type": "string",
-              "description": "Stemmer language (e.g., `english`)."
+              "description": "Stemmer language (e.g. english)."
             }
           }
         },
@@ -115,7 +128,9 @@
           "properties": {
             "synonyms": {
               "type": "array",
-              "items": { "$ref": "#/$defs/synonym_rule" },
+              "items": {
+                "$ref": "#/$defs/synonymRule"
+              },
               "description": "Synonym expansion rules applied at the same token position."
             }
           }
@@ -125,27 +140,35 @@
           "required": ["edge_ngram"],
           "additionalProperties": false,
           "properties": {
-            "edge_ngram": { "$ref": "#/$defs/edge_ngram" }
+            "edge_ngram": {
+              "$ref": "#/$defs/edgeNgram"
+            }
           }
         }
       ]
     },
-    "stopwords_config": {
+    "stopwordsConfig": {
       "oneOf": [
         { "type": "string" },
         { "type": "array", "items": { "type": "string" } }
       ]
     },
-    "synonym_rule": {
+    "synonymRule": {
       "type": "object",
       "additionalProperties": false,
       "required": ["from", "to"],
       "properties": {
-        "from": { "type": "array", "items": { "type": "string" } },
-        "to": { "type": "array", "items": { "type": "string" } }
+        "from": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "to": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       }
     },
-    "edge_ngram": {
+    "edgeNgram": {
       "type": "object",
       "additionalProperties": false,
       "required": ["min", "max"],
@@ -154,342 +177,62 @@
         "max": { "type": "integer", "minimum": 1 }
       }
     },
-    "search_as_you_type": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "min_gram": { "type": "integer", "minimum": 1, "default": 1 },
-        "max_gram": { "type": "integer", "minimum": 1, "default": 15 }
-      },
-      "description": "Convenience flag that adds an edge_ngram filter to the index analyzer while keeping the search analyzer unchanged."
+    "searchlite:kind": {
+      "type": "string",
+      "enum": ["keyword"],
+      "description": "The searchlite field kind."
     },
-    "text_field": {
-      "type": "object",
-      "description": "Tokenized text column stored in postings and optionally in the doc store.",
-      "additionalProperties": false,
-      "required": ["name", "stored", "indexed"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name used in documents and queries."
-        },
-        "analyzer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Analyzer identifier applied at index time."
-        },
-        "tokenizer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Deprecated alias for `analyzer`."
-        },
-        "search_analyzer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Optional analyzer to use at search time."
-        },
-        "search_tokenizer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Deprecated alias for `search_analyzer`."
-        },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep raw field values for retrieval and snippets."
-        },
-        "indexed": {
-          "type": "boolean",
-          "description": "Index tokenized terms to make the field searchable."
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
-        },
-        "search_as_you_type": {
-          "$ref": "#/$defs/search_as_you_type",
-          "description": "Enable edge n-gram indexing for search-as-you-type queries."
-        }
-      },
-      "allOf": [
-        {
-          "anyOf": [
-            { "required": ["analyzer"] },
-            { "required": ["tokenizer"] },
-            { "required": ["search_as_you_type"] }
-          ]
-        },
-        { "not": { "required": ["analyzer", "tokenizer"] } },
-        { "not": { "required": ["search_analyzer", "search_tokenizer"] } }
-      ]
+    "searchlite:stored": {
+      "type": "boolean",
+      "description": "Keep raw field values for retrieval and snippets."
     },
-    "keyword_field": {
+    "searchlite:indexed": {
+      "type": "boolean",
+      "description": "Index terms to make the field searchable."
+    },
+    "searchlite:fast": {
+      "type": "boolean",
+      "description": "Expose as a fast field to enable filters and aggregations."
+    },
+    "searchlite:analyzer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Analyzer identifier applied at index time."
+    },
+    "searchlite:searchAnalyzer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Analyzer to use at search time (defaults to the index analyzer)."
+    },
+    "searchlite:searchAsYouType": {
       "type": "object",
-      "description": "Keyword (untokenized) field for exact matches and fast filtering.",
       "additionalProperties": false,
-      "required": ["name", "stored", "indexed", "fast"],
+      "description": "Enable edge n-gram indexing for search-as-you-type queries.",
       "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name used in documents and filters."
+        "minGram": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Minimum edge n-gram length."
         },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep raw keyword values for retrieval."
-        },
-        "indexed": {
-          "type": "boolean",
-          "description": "Index keyword terms for matching."
-        },
-        "fast": {
-          "type": "boolean",
-          "description": "Expose as a fast field to enable filters and aggregations."
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
+        "maxGram": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 15,
+          "description": "Maximum edge n-gram length."
         }
       }
     },
-    "numeric_field": {
-      "type": "object",
-      "description": "Numeric field (i64 or f64) used for range queries and aggregations.",
-      "additionalProperties": false,
-      "required": ["name", "i64", "fast"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name used in documents and filters."
-        },
-        "i64": {
-          "type": "boolean",
-          "description": "When true store as a signed 64-bit integer; otherwise store as f64."
-        },
-        "fast": {
-          "type": "boolean",
-          "description": "Expose as a fast field to enable filters and aggregations."
-        },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep numeric values in the doc store for retrieval.",
-          "default": false
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
-        }
-      }
+    "searchlite:nullable": {
+      "type": "boolean",
+      "description": "Permit null values in documents for this field."
     },
-    "nested_field": {
+    "searchlite:vector": {
       "type": "object",
-      "description": "Nested object whose child fields are validated per object and stored separately.",
       "additionalProperties": false,
-      "required": ["name"],
+      "required": ["dim", "metric"],
+      "description": "Dense vector field configuration.",
       "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Name of the nested object as it appears in documents."
-        },
-        "fields": {
-          "type": "array",
-          "description": "Fields contained within this nested object.",
-          "items": { "$ref": "#/$defs/nested_property" },
-          "default": []
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Allow the entire object to be null in documents.",
-          "default": false
-        }
-      }
-    },
-    "nested_property": {
-      "description": "Field definitions allowed inside a nested object. Each entry must declare its type.",
-      "oneOf": [
-        { "$ref": "#/$defs/nested_text_property" },
-        { "$ref": "#/$defs/nested_keyword_property" },
-        { "$ref": "#/$defs/nested_numeric_property" },
-        { "$ref": "#/$defs/nested_object_property" }
-      ]
-    },
-    "nested_text_property": {
-      "type": "object",
-      "description": "Text field within a nested object.",
-      "additionalProperties": false,
-      "required": ["type", "name", "stored", "indexed"],
-      "properties": {
-        "type": {
-          "const": "text",
-          "description": "Marks this nested field as text."
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name relative to its parent object."
-        },
-        "analyzer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Analyzer identifier applied at index time."
-        },
-        "tokenizer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Deprecated alias for `analyzer`."
-        },
-        "search_analyzer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Optional analyzer to use at search time."
-        },
-        "search_tokenizer": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Deprecated alias for `search_analyzer`."
-        },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep raw field values for retrieval and snippets."
-        },
-        "indexed": {
-          "type": "boolean",
-          "description": "Index tokenized terms to make the field searchable."
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
-        },
-        "search_as_you_type": {
-          "$ref": "#/$defs/search_as_you_type",
-          "description": "Enable edge n-gram indexing for search-as-you-type queries."
-        }
-      },
-      "allOf": [
-        {
-          "anyOf": [
-            { "required": ["analyzer"] },
-            { "required": ["tokenizer"] }
-          ]
-        },
-        { "not": { "required": ["analyzer", "tokenizer"] } },
-        { "not": { "required": ["search_analyzer", "search_tokenizer"] } }
-      ]
-    },
-    "nested_keyword_property": {
-      "type": "object",
-      "description": "Keyword field within a nested object.",
-      "additionalProperties": false,
-      "required": ["type", "name", "stored", "indexed", "fast"],
-      "properties": {
-        "type": {
-          "const": "keyword",
-          "description": "Marks this nested field as keyword."
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name relative to its parent object."
-        },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep raw keyword values for retrieval."
-        },
-        "indexed": {
-          "type": "boolean",
-          "description": "Index keyword terms for matching."
-        },
-        "fast": {
-          "type": "boolean",
-          "description": "Expose as a fast field to enable filters and aggregations."
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
-        }
-      }
-    },
-    "nested_numeric_property": {
-      "type": "object",
-      "description": "Numeric field within a nested object.",
-      "additionalProperties": false,
-      "required": ["type", "name", "i64", "fast"],
-      "properties": {
-        "type": {
-          "const": "numeric",
-          "description": "Marks this nested field as numeric."
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name relative to its parent object."
-        },
-        "i64": {
-          "type": "boolean",
-          "description": "When true store as a signed 64-bit integer; otherwise store as f64."
-        },
-        "fast": {
-          "type": "boolean",
-          "description": "Expose as a fast field to enable filters and aggregations."
-        },
-        "stored": {
-          "type": "boolean",
-          "description": "Keep numeric values in the doc store for retrieval.",
-          "default": false
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Permit null values in documents for this field.",
-          "default": false
-        }
-      }
-    },
-    "nested_object_property": {
-      "type": "object",
-      "description": "Nested object contained within another nested object.",
-      "additionalProperties": false,
-      "required": ["type", "name"],
-      "properties": {
-        "type": {
-          "const": "object",
-          "description": "Marks this nested entry as another nested object."
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Name of the nested object relative to its parent."
-        },
-        "fields": {
-          "type": "array",
-          "description": "Child fields contained in this nested object.",
-          "items": { "$ref": "#/$defs/nested_property" },
-          "default": []
-        },
-        "nullable": {
-          "type": "boolean",
-          "description": "Allow the entire nested object to be null in documents.",
-          "default": false
-        }
-      }
-    },
-    "vector_field": {
-      "type": "object",
-      "description": "Dense vector field configuration (requires the `vectors` feature).",
-      "additionalProperties": false,
-      "required": ["name", "dim", "metric"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Field name for vector embeddings."
-        },
         "dim": {
           "type": "integer",
           "minimum": 1,
@@ -499,6 +242,166 @@
           "type": "string",
           "enum": ["Cosine", "L2"],
           "description": "Similarity metric used for vector search."
+        },
+        "hnsw": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "HNSW index parameters.",
+          "properties": {
+            "m": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of bi-directional links per node."
+            },
+            "ef_construction": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Size of the dynamic candidate list during construction."
+            }
+          }
+        }
+      }
+    },
+    "propertySchema": {
+      "description": "A JSON Schema for a single property, extended with optional searchlite: keywords.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "default": true,
+        "enum": {
+          "type": "array"
+        },
+        "const": true,
+        "format": {
+          "type": "string"
+        },
+        "minLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "exclusiveMinimum": {
+          "type": "number"
+        },
+        "exclusiveMaximum": {
+          "type": "number"
+        },
+        "multipleOf": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "items": true,
+        "minItems": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "uniqueItems": {
+          "type": "boolean"
+        },
+        "properties": {
+          "type": "object"
+        },
+        "required": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "additionalProperties": true,
+        "oneOf": {
+          "type": "array"
+        },
+        "anyOf": {
+          "type": "array"
+        },
+        "allOf": {
+          "type": "array"
+        },
+        "not": true,
+        "if": true,
+        "then": true,
+        "else": true,
+        "$ref": {
+          "type": "string"
+        },
+        "$defs": {
+          "type": "object"
+        },
+        "examples": {
+          "type": "array"
+        },
+        "deprecated": {
+          "type": "boolean"
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "writeOnly": {
+          "type": "boolean"
+        },
+        "title": {
+          "type": "string"
+        },
+        "searchlite:kind": {
+          "$ref": "#/$defs/searchlite:kind"
+        },
+        "searchlite:stored": {
+          "$ref": "#/$defs/searchlite:stored"
+        },
+        "searchlite:indexed": {
+          "$ref": "#/$defs/searchlite:indexed"
+        },
+        "searchlite:fast": {
+          "$ref": "#/$defs/searchlite:fast"
+        },
+        "searchlite:analyzer": {
+          "$ref": "#/$defs/searchlite:analyzer"
+        },
+        "searchlite:searchAnalyzer": {
+          "$ref": "#/$defs/searchlite:searchAnalyzer"
+        },
+        "searchlite:searchAsYouType": {
+          "$ref": "#/$defs/searchlite:searchAsYouType"
+        },
+        "searchlite:nullable": {
+          "$ref": "#/$defs/searchlite:nullable"
+        },
+        "searchlite:vector": {
+          "$ref": "#/$defs/searchlite:vector"
+        }
+      },
+      "patternProperties": {
+        "^searchlite:": {
+          "oneOf": [
+            { "$ref": "#/$defs/searchlite:kind" },
+            { "$ref": "#/$defs/searchlite:stored" },
+            { "$ref": "#/$defs/searchlite:indexed" },
+            { "$ref": "#/$defs/searchlite:fast" },
+            { "$ref": "#/$defs/searchlite:analyzer" },
+            { "$ref": "#/$defs/searchlite:searchAnalyzer" },
+            { "$ref": "#/$defs/searchlite:searchAsYouType" },
+            { "$ref": "#/$defs/searchlite:nullable" },
+            { "$ref": "#/$defs/searchlite:vector" }
+          ]
         }
       }
     }

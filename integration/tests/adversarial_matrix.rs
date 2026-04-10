@@ -11,19 +11,20 @@ use integration::surfaces::SurfaceHarness;
 
 fn valid_schema() -> serde_json::Value {
   json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": []
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" }
+    }
   })
 }
 
 fn invalid_schema() -> serde_json::Value {
-  json!({ "doc_id_field": 7 })
+  json!({
+    "type": "object",
+    "properties": {
+      "x": { "type": "string", "searchlite:bogus": true }
+    }
+  })
 }
 
 fn docs_ndjson() -> &'static str {

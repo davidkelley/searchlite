@@ -22,16 +22,11 @@ fn opts(path: &std::path::Path) -> IndexOptions {
 fn update_set_unset_top_level_fields() {
   let dir = tempdir().unwrap();
   let schema: Schema = serde_json::from_value(serde_json::json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [
-      { "name": "count", "i64": true, "fast": false, "stored": true, "nullable": false }
-    ],
-    "nested_fields": [],
-    "vector_fields": []
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "count": { "type": "integer", "searchlite:stored": true, "searchlite:fast": false }
+    }
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -69,17 +64,19 @@ fn update_set_unset_top_level_fields() {
 fn update_supports_nested_paths() {
   let dir = tempdir().unwrap();
   let schema: Schema = serde_json::from_value(serde_json::json!({
-    "doc_id_field": "_id",
-    "text_fields": [{ "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [
-      { "name": "metadata", "nullable": true, "fields": [
-          { "type": "keyword", "name": "alt", "stored": true, "indexed": true, "fast": false, "nullable": true }
-        ]
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "metadata": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "alt": { "type": ["string", "null"], "searchlite:kind": "keyword", "searchlite:fast": false }
+          }
+        }
       }
-    ],
-    "vector_fields": []
+    }
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -220,14 +217,10 @@ fn update_rejects_doc_id_mutation() {
 fn update_rejects_nonstored_indexed_fields() {
   let dir = tempdir().unwrap();
   let schema: Schema = serde_json::from_value(serde_json::json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": false, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": []
+    "type": "object",
+    "properties": {
+      "body": { "type": "string", "searchlite:stored": false }
+    }
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -257,16 +250,11 @@ fn update_rejects_nonstored_indexed_fields() {
 fn update_rejects_vector_fields() {
   let dir = tempdir().unwrap();
   let schema: Schema = serde_json::from_value(serde_json::json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": [
-      { "name": "embedding", "dim": 2, "metric": "Cosine" }
-    ]
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "embedding": { "type": "array", "items": { "type": "number" }, "searchlite:vector": { "dim": 2, "metric": "Cosine" } }
+    }
   }))
   .unwrap();
   let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();

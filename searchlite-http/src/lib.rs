@@ -2737,16 +2737,11 @@ mod tests {
     let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [
-        { "name": "lang", "stored": true, "indexed": true, "fast": true, "nullable": false }
-      ],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": []
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" },
+        "lang": { "type": "string", "searchlite:kind": "keyword" }
+      }
     }))
     .unwrap();
     client
@@ -2874,22 +2869,19 @@ mod tests {
     let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [
-        {
-          "name": "images",
-          "nullable": false,
-          "fields": [
-            { "type": "keyword", "name": "illustrator", "stored": true, "indexed": true, "fast": true, "nullable": false }
-          ]
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "illustrator": { "type": "string", "searchlite:kind": "keyword" }
+            }
+          }
         }
-      ],
-      "vector_fields": []
+      }
     }))
     .unwrap();
     client
@@ -2996,16 +2988,15 @@ mod tests {
     let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": [
-        { "name": "embedding", "dim": 2, "metric": "Cosine" }
-      ]
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" },
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "searchlite:vector": { "dim": 2, "metric": "Cosine" }
+        }
+      }
     }))
     .unwrap();
     client
@@ -3104,16 +3095,15 @@ mod tests {
     let index_base = format!("{base}/indexes/{INDEX_NAME}");
 
     let schema: Schema = serde_json::from_value(json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": [
-        { "name": "embedding", "dim": 2, "metric": "Cosine" }
-      ]
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" },
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "searchlite:vector": { "dim": 2, "metric": "Cosine" }
+        }
+      }
     }))
     .unwrap();
     client
@@ -3488,16 +3478,11 @@ mod tests {
     let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
 
     let schema: Schema = serde_json::from_value(serde_json::json!({
-      "doc_id_field": "_id",
-      "text_fields": [
-        { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-      ],
-      "keyword_fields": [],
-      "numeric_fields": [
-        { "name": "rank", "stored": true, "fast": true, "nullable": false, "i64": true }
-      ],
-      "nested_fields": [],
-      "vector_fields": []
+      "type": "object",
+      "properties": {
+        "body": { "type": "string" },
+        "rank": { "type": "integer", "searchlite:stored": true }
+      }
     }))
     .unwrap();
     client
@@ -3764,12 +3749,9 @@ mod tests {
     let (_client, _base, index_base, handle, _state, _args) =
       setup_server(dir.path().join("idx-invalid")).await;
     let bad_schema: Schema = serde_json::from_value(json!({
-      "doc_id_field": "a.b",
-      "text_fields": [],
-      "keyword_fields": [],
-      "numeric_fields": [],
-      "nested_fields": [],
-      "vector_fields": []
+      "type": "object",
+      "properties": {},
+      "searchlite:docIdField": "a.b"
     }))
     .unwrap();
     let res = _client

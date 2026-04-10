@@ -85,19 +85,36 @@ impl Manifest {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Schema {
-  #[serde(default = "default_doc_id_field")]
   pub doc_id_field: String,
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub analyzers: Vec<AnalyzerDef>,
   pub text_fields: Vec<TextField>,
   pub keyword_fields: Vec<KeywordField>,
   pub numeric_fields: Vec<NumericField>,
-  #[serde(default)]
   pub nested_fields: Vec<NestedField>,
   #[cfg(feature = "vectors")]
   pub vector_fields: Vec<VectorField>,
+}
+
+impl Serialize for Schema {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let json_value = super::json_schema::schema_to_json_schema(self);
+    json_value.serialize(serializer)
+  }
+}
+
+impl<'de> Deserialize<'de> for Schema {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    super::json_schema::parse_json_schema(&value).map_err(serde::de::Error::custom)
+  }
 }
 
 pub fn default_doc_id_field() -> String {
@@ -818,115 +835,6 @@ pub struct TextField {
   pub search_as_you_type: Option<SearchAsYouType>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TextFieldSerde {
-  pub name: String,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub tokenizer: Option<String>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub analyzer: Option<String>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub search_analyzer: Option<String>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub search_tokenizer: Option<String>,
-  pub stored: bool,
-  pub indexed: bool,
-  #[serde(default)]
-  pub nullable: bool,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub search_as_you_type: Option<SearchAsYouType>,
-}
-
-impl From<TextField> for TextFieldSerde {
-  fn from(value: TextField) -> Self {
-    Self {
-      name: value.name,
-      tokenizer: Some(value.analyzer),
-      analyzer: None,
-      search_analyzer: value.search_analyzer,
-      search_tokenizer: None,
-      stored: value.stored,
-      indexed: value.indexed,
-      nullable: value.nullable,
-      search_as_you_type: value.search_as_you_type,
-    }
-  }
-}
-
-impl TryFrom<TextFieldSerde> for TextField {
-  type Error = serde::de::value::Error;
-
-  fn try_from(value: TextFieldSerde) -> Result<Self, Self::Error> {
-    let primary = match (value.analyzer, value.tokenizer) {
-      (Some(a), None) => a,
-      (None, Some(t)) => t,
-      (Some(_), Some(_)) => {
-        return Err(serde::de::Error::custom(
-          "text field cannot set both `tokenizer` and `analyzer`",
-        ));
-      }
-      (None, None) => {
-        if value.search_as_you_type.is_some() {
-          "default".to_string()
-        } else {
-          return Err(serde::de::Error::custom(
-            "text field must set `analyzer` (or `tokenizer` as an alias)",
-          ));
-        }
-      }
-    };
-    let search_analyzer = match (value.search_analyzer, value.search_tokenizer) {
-      (Some(a), None) => Some(a),
-      (None, Some(t)) => Some(t),
-      (Some(_), Some(_)) => {
-        return Err(serde::de::Error::custom(
-          "text field cannot set both `search_analyzer` and `search_tokenizer`",
-        ));
-      }
-      (None, None) => None,
-    };
-    Ok(TextField {
-      name: value.name,
-      analyzer: primary,
-      search_analyzer,
-      stored: value.stored,
-      indexed: value.indexed,
-      nullable: value.nullable,
-      search_as_you_type: value.search_as_you_type,
-    })
-  }
-}
-
-impl Serialize for TextField {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
-    let helper = TextFieldSerde {
-      name: self.name.clone(),
-      tokenizer: Some(self.analyzer.clone()),
-      analyzer: None,
-      search_analyzer: self.search_analyzer.clone(),
-      search_tokenizer: None,
-      stored: self.stored,
-      indexed: self.indexed,
-      nullable: self.nullable,
-      search_as_you_type: self.search_as_you_type.clone(),
-    };
-    helper.serialize(serializer)
-  }
-}
-
-impl<'de> Deserialize<'de> for TextField {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
-    let helper = TextFieldSerde::deserialize(deserializer)?;
-    TextField::try_from(helper).map_err(serde::de::Error::custom)
-  }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeywordField {
   pub name: String,
@@ -948,12 +856,10 @@ pub struct NumericField {
   pub nullable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct NestedField {
   pub name: String,
-  #[serde(default)]
   pub fields: Vec<NestedProperty>,
-  #[serde(default)]
   pub nullable: bool,
 }
 
@@ -1014,8 +920,7 @@ impl NestedField {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum NestedProperty {
   Text(TextField),
   Keyword(KeywordField),

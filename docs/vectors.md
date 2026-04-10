@@ -26,13 +26,15 @@ searchlite-core = { version = "0.5", features = ["vectors"] }
 
 ## Schema
 
-Add a `vector_fields` entry to your schema with the embedding dimension and distance metric:
+Add a vector property to your schema with the embedding dimension and distance metric:
 
 ```json
 {
-  "vector_fields": [
-    { "name": "embedding", "dim": 384, "metric": "Cosine" }
-  ]
+  "embedding": {
+    "type": "array",
+    "items": { "type": "number" },
+    "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+  }
 }
 ```
 
