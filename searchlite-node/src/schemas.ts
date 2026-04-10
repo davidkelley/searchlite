@@ -238,8 +238,43 @@ export const SearchResultSchema = z.object({
 
 export type OpenOptions = z.infer<typeof OpenOptionsSchema>;
 export type SearchRequest = z.input<typeof SearchRequestSchema>;
-export type SearchResult = z.infer<typeof SearchResultSchema>;
-export type Hit = z.infer<typeof HitSchema>;
+
+// --- Explicit generic interfaces (replaces z.infer which resolved to `unknown`) ---
+
+export interface Hit<TFields = unknown> {
+	docId: string;
+	score: number;
+	vectorScore?: number;
+	sortKey?: unknown[];
+	fields?: TFields | null;
+	snippet?: string | null;
+	explanation?: unknown;
+	highlights?: Record<string, string[]>;
+	innerHits?: Hit<TFields>[];
+}
+
+export interface SearchResult<TFields = unknown> {
+	totalHits: number;
+	totalGroups?: number;
+	hits: Hit<TFields>[];
+	nextCursor?: string;
+	nextSearchAfter?: unknown[];
+	aggregations: Record<string, unknown>;
+	suggest: Record<string, unknown>;
+	profile?: unknown;
+}
+
+// --- Typed variants returned when a Zod schema is provided to search() ---
+// `fields` is guaranteed non-optional because the schema validates it.
+
+export interface TypedHit<TFields> extends Omit<Hit<TFields>, "fields" | "innerHits"> {
+	fields: TFields;
+	innerHits?: TypedHit<TFields>[];
+}
+
+export interface TypedSearchResult<TFields> extends Omit<SearchResult<TFields>, "hits"> {
+	hits: TypedHit<TFields>[];
+}
 
 export type FieldShorthand = "text" | "keyword" | "integer" | "float";
 

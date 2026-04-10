@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { afterEach, describe, expect, it } from "vitest";
 import { Index } from "../dist/index.js";
 
@@ -719,6 +720,166 @@ describe("result shape", () => {
 
 		const result = idx.search({ query: "numeric", returnStored: true });
 		expect(result.hits[0].fields).toBeTruthy();
+		idx.close();
+	});
+});
+
+// =============================================================================
+// Typed search (Zod schema)
+// =============================================================================
+
+describe("typed search", () => {
+	const BodySchema = z.object({
+		body: z.string(),
+	});
+
+	it("validates and returns typed fields with request object", () => {
+		const idx = createIndex();
+		idx.add({ _id: "1", body: "hello world" });
+		idx.commit();
+
+		const result = idx.search(BodySchema, { query: "hello" });
+		expect(result.totalHits).toBe(1);
+		expect(result.hits[0].fields).toEqual({ body: "hello world" });
+		idx.close();
+	});
+
+	it("validates and returns typed fields with string query", () => {
+		const idx = createIndex();
+		idx.add({ _id: "1", body: "hello world" });
+		idx.commit();
+
+		const result = idx.search(BodySchema, "hello");
+		expect(result.totalHits).toBe(1);
+		expect(result.hits[0].fields).toEqual({ body: "hello world" });
+		idx.close();
+	});
+
+	it("auto-sets returnStored when schema is provided", () => {
+		const idx = createIndex();
+		idx.add({ _id: "1", body: "auto stored" });
+		idx.commit();
+
+		// No need to manually set returnStored
+		const result = idx.search(BodySchema, { query: "auto" });
+		expect(result.hits[0].fields).toBeTruthy();
+		expect(result.hits[0].fields.body).toBe("auto stored");
+		idx.close();
+	});
+
+	it("throws with context when fields do not match schema", () => {
+		const idx = createIndex();
+		idx.add({ _id: "doc-42", body: "mismatch test" });
+		idx.commit();
+
+		const StrictSchema = z.object({
+			body: z.string(),
+			missing: z.number(),
+		});
+
+		expect(() => idx.search(StrictSchema, "mismatch")).toThrowError(/hit 0.*docId.*doc-42/s);
+		idx.close();
+	});
+
+	it("succeeds with empty results", () => {
+		const idx = createIndex();
+		idx.commit();
+
+		const result = idx.search(BodySchema, "nonexistent_xyz");
+		expect(result.hits).toHaveLength(0);
+		idx.close();
+	});
+
+	it("works with optional fields in schema", () => {
+		const idx = createIndex({ body: "text", tag: "keyword" });
+		idx.add({ _id: "1", body: "optional test" });
+		idx.commit();
+
+		const FlexSchema = z.object({
+			body: z.string(),
+			tag: z.string().optional(),
+		});
+
+		const result = idx.search(FlexSchema, "optional");
+		expect(result.hits[0].fields.body).toBe("optional test");
+		idx.close();
+	});
+
+	it("works with multiple hits", () => {
+		const idx = createIndex();
+		idx.addMany([
+			{ _id: "1", body: "alpha beta" },
+			{ _id: "2", body: "alpha gamma" },
+		]);
+		idx.commit();
+
+		const result = idx.search(BodySchema, "alpha");
+		expect(result.totalHits).toBe(2);
+		for (const hit of result.hits) {
+			expect(hit.fields.body).toBeTruthy();
+		}
+		idx.close();
+	});
+
+	it("applies Zod transforms to fields", () => {
+		const idx = createIndex();
+		idx.add({ _id: "1", body: "transform test" });
+		idx.commit();
+
+		const UpperSchema = z.object({
+			body: z.string().transform((s) => s.toUpperCase()),
+		});
+
+		const result = idx.search(UpperSchema, "transform");
+		expect(result.hits[0].fields.body).toBe("TRANSFORM TEST");
+		idx.close();
+	});
+
+	it("applies Zod defaults for missing fields", () => {
+		const idx = createIndex();
+		idx.add({ _id: "1", body: "defaults test" });
+		idx.commit();
+
+		const WithDefault = z.object({
+			body: z.string(),
+			extra: z.string().default("fallback"),
+		});
+
+		const result = idx.search(WithDefault, "defaults");
+		expect(result.hits[0].fields.body).toBe("defaults test");
+		expect(result.hits[0].fields.extra).toBe("fallback");
+		idx.close();
+	});
+
+	it("strips unknown keys by default (z.object behavior)", () => {
+		const idx = createIndex({ body: "text", tag: "keyword" });
+		idx.add({ _id: "1", body: "strip test", tag: "hello" });
+		idx.commit();
+
+		const PartialSchema = z.object({
+			body: z.string(),
+		});
+
+		const result = idx.search(PartialSchema, "strip");
+		expect(result.hits[0].fields.body).toBe("strip test");
+		// tag was stored but not in the schema — stripped by Zod
+		expect("tag" in result.hits[0].fields).toBe(false);
+		idx.close();
+	});
+
+	it("preserves unknown keys with passthrough", () => {
+		const idx = createIndex({ body: "text", tag: "keyword" });
+		idx.add({ _id: "1", body: "passthrough test", tag: "kept" });
+		idx.commit();
+
+		const PassthroughSchema = z.object({
+			body: z.string(),
+		}).passthrough();
+
+		const result = idx.search(PassthroughSchema, "passthrough");
+		expect(result.hits[0].fields.body).toBe("passthrough test");
+		// tag is preserved because of passthrough
+		expect(result.hits[0].fields.tag).toBe("kept");
 		idx.close();
 	});
 });
