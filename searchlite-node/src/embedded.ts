@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ZodType } from "zod";
-import type { SearchIndex } from "./search-index";
 import {
 	DocumentSchema,
 	DocumentsSchema,
@@ -11,6 +10,7 @@ import {
 	expandSchema,
 } from "./schemas";
 import type { SchemaDefinition, SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
+import type { SearchIndex } from "./search-index";
 import {
 	type RawSearchResult,
 	requestToSnake,

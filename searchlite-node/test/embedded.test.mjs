@@ -96,9 +96,9 @@ describe("schema validation on reopen", () => {
 		const idx1 = new EmbeddedIndex(path, { schema: { title: "text" } });
 		await idx1.close();
 
-		expect(() => new EmbeddedIndex(path, { schema: { title: "text", extra: "keyword" } })).toThrowError(
-			/schema mismatch/,
-		);
+		expect(
+			() => new EmbeddedIndex(path, { schema: { title: "text", extra: "keyword" } }),
+		).toThrowError(/schema mismatch/);
 	});
 });
 
@@ -771,7 +771,9 @@ describe("typed search", () => {
 			missing: z.number(),
 		});
 
-		await expect(idx.search(StrictSchema, "mismatch")).rejects.toThrowError(/hit 0.*docId.*doc-42/s);
+		await expect(idx.search(StrictSchema, "mismatch")).rejects.toThrowError(
+			/hit 0.*docId.*doc-42/s,
+		);
 		await idx.close();
 	});
 

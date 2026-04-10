@@ -8,8 +8,18 @@ function mockFetch(responses) {
 	const calls = [];
 	let callIndex = 0;
 	const fn = vi.fn(async (url, init) => {
-		calls.push({ url, method: init?.method, headers: init?.headers, body: init?.body ? JSON.parse(init.body) : undefined });
-		const response = typeof responses === "function" ? responses(callIndex) : (Array.isArray(responses) ? responses[callIndex] : responses);
+		calls.push({
+			url,
+			method: init?.method,
+			headers: init?.headers,
+			body: init?.body ? JSON.parse(init.body) : undefined,
+		});
+		const response =
+			typeof responses === "function"
+				? responses(callIndex)
+				: Array.isArray(responses)
+					? responses[callIndex]
+					: responses;
 		callIndex++;
 		return {
 			ok: response.ok ?? true,
@@ -65,7 +75,7 @@ describe("URL construction", () => {
 	});
 
 	it("constructs correct bulk URL", async () => {
-		const fetch = mockFetch({ body: { added: 1 } });
+		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "products", { fetch });
 		await idx.add({ _id: "1", body: "test" });
 		expect(fetch._calls[0].url).toBe("http://host:9200/indexes/products/bulk");
@@ -107,14 +117,14 @@ describe("request formatting", () => {
 	});
 
 	it("sends X-Write-Key header when configured", async () => {
-		const fetch = mockFetch({ body: { added: 1 } });
+		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { writeKey: "secret", fetch });
 		await idx.add({ _id: "1", body: "test" });
 		expect(fetch._calls[0].headers["X-Write-Key"]).toBe("secret");
 	});
 
 	it("omits X-Write-Key header when not configured", async () => {
-		const fetch = mockFetch({ body: { added: 1 } });
+		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
 		await idx.add({ _id: "1", body: "test" });
 		expect(fetch._calls[0].headers["X-Write-Key"]).toBeUndefined();
@@ -131,14 +141,14 @@ describe("request formatting", () => {
 	});
 
 	it("wraps single doc in bulk format for add()", async () => {
-		const fetch = mockFetch({ body: { added: 1 } });
+		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
 		await idx.add({ _id: "doc1", body: "test" });
 		expect(fetch._calls[0].body).toEqual({ docs: [{ _id: "doc1", body: "test" }] });
 	});
 
 	it("wraps array in bulk format for addMany()", async () => {
-		const fetch = mockFetch({ body: { added: 2 } });
+		const fetch = mockFetch({ body: { queued: 2 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
 		const count = await idx.addMany([
 			{ _id: "1", body: "one" },
@@ -149,7 +159,7 @@ describe("request formatting", () => {
 	});
 
 	it("wraps single object in array for addMany()", async () => {
-		const fetch = mockFetch({ body: { added: 1 } });
+		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
 		const count = await idx.addMany({ _id: "1", body: "one" });
 		expect(count).toBe(1);
@@ -209,11 +219,13 @@ describe("response transformation", () => {
 		const fetch = mockFetch({
 			body: {
 				total_hits_estimate: 1,
-				hits: [{
-					doc_id: "parent",
-					score: 1.0,
-					inner_hits: [{ doc_id: "child", score: 0.5 }],
-				}],
+				hits: [
+					{
+						doc_id: "parent",
+						score: 1.0,
+						inner_hits: [{ doc_id: "child", score: 0.5 }],
+					},
+				],
 			},
 		});
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
@@ -234,7 +246,7 @@ describe("error handling", () => {
 			ok: false,
 			status: 404,
 			statusText: "Not Found",
-			body: { kind: "index_not_found", reason: "index 'missing' does not exist" },
+			body: { error: { type: "index_missing", reason: "index 'missing' does not exist" } },
 		});
 		const idx = new RemoteIndex("http://host:9200", "missing", { fetch });
 		await expect(idx.search("test")).rejects.toThrowError(/index 'missing' does not exist/);
@@ -245,7 +257,9 @@ describe("error handling", () => {
 			ok: false,
 			status: 500,
 			statusText: "Internal Server Error",
-			json: async () => { throw new Error("invalid json"); },
+			json: async () => {
+				throw new Error("invalid json");
+			},
 		}));
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch: fn });
 		await expect(idx.search("test")).rejects.toThrowError(/Internal Server Error/);
@@ -256,7 +270,7 @@ describe("error handling", () => {
 			ok: false,
 			status: 401,
 			statusText: "Unauthorized",
-			body: { kind: "write_key_required", reason: "write key required" },
+			body: { error: { type: "write_key_required", reason: "write key required" } },
 		});
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
 		await expect(idx.commit()).rejects.toThrowError(/401/);

@@ -694,37 +694,39 @@ const index = new EmbeddedIndex('./protected', { writeKey: 'my-secret' });
 
 ## Error Handling
 
-All errors throw synchronously. Common error scenarios:
+Constructor errors throw synchronously. All other methods return rejected Promises on failure:
 
 ```javascript
-// Missing index without schema
+// Constructor errors throw synchronously
 try {
   new EmbeddedIndex('./nonexistent');
 } catch (e) {
   // "index does not exist; provide a schema to create it"
 }
 
-// Schema mismatch on reopen
+// Async method errors — use try/await
+const index = new EmbeddedIndex('./my-index', { schema: { body: 'text' } });
+
 try {
-  new EmbeddedIndex('./existing', { schema: { different: 'text' } });
+  await index.add('not an object');
 } catch (e) {
-  // "schema mismatch: provided schema does not match existing index"
+  // validation error — documents must be plain objects
 }
 
 // Operations on closed index
-const index = new EmbeddedIndex('./my-index');
-index.close();
+await index.close();
 try {
-  index.search('hello');
+  await index.search('hello');
 } catch (e) {
   // "index is closed"
 }
 
-// Invalid document shape
+// RemoteIndex HTTP errors
+const remote = new RemoteIndex('http://localhost:8080', 'missing');
 try {
-  index.add('not an object');
+  await remote.search('hello');
 } catch (e) {
-  // ZodError — documents must be plain objects
+  // "searchlite search failed (404): index 'missing' does not exist"
 }
 ```
 
@@ -800,18 +802,24 @@ index.close();
 Full type definitions are included. Import and use with full IntelliSense:
 
 ```typescript
-import { Index, SearchResult, SearchRequest, SchemaDefinition } from 'searchlite-js';
+import { EmbeddedIndex, RemoteIndex, SearchResult, SchemaDefinition } from 'searchlite-js';
+import type { SearchIndex } from 'searchlite-js';
 
-const schema: SchemaDefinition = {
-  title: 'text',
-  tag: 'keyword',
-};
+// Both index types implement the same SearchIndex interface
+async function search(index: SearchIndex): Promise<SearchResult> {
+  return index.search({ query: 'hello', returnStored: true });
+}
 
-const index = new EmbeddedIndex('./my-index', { schema });
-index.add({ _id: '1', title: 'Hello', tag: 'greeting' });
-index.commit();
+// EmbeddedIndex — local native engine
+const schema: SchemaDefinition = { title: 'text', tag: 'keyword' };
+const embedded = new EmbeddedIndex('./my-index', { schema });
+await embedded.add({ _id: '1', title: 'Hello', tag: 'greeting' });
+await embedded.commit();
+const local: SearchResult = await search(embedded);
 
-const results: SearchResult = index.search({ query: 'hello', returnStored: true });
+// RemoteIndex — HTTP client
+const remote = new RemoteIndex('http://localhost:8080', 'my-index');
+const results: SearchResult = await search(remote);
 ```
 
 ## License

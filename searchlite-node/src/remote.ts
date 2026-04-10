@@ -1,5 +1,4 @@
 import type { ZodType } from "zod";
-import type { SearchIndex } from "./search-index";
 import {
 	DocumentSchema,
 	DocumentsSchema,
@@ -7,6 +6,7 @@ import {
 	SearchResultSchema,
 } from "./schemas";
 import type { SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
+import type { SearchIndex } from "./search-index";
 import {
 	type RawSearchResult,
 	requestToSnake,
@@ -49,8 +49,8 @@ export class RemoteIndex implements SearchIndex {
 	async addMany(docs: Record<string, unknown>[] | Record<string, unknown>): Promise<number> {
 		validate(DocumentsSchema, docs, "documents");
 		const docsArray = Array.isArray(docs) ? docs : [docs];
-		const body = await this.#post<{ added: number }>("bulk", { docs: docsArray });
-		return body.added;
+		const body = await this.#post<{ queued: number }>("bulk", { docs: docsArray });
+		return body.queued;
 	}
 
 	async commit(): Promise<void> {
@@ -137,8 +137,10 @@ export class RemoteIndex implements SearchIndex {
 		if (!response.ok) {
 			let detail: string;
 			try {
-				const err = (await response.json()) as { kind?: string; reason?: string };
-				detail = err.reason ?? err.kind ?? response.statusText;
+				const body = (await response.json()) as {
+					error?: { type?: string; reason?: string };
+				};
+				detail = body.error?.reason ?? body.error?.type ?? response.statusText;
 			} catch {
 				detail = response.statusText;
 			}
