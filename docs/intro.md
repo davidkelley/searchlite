@@ -12,7 +12,7 @@ Searchlite is a lightweight, SQLite-flavored search engine: a single on-disk ind
 
 ## Try It Fast
 
-Walk through ingesting a small JSONL file and running your first search in minutes: see [Quickstart](quickstart.md) (coming next).
+Walk through ingesting a small JSONL file and running your first search in minutes: see [Quickstart](quickstart.md).
 
 ## Features
 
@@ -58,7 +58,7 @@ Walk through ingesting a small JSONL file and running your first search in minut
 
 ## Compatibility and License
 
-- Rust 1.88.0+ (CI also checks 1.92, stable, beta, nightly); Linux and macOS are primary targets.
+- Rust 1.88.0+ (CI also checks 1.92.0, stable, beta, nightly); Linux and macOS are primary targets.
 - MIT licensed.
 
 ## Who Will Like It

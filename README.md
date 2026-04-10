@@ -39,7 +39,7 @@ searchlite add /tmp/myindex docs.jsonl
 searchlite commit /tmp/myindex
 
 # Search
-searchlite search /tmp/myindex --q "rust search" --limit 5
+searchlite search /tmp/myindex -q "rust search" --limit 5
 ```
 
 ### Docker (zero install)

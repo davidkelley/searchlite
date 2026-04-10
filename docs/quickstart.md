@@ -83,20 +83,17 @@ searchlite commit "$INDEX"
 
 ## 5) Run a search
 
-Search by query string plus filters. This example looks for “search” in `title`/`body` and filters by `year`:
+Search by query string. This example looks for "search" across all indexed text fields:
 
 ```bash
-searchlite search "$INDEX" \
-  --q "search" \
-  --filter '{"I64Range":{"field":"year","min":2022,"max":2024}}' \
-  --return-stored
+searchlite search "$INDEX" -q "search" --return-stored
 ```
 
 You should see hits with `_score`, `_id`, and stored fields.
 
 ## 6) Try a JSON request
 
-For more control (sorting, aggregations, highlighting), send a full JSON payload. Save this as `/tmp/request.json`:
+For filters, sorting, aggregations, or highlighting, send a full JSON payload via `--request`. Save this as `/tmp/request.json`:
 
 ```json
 {
@@ -122,14 +119,16 @@ searchlite search "$INDEX" --request /tmp/request.json
 Run the bundled HTTP server straight from the installed binary (no Rust toolchain needed):
 
 ```bash
-searchlite http --index "$INDEX" --bind 127.0.0.1:8080
+searchlite http --index "default:$INDEX" --bind 127.0.0.1:8080
 # Add --refresh-on-commit if you want searches to see new data immediately.
 ```
+
+All endpoints are prefixed with `/indexes/{name}/` where `{name}` matches the mount name (here, `default`).
 
 Send the same search over HTTP:
 
 ```bash
-curl -s http://127.0.0.1:8080/search \
+curl -s http://127.0.0.1:8080/indexes/default/search \
   -H "content-type: application/json" \
   -d @/tmp/request.json
 ```
@@ -140,10 +139,10 @@ You can also ingest over HTTP instead of the CLI:
 curl -X POST \
   -H "content-type: application/x-ndjson" \
   --data-binary @/tmp/docs.jsonl \
-  http://127.0.0.1:8080/add
-curl -X POST http://127.0.0.1:8080/commit
+  http://127.0.0.1:8080/indexes/default/add
+curl -X POST http://127.0.0.1:8080/indexes/default/commit
 # If you did not start the server with --refresh-on-commit, also call:
-curl -X POST http://127.0.0.1:8080/refresh
+curl -X POST http://127.0.0.1:8080/indexes/default/refresh
 ```
 
 Keep the server bound to localhost unless you front it with a proxy or firewall.
@@ -164,7 +163,8 @@ Keep the server bound to localhost unless you front it with a proxy or firewall.
 
 ## Next Steps
 
-- Start with the outlines in `docs/beginner-overview.md`, `docs/cli-indexing-guide.md`, and `docs/http-serving-guide.md` for a slower, junior-friendly walkthrough.
-- Explore analyzers, nested filters, aggregations, and vectors in the feature docs.
-- Embed Searchlite via the Rust API or FFI if you want to integrate directly into your app.
-- Check the Searchlite documentation site for updates and cross-links to deeper guides once they land.
+- Read [Searchlite in a Nutshell](intro.md) for a high-level overview of features, limits, and operational basics.
+- See the [Schema guide](schema.md) for field types, analyzers, and nested object configuration.
+- Explore [Queries](queries.md), [Filters](filters.md), and [Aggregations](aggregations.md) for the full search DSL.
+- See [HTTP Service](http.md) for the complete REST API reference.
+- See [Binding Lifecycle](bindings.md) for FFI and WASM-specific details.
