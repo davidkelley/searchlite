@@ -44,11 +44,11 @@ pub fn parse_json_schema(root: &Value) -> Result<Schema> {
     );
   }
 
-  let doc_id_field = obj
-    .get("searchlite:docIdField")
-    .and_then(|v| v.as_str())
-    .map(String::from)
-    .unwrap_or_else(default_doc_id_field);
+  let doc_id_field = match obj.get("searchlite:docIdField") {
+    Some(Value::String(s)) => s.clone(),
+    Some(_) => bail!("searchlite:docIdField must be a string"),
+    None => default_doc_id_field(),
+  };
 
   let analyzers: Vec<AnalyzerDef> = match obj.get("searchlite:analyzers") {
     Some(v) => serde_json::from_value(v.clone()).context("parsing searchlite:analyzers")?,
@@ -94,7 +94,10 @@ pub fn parse_json_schema(root: &Value) -> Result<Schema> {
         if kind.as_deref() == Some("keyword") {
           keyword_fields.push(parse_keyword_field(name, prop, nullable)?);
         } else if kind.is_some() {
-          bail!("property `{name}`: unknown searchlite:kind value `{}`", kind.unwrap());
+          bail!(
+            "property `{name}`: unknown searchlite:kind value `{}`",
+            kind.unwrap()
+          );
         } else {
           text_fields.push(parse_text_field(name, prop, nullable)?);
         }
@@ -116,6 +119,12 @@ pub fn parse_json_schema(root: &Value) -> Result<Schema> {
 
         #[cfg(feature = "vectors")]
         if prop.contains_key("searchlite:vector") {
+          let items_type = items.get("type").and_then(|v| v.as_str()).unwrap_or("");
+          if items_type != "number" {
+            bail!(
+              "property `{name}`: vector fields require items.type to be \"number\", got \"{items_type}\""
+            );
+          }
           vector_fields.push(parse_vector_field(name, prop, items)?);
           continue;
         }
@@ -299,7 +308,9 @@ fn parse_nested_properties(props: &Map<String, Value>) -> Result<Vec<NestedPrope
             kind.unwrap()
           );
         } else {
-          out.push(NestedProperty::Text(parse_text_field(name, prop, nullable)?));
+          out.push(NestedProperty::Text(parse_text_field(
+            name, prop, nullable,
+          )?));
         }
       }
       "integer" => {
@@ -330,9 +341,7 @@ fn parse_nested_properties(props: &Map<String, Value>) -> Result<Vec<NestedPrope
             name, items, nullable,
           )?));
         } else {
-          bail!(
-            "nested property `{name}`: unsupported array items type `{items_type}`"
-          );
+          bail!("nested property `{name}`: unsupported array items type `{items_type}`");
         }
       }
       other => {
@@ -387,7 +396,9 @@ fn parse_vector_field(
     .get("dim")
     .and_then(|v| v.as_u64())
     .map(|v| v as usize)
-    .ok_or_else(|| anyhow!("property `{name}`: searchlite:vector.dim is required and must be a positive integer"))?;
+    .ok_or_else(|| {
+      anyhow!("property `{name}`: searchlite:vector.dim is required and must be a positive integer")
+    })?;
 
   let metric_str = vec_obj
     .get("metric")
@@ -543,7 +554,10 @@ fn vector_field_to_json(f: &VectorField) -> Value {
     }),
   );
   if let Some(hnsw) = &f.hnsw {
-    vec_config.insert("hnsw".into(), serde_json::to_value(hnsw).unwrap_or(json!({})));
+    vec_config.insert(
+      "hnsw".into(),
+      serde_json::to_value(hnsw).unwrap_or(json!({})),
+    );
   }
 
   let mut prop = Map::new();
@@ -750,8 +764,14 @@ mod tests {
     assert_eq!(n.name, "author");
     assert_eq!(n.fields.len(), 2);
     // BTreeMap ordering: "age" < "name"
-    assert!(n.fields.iter().any(|f| matches!(f, NestedProperty::Keyword(kf) if kf.name == "name")));
-    assert!(n.fields.iter().any(|f| matches!(f, NestedProperty::Numeric(nf) if nf.name == "age")));
+    assert!(n
+      .fields
+      .iter()
+      .any(|f| matches!(f, NestedProperty::Keyword(kf) if kf.name == "name")));
+    assert!(n
+      .fields
+      .iter()
+      .any(|f| matches!(f, NestedProperty::Numeric(nf) if nf.name == "age")));
   }
 
   #[test]
@@ -877,6 +897,40 @@ mod tests {
   }
 
   #[test]
+  fn error_on_non_string_doc_id_field() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "searchlite:docIdField": 123,
+      "properties": {}
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("must be a string"),
+      "expected doc_id_field type error, got: {err}"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn error_on_vector_with_wrong_items_type() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "properties": {
+        "embedding": {
+          "type": "array",
+          "items": { "type": "string" },
+          "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+        }
+      }
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("items.type") && err.to_string().contains("number"),
+      "expected vector items.type error, got: {err}"
+    );
+  }
+
+  #[test]
   fn error_on_old_format() {
     let err = parse_json_schema(&json!({
       "text_fields": [],
@@ -966,7 +1020,10 @@ mod tests {
     let rt = round_trip(&original);
     assert_eq!(rt.doc_id_field, "pk");
     assert_eq!(rt.text_fields[0].analyzer, "english");
-    assert_eq!(rt.text_fields[0].search_analyzer.as_deref(), Some("standard"));
+    assert_eq!(
+      rt.text_fields[0].search_analyzer.as_deref(),
+      Some("standard")
+    );
     assert!(rt.keyword_fields[0].nullable);
     assert!(!rt.keyword_fields[0].fast);
     assert!(!rt.numeric_fields[0].i64);
