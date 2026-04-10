@@ -99,6 +99,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - name: Run release-plz
+        id: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
@@ -110,8 +111,51 @@ jobs:
           fi
           # release-plz detects the previous published version from git tags; the registry manifest
           # lookup that used to be here is no longer required with the current release-plz defaults.
-          release-plz release-pr \
+          output=$(release-plz release-pr \
             --git-token "${GITHUB_TOKEN}" \
             --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
             "${args[@]}" \
-            -o json
+            -o json)
+          echo "$output"
+          # Extract the release PR branch name (if a PR was created/updated)
+          branch=$(echo "$output" | jq -r '.prs[0].head_branch // empty')
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      # Keep searchlite-node/package.json version in sync with Cargo.toml.
+      # release-plz only manages Cargo versions; this step patches package.json
+      # on the release PR branch so the CI version-sync check passes.
+      - name: Sync package.json version
+        if: steps.release-pr.outputs.branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.release-pr.outputs.branch }}"
+          git fetch origin "$branch"
+          git checkout "$branch"
+
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          node_version=$(node -p "require('./searchlite-node/package.json').version" 2>/dev/null || echo "")
+
+          if [ -z "$node_version" ]; then
+            echo "No searchlite-node/package.json found, skipping"
+            exit 0
+          fi
+
+          if [ "$cargo_version" = "$node_version" ]; then
+            echo "Versions already in sync ($cargo_version)"
+            exit 0
+          fi
+
+          echo "Syncing package.json $node_version -> $cargo_version"
+          cd searchlite-node
+          npm version "$cargo_version" --no-git-tag-version --allow-same-version
+          cd ..
+
+          git add searchlite-node/package.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: sync package.json version to $cargo_version"
+            git push origin "$branch"
+          fi
