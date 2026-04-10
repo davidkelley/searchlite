@@ -1,22 +1,36 @@
 # searchlite-js
 
-A fast, embedded full-text search engine for Node.js. Native Rust bindings via [napi-rs](https://napi.rs) — no external services, no network calls, no setup. Just `require('searchlite-js')` and go.
+A fast full-text search engine for Node.js with two index backends:
+
+- **`EmbeddedIndex`** — native Rust bindings via [napi-rs](https://napi.rs). No external services, no network calls, no setup.
+- **`RemoteIndex`** — HTTP client for a remote [searchlite-http](../searchlite-http) server. Query indexes that live on another machine.
+
+Both implement the same async `SearchIndex` interface, so you can swap backends without changing application code.
 
 ```javascript
-const { Index } = require('searchlite-js');
+const { EmbeddedIndex } = require('searchlite-js');
 
-const index = new Index('./my-index', {
+const index = new EmbeddedIndex('./my-index', {
   schema: { title: 'text', body: 'text', tag: 'keyword' },
 });
 
-index.add({ _id: '1', title: 'Getting Started', body: 'Hello, world!', tag: 'intro' });
-index.add({ _id: '2', title: 'Advanced Search', body: 'Filters, facets, and more', tag: 'guide' });
-index.commit();
+await index.add({ _id: '1', title: 'Getting Started', body: 'Hello, world!', tag: 'intro' });
+await index.add({ _id: '2', title: 'Advanced Search', body: 'Filters, facets, and more', tag: 'guide' });
+await index.commit();
 
-const results = index.search('hello');
+const results = await index.search('hello');
 console.log(results.hits[0].docId); // "1"
 
-index.close();
+await index.close();
+```
+
+Or connect to a remote server:
+
+```javascript
+const { RemoteIndex } = require('searchlite-js');
+
+const index = new RemoteIndex('http://localhost:8080', 'my-index');
+const results = await index.search('hello');
 ```
 
 ## Installation
@@ -40,7 +54,7 @@ Prebuilt binaries are available for:
 Every index has a schema that describes what fields your documents contain. Use shorthand strings for common configurations:
 
 ```javascript
-const index = new Index('./products', {
+const index = new EmbeddedIndex('./products', {
   schema: {
     name: 'text',       // full-text searchable, stored
     description: 'text',
@@ -54,7 +68,7 @@ const index = new Index('./products', {
 Or use detailed definitions when you need more control:
 
 ```javascript
-const index = new Index('./products', {
+const index = new EmbeddedIndex('./products', {
   schema: {
     name: { type: 'text', stored: true, indexed: true, analyzer: 'default' },
     brand: { type: 'keyword', stored: true, fast: true },
@@ -66,7 +80,7 @@ const index = new Index('./products', {
 ### 2. Add Documents
 
 ```javascript
-index.add({
+await index.add({
   _id: 'product-1',
   name: 'Wireless Headphones',
   description: 'Noise-cancelling over-ear headphones',
@@ -76,7 +90,7 @@ index.add({
 });
 
 // Or add many at once
-const count = index.addMany([
+const count = await index.addMany([
   { _id: 'product-2', name: 'USB Microphone', brand: 'SoundPro', price: 49.99, year: 2024 },
   { _id: 'product-3', name: 'Webcam HD', brand: 'VisionTech', price: 39.99, year: 2023 },
 ]);
@@ -88,34 +102,46 @@ console.log(count); // 2
 Documents are queued in memory until you commit. This makes bulk indexing fast — commit once after adding a batch.
 
 ```javascript
-index.commit();
+await index.commit();
 // Now documents are searchable and durable on disk
 ```
 
 ### 4. Search
 
 ```javascript
-const results = index.search('headphones');
+const results = await index.search('headphones');
 console.log(results.totalHits);           // 1
 console.log(results.hits[0].docId);       // "product-1"
 console.log(results.hits[0].score);       // BM25 relevance score
 ```
 
+## Choosing an Index Type
+
+| | `EmbeddedIndex` | `RemoteIndex` |
+|---|---|---|
+| **Use when** | Search runs in-process | Index lives on another server |
+| **Latency** | Microseconds (native) | Network round-trip |
+| **Write support** | Full (add, commit, compact) | Full (via HTTP API) |
+| **Dependencies** | Native binary (.node) | `fetch` (Node 18+) |
+| **Constructor** | `new EmbeddedIndex(path, opts?)` | `new RemoteIndex(baseUrl, indexName, opts?)` |
+
+Both implement the `SearchIndex` interface — all methods return Promises.
+
 ## API Reference
 
-### `new Index(path, options?)`
+### `new EmbeddedIndex(path, options?)`
 
 Opens or creates an index at the given filesystem path.
 
 ```javascript
 // Create a new index (schema required)
-const index = new Index('./my-index', { schema: { title: 'text' } });
+const index = new EmbeddedIndex('./my-index', { schema: { title: 'text' } });
 
 // Open an existing index
-const index = new Index('./my-index');
+const index = new EmbeddedIndex('./my-index');
 
 // With a write key for access control
-const index = new Index('./my-index', {
+const index = new EmbeddedIndex('./my-index', {
   schema: { title: 'text' },
   writeKey: 'my-secret-key',
 });
@@ -202,6 +228,39 @@ Merges index segments for better read performance. Call this periodically after 
 ### `index.close()`
 
 Closes the index and releases native resources. Any subsequent method calls will throw.
+
+### `new RemoteIndex(baseUrl, indexName, options?)`
+
+Connects to a remote searchlite-http server.
+
+```javascript
+const { RemoteIndex } = require('searchlite-js');
+
+// Basic connection
+const index = new RemoteIndex('http://localhost:8080', 'products');
+
+// With write key for protected indexes
+const index = new RemoteIndex('http://localhost:8080', 'products', {
+  writeKey: 'my-secret-key',
+});
+
+// With custom fetch (for testing or custom transports)
+const index = new RemoteIndex('http://localhost:8080', 'products', {
+  fetch: myCustomFetch,
+});
+```
+
+`RemoteIndex` implements the same `SearchIndex` interface as `EmbeddedIndex` — all methods (`add`, `addMany`, `commit`, `compact`, `search`, `close`) work identically. The `close()` method is a no-op since HTTP connections are stateless.
+
+Internally, methods map to [searchlite-http](../searchlite-http) endpoints:
+
+| Method | HTTP Endpoint |
+|--------|--------------|
+| `add(doc)` | `POST /indexes/:name/bulk` |
+| `addMany(docs)` | `POST /indexes/:name/bulk` |
+| `commit()` | `POST /indexes/:name/commit` |
+| `compact()` | `POST /indexes/:name/compact` |
+| `search(query)` | `POST /indexes/:name/search` |
 
 ## Schema
 
@@ -624,58 +683,60 @@ Protect an index with a write key to prevent unauthorized modifications:
 
 ```javascript
 // Create with write key
-const index = new Index('./protected', {
+const index = new EmbeddedIndex('./protected', {
   schema: { title: 'text' },
   writeKey: 'my-secret',
 });
 
 // Reopen — must provide the same write key to write
-const index = new Index('./protected', { writeKey: 'my-secret' });
+const index = new EmbeddedIndex('./protected', { writeKey: 'my-secret' });
 ```
 
 ## Error Handling
 
-All errors throw synchronously. Common error scenarios:
+Constructor errors throw synchronously. All other methods return rejected Promises on failure:
 
 ```javascript
-// Missing index without schema
+// Constructor errors throw synchronously
 try {
-  new Index('./nonexistent');
+  new EmbeddedIndex('./nonexistent');
 } catch (e) {
   // "index does not exist; provide a schema to create it"
 }
 
-// Schema mismatch on reopen
+// Async method errors — use try/await
+const index = new EmbeddedIndex('./my-index', { schema: { body: 'text' } });
+
 try {
-  new Index('./existing', { schema: { different: 'text' } });
+  await index.add('not an object');
 } catch (e) {
-  // "schema mismatch: provided schema does not match existing index"
+  // validation error — documents must be plain objects
 }
 
 // Operations on closed index
-const index = new Index('./my-index');
-index.close();
+await index.close();
 try {
-  index.search('hello');
+  await index.search('hello');
 } catch (e) {
   // "index is closed"
 }
 
-// Invalid document shape
+// RemoteIndex HTTP errors
+const remote = new RemoteIndex('http://localhost:8080', 'missing');
 try {
-  index.add('not an object');
+  await remote.search('hello');
 } catch (e) {
-  // ZodError — documents must be plain objects
+  // "searchlite search failed (404): index 'missing' does not exist"
 }
 ```
 
 ## Complete Example
 
 ```javascript
-const { Index } = require('searchlite-js');
+const { EmbeddedIndex } = require('searchlite-js');
 
 // Create an index for a recipe database
-const index = new Index('./recipes', {
+const index = new EmbeddedIndex('./recipes', {
   schema: {
     title: 'text',
     ingredients: 'text',
@@ -741,18 +802,24 @@ index.close();
 Full type definitions are included. Import and use with full IntelliSense:
 
 ```typescript
-import { Index, SearchResult, SearchRequest, SchemaDefinition } from 'searchlite-js';
+import { EmbeddedIndex, RemoteIndex, SearchResult, SchemaDefinition } from 'searchlite-js';
+import type { SearchIndex } from 'searchlite-js';
 
-const schema: SchemaDefinition = {
-  title: 'text',
-  tag: 'keyword',
-};
+// Both index types implement the same SearchIndex interface
+async function search(index: SearchIndex): Promise<SearchResult> {
+  return index.search({ query: 'hello', returnStored: true });
+}
 
-const index = new Index('./my-index', { schema });
-index.add({ _id: '1', title: 'Hello', tag: 'greeting' });
-index.commit();
+// EmbeddedIndex — local native engine
+const schema: SchemaDefinition = { title: 'text', tag: 'keyword' };
+const embedded = new EmbeddedIndex('./my-index', { schema });
+await embedded.add({ _id: '1', title: 'Hello', tag: 'greeting' });
+await embedded.commit();
+const local: SearchResult = await search(embedded);
 
-const results: SearchResult = index.search({ query: 'hello', returnStored: true });
+// RemoteIndex — HTTP client
+const remote = new RemoteIndex('http://localhost:8080', 'my-index');
+const results: SearchResult = await search(remote);
 ```
 
 ## License
