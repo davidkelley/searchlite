@@ -903,7 +903,7 @@ const StrictFields = z.object({
 try {
   await index.search(StrictFields, 'headphones');
 } catch (e) {
-  // Error: "typed result validation failed at hit 0 (doc_id=product-1): Required at "price""
+  // Error: 'Invalid fields on hit 0 (docId: "product-1"):\n Required at "price"'
 }
 ```
 

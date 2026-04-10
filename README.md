@@ -130,7 +130,7 @@ npm install searchlite-js
 ```
 
 ```javascript
-const { EmbeddedIndex } = require('searchlite-js');
+import { EmbeddedIndex } from 'searchlite-js';
 
 const index = new EmbeddedIndex('./my-index', {
   schema: { title: 'text', body: 'text', tag: 'keyword' },
@@ -148,7 +148,7 @@ console.log(results.hits[0].docId); // "1"
 await index.close();
 ```
 
-See the [quickstart](docs/quickstart.md#node-js--typescript) for a full TypeScript example with Zod-validated typed search.
+See the [quickstart](docs/quickstart.md#nodejs--typescript) for a full TypeScript example with Zod-validated typed search.
 
 ---
 
