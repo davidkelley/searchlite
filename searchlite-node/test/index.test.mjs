@@ -1,8 +1,8 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { Index } from "../dist/index.js";
 
 let cleanup = [];
@@ -872,9 +872,11 @@ describe("typed search", () => {
 		idx.add({ _id: "1", body: "passthrough test", tag: "kept" });
 		idx.commit();
 
-		const PassthroughSchema = z.object({
-			body: z.string(),
-		}).passthrough();
+		const PassthroughSchema = z
+			.object({
+				body: z.string(),
+			})
+			.passthrough();
 
 		const result = idx.search(PassthroughSchema, "passthrough");
 		expect(result.hits[0].fields.body).toBe("passthrough test");

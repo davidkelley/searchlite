@@ -10,12 +10,7 @@ import {
 	expandSchema,
 } from "./schemas";
 
-import type {
-	SchemaDefinition,
-	SearchRequest,
-	SearchResult,
-	TypedSearchResult,
-} from "./schemas";
+import type { SchemaDefinition, SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 
 export type {
 	FieldDefinition,
@@ -258,11 +253,9 @@ export class Index {
 
 		// Validate each hit's fields against the user's schema
 		if (fieldsSchema) {
-			const validateHitFields = (
-				hit: SearchResult["hits"][number],
-				path: string,
-			): void => {
-				const parsed = fieldsSchema!.safeParse(hit.fields);
+			const schema = fieldsSchema;
+			const validateHitFields = (hit: SearchResult["hits"][number], path: string): void => {
+				const parsed = schema.safeParse(hit.fields);
 				if (!parsed.success) {
 					throw new Error(
 						`Invalid fields on ${path} (docId: "${hit.docId}"):\n${prettifyError(parsed.error)}`,
