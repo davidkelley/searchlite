@@ -164,21 +164,13 @@ fn multi_match_most_fields_counts_across_fields() {
     boost: None,
   };
   let body_ids = ids(&reader.search(&request(body_only)).unwrap());
-  assert!(body_ids.contains("doc-3"), "{:?}", body_ids);
+  assert!(body_ids.contains("doc-3"), "{body_ids:?}");
   let best_res = reader.search(&request(best)).unwrap();
   let most_res = reader.search(&request(most)).unwrap();
   let best_ids = ids(&best_res);
   let most_ids = ids(&most_res);
-  assert!(
-    best_ids.contains("doc-2"),
-    "best_fields ids: {:?}",
-    best_ids
-  );
-  assert!(
-    most_ids.contains("doc-2"),
-    "most_fields ids: {:?}",
-    most_ids
-  );
+  assert!(best_ids.contains("doc-2"), "best_fields ids: {best_ids:?}");
+  assert!(most_ids.contains("doc-2"), "most_fields ids: {most_ids:?}");
   let best_score = score_for(&best_res, "doc-2").unwrap();
   let most_score = score_for(&most_res, "doc-2").unwrap();
   assert!(most_score > best_score);
@@ -274,8 +266,8 @@ fn cross_fields_operator_and_matches_split_terms() {
     boost: None,
   };
   let hits = ids(&reader.search(&request(query)).unwrap());
-  assert!(hits.contains("doc-2"), "hits: {:?}", hits);
-  assert!(!hits.contains("doc-4"), "hits: {:?}", hits);
+  assert!(hits.contains("doc-2"), "hits: {hits:?}");
+  assert!(!hits.contains("doc-4"), "hits: {hits:?}");
 }
 
 #[test]
@@ -301,7 +293,7 @@ fn cross_fields_fuzziness_auto_recovers_typo() {
     boost: None,
   });
   let exact_hits = ids(&reader.search(&exact).unwrap());
-  assert!(exact_hits.is_empty(), "exact hits: {:?}", exact_hits);
+  assert!(exact_hits.is_empty(), "exact hits: {exact_hits:?}");
 
   exact.query = Query::Node(QueryNode::MultiMatch {
     query: "rust serch".into(),
@@ -323,12 +315,8 @@ fn cross_fields_fuzziness_auto_recovers_typo() {
     boost: None,
   });
   let fuzzy_hits = ids(&reader.search(&exact).unwrap());
-  assert!(fuzzy_hits.contains("doc-2"), "fuzzy hits: {:?}", fuzzy_hits);
-  assert!(
-    !fuzzy_hits.contains("doc-4"),
-    "fuzzy hits: {:?}",
-    fuzzy_hits
-  );
+  assert!(fuzzy_hits.contains("doc-2"), "fuzzy hits: {fuzzy_hits:?}");
+  assert!(!fuzzy_hits.contains("doc-4"), "fuzzy hits: {fuzzy_hits:?}");
 }
 
 #[test]

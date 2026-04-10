@@ -279,7 +279,7 @@ fn cmd_init(index: &Path, schema_path: &Path, write_key: Option<&str>) -> Result
   let schema_str = fs::read_to_string(schema_path)?;
   let schema: searchlite_core::api::types::Schema = serde_json::from_str(&schema_str)?;
   IndexBuilder::create_with_write_key(index, schema, opts, write_key)?;
-  println!("initialized index at {:?}", index);
+  println!("initialized index at {index:?}");
   Ok(())
 }
 
@@ -288,7 +288,7 @@ fn cmd_add(index: &Path, doc_path: &Path, write_key: Option<&str>) -> Result<()>
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
   let content =
-    fs::read_to_string(doc_path).with_context(|| format!("reading docs from {:?}", doc_path))?;
+    fs::read_to_string(doc_path).with_context(|| format!("reading docs from {doc_path:?}"))?;
   for (line_no, line) in content.lines().enumerate() {
     if line.trim().is_empty() {
       continue;
@@ -312,7 +312,7 @@ fn cmd_delete(index: &Path, ids_path: &Path, write_key: Option<&str>) -> Result<
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
   let content = fs::read_to_string(ids_path)
-    .with_context(|| format!("reading document ids from {:?}", ids_path))?;
+    .with_context(|| format!("reading document ids from {ids_path:?}"))?;
   let mut ids = Vec::new();
   for (line_no, line) in content.lines().enumerate() {
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -459,9 +459,9 @@ fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
 fn read_request(path: Option<PathBuf>, request_stdin: bool) -> Result<Option<SearchRequest>> {
   if let Some(p) = path {
     let contents =
-      fs::read_to_string(&p).with_context(|| format!("reading search request from {:?}", p))?;
+      fs::read_to_string(&p).with_context(|| format!("reading search request from {p:?}"))?;
     let request = serde_json::from_str::<SearchRequest>(&contents)
-      .with_context(|| format!("parsing search request JSON from {:?}", p))?;
+      .with_context(|| format!("parsing search request JSON from {p:?}"))?;
     if request.limit == 0 && request.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
     }
@@ -487,7 +487,7 @@ fn load_aggs(
   aggs_file: Option<PathBuf>,
 ) -> Result<BTreeMap<String, Aggregation>> {
   let raw = if let Some(path) = aggs_file {
-    Some(fs::read_to_string(&path).with_context(|| format!("reading aggs from {:?}", path))?)
+    Some(fs::read_to_string(&path).with_context(|| format!("reading aggs from {path:?}"))?)
   } else {
     aggs
   };

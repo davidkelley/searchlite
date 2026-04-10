@@ -101,13 +101,11 @@ fn concurrent_reads_during_writes() {
           Ok(res) => {
             assert!(
               !res.hits.is_empty(),
-              "reader {} iter {}: search returned 0 hits",
-              reader_id,
-              iter,
+              "reader {reader_id} iter {iter}: search returned 0 hits",
             );
           }
           Err(e) => {
-            panic!("reader {} iter {} got error: {:?}", reader_id, iter, e);
+            panic!("reader {reader_id} iter {iter} got error: {e:?}");
           }
         }
       }
@@ -172,8 +170,7 @@ fn rapid_commit_cycles() {
     // We should get some hits (at least up to the limit of 10)
     assert!(
       !result.hits.is_empty() || result.total_hits_estimate > 0,
-      "cycle {}: search returned no results",
-      cycle
+      "cycle {cycle}: search returned no results"
     );
   }
 
@@ -255,10 +252,7 @@ fn readers_survive_compaction() {
             );
           }
           Err(e) => {
-            panic!(
-              "reader {} iter {} got error: {:?}",
-              reader_id, iterations, e
-            );
+            panic!("reader {reader_id} iter {iterations} got error: {e:?}");
           }
         }
         iterations += 1;

@@ -16,29 +16,17 @@ pub fn wal_path(root: &Path) -> PathBuf {
 pub fn segment_paths(root: &Path, id: &str) -> SegmentPaths {
   SegmentPaths {
     terms: root
-      .join(format!("seg_{}.terms", id))
+      .join(format!("seg_{id}.terms"))
       .to_string_lossy()
       .into(),
-    postings: root
-      .join(format!("seg_{}.post", id))
-      .to_string_lossy()
-      .into(),
-    docstore: root
-      .join(format!("seg_{}.docs", id))
-      .to_string_lossy()
-      .into(),
-    fast: root
-      .join(format!("seg_{}.fast", id))
-      .to_string_lossy()
-      .into(),
-    meta: root
-      .join(format!("seg_{}.meta", id))
-      .to_string_lossy()
-      .into(),
+    postings: root.join(format!("seg_{id}.post")).to_string_lossy().into(),
+    docstore: root.join(format!("seg_{id}.docs")).to_string_lossy().into(),
+    fast: root.join(format!("seg_{id}.fast")).to_string_lossy().into(),
+    meta: root.join(format!("seg_{id}.meta")).to_string_lossy().into(),
     #[cfg(feature = "vectors")]
     vector_dir: Some(
       root
-        .join(format!("seg_{}_vectors", id))
+        .join(format!("seg_{id}_vectors"))
         .to_string_lossy()
         .into(),
     ),
@@ -47,7 +35,7 @@ pub fn segment_paths(root: &Path, id: &str) -> SegmentPaths {
 
 #[allow(dead_code)]
 pub fn segment_meta_path(root: &Path, id: &str) -> PathBuf {
-  root.join(format!("seg_{}.meta", id))
+  root.join(format!("seg_{id}.meta"))
 }
 
 #[allow(dead_code)]

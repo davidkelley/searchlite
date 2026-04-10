@@ -935,8 +935,8 @@ impl<'a> SegmentWriter<'a> {
       let (vec_path, hnsw_path) = vector_paths(&paths, field)?;
       let vec_buf = self.storage.read_to_end(&vec_path)?;
       let hnsw_buf = self.storage.read_to_end(&hnsw_path)?;
-      checksums.insert(format!("vector_{}_bin", field), checksum(&vec_buf));
-      checksums.insert(format!("vector_{}_hnsw", field), checksum(&hnsw_buf));
+      checksums.insert(format!("vector_{field}_bin"), checksum(&vec_buf));
+      checksums.insert(format!("vector_{field}_hnsw"), checksum(&hnsw_buf));
     }
 
     let meta = SegmentMeta {
@@ -1089,48 +1089,29 @@ fn read_vector_file(
   let mut cursor = Cursor::new(bytes);
   let magic = cursor.read_u32::<LittleEndian>()?;
   if magic != VECTOR_FILE_MAGIC {
-    bail!("invalid vector file magic for {:?}", path);
+    bail!("invalid vector file magic for {path:?}");
   }
   let version = cursor.read_u32::<LittleEndian>()?;
   if version != VECTOR_FILE_VERSION {
-    bail!("unsupported vector file version {} for {:?}", version, path);
+    bail!("unsupported vector file version {version} for {path:?}");
   }
   let dim = cursor.read_u32::<LittleEndian>()? as usize;
   if dim != expected_dim {
-    bail!(
-      "vector dim mismatch for {:?}: expected {}, found {}",
-      path,
-      expected_dim,
-      dim
-    );
+    bail!("vector dim mismatch for {path:?}: expected {expected_dim}, found {dim}");
   }
   let metric_code_raw = cursor.read_u8()?;
   let Some(metric) = metric_from_code(metric_code_raw) else {
-    bail!(
-      "unknown vector metric code {} in {:?}",
-      metric_code_raw,
-      path
-    );
+    bail!("unknown vector metric code {metric_code_raw} in {path:?}");
   };
   if &metric != expected_metric {
-    bail!(
-      "vector metric mismatch for {:?}: expected {:?}, found {:?}",
-      path,
-      expected_metric,
-      metric
-    );
+    bail!("vector metric mismatch for {path:?}: expected {expected_metric:?}, found {metric:?}");
   }
   // skip reserved bytes
   let _ = cursor.read_u8()?;
   let _ = cursor.read_u16::<LittleEndian>()?;
   let doc_count = cursor.read_u32::<LittleEndian>()? as usize;
   if doc_count != expected_docs {
-    bail!(
-      "vector doc count mismatch for {:?}: expected {}, found {}",
-      path,
-      expected_docs,
-      doc_count
-    );
+    bail!("vector doc count mismatch for {path:?}: expected {expected_docs}, found {doc_count}");
   }
   let vector_count = cursor.read_u32::<LittleEndian>()? as usize;
   let mut offsets = Vec::with_capacity(doc_count);
@@ -1222,15 +1203,15 @@ fn verify_checksums(
         for field in seg_meta.vector_fields.keys() {
           let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
           verify(
-            &format!("vector {} bin", field),
+            &format!("vector {field} bin"),
             &vec_path,
-            meta.checksums.get(&format!("vector_{}_bin", field)),
+            meta.checksums.get(&format!("vector_{field}_bin")),
             None,
           )?;
           verify(
-            &format!("vector {} hnsw", field),
+            &format!("vector {field} hnsw"),
             &hnsw_path,
-            meta.checksums.get(&format!("vector_{}_hnsw", field)),
+            meta.checksums.get(&format!("vector_{field}_hnsw")),
             None,
           )?;
         }

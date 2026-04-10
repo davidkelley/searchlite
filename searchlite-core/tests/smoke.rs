@@ -466,8 +466,7 @@ fn compact_removes_old_segments() {
   for p in old_paths {
     assert!(
       !p.exists(),
-      "expected old segment file {:?} to be removed after compaction",
-      p
+      "expected old segment file {p:?} to be removed after compaction"
     );
   }
 }
@@ -578,7 +577,7 @@ fn cursor_paginates_ordered_hits() {
       let repeats = 6 - i;
       writer
         .add_document(&doc(
-          &format!("{}", i),
+          &format!("{i}"),
           vec![("body", json!("rust ".repeat(repeats)))],
         ))
         .unwrap();
@@ -591,7 +590,7 @@ fn cursor_paginates_ordered_hits() {
       let repeats = 6 - i;
       writer
         .add_document(&doc(
-          &format!("{}", i),
+          &format!("{i}"),
           vec![("body", json!("rust ".repeat(repeats)))],
         ))
         .unwrap();

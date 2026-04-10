@@ -67,9 +67,9 @@ impl Manifest {
   pub fn load(storage: &dyn Storage, path: &Path) -> Result<Self> {
     let data = storage
       .read_to_end(path)
-      .with_context(|| format!("reading manifest at {:?}", path))?;
+      .with_context(|| format!("reading manifest at {path:?}"))?;
     let manifest: Manifest =
-      serde_json::from_slice(&data).with_context(|| format!("parsing manifest at {:?}", path))?;
+      serde_json::from_slice(&data).with_context(|| format!("parsing manifest at {path:?}"))?;
     Ok(manifest)
   }
 
@@ -77,7 +77,7 @@ impl Manifest {
     let data = serde_json::to_vec_pretty(self)?;
     storage
       .atomic_write(path, &data)
-      .with_context(|| format!("writing manifest at {:?}", path))
+      .with_context(|| format!("writing manifest at {path:?}"))
   }
 
   pub fn manifest_path(root: &Path) -> PathBuf {

@@ -27,7 +27,7 @@ impl Wal {
   pub fn open(storage: Arc<dyn Storage>, path: &Path) -> Result<Self> {
     let file = storage
       .open_append(path)
-      .with_context(|| format!("opening wal at {:?}", path))?;
+      .with_context(|| format!("opening wal at {path:?}"))?;
     Ok(Self {
       _storage: storage,
       _path: path.to_path_buf(),
