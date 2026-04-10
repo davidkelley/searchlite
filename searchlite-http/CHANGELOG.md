@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.1.5...searchlite-http-v0.2.0) - 2026-04-10
+
+### Added
+
+- product readiness — modularize reader, scale benchmarks, merge policy ([#107](https://github.com/davidkelley/searchlite/pull/107))
+- auto commit refresh indexes ([#104](https://github.com/davidkelley/searchlite/pull/104))
+- Fuzzy/cross-field search + exact total hits ([#103](https://github.com/davidkelley/searchlite/pull/103))
+- feat/nested aggregations ([#102](https://github.com/davidkelley/searchlite/pull/102))
+- partial update APIs ([#101](https://github.com/davidkelley/searchlite/pull/101))
+- feat/mget documentation ([#100](https://github.com/davidkelley/searchlite/pull/100))
+- mget & `search_after` ([#95](https://github.com/davidkelley/searchlite/pull/95))
+
+### Fixed
+
+- inline format args for clippy on Rust 1.88.0 ([#113](https://github.com/davidkelley/searchlite/pull/113))
+
 ## [0.1.5](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.1.4...searchlite-http-v0.1.5) - 2026-01-30
 
 ### Added

@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "integration"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-ffi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "searchlite-core",
@@ -2148,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-http"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-node"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "napi",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-wasm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "futures",

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.5...searchlite-ffi-v0.1.6) - 2026-04-10
+
+### Added
+
+- product readiness — modularize reader, scale benchmarks, merge policy ([#107](https://github.com/davidkelley/searchlite/pull/107))
+- Fuzzy/cross-field search + exact total hits ([#103](https://github.com/davidkelley/searchlite/pull/103))
+- feat/mget documentation ([#100](https://github.com/davidkelley/searchlite/pull/100))
+- mget & `search_after` ([#95](https://github.com/davidkelley/searchlite/pull/95))
+
 ## [0.1.5](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.4...searchlite-ffi-v0.1.5) - 2026-01-30
 
 ### Added
