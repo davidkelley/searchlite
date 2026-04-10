@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.0...searchlite-core-v0.6.1) - 2026-04-10
+
+### Fixed
+
+- WASM getrandom error and Docker missing workspace members ([#116](https://github.com/davidkelley/searchlite/pull/116))
+
 ## [0.6.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.5.0...searchlite-core-v0.6.0) - 2026-04-10
 
 ### Added
