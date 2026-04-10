@@ -19,15 +19,18 @@ COPY searchlite-wasm/Cargo.toml searchlite-wasm/Cargo.toml
 COPY searchlite-node/Cargo.toml searchlite-node/Cargo.toml
 COPY integration/Cargo.toml integration/Cargo.toml
 
-# Create dummy source files so cargo can resolve the workspace without pulling full sources yet.
-RUN mkdir -p searchlite-core/src searchlite-cli/src searchlite-http/src searchlite-ffi/src searchlite-wasm/src searchlite-node/src integration/src \
+# Create dummy source and bench files so cargo can resolve the workspace without pulling full sources yet.
+RUN mkdir -p searchlite-core/src searchlite-core/benches searchlite-cli/src searchlite-http/src searchlite-ffi/src searchlite-wasm/src searchlite-node/src integration/src \
  && echo "fn main() {}" > searchlite-cli/src/main.rs \
  && echo "pub fn placeholder() {}" > searchlite-core/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-http/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-ffi/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-wasm/src/lib.rs \
  && echo "pub fn placeholder() {}" > searchlite-node/src/lib.rs \
- && echo "pub fn placeholder() {}" > integration/src/lib.rs
+ && echo "pub fn placeholder() {}" > integration/src/lib.rs \
+ && echo "fn main() {}" > searchlite-core/benches/aggs.rs \
+ && echo "fn main() {}" > searchlite-core/benches/end_to_end.rs \
+ && echo "fn main() {}" > searchlite-core/benches/scale.rs
 
 RUN cargo fetch --locked
 
