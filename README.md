@@ -123,6 +123,33 @@ for hit in &results.hits {
 }
 ```
 
+### As an npm package
+
+```bash
+npm install searchlite-js
+```
+
+```javascript
+const { EmbeddedIndex } = require('searchlite-js');
+
+const index = new EmbeddedIndex('./my-index', {
+  schema: { title: 'text', body: 'text', tag: 'keyword' },
+});
+
+await index.addMany([
+  { _id: '1', title: 'Getting Started', body: 'Hello, world!', tag: 'intro' },
+  { _id: '2', title: 'Advanced Search', body: 'Filters, facets, and more', tag: 'guide' },
+]);
+await index.commit();
+
+const results = await index.search('hello');
+console.log(results.hits[0].docId); // "1"
+
+await index.close();
+```
+
+See the [quickstart](docs/quickstart.md#node-js--typescript) for a full TypeScript example with Zod-validated typed search.
+
 ---
 
 ## Features
@@ -162,6 +189,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | **CLI** | [`searchlite-cli`](searchlite-cli/) | Stable &mdash; init, add, commit, search, compact |
 | **HTTP** | [`searchlite-http`](searchlite-http/) | Stable &mdash; REST API over one or more indexes |
 | **C FFI** | [`searchlite-ffi`](searchlite-ffi/) | Stable &mdash; shared library + C header |
+| **Node.js** | [`searchlite-js`](searchlite-node/) | Stable &mdash; native bindings + HTTP client, TypeScript + Zod |
 | **WASM** | [`searchlite-wasm`](searchlite-wasm/) | Experimental &mdash; IndexedDB-backed, browser search |
 
 ---
@@ -227,6 +255,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | Feature flags | [docs/feature-flags.md](docs/feature-flags.md) |
 | Benchmarks | [BENCHMARKS.md](BENCHMARKS.md) |
 | Architecture deep-dive | [docs/intro.md](docs/intro.md) |
+| Node.js bindings | [searchlite-node/README.md](searchlite-node/README.md) |
 | Binding behaviors | [docs/bindings.md](docs/bindings.md) |
 
 ---
