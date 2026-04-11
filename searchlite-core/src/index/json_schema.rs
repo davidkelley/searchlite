@@ -90,7 +90,7 @@ pub fn parse_json_schema(root: &Value) -> Result<Schema> {
 
     match base_type.as_str() {
       "string" => {
-        let kind = sl_str(prop, "kind");
+        let kind = sl_str(prop, "kind")?;
         if kind.as_deref() == Some("keyword") {
           keyword_fields.push(parse_keyword_field(name, prop, nullable)?);
         } else if kind.is_some() {
@@ -209,13 +209,23 @@ pub fn schema_to_json_schema(schema: &Schema) -> Value {
 // ── Field parsers ────────────────────────────────────────────────────────────
 
 fn parse_text_field(name: &str, prop: &Map<String, Value>, nullable: bool) -> Result<TextField> {
-  let nullable = sl_bool(prop, "nullable").unwrap_or(nullable);
+  let nullable = sl_bool(prop, "nullable")?.unwrap_or(nullable);
+  let analyzer = sl_str(prop, "analyzer")?.unwrap_or_else(|| "default".to_string());
+  if analyzer.is_empty() {
+    bail!("property `{name}`: searchlite:analyzer must not be empty");
+  }
+  let search_analyzer = sl_str(prop, "searchAnalyzer")?;
+  if let Some(ref sa) = search_analyzer {
+    if sa.is_empty() {
+      bail!("property `{name}`: searchlite:searchAnalyzer must not be empty");
+    }
+  }
   Ok(TextField {
     name: name.to_string(),
-    analyzer: sl_str(prop, "analyzer").unwrap_or_else(|| "default".to_string()),
-    search_analyzer: sl_str(prop, "searchAnalyzer"),
-    stored: sl_bool(prop, "stored").unwrap_or(true),
-    indexed: sl_bool(prop, "indexed").unwrap_or(true),
+    analyzer,
+    search_analyzer,
+    stored: sl_bool(prop, "stored")?.unwrap_or(true),
+    indexed: sl_bool(prop, "indexed")?.unwrap_or(true),
     nullable,
     search_as_you_type: parse_search_as_you_type(prop)?,
   })
@@ -226,12 +236,12 @@ fn parse_keyword_field(
   prop: &Map<String, Value>,
   nullable: bool,
 ) -> Result<KeywordField> {
-  let nullable = sl_bool(prop, "nullable").unwrap_or(nullable);
+  let nullable = sl_bool(prop, "nullable")?.unwrap_or(nullable);
   Ok(KeywordField {
     name: name.to_string(),
-    stored: sl_bool(prop, "stored").unwrap_or(true),
-    indexed: sl_bool(prop, "indexed").unwrap_or(true),
-    fast: sl_bool(prop, "fast").unwrap_or(true),
+    stored: sl_bool(prop, "stored")?.unwrap_or(true),
+    indexed: sl_bool(prop, "indexed")?.unwrap_or(true),
+    fast: sl_bool(prop, "fast")?.unwrap_or(true),
     nullable,
   })
 }
@@ -242,12 +252,12 @@ fn parse_numeric_field(
   nullable: bool,
   is_i64: bool,
 ) -> Result<NumericField> {
-  let nullable = sl_bool(prop, "nullable").unwrap_or(nullable);
+  let nullable = sl_bool(prop, "nullable")?.unwrap_or(nullable);
   Ok(NumericField {
     name: name.to_string(),
     i64: is_i64,
-    fast: sl_bool(prop, "fast").unwrap_or(true),
-    stored: sl_bool(prop, "stored").unwrap_or(false),
+    fast: sl_bool(prop, "fast")?.unwrap_or(true),
+    stored: sl_bool(prop, "stored")?.unwrap_or(false),
     nullable,
   })
 }
@@ -257,7 +267,7 @@ fn parse_nested_field(
   prop: &Map<String, Value>,
   nullable: bool,
 ) -> Result<NestedField> {
-  let nullable = sl_bool(prop, "nullable").unwrap_or(nullable);
+  let nullable = sl_bool(prop, "nullable")?.unwrap_or(nullable);
   let fields = match prop.get("properties") {
     Some(Value::Object(m)) => parse_nested_properties(m)?,
     _ => Vec::new(),
@@ -297,7 +307,7 @@ fn parse_nested_properties(props: &Map<String, Value>) -> Result<Vec<NestedPrope
 
     match base_type.as_str() {
       "string" => {
-        let kind = sl_str(prop, "kind");
+        let kind = sl_str(prop, "kind")?;
         if kind.as_deref() == Some("keyword") {
           out.push(NestedProperty::Keyword(parse_keyword_field(
             name, prop, nullable,
@@ -594,19 +604,24 @@ fn resolve_type(name: &str, prop: &Map<String, Value>) -> Result<(String, bool)>
   }
 }
 
-/// Read a `searchlite:` boolean keyword.
-fn sl_bool(prop: &Map<String, Value>, key: &str) -> Option<bool> {
-  prop
-    .get(&format!("{PREFIX}{key}"))
-    .and_then(|v| v.as_bool())
+/// Read a `searchlite:` boolean keyword, rejecting wrong types.
+fn sl_bool(prop: &Map<String, Value>, key: &str) -> Result<Option<bool>> {
+  let full_key = format!("{PREFIX}{key}");
+  match prop.get(&full_key) {
+    Some(Value::Bool(b)) => Ok(Some(*b)),
+    Some(_) => bail!("`{full_key}` must be a boolean"),
+    None => Ok(None),
+  }
 }
 
-/// Read a `searchlite:` string keyword.
-fn sl_str(prop: &Map<String, Value>, key: &str) -> Option<String> {
-  prop
-    .get(&format!("{PREFIX}{key}"))
-    .and_then(|v| v.as_str())
-    .map(String::from)
+/// Read a `searchlite:` string keyword, rejecting wrong types.
+fn sl_str(prop: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+  let full_key = format!("{PREFIX}{key}");
+  match prop.get(&full_key) {
+    Some(Value::String(s)) => Ok(Some(s.clone())),
+    Some(_) => bail!("`{full_key}` must be a string"),
+    None => Ok(None),
+  }
 }
 
 /// Known `searchlite:` keywords that may appear on individual properties.
@@ -927,6 +942,51 @@ mod tests {
     assert!(
       err.to_string().contains("items.type") && err.to_string().contains("number"),
       "expected vector items.type error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn error_on_wrong_type_for_stored() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "properties": {
+        "x": { "type": "string", "searchlite:stored": "yes" }
+      }
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("must be a boolean"),
+      "expected type error for stored, got: {err}"
+    );
+  }
+
+  #[test]
+  fn error_on_wrong_type_for_kind() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "properties": {
+        "x": { "type": "string", "searchlite:kind": true }
+      }
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("must be a string"),
+      "expected type error for kind, got: {err}"
+    );
+  }
+
+  #[test]
+  fn error_on_empty_analyzer() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "properties": {
+        "x": { "type": "string", "searchlite:analyzer": "" }
+      }
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("must not be empty"),
+      "expected empty analyzer error, got: {err}"
     );
   }
 

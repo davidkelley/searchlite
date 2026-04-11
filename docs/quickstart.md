@@ -41,7 +41,7 @@ Create a schema file that defines your fields and analyzers. Save the JSON below
 }
 ```
 
-`stored: true` lets you return fields in results, and `fast: true` enables efficient filters/aggregations (used below for `lang` and `year`).
+`searchlite:stored` lets you return fields in results, and `searchlite:fast` enables efficient filters and aggregations. Keyword and numeric fields have `searchlite:fast` on by default, so `lang` and `year` are filterable without any extra configuration.
 
 Initialize the index with that schema:
 
