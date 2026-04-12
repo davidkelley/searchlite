@@ -99,7 +99,7 @@ fields `"Rust"` and `"rust"` are equivalent.
 - **`must`** -- clauses that *must* match and contribute to the score
 - **`should`** -- optional boosts; non-matching documents are still returned
 - **`must_not`** -- exclusions; non-scoring
-- **`filter`** -- *must* match, but like filters elsewhere, does not affect scores
+- **`filter`** -- *must* match, but does not affect scores. Unlike `must`/`should`/`must_not`, each entry here is a `Filter` variant (`KeywordEq`, `I64Range`, `Nested`, …), not a query node.
 
 ```json
 {
@@ -109,8 +109,7 @@ fields `"Rust"` and `"rust"` are equivalent.
     "should":   [ { "type": "term",         "field": "brand", "value": "framework" } ],
     "must_not": [ { "type": "term",         "field": "status", "value": "archived" } ],
     "filter":   [
-      { "type": "constant_score",
-        "filter": { "KeywordEq": { "field": "in_stock", "value": "true" } } }
+      { "KeywordEq": { "field": "in_stock", "value": "true" } }
     ]
   }
 }

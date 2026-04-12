@@ -131,16 +131,30 @@ content embedding):
 | `candidate_size` | -- | Oversampling during ANN search (higher = better recall, slower) |
 | `ef_search` | auto | HNSW beam width (higher = better recall, slower) |
 | `vector_filter` | -- | Pre-filter applied during vector candidate selection |
-| `max_global_vector_candidates` | server default | **Per-request** override of the server-wide cap on combined vector candidates across every clause in the query. Lower it to bound worst-case memory; raise it when a complex `bool`/`dis_max` with many vector subqueries is being unfairly truncated. |
+| `max_global_vector_candidates` | server default | **Per-request** override of the default cap on combined vector candidates across every clause in the query. |
 
 Raising `candidate_size` or `ef_search` improves recall at the cost of latency. Start
 with defaults and tune only if you see relevant documents missing from results.
 
-`max_global_vector_candidates` is a safety cap, not a recall lever. It is the
-per-request counterpart to the HTTP server's `--max-vector-candidates` flag
-(and `SEARCHLITE_MAX_VECTOR_CANDIDATES` env var): the server sets a ceiling,
-and an individual request can lower it further when you want tighter latency
-bounds on that one query.
+### About `max_global_vector_candidates`
+
+This field is the per-request counterpart to the HTTP server's
+`--max-vector-candidates` flag (and `SEARCHLITE_MAX_VECTOR_CANDIDATES` env
+var). It works as a **default, not a ceiling**: when a request omits the
+field, the HTTP server fills it in with the server-configured value; when a
+request supplies it, that value wins -- whether it is lower *or* higher than
+the server default.
+
+In practice:
+
+- Operators should pick the server default to match a typical workload, not
+  to act as a hard enforcement limit. A misconfigured or malicious client can
+  set `max_global_vector_candidates` to any value it likes.
+- Clients should lower it when they want tighter latency bounds on a specific
+  query, or raise it when a complex `bool` / `dis_max` with many vector
+  subqueries is being unfairly truncated.
+- If you need an absolute enforcement ceiling, apply it in a proxy or
+  gateway in front of the HTTP service.
 
 ---
 

@@ -195,28 +195,36 @@ that best matches your UI:
 # 1. Offset pagination
 curl -XPOST .../search -d '{"query": "rust", "from": 10, "size": 5}'
 
-# 2. search_after -- use next_search_after from the previous response
-curl -XPOST .../search -d '{
-  "query": "rust",
-  "sort":  [{"field": "year", "order": "asc"}, {"field": "_id", "order": "asc"}],
-  "size":  5,
-  "search_after": [2024, "doc-42"]
-}'
-
-# 3. Cursor -- pull next_cursor from the previous response
+# 2. Cursor -- pull next_cursor from the previous response
 curl -XPOST .../search -d '{"query": "rust", "limit": 5, "cursor": "AAEFMTIzNA=="}'
 ```
 
-A typical client loop with `search_after`:
+`search_after` tokens are opaque positional arrays whose exact shape depends
+on your `sort` clause (one entry per sort field, plus the document ID and
+segment ordinal that uniquely anchor the cursor on the previous page's last
+hit). Treat them as black boxes: always lift `next_search_after` verbatim
+from the previous response and hand it back to the next request. Hand-crafting
+the values is error-prone and will be rejected.
 
 ```bash
 # page 1
-resp=$(curl -s -XPOST .../search -d '{"query":"rust","sort":[{"field":"_id","order":"asc"}],"size":5}')
+resp=$(curl -s -XPOST .../search -d '{
+  "query": "rust",
+  "sort":  [{"field": "year", "order": "asc"}, {"field": "_id", "order": "asc"}],
+  "size":  5
+}')
 after=$(echo "$resp" | jq -c '.next_search_after')
 
-# page 2
-curl -s -XPOST .../search -d "{\"query\":\"rust\",\"sort\":[{\"field\":\"_id\",\"order\":\"asc\"}],\"size\":5,\"search_after\":$after}"
+# page 2 — pass the token through unchanged
+curl -s -XPOST .../search -d "{
+  \"query\": \"rust\",
+  \"sort\":  [{\"field\":\"year\",\"order\":\"asc\"},{\"field\":\"_id\",\"order\":\"asc\"}],
+  \"size\":  5,
+  \"search_after\": $after
+}"
 ```
+
+When `next_search_after` is `null`, you've reached the last page.
 
 ### Fetch documents by ID
 

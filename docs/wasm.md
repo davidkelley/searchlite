@@ -158,16 +158,19 @@ console.log(response.aggregations);   // { tags: { buckets: [...] } }
 
 ### Threaded queries
 
-Enable threading before the first search to let the engine use multiple cores.
-The build and the page both need extra configuration -- see the bullets below:
+Enable threading before the first search so the engine can use multiple cores.
+`init_threads` is an **instance method** on `Searchlite`, so you need to have
+initialised the index first. The build and the page both need extra
+configuration -- see the bullets below:
 
 ```javascript
-await Searchlite.init_threads();                    // uses navigator.hardwareConcurrency
-// or:
-await Searchlite.init_threads(4);
-
 const db = await Searchlite.init("docs-demo", JSON.stringify(schema), "indexeddb");
-// subsequent searches will now run across threads
+
+await db.init_threads();       // uses navigator.hardwareConcurrency
+// or:
+await db.init_threads(4);
+
+// subsequent searches on this `db` run across threads
 ```
 
 Requirements:
