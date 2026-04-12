@@ -157,13 +157,49 @@ describe("expandSchema", () => {
 		});
 
 		it("rejects non-object input", () => {
-			expect(() => expandSchema(null)).toThrowError(/schema must be an object/);
+			expect(() => expandSchema(null)).toThrowError(/schema must be a plain object/);
+		});
+
+		it("rejects array input", () => {
+			expect(() => expandSchema([])).toThrowError(/schema must be a plain object/);
 		});
 
 		it("rejects old-format schemas", () => {
 			expect(() =>
 				expandSchema({ text_fields: [], keyword_fields: [], numeric_fields: [] }),
 			).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects old-format schemas with only keyword_fields", () => {
+			expect(() => expandSchema({ keyword_fields: [] })).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects old-format schemas with only numeric_fields", () => {
+			expect(() => expandSchema({ numeric_fields: [] })).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects JSON Schema input without type=object", () => {
+			expect(() => expandSchema({ properties: { x: { type: "string" } } })).toThrowError(
+				/type: "object"/,
+			);
+		});
+
+		it("rejects JSON Schema input with non-object properties", () => {
+			expect(() => expandSchema({ type: "object", properties: "not-an-object" })).toThrowError(
+				/properties.*plain object/,
+			);
+		});
+
+		it("rejects non-string doc_id_field", () => {
+			expect(() => expandSchema({ doc_id_field: 123, title: "text" })).toThrowError(
+				/doc_id_field must be a non-empty string/,
+			);
+		});
+
+		it("rejects empty doc_id_field", () => {
+			expect(() => expandSchema({ doc_id_field: "", title: "text" })).toThrowError(
+				/doc_id_field must be a non-empty string/,
+			);
 		});
 	});
 });

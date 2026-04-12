@@ -44,8 +44,21 @@ pub fn parse_json_schema(root: &Value) -> Result<Schema> {
     );
   }
 
+  // Enforce root `type: "object"` when present (the meta-schema requires it,
+  // so the parser should not silently accept other values).
+  match obj.get("type") {
+    Some(Value::String(s)) if s == "object" => {}
+    Some(_) => bail!("root `type` must be \"object\""),
+    None => {}
+  }
+
+  // Reject unknown root-level `searchlite:` keywords so malformed schemas
+  // surface a clear error instead of being silently ignored.
+  validate_root_searchlite_keys(obj)?;
+
   let doc_id_field = match obj.get("searchlite:docIdField") {
-    Some(Value::String(s)) => s.clone(),
+    Some(Value::String(s)) if !s.is_empty() => s.clone(),
+    Some(Value::String(_)) => bail!("searchlite:docIdField must be a non-empty string"),
     Some(_) => bail!("searchlite:docIdField must be a string"),
     None => default_doc_id_field(),
   };
@@ -637,11 +650,24 @@ const KNOWN_PROPERTY_KEYS: &[&str] = &[
   "searchlite:vector",
 ];
 
+/// Known `searchlite:` keywords that may appear at the root of a schema.
+const KNOWN_ROOT_KEYS: &[&str] = &["searchlite:docIdField", "searchlite:analyzers"];
+
 /// Validate that all `searchlite:` keys on a property are known.
 fn validate_searchlite_keys(name: &str, prop: &Map<String, Value>) -> Result<()> {
   for key in prop.keys() {
     if key.starts_with(PREFIX) && !KNOWN_PROPERTY_KEYS.contains(&key.as_str()) {
       bail!("property `{name}`: unknown keyword `{key}`");
+    }
+  }
+  Ok(())
+}
+
+/// Validate that all `searchlite:` keys at the root of the schema are known.
+fn validate_root_searchlite_keys(obj: &Map<String, Value>) -> Result<()> {
+  for key in obj.keys() {
+    if key.starts_with(PREFIX) && !KNOWN_ROOT_KEYS.contains(&key.as_str()) {
+      bail!("unknown root-level keyword `{key}`");
     }
   }
   Ok(())
@@ -1011,6 +1037,47 @@ mod tests {
     }))
     .unwrap_err();
     assert!(err.to_string().contains("unknown keyword"));
+  }
+
+  #[test]
+  fn error_on_unknown_root_searchlite_key() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "searchlite:bogus": true,
+      "properties": {}
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("unknown root-level keyword"),
+      "expected unknown root-level keyword error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn error_on_wrong_root_type() {
+    let err = parse_json_schema(&json!({
+      "type": "array",
+      "properties": {}
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("root `type` must be \"object\""),
+      "expected root type error, got: {err}"
+    );
+  }
+
+  #[test]
+  fn error_on_empty_doc_id_field() {
+    let err = parse_json_schema(&json!({
+      "type": "object",
+      "searchlite:docIdField": "",
+      "properties": {}
+    }))
+    .unwrap_err();
+    assert!(
+      err.to_string().contains("non-empty string"),
+      "expected empty doc_id_field error, got: {err}"
+    );
   }
 
   #[test]

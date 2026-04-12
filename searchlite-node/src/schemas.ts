@@ -31,24 +31,44 @@ interface JsonSchemaOutput {
 }
 
 export function expandSchema(input: Record<string, unknown>): JsonSchemaOutput {
-	if (!input || typeof input !== "object") {
-		throw new Error("schema must be an object");
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		throw new Error("schema must be a plain object");
 	}
 
 	// Already in JSON Schema format (has `properties` or `$schema`)
 	if ("properties" in input || "$schema" in input) {
+		if (input.type !== "object") {
+			throw new Error('JSON Schema input must have `type: "object"` at the root');
+		}
+		if (
+			typeof input.properties !== "object" ||
+			input.properties === null ||
+			Array.isArray(input.properties)
+		) {
+			throw new Error("JSON Schema input must have `properties` as a plain object");
+		}
 		return input as unknown as JsonSchemaOutput;
 	}
 
-	// Reject old-format schemas
-	if (Array.isArray(input.text_fields)) {
+	// Reject old-format schemas (any of the three legacy field arrays)
+	if (
+		Array.isArray(input.text_fields) ||
+		Array.isArray(input.keyword_fields) ||
+		Array.isArray(input.numeric_fields)
+	) {
 		throw new Error(
-			"legacy field-array schema format (text_fields/keyword_fields) is no longer supported. " +
+			"legacy field-array schema format (text_fields/keyword_fields/numeric_fields) is no longer supported. " +
 				"Use JSON Schema with `searchlite:` vocabulary keywords.",
 		);
 	}
 
-	const docIdField = (input.doc_id_field as string) ?? "_id";
+	let docIdField = "_id";
+	if ("doc_id_field" in input && input.doc_id_field !== undefined) {
+		if (typeof input.doc_id_field !== "string" || input.doc_id_field.length === 0) {
+			throw new Error("doc_id_field must be a non-empty string");
+		}
+		docIdField = input.doc_id_field;
+	}
 	const properties: Record<string, Record<string, unknown>> = {};
 
 	for (const [name, def] of Object.entries(input)) {

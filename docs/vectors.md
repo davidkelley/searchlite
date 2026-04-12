@@ -30,10 +30,14 @@ Add a vector property to your schema with the embedding dimension and distance m
 
 ```json
 {
-  "embedding": {
-    "type": "array",
-    "items": { "type": "number" },
-    "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+  "$schema": "https://searchlite.dev/draft/2025/schema",
+  "type": "object",
+  "properties": {
+    "embedding": {
+      "type": "array",
+      "items": { "type": "number" },
+      "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+    }
   }
 }
 ```
