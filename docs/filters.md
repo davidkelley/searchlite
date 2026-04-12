@@ -10,7 +10,8 @@ the inverted index.
 - A job board filters by location, salary range, and employment type
 - A content platform restricts results to a specific language or publication date
 
-Filters require the field to have `"fast": true` in the [schema](schema.md).
+Filters require the field to have `searchlite:fast` enabled in the [schema](schema.md).
+Keyword and numeric fields have `searchlite:fast` set to `true` by default.
 
 ---
 
@@ -112,13 +113,16 @@ Schema excerpt:
 
 ```json
 {
-  "nested_fields": [{
-    "name": "review",
-    "fields": [
-      { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
-      { "type": "numeric", "name": "rating", "i64": true, "fast": true }
-    ]
-  }]
+  "review": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "author": { "type": "string", "searchlite:kind": "keyword" },
+        "rating": { "type": "integer" }
+      }
+    }
+  }
 }
 ```
 
@@ -199,7 +203,7 @@ You can freely combine top-level field filters with nested filters.
 
 ## Tips
 
-- Mark every field you want to filter or sort on with `"fast": true` in the schema.
+- Ensure every field you want to filter or sort on has `searchlite:fast` enabled (keyword and numeric fields have it on by default).
 - For nested filters, wrap each condition in its own `Nested` block to enforce per-object binding.
 - Stored nested fields preserve their original structure in results; unstored fields are omitted.
 - Filters are applied after scoring, so they don't affect relevance rankings -- they only include/exclude documents.

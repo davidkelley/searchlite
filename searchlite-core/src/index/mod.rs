@@ -21,6 +21,7 @@ pub mod directory;
 pub mod docstore;
 pub mod fastfields;
 pub mod highlight;
+pub mod json_schema;
 pub mod manifest;
 pub mod merge;
 pub mod postings;

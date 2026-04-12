@@ -27,35 +27,24 @@ fn opts(path: &Path) -> IndexOptions {
 
 fn schema() -> Schema {
   serde_json::from_value(json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [
-      { "name": "tag", "stored": true, "indexed": true, "fast": true, "nullable": true }
-    ],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": [
-      { "name": "embedding", "dim": 2, "metric": "Cosine" }
-    ]
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "tag": { "type": ["string", "null"], "searchlite:kind": "keyword" },
+      "embedding": { "type": "array", "items": { "type": "number" }, "searchlite:vector": { "dim": 2, "metric": "Cosine" } }
+    }
   }))
   .expect("schema")
 }
 
 fn multi_vector_schema() -> Schema {
   serde_json::from_value(json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": [
-      { "name": "vec_a", "dim": 2, "metric": "Cosine" },
-      { "name": "vec_b", "dim": 2, "metric": "Cosine" }
-    ]
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "vec_a": { "type": "array", "items": { "type": "number" }, "searchlite:vector": { "dim": 2, "metric": "Cosine" } },
+      "vec_b": { "type": "array", "items": { "type": "number" }, "searchlite:vector": { "dim": 2, "metric": "Cosine" } }
+    }
   }))
   .expect("schema")
 }
@@ -322,16 +311,11 @@ fn hybrid_blends_text_and_vector() {
 
 fn schema_l2() -> Schema {
   serde_json::from_value(json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": [
-      { "name": "embedding", "dim": 2, "metric": "L2" }
-    ]
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "embedding": { "type": "array", "items": { "type": "number" }, "searchlite:vector": { "dim": 2, "metric": "L2" } }
+    }
   }))
   .expect("schema")
 }

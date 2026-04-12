@@ -4,60 +4,97 @@ A schema defines the shape of your index: which fields exist, how text is analyz
 and which fields support filtering and aggregations. You write it once when you create
 an index, and every document you add is validated against it.
 
-Think of it like a database table definition, but tuned for search. A blog might define
-a `title` (text, searchable), `body` (text, searchable, highlighted), `author` (keyword,
-filterable), and `published_at` (numeric, sortable). An e-commerce catalog might add
-`price` (numeric, fast for range filters) and `category` (keyword, fast for faceted
-navigation).
+Schemas are standard **JSON Schema 2020-12** documents annotated with `searchlite:`
+vocabulary keywords. Think of it as a document shape definition with search
+annotations layered on top. The same file both validates your documents and
+configures how Searchlite indexes them.
+
+A blog might define a `title` (text, searchable), `body` (text, searchable,
+highlighted), `author` (keyword, filterable), and `published_at` (numeric, sortable).
+An e-commerce catalog might add `price` (numeric, fast for range filters) and
+`category` (keyword, fast for faceted navigation).
 
 ## Example schema
 
+Here is an abbreviated version of the recipes example schema:
+
 ```json
 {
-  "doc_id_field": "_id",
-  "analyzers": [
-    {
-      "name": "english",
-      "tokenizer": "default",
-      "filters": [{ "stopwords": "en" }, { "stemmer": "english" }]
-    },
-    {
-      "name": "title_prefix",
-      "tokenizer": "default",
-      "filters": [{ "edge_ngram": { "min": 1, "max": 5 } }]
-    }
-  ],
-  "text_fields": [
-    { "name": "body", "analyzer": "english", "stored": true, "indexed": true },
-    {
-      "name": "title",
-      "analyzer": "title_prefix",
-      "search_analyzer": "english",
-      "stored": true,
-      "indexed": true
-    }
-  ],
-  "keyword_fields": [
-    { "name": "lang", "stored": true, "indexed": true, "fast": true }
-  ],
-  "numeric_fields": [{ "name": "year", "i64": true, "fast": true }],
-  "nested_fields": [
-    {
-      "name": "comment",
-      "fields": [
-        {
-          "type": "keyword",
-          "name": "author",
-          "stored": true,
-          "indexed": true,
-          "fast": true
+  "$schema": "https://searchlite.dev/draft/2025/schema",
+  "type": "object",
+  "searchlite:docIdField": "doc_id",
+  "properties": {
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "cuisine": { "type": "string", "searchlite:kind": "keyword" },
+    "difficulty": { "type": "string", "searchlite:kind": "keyword" },
+    "prep_time_minutes": { "type": "integer", "searchlite:stored": true },
+    "servings": { "type": "integer", "searchlite:stored": true },
+    "ingredients": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "item": { "type": "string", "searchlite:kind": "keyword" },
+          "quantity": { "type": "number", "searchlite:stored": true },
+          "unit": { "type": "string", "searchlite:kind": "keyword" }
         }
-      ]
+      }
     }
-  ],
-  "vector_fields": []
+  }
 }
 ```
+
+This single file does double duty. As JSON Schema, it validates that every document
+has a `title` string, an `ingredients` array of objects, and so on. The `searchlite:`
+keywords tell the engine that `cuisine` is a keyword (exact-match, filterable),
+`prep_time_minutes` should be stored for retrieval, and `ingredients` is a nested
+field with its own sub-fields.
+
+## Type inference
+
+Searchlite infers the field type from the JSON Schema `type` value:
+
+| JSON Schema `type` | Searchlite field type | Notes |
+|---|---|---|
+| `"string"` | text | Full-text analyzed. Override with `searchlite:kind: "keyword"` for exact match. |
+| `"string"` + `searchlite:kind: "keyword"` | keyword | Unanalyzed, exact-match values. |
+| `"integer"` | numeric (i64) | Signed 64-bit integer. |
+| `"number"` | numeric (f64) | 64-bit floating point. |
+| `"object"` with `properties` | nested | Single nested object with typed sub-fields. |
+| `"array"` with `items.type: "object"` | nested | Array of nested objects (most common form). |
+| `"array"` with `items.type: "number"` + `searchlite:vector` | vector | Dense embedding vector. |
+| `["string", "null"]` | nullable text | Any base type can be made nullable this way. |
+
+## `searchlite:` keyword reference
+
+All configuration beyond standard JSON Schema uses `searchlite:` prefixed keywords.
+Any unknown `searchlite:` keyword on a property is rejected at parse time.
+
+### Root-level keywords
+
+These appear on the root schema object, alongside `type` and `properties`:
+
+| Keyword | Type | Default | Description |
+|---|---|---|---|
+| `searchlite:docIdField` | string | `"_id"` | Name of the string primary key field expected on every document. |
+| `searchlite:analyzers` | array | `[]` | Custom analyzer definitions (see [Analyzers](#analyzers)). |
+
+### Property-level keywords
+
+These appear on individual property definitions inside `properties`:
+
+| Keyword | Type | Default | Applies to | Description |
+|---|---|---|---|---|
+| `searchlite:kind` | `"keyword"` | -- | string fields | Marks a string as a keyword (exact-match) instead of text (analyzed). |
+| `searchlite:stored` | boolean | text: `true`, keyword: `true`, numeric: `false` | text, keyword, numeric | Save the raw value in the doc store for retrieval. |
+| `searchlite:indexed` | boolean | text: `true`, keyword: `true` | text, keyword | Add the field to the inverted index so it can be searched. |
+| `searchlite:fast` | boolean | keyword: `true`, numeric: `true` | keyword, numeric | Build a columnar store for fast filtering, sorting, and aggregations. |
+| `searchlite:analyzer` | string | `"default"` | text | Analyzer applied at index time (see [Analyzers](#analyzers)). |
+| `searchlite:searchAnalyzer` | string | same as analyzer | text | Separate analyzer applied at query time. |
+| `searchlite:searchAsYouType` | `{minGram, maxGram}` | -- | text | Enable automatic edge n-gram indexing (see [Search-as-you-type](#search-as-you-type)). |
+| `searchlite:nullable` | boolean | `false` | all | Allow the field to be absent from documents. |
+| `searchlite:vector` | `{dim, metric, hnsw?}` | -- | array-of-number | Configure dense vector storage (see [Vector fields](#vector-fields)). |
 
 ## Field types
 
@@ -68,19 +105,26 @@ When a user searches for "programming languages", a text field will match docume
 containing "language", "programming", or related stems.
 
 ```json
-{ "name": "body", "analyzer": "english", "stored": true, "indexed": true }
+{
+  "body": { "type": "string" },
+  "title": { "type": "string", "searchlite:analyzer": "english" }
+}
 ```
 
-- **`stored: true`** -- the original text is saved and can be returned in search results
-  (useful for displaying snippets, titles, or descriptions in your UI).
-- **`indexed: true`** -- the field is tokenized and added to the inverted index so it
-  can be searched.
-- **`analyzer`** -- controls how text is broken into tokens (see Analyzers below).
-- **`search_analyzer`** -- optional separate analyzer used at query time. Useful when
-  the index analyzer produces edge n-grams for autocomplete but you want the search
-  analyzer to match full words.
-- **`nullable: true`** -- allows the field to be omitted from documents. See
-  [Nullable fields](#nullable-fields) below.
+A bare `{"type": "string"}` creates a text field with all defaults: stored, indexed,
+using the `default` analyzer. Add `searchlite:` keywords only when you need to
+override a default:
+
+- **`searchlite:stored`** (default: `true`) -- the original text is saved and can be
+  returned in search results (useful for displaying snippets, titles, or descriptions
+  in your UI).
+- **`searchlite:indexed`** (default: `true`) -- the field is tokenized and added to
+  the inverted index so it can be searched.
+- **`searchlite:analyzer`** (default: `"default"`) -- controls how text is broken into
+  tokens (see [Analyzers](#analyzers) below).
+- **`searchlite:searchAnalyzer`** -- optional separate analyzer used at query time.
+  Useful when the index analyzer produces edge n-grams for autocomplete but you want
+  the search analyzer to match full words.
 
 ### Keyword fields
 
@@ -88,31 +132,43 @@ Keyword fields store exact, unanalyzed values. Use them for categorical data tha
 filter or aggregate on: language codes, product categories, tags, status labels, user IDs.
 
 ```json
-{ "name": "category", "stored": true, "indexed": true, "fast": true }
+{
+  "category": { "type": "string", "searchlite:kind": "keyword" },
+  "source": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false }
+}
 ```
 
-- **`fast: true`** -- builds a columnar store (like a database column index) for the
-  field. Required for filters, sorting, and aggregations. This is what makes
+The `searchlite:kind: "keyword"` annotation is what distinguishes a keyword field from
+a text field. Default keyword settings are stored, indexed, and fast -- all `true`.
+Override only what you need:
+
+- **`searchlite:fast`** (default: `true`) -- builds a columnar store for the field.
+  Required for filters, sorting, and aggregations. This is what makes
   `KeywordEq { field: "category", value: "electronics" }` fast even over millions
   of documents.
-- **`nullable: true`** -- allows the field to be omitted from documents. See
-  [Nullable fields](#nullable-fields) below.
+- **`searchlite:stored`** (default: `true`) -- save the raw value for retrieval.
+- **`searchlite:indexed`** (default: `true`) -- add to the inverted index for term
+  matching.
 
 ### Numeric fields
 
-Numeric fields store integer (`i64`) or floating-point (`f64`) values. Use them for
-prices, ratings, timestamps, counters, or any value you want to filter by range or
-aggregate with stats.
+Numeric fields store integer or floating-point values. Use them for prices, ratings,
+timestamps, counters, or any value you want to filter by range or aggregate with stats.
 
 ```json
-{ "name": "price", "i64": true, "fast": true, "stored": true }
-{ "name": "rating", "i64": false, "fast": true, "stored": true }
+{
+  "year": { "type": "integer" },
+  "price": { "type": "number", "searchlite:stored": true },
+  "rating": { "type": "number", "searchlite:stored": true }
+}
 ```
 
-Setting `i64: false` stores the value as `f64` (floating point). The `fast` flag
+Use `"type": "integer"` for i64 (signed 64-bit integer) or `"type": "number"` for f64
+(floating point). Numeric fields are fast by default (`searchlite:fast: true`), which
 is required for range filters (`I64Range`, `F64Range`), sorting, and numeric
-aggregations like `stats`, `histogram`, and `percentiles`. As with other field types,
-set `nullable: true` if the field may be absent from some documents.
+aggregations like `stats`, `histogram`, and `percentiles`. Unlike text and keyword
+fields, numeric fields are **not** stored by default -- add `searchlite:stored: true`
+if you need to retrieve the value in search results.
 
 ### Nested fields
 
@@ -121,34 +177,69 @@ together. For example, a product with multiple reviews where you need to filter 
 "reviews where user=alice AND rating >= 4" (not "any review by alice" AND "any
 review with rating >= 4").
 
-Each nested field contains an array of property definitions. Properties can be keyword,
-numeric, text, or object (for deeper nesting):
+The most common form uses an array of objects:
 
 ```json
 {
-  "name": "review",
-  "fields": [
-    { "type": "keyword", "name": "author", "fast": true, "stored": true, "indexed": true },
-    { "type": "numeric", "name": "rating", "i64": true, "fast": true, "stored": true },
-    { "type": "text", "name": "comment", "analyzer": "default", "stored": true, "indexed": true },
-    {
-      "type": "object", "name": "reply",
-      "fields": [
-        { "type": "keyword", "name": "tag", "fast": true, "stored": true, "indexed": true }
-      ]
+  "ingredients": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "item": { "type": "string", "searchlite:kind": "keyword" },
+        "quantity": { "type": "number", "searchlite:stored": true },
+        "unit": { "type": "string", "searchlite:kind": "keyword" }
+      }
     }
-  ]
+  }
 }
 ```
 
-Nested objects are flattened into dotted field names internally (e.g., `review.author`,
-`review.reply.tag`). The `object` type creates another level of nesting for
-hierarchical data like threaded comments.
+You can also use a plain object for a single nested level:
 
-Set `"nullable": true` on the nested field itself to allow documents without the
-nested array.
+```json
+{
+  "metadata": {
+    "type": "object",
+    "properties": {
+      "author": { "type": "string", "searchlite:kind": "keyword" },
+      "version": { "type": "integer" }
+    }
+  }
+}
+```
+
+Nested objects are flattened into dotted field names internally (e.g.,
+`ingredients.item`, `metadata.author`). Properties inside nested objects follow the
+same type inference and `searchlite:` keyword rules as top-level properties -- you
+can nest text, keyword, numeric, and even deeper object fields.
 
 See [filters.md](filters.md) for nested filter examples.
+
+### Vector fields
+
+Vector fields store numeric embeddings for approximate nearest neighbor (ANN) search.
+They require the `vectors` feature flag. See [vectors.md](vectors.md) for search
+usage.
+
+```json
+{
+  "embedding": {
+    "type": "array",
+    "items": { "type": "number" },
+    "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+  }
+}
+```
+
+The `searchlite:vector` object is what distinguishes a vector field from a nested
+array. It requires:
+
+- **`dim`** -- embedding dimension (must match your model output).
+- **`metric`** -- `"Cosine"` (similarity, best for normalized embeddings) or `"L2"`
+  (Euclidean distance, best for unnormalized embeddings).
+- **`hnsw`** -- optional HNSW tuning parameters (see [HNSW tuning](#hnsw-tuning)
+  below).
 
 ## Analyzers
 
@@ -156,8 +247,38 @@ Analyzers control how text is processed before being indexed and searched. Choos
 the right analyzer determines whether a search for "running" matches a document
 containing "ran".
 
-If you omit `analyzers`, Searchlite uses its built-in `default` analyzer (ASCII
-lowercase + alphanumeric tokenization).
+Define custom analyzers with the `searchlite:analyzers` array at the schema root:
+
+```json
+{
+  "$schema": "https://searchlite.dev/draft/2025/schema",
+  "type": "object",
+  "searchlite:analyzers": [
+    {
+      "name": "english",
+      "tokenizer": "default",
+      "filters": [{ "stopwords": "en" }, { "stemmer": "english" }]
+    },
+    {
+      "name": "autocomplete",
+      "tokenizer": "default",
+      "filters": [{ "edge_ngram": { "min": 1, "max": 10 } }]
+    }
+  ],
+  "properties": {
+    "body": { "type": "string", "searchlite:analyzer": "english" },
+    "title": {
+      "type": "string",
+      "searchlite:analyzer": "autocomplete",
+      "searchlite:searchAnalyzer": "english"
+    }
+  }
+}
+```
+
+If you omit `searchlite:analyzers`, Searchlite uses its built-in `default` analyzer
+(ASCII lowercase + alphanumeric tokenization). Reference a custom analyzer by name
+via `searchlite:analyzer` on any text field.
 
 ### Available tokenizers
 
@@ -200,78 +321,112 @@ Searching for "programming languages" will match documents containing "program",
 }
 ```
 
-Use this as the index analyzer with a standard `search_analyzer` so that typing "pro"
-in a search bar matches "programming", "production", "prometheus".
+Use this as the index analyzer with a separate `searchlite:searchAnalyzer` so that
+typing "pro" in a search bar matches "programming", "production", "prometheus".
 
-## Field storage and fast fields
+## Defaults
 
-These two flags control what you can do with a field at query time:
+When `searchlite:` keywords are omitted from a property, Searchlite applies
+sensible defaults. You only need to specify non-default values, which keeps schemas
+concise.
 
-- **`stored: true`** -- the raw value is saved in the docstore. Enable this on fields
-  you want to return in search results (titles, descriptions, prices). Without it, the
-  field is searchable but its original value is not returned.
-- **`fast: true`** -- builds a columnar store for the field. Enable this on fields you
-  want to filter, sort, or aggregate on. Fast fields are memory-mapped for zero-copy
-  access, making filter evaluation fast even at scale.
+| Field type | `stored` | `indexed` | `fast` | `analyzer` | `nullable` |
+|---|---|---|---|---|---|
+| text | `true` | `true` | -- | `"default"` | `false` |
+| keyword | `true` | `true` | `true` | -- | `false` |
+| numeric | `false` | -- | `true` | -- | `false` |
 
-Nested objects are flattened into dotted field names (e.g., `comment.author`). You can
-filter on the dotted path directly, or wrap the clause in a `Nested` filter to enforce
-per-object binding (see [filters](filters.md)).
+This means `{"type": "string"}` is equivalent to writing:
+
+```json
+{
+  "type": "string",
+  "searchlite:stored": true,
+  "searchlite:indexed": true,
+  "searchlite:analyzer": "default",
+  "searchlite:nullable": false
+}
+```
+
+And `{"type": "string", "searchlite:kind": "keyword"}` is equivalent to:
+
+```json
+{
+  "type": "string",
+  "searchlite:kind": "keyword",
+  "searchlite:stored": true,
+  "searchlite:indexed": true,
+  "searchlite:fast": true,
+  "searchlite:nullable": false
+}
+```
+
+When serializing a schema back to JSON, Searchlite omits keywords that match their
+default values. Only emit non-default values in your own schemas to keep them
+readable.
 
 ## Nullable fields
 
 By default, every field defined in the schema is **required** -- Searchlite rejects
-documents that omit a defined field. Set `nullable: true` on a field to make it
-optional.
+documents that omit a defined field. There are two ways to make a field optional.
 
-This is common in real-world data. Not every product has a sale price. Not every
-article has a subtitle. Not every user has a bio.
+### Option 1: JSON Schema type array
+
+Use the standard JSON Schema nullable pattern:
 
 ```json
 {
-  "text_fields": [
-    { "name": "title", "analyzer": "default", "stored": true, "indexed": true },
-    { "name": "subtitle", "analyzer": "default", "stored": true, "indexed": true, "nullable": true }
-  ],
-  "numeric_fields": [
-    { "name": "price", "i64": true, "fast": true, "stored": true },
-    { "name": "sale_price", "i64": true, "fast": true, "stored": true, "nullable": true }
-  ],
-  "keyword_fields": [
-    { "name": "category", "stored": true, "indexed": true, "fast": true },
-    { "name": "brand", "stored": true, "indexed": true, "fast": true, "nullable": true }
-  ]
+  "subtitle": { "type": ["string", "null"] },
+  "sale_price": { "type": ["integer", "null"] },
+  "brand": { "type": ["string", "null"], "searchlite:kind": "keyword" }
 }
 ```
 
-With this schema, a document like `{"_id": "1", "title": "Widget", "price": 999, "category": "gadgets"}`
-is valid even though it omits `subtitle`, `sale_price`, and `brand`.
+### Option 2: `searchlite:nullable`
+
+Use the `searchlite:nullable` keyword directly:
+
+```json
+{
+  "subtitle": { "type": "string", "searchlite:nullable": true },
+  "sale_price": { "type": "integer", "searchlite:nullable": true }
+}
+```
+
+Both approaches are equivalent. If either one signals nullable, the field is optional.
+
+With these definitions, a document like
+`{"_id": "1", "title": "Widget", "price": 999, "category": "gadgets"}` is valid
+even though it omits `subtitle`, `sale_price`, and `brand`.
 
 **Behavior of nullable fields:**
-- Nullable text fields: documents without the field are simply not indexed for that field.
-  Searches against the field won't match those documents.
+
+- Nullable text fields: documents without the field are simply not indexed for that
+  field. Searches against the field will not match those documents.
 - Nullable keyword/numeric fields: missing values produce no fast-field entry.
   Filters and aggregations skip documents without a value.
-- Nullable nested fields: documents without the nested array are valid.
-  Nested filters and aggregations simply don't match those documents.
+- Nullable nested fields: documents without the nested array are valid. Nested
+  filters and aggregations simply do not match those documents.
 
 ## Vector fields
 
 Vector fields store numeric embeddings for approximate nearest neighbor (ANN) search.
-They require the `vectors` feature flag. See [vectors.md](vectors.md) for search
-usage.
+They are declared as a JSON Schema array of numbers with the `searchlite:vector`
+annotation:
 
 ```json
 {
-  "vector_fields": [
-    { "name": "embedding", "dim": 384, "metric": "Cosine" }
-  ]
+  "embedding": {
+    "type": "array",
+    "items": { "type": "number" },
+    "searchlite:vector": { "dim": 384, "metric": "Cosine" }
+  }
 }
 ```
 
-- **`dim`** -- embedding dimension (must match your model output)
-- **`metric`** -- `Cosine` (similarity, best for normalized embeddings) or `L2`
-  (Euclidean distance, best for unnormalized embeddings)
+- **`dim`** -- embedding dimension (must match your model output).
+- **`metric`** -- `"Cosine"` (similarity, best for normalized embeddings) or `"L2"`
+  (Euclidean distance, best for unnormalized embeddings).
 
 ### HNSW tuning
 
@@ -280,12 +435,15 @@ index parameters for your recall/speed tradeoff:
 
 ```json
 {
-  "vector_fields": [
-    {
-      "name": "embedding", "dim": 384, "metric": "Cosine",
+  "embedding": {
+    "type": "array",
+    "items": { "type": "number" },
+    "searchlite:vector": {
+      "dim": 384,
+      "metric": "Cosine",
       "hnsw": { "m": 16, "ef_construction": 64 }
     }
-  ]
+  }
 }
 ```
 
@@ -299,35 +457,58 @@ The defaults work well for most workloads (up to ~1M vectors). Increase `m` to 3
 time, you can further tune recall with the `ef_search` and `candidate_size` parameters
 on the search request (see [vectors.md](vectors.md)).
 
-## Document ID
-
-Every document must include a string primary key under the field named by `doc_id_field`
-(defaults to `_id`). This ID is stored automatically and used for upserts, deletes,
-and multi-get lookups. Don't list it in your field definitions.
-
-```json
-{"_id": "product-42", "title": "Wireless Mouse", "price": 2999, "category": "electronics"}
-```
-
 ## Search-as-you-type
 
 For building autocomplete UIs, text fields can opt into automatic edge n-gram
-indexing. This means typing just a few characters in a search box will immediately
-match full words.
+indexing with `searchlite:searchAsYouType`. This means typing just a few characters
+in a search box will immediately match full words.
 
 ```json
 {
-  "name": "title",
-  "analyzer": "default",
-  "stored": true,
-  "indexed": true,
-  "search_as_you_type": { "min_gram": 1, "max_gram": 10 }
+  "title": {
+    "type": "string",
+    "searchlite:searchAsYouType": { "minGram": 1, "maxGram": 10 }
+  }
 }
 ```
 
 With this configuration, searching for `"ru"` matches documents with `"rustacean"`,
 `"ruby"`, or `"runtime"` in the title -- perfect for powering a live search dropdown.
 
+| Parameter | Default | Description |
+|---|---|---|
+| `minGram` | 1 | Minimum prefix length to generate. |
+| `maxGram` | 15 | Maximum prefix length to generate. |
+
 You can also build this manually by defining an analyzer with an `edge_ngram` filter
-as the index analyzer and a normal analyzer as the search analyzer. The built-in
-`search_as_you_type` option is a shorthand that does this for you.
+as the index analyzer and a separate `searchlite:searchAnalyzer` for query time. The
+`searchlite:searchAsYouType` keyword is a shorthand that does this for you.
+
+## Document ID
+
+Every document must include a string primary key under the field named by
+`searchlite:docIdField` (defaults to `"_id"`). This ID is stored automatically and
+used for upserts, deletes, and multi-get lookups. Do not list it in your `properties`.
+
+```json
+{
+  "$schema": "https://searchlite.dev/draft/2025/schema",
+  "type": "object",
+  "searchlite:docIdField": "doc_id",
+  "properties": {
+    "title": { "type": "string" }
+  }
+}
+```
+
+With this schema, documents must include a `doc_id` field:
+
+```json
+{"doc_id": "product-42", "title": "Wireless Mouse"}
+```
+
+If you omit `searchlite:docIdField`, the default is `"_id"`:
+
+```json
+{"_id": "product-42", "title": "Wireless Mouse"}
+```

@@ -7,16 +7,11 @@ use integration::surfaces::SurfaceHarness;
 
 fn schema_json() -> serde_json::Value {
   json!({
-    "doc_id_field": "_id",
-    "text_fields": [
-      { "name": "body", "analyzer": "default", "stored": true, "indexed": true, "nullable": false }
-    ],
-    "keyword_fields": [
-      { "name": "lang", "stored": true, "indexed": true, "fast": true, "nullable": false }
-    ],
-    "numeric_fields": [],
-    "nested_fields": [],
-    "vector_fields": []
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "lang": { "type": "string", "searchlite:kind": "keyword" }
+    }
   })
 }
 

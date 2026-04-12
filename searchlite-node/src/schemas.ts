@@ -5,8 +5,8 @@ import { z } from "zod";
 const FIELD_DEFAULTS = {
 	text: { stored: true, indexed: true, analyzer: "default", nullable: false },
 	keyword: { stored: true, indexed: true, fast: true, nullable: false },
-	integer: { i64: true, fast: true, stored: false, nullable: false },
-	float: { i64: false, fast: true, stored: false, nullable: false },
+	integer: { fast: true, stored: false, nullable: false },
+	float: { fast: true, stored: false, nullable: false },
 } as const;
 
 type FieldType = keyof typeof FIELD_DEFAULTS;
@@ -20,47 +20,56 @@ interface FieldDef {
 	nullable?: boolean;
 }
 
-interface CoreSchema {
-	doc_id_field: string;
-	analyzers: unknown[];
-	text_fields: Array<{
-		name: string;
-		analyzer: string;
-		stored: boolean;
-		indexed: boolean;
-		nullable: boolean;
-	}>;
-	keyword_fields: Array<{
-		name: string;
-		stored: boolean;
-		indexed: boolean;
-		fast: boolean;
-		nullable: boolean;
-	}>;
-	numeric_fields: Array<{
-		name: string;
-		i64: boolean;
-		fast: boolean;
-		stored: boolean;
-		nullable: boolean;
-	}>;
-	nested_fields: unknown[];
+/** JSON Schema output with `searchlite:` vocabulary keywords. */
+interface JsonSchemaOutput {
+	$schema?: string;
+	type: "object";
+	"searchlite:docIdField"?: string;
+	"searchlite:analyzers"?: unknown[];
+	properties: Record<string, Record<string, unknown>>;
+	[key: string]: unknown;
 }
 
-export function expandSchema(input: Record<string, unknown>): CoreSchema {
-	if (!input || typeof input !== "object") {
-		throw new Error("schema must be an object");
+export function expandSchema(input: Record<string, unknown>): JsonSchemaOutput {
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		throw new Error("schema must be a plain object");
 	}
 
-	// Already in core format (has text_fields array)
-	if (Array.isArray((input as Record<string, unknown>).text_fields)) {
-		return input as unknown as CoreSchema;
+	// Already in JSON Schema format (has `properties` or `$schema`)
+	if ("properties" in input || "$schema" in input) {
+		if (input.type !== "object") {
+			throw new Error('JSON Schema input must have `type: "object"` at the root');
+		}
+		if (
+			typeof input.properties !== "object" ||
+			input.properties === null ||
+			Array.isArray(input.properties)
+		) {
+			throw new Error("JSON Schema input must have `properties` as a plain object");
+		}
+		return input as unknown as JsonSchemaOutput;
 	}
 
-	const docIdField = (input.doc_id_field as string) ?? "_id";
-	const textFields: CoreSchema["text_fields"] = [];
-	const keywordFields: CoreSchema["keyword_fields"] = [];
-	const numericFields: CoreSchema["numeric_fields"] = [];
+	// Reject old-format schemas (any of the three legacy field arrays)
+	if (
+		Array.isArray(input.text_fields) ||
+		Array.isArray(input.keyword_fields) ||
+		Array.isArray(input.numeric_fields)
+	) {
+		throw new Error(
+			"legacy field-array schema format (text_fields/keyword_fields/numeric_fields) is no longer supported. " +
+				"Use JSON Schema with `searchlite:` vocabulary keywords.",
+		);
+	}
+
+	let docIdField = "_id";
+	if ("doc_id_field" in input && input.doc_id_field !== undefined) {
+		if (typeof input.doc_id_field !== "string" || input.doc_id_field.length === 0) {
+			throw new Error("doc_id_field must be a non-empty string");
+		}
+		docIdField = input.doc_id_field;
+	}
+	const properties: Record<string, Record<string, unknown>> = {};
 
 	for (const [name, def] of Object.entries(input)) {
 		if (name === "doc_id_field" || name === "analyzers") continue;
@@ -85,45 +94,52 @@ export function expandSchema(input: Record<string, unknown>): CoreSchema {
 			);
 		}
 
-		const defaults = FIELD_DEFAULTS[type];
+		const prop: Record<string, unknown> = {};
 
 		if (type === "text") {
-			textFields.push({
-				name,
-				analyzer: fieldDef.analyzer ?? (defaults as (typeof FIELD_DEFAULTS)["text"]).analyzer,
-				stored: fieldDef.stored ?? defaults.stored,
-				indexed: fieldDef.indexed ?? (defaults as (typeof FIELD_DEFAULTS)["text"]).indexed,
-				nullable: fieldDef.nullable ?? defaults.nullable,
-			});
+			const defaults = FIELD_DEFAULTS.text;
+			prop.type = fieldDef.nullable ? ["string", "null"] : "string";
+			const analyzer = fieldDef.analyzer ?? defaults.analyzer;
+			if (analyzer !== "default") prop["searchlite:analyzer"] = analyzer;
+			if ((fieldDef.stored ?? defaults.stored) !== true) prop["searchlite:stored"] = false;
+			if ((fieldDef.indexed ?? defaults.indexed) !== true) prop["searchlite:indexed"] = false;
 		} else if (type === "keyword") {
-			keywordFields.push({
-				name,
-				stored: fieldDef.stored ?? defaults.stored,
-				indexed: fieldDef.indexed ?? (defaults as (typeof FIELD_DEFAULTS)["keyword"]).indexed,
-				fast: fieldDef.fast ?? (defaults as (typeof FIELD_DEFAULTS)["keyword"]).fast,
-				nullable: fieldDef.nullable ?? defaults.nullable,
-			});
+			const defaults = FIELD_DEFAULTS.keyword;
+			prop.type = fieldDef.nullable ? ["string", "null"] : "string";
+			prop["searchlite:kind"] = "keyword";
+			if ((fieldDef.stored ?? defaults.stored) !== true) prop["searchlite:stored"] = false;
+			if ((fieldDef.indexed ?? defaults.indexed) !== true) prop["searchlite:indexed"] = false;
+			if ((fieldDef.fast ?? defaults.fast) !== true) prop["searchlite:fast"] = false;
+		} else if (type === "integer") {
+			const defaults = FIELD_DEFAULTS.integer;
+			prop.type = fieldDef.nullable ? ["integer", "null"] : "integer";
+			if ((fieldDef.fast ?? defaults.fast) !== true) prop["searchlite:fast"] = false;
+			if ((fieldDef.stored ?? defaults.stored) !== false) prop["searchlite:stored"] = true;
 		} else {
-			// integer or float
-			const numDefaults = defaults as (typeof FIELD_DEFAULTS)["integer"];
-			numericFields.push({
-				name,
-				i64: numDefaults.i64,
-				fast: fieldDef.fast ?? numDefaults.fast,
-				stored: fieldDef.stored ?? numDefaults.stored,
-				nullable: fieldDef.nullable ?? numDefaults.nullable,
-			});
+			// float
+			const defaults = FIELD_DEFAULTS.float;
+			prop.type = fieldDef.nullable ? ["number", "null"] : "number";
+			if ((fieldDef.fast ?? defaults.fast) !== true) prop["searchlite:fast"] = false;
+			if ((fieldDef.stored ?? defaults.stored) !== false) prop["searchlite:stored"] = true;
 		}
+
+		properties[name] = prop;
 	}
 
-	return {
-		doc_id_field: docIdField,
-		analyzers: (input.analyzers as unknown[]) ?? [],
-		text_fields: textFields,
-		keyword_fields: keywordFields,
-		numeric_fields: numericFields,
-		nested_fields: [],
+	const result: JsonSchemaOutput = {
+		type: "object",
+		properties,
 	};
+
+	if (docIdField !== "_id") {
+		result["searchlite:docIdField"] = docIdField;
+	}
+
+	if (input.analyzers) {
+		result["searchlite:analyzers"] = input.analyzers as unknown[];
+	}
+
+	return result;
 }
 
 // --- Input schemas (camelCase) ---

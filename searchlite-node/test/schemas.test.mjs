@@ -5,32 +5,26 @@ describe("expandSchema", () => {
 	describe("shorthand strings", () => {
 		it("expands 'text' with defaults", () => {
 			const schema = expandSchema({ title: "text" });
-			expect(schema.text_fields).toEqual([
-				{ name: "title", analyzer: "default", stored: true, indexed: true, nullable: false },
-			]);
-			expect(schema.keyword_fields).toEqual([]);
-			expect(schema.numeric_fields).toEqual([]);
+			expect(schema.type).toBe("object");
+			expect(schema.properties.title).toEqual({ type: "string" });
 		});
 
 		it("expands 'keyword' with defaults", () => {
 			const schema = expandSchema({ tag: "keyword" });
-			expect(schema.keyword_fields).toEqual([
-				{ name: "tag", stored: true, indexed: true, fast: true, nullable: false },
-			]);
+			expect(schema.properties.tag).toEqual({
+				type: "string",
+				"searchlite:kind": "keyword",
+			});
 		});
 
 		it("expands 'integer' with defaults", () => {
 			const schema = expandSchema({ year: "integer" });
-			expect(schema.numeric_fields).toEqual([
-				{ name: "year", i64: true, fast: true, stored: false, nullable: false },
-			]);
+			expect(schema.properties.year).toEqual({ type: "integer" });
 		});
 
 		it("expands 'float' with defaults", () => {
 			const schema = expandSchema({ price: "float" });
-			expect(schema.numeric_fields).toEqual([
-				{ name: "price", i64: false, fast: true, stored: false, nullable: false },
-			]);
+			expect(schema.properties.price).toEqual({ type: "number" });
 		});
 	});
 
@@ -39,12 +33,10 @@ describe("expandSchema", () => {
 			const schema = expandSchema({
 				body: { type: "text", stored: false, analyzer: "english" },
 			});
-			expect(schema.text_fields[0]).toEqual({
-				name: "body",
-				analyzer: "english",
-				stored: false,
-				indexed: true,
-				nullable: false,
+			expect(schema.properties.body).toEqual({
+				type: "string",
+				"searchlite:analyzer": "english",
+				"searchlite:stored": false,
 			});
 		});
 
@@ -52,12 +44,11 @@ describe("expandSchema", () => {
 			const schema = expandSchema({
 				status: { type: "keyword", stored: false, fast: false },
 			});
-			expect(schema.keyword_fields[0]).toEqual({
-				name: "status",
-				stored: false,
-				indexed: true,
-				fast: false,
-				nullable: false,
+			expect(schema.properties.status).toEqual({
+				type: "string",
+				"searchlite:kind": "keyword",
+				"searchlite:stored": false,
+				"searchlite:fast": false,
 			});
 		});
 
@@ -65,12 +56,9 @@ describe("expandSchema", () => {
 			const schema = expandSchema({
 				count: { type: "integer", stored: true },
 			});
-			expect(schema.numeric_fields[0]).toEqual({
-				name: "count",
-				i64: true,
-				fast: true,
-				stored: true,
-				nullable: false,
+			expect(schema.properties.count).toEqual({
+				type: "integer",
+				"searchlite:stored": true,
 			});
 		});
 
@@ -78,7 +66,7 @@ describe("expandSchema", () => {
 			const schema = expandSchema({
 				notes: { type: "text", nullable: true },
 			});
-			expect(schema.text_fields[0].nullable).toBe(true);
+			expect(schema.properties.notes.type).toEqual(["string", "null"]);
 		});
 	});
 
@@ -91,50 +79,57 @@ describe("expandSchema", () => {
 				year: "integer",
 				price: "float",
 			});
-			expect(schema.text_fields).toHaveLength(2);
-			expect(schema.keyword_fields).toHaveLength(1);
-			expect(schema.numeric_fields).toHaveLength(2);
+			expect(Object.keys(schema.properties)).toHaveLength(5);
+			expect(schema.properties.title.type).toBe("string");
+			expect(schema.properties.body["searchlite:analyzer"]).toBe("english");
+			expect(schema.properties.tag["searchlite:kind"]).toBe("keyword");
+			expect(schema.properties.year.type).toBe("integer");
+			expect(schema.properties.price.type).toBe("number");
 		});
 	});
 
 	describe("metadata fields", () => {
-		it("sets doc_id_field to _id by default", () => {
+		it("omits searchlite:docIdField when default _id", () => {
 			const schema = expandSchema({ title: "text" });
-			expect(schema.doc_id_field).toBe("_id");
+			expect(schema["searchlite:docIdField"]).toBeUndefined();
 		});
 
 		it("allows doc_id_field override", () => {
 			const schema = expandSchema({ doc_id_field: "uuid", title: "text" });
-			expect(schema.doc_id_field).toBe("uuid");
+			expect(schema["searchlite:docIdField"]).toBe("uuid");
 		});
 
 		it("passes through analyzers", () => {
 			const schema = expandSchema({ analyzers: [{ name: "custom" }], title: "text" });
-			expect(schema.analyzers).toEqual([{ name: "custom" }]);
+			expect(schema["searchlite:analyzers"]).toEqual([{ name: "custom" }]);
 		});
 
-		it("defaults analyzers to empty array", () => {
+		it("omits analyzers when not provided", () => {
 			const schema = expandSchema({ title: "text" });
-			expect(schema.analyzers).toEqual([]);
-		});
-
-		it("defaults nested_fields to empty array", () => {
-			const schema = expandSchema({ title: "text" });
-			expect(schema.nested_fields).toEqual([]);
+			expect(schema["searchlite:analyzers"]).toBeUndefined();
 		});
 	});
 
-	describe("core format pass-through", () => {
-		it("returns core format unchanged", () => {
-			const core = {
-				text_fields: [
-					{ name: "body", analyzer: "default", stored: true, indexed: true, nullable: false },
-				],
-				keyword_fields: [],
-				numeric_fields: [],
+	describe("JSON Schema pass-through", () => {
+		it("returns JSON Schema format unchanged", () => {
+			const jsonSchema = {
+				type: "object",
+				properties: {
+					body: { type: "string" },
+				},
 			};
-			const result = expandSchema(core);
-			expect(result).toBe(core);
+			const result = expandSchema(jsonSchema);
+			expect(result).toBe(jsonSchema);
+		});
+
+		it("passes through $schema-prefixed input", () => {
+			const jsonSchema = {
+				$schema: "https://searchlite.dev/draft/2025/schema",
+				type: "object",
+				properties: {},
+			};
+			const result = expandSchema(jsonSchema);
+			expect(result).toBe(jsonSchema);
 		});
 	});
 
@@ -162,7 +157,49 @@ describe("expandSchema", () => {
 		});
 
 		it("rejects non-object input", () => {
-			expect(() => expandSchema(null)).toThrowError(/schema must be an object/);
+			expect(() => expandSchema(null)).toThrowError(/schema must be a plain object/);
+		});
+
+		it("rejects array input", () => {
+			expect(() => expandSchema([])).toThrowError(/schema must be a plain object/);
+		});
+
+		it("rejects old-format schemas", () => {
+			expect(() =>
+				expandSchema({ text_fields: [], keyword_fields: [], numeric_fields: [] }),
+			).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects old-format schemas with only keyword_fields", () => {
+			expect(() => expandSchema({ keyword_fields: [] })).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects old-format schemas with only numeric_fields", () => {
+			expect(() => expandSchema({ numeric_fields: [] })).toThrowError(/legacy field-array schema/);
+		});
+
+		it("rejects JSON Schema input without type=object", () => {
+			expect(() => expandSchema({ properties: { x: { type: "string" } } })).toThrowError(
+				/type: "object"/,
+			);
+		});
+
+		it("rejects JSON Schema input with non-object properties", () => {
+			expect(() => expandSchema({ type: "object", properties: "not-an-object" })).toThrowError(
+				/properties.*plain object/,
+			);
+		});
+
+		it("rejects non-string doc_id_field", () => {
+			expect(() => expandSchema({ doc_id_field: 123, title: "text" })).toThrowError(
+				/doc_id_field must be a non-empty string/,
+			);
+		});
+
+		it("rejects empty doc_id_field", () => {
+			expect(() => expandSchema({ doc_id_field: "", title: "text" })).toThrowError(
+				/doc_id_field must be a non-empty string/,
+			);
 		});
 	});
 });

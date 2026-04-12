@@ -38,9 +38,11 @@ await init();
 
 // Create an index backed by IndexedDB (persists across page reloads)
 const schema = {
-  doc_id_field: "_id",
-  text_fields: [{ name: "title", analyzer: "default", stored: true, indexed: true }],
-  keyword_fields: [{ name: "category", stored: true, indexed: true, fast: true }],
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    category: { type: "string", "searchlite:kind": "keyword" },
+  },
 };
 const db = await Searchlite.init("my-search-db", JSON.stringify(schema), "indexeddb");
 
