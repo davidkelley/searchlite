@@ -829,29 +829,200 @@ console.log('Cuisines:', filtered.aggregations.byCuisine);
 index.close();
 ```
 
+## Typed Search with Zod
+
+Pass a [Zod](https://zod.dev) schema as the first argument to `search()` and every hit's `fields` property is validated and fully typed at compile time. No more `as any` casts or manual null checks on search results.
+
+When you pass a schema, `returnStored` is set automatically — you don't need to specify it.
+
+### Basic typed search
+
+```typescript
+import { EmbeddedIndex } from 'searchlite-js';
+import { z } from 'zod';
+
+const index = new EmbeddedIndex('./products', {
+  schema: { name: 'text', brand: 'keyword', price: 'float' },
+});
+
+// ... add documents and commit ...
+
+// Define the shape you expect back
+const ProductFields = z.object({
+  name: z.string(),
+  brand: z.string(),
+  price: z.number(),
+});
+
+// Pass the schema as the first argument — results are typed
+const results = await index.search(ProductFields, 'wireless headphones');
+
+for (const hit of results.hits) {
+  // hit.fields is { name: string; brand: string; price: number } — fully typed
+  console.log(`${hit.fields.name} by ${hit.fields.brand} — $${hit.fields.price}`);
+}
+```
+
+### Typed search with filters and aggregations
+
+The schema works with structured queries too:
+
+```typescript
+const BrandPrice = z.object({
+  brand: z.string(),
+  price: z.number(),
+});
+
+const results = await index.search(BrandPrice, {
+  query: 'headphones',
+  filter: { F64Range: { field: 'price', min: 20, max: 100 } },
+  sort: [{ price: 'asc' }],
+  aggs: {
+    brands: { type: 'terms', field: 'brand', size: 5 },
+  },
+});
+
+// Fields are typed, aggregations are available alongside
+for (const hit of results.hits) {
+  console.log(`${hit.fields.brand}: $${hit.fields.price.toFixed(2)}`);
+}
+console.log('Top brands:', results.aggregations?.brands);
+```
+
+### Transforms and defaults
+
+Zod transforms and defaults run during validation, so you can reshape data as it comes out of the index:
+
+```typescript
+const Product = z.object({
+  name: z.string().transform((s) => s.toUpperCase()),
+  price: z.number(),
+  currency: z.string().default('USD'),
+});
+
+const results = await index.search(Product, 'headphones');
+
+// Transforms are applied — name is uppercased, currency defaults to "USD"
+console.log(results.hits[0].fields.name);     // "WIRELESS HEADPHONES"
+console.log(results.hits[0].fields.currency);  // "USD"
+```
+
+### Optional and partial fields
+
+Use `.optional()` for fields that may not be stored on every document:
+
+```typescript
+const FlexProduct = z.object({
+  name: z.string(),
+  brand: z.string().optional(),
+  price: z.number().optional(),
+});
+
+const results = await index.search(FlexProduct, 'headphones');
+// hit.fields.brand is string | undefined — TypeScript knows
+```
+
+### Validation errors
+
+If a document's stored fields don't match your schema, `search()` throws with a clear error that includes the document ID and field path:
+
+```typescript
+const StrictFields = z.object({
+  name: z.string(),
+  price: z.number(), // will fail if price is missing or wrong type
+});
+
+try {
+  await index.search(StrictFields, 'headphones');
+} catch (e) {
+  // Error: 'Invalid fields on hit 0 (docId: "product-1"):\n Required at "price"'
+}
+```
+
+### End-to-end example: typed product search
+
+```typescript
+import { EmbeddedIndex } from 'searchlite-js';
+import { z } from 'zod';
+
+// Schema for the index
+const index = new EmbeddedIndex('./shop', {
+  schema: {
+    name: 'text',
+    description: 'text',
+    category: 'keyword',
+    price: 'float',
+    inStock: 'integer',
+  },
+});
+
+// Index a product catalog
+await index.addMany([
+  { _id: 'sku-1', name: 'Wireless Earbuds', description: 'Bluetooth 5.3 with ANC', category: 'audio', price: 59.99, inStock: 142 },
+  { _id: 'sku-2', name: 'Studio Headphones', description: 'Over-ear open-back for mixing', category: 'audio', price: 199.99, inStock: 38 },
+  { _id: 'sku-3', name: 'USB Microphone', description: 'Condenser mic for podcasting', category: 'microphones', price: 89.99, inStock: 67 },
+  { _id: 'sku-4', name: 'Webcam 4K', description: 'Ultra HD with autofocus', category: 'video', price: 129.99, inStock: 0 },
+]);
+await index.commit();
+
+// Zod schema for validated results
+const CatalogItem = z.object({
+  name: z.string(),
+  category: z.string(),
+  price: z.number(),
+  inStock: z.number().transform((n) => n > 0),  // transform count to boolean
+});
+
+type CatalogItem = z.infer<typeof CatalogItem>;
+// { name: string; category: string; price: number; inStock: boolean }
+
+// Typed search with filter and facets
+const results = await index.search(CatalogItem, {
+  query: { type: 'multi_match', query: 'audio', fields: [{ field: 'name' }, { field: 'description', boost: 0.5 }] },
+  filter: { F64Range: { field: 'price', min: 0, max: 150 } },
+  aggs: {
+    categories: { type: 'terms', field: 'category' },
+    priceStats: { type: 'stats', field: 'price' },
+  },
+  highlightField: 'description',
+});
+
+for (const hit of results.hits) {
+  const { name, category, price, inStock } = hit.fields;
+  const badge = inStock ? 'In Stock' : 'Out of Stock';
+  console.log(`[${badge}] ${name} (${category}) — $${price}`);
+  if (hit.snippet) console.log(`  ${hit.snippet}`);
+}
+
+await index.close();
+```
+
 ## TypeScript
 
 Full type definitions are included. Import and use with full IntelliSense:
 
 ```typescript
-import { EmbeddedIndex, RemoteIndex, SearchResult, SchemaDefinition } from 'searchlite-js';
-import type { SearchIndex } from 'searchlite-js';
+import { EmbeddedIndex, RemoteIndex, SchemaDefinition } from 'searchlite-js';
+import type { SearchIndex, SearchResult, TypedSearchResult } from 'searchlite-js';
+import { z } from 'zod';
 
 // Both index types implement the same SearchIndex interface
-async function search(index: SearchIndex): Promise<SearchResult> {
-  return index.search({ query: 'hello', returnStored: true });
-}
-
-// EmbeddedIndex — local native engine
 const schema: SchemaDefinition = { title: 'text', tag: 'keyword' };
 const embedded = new EmbeddedIndex('./my-index', { schema });
 await embedded.add({ _id: '1', title: 'Hello', tag: 'greeting' });
 await embedded.commit();
-const local: SearchResult = await search(embedded);
 
-// RemoteIndex — HTTP client
+// Untyped search — returns SearchResult with optional fields
+const basic: SearchResult = await embedded.search({ query: 'hello', returnStored: true });
+
+// Typed search — returns TypedSearchResult<T> with validated fields
+const Fields = z.object({ title: z.string(), tag: z.string() });
+const typed: TypedSearchResult<z.infer<typeof Fields>> = await embedded.search(Fields, 'hello');
+// typed.hits[0].fields.title — string, guaranteed
+
+// RemoteIndex works the same way
 const remote = new RemoteIndex('http://localhost:8080', 'my-index');
-const results: SearchResult = await search(remote);
+const remoteTyped = await remote.search(Fields, 'hello');
 ```
 
 ## License
