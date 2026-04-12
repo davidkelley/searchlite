@@ -112,3 +112,79 @@ npx http-server -c-1 --cors -p 8080 \
 - Use `search_request_value` / `search_request` for advanced queries (filters,
   aggregations, highlighting).
 - See [bindings.md](bindings.md) for a reference of binding behaviors.
+
+---
+
+## Full examples
+
+### Advanced search with filters and facets
+
+`search()` is a convenience wrapper. For filters, aggregations, sorting, or
+highlighting, build a full request and pass it to `search_request_value`
+(which takes a plain JS object) or `search_request` (which takes a JSON
+string). These mirror the [HTTP API](http.md) payload exactly.
+
+```javascript
+import init, { Searchlite } from './pkg/searchlite_wasm.js';
+await init();
+
+const schema = {
+  doc_id_field: "_id",
+  text_fields:    [{ name: "title", analyzer: "default", stored: true, indexed: true }],
+  keyword_fields: [{ name: "tag",  stored: true, indexed: true, fast: true }],
+  numeric_fields: [{ name: "year", i64: true,  fast: true, stored: true }],
+};
+
+const db = await Searchlite.init("docs-demo", JSON.stringify(schema), "indexeddb");
+await db.add_documents([
+  { _id: "1", title: "Rust search",  tag: "rust",   year: 2024 },
+  { _id: "2", title: "BM25 basics",  tag: "search", year: 2023 },
+  { _id: "3", title: "Edge ranking", tag: "search", year: 2022 },
+]);
+await db.commit();
+
+const response = await db.search_request_value({
+  query:   { type: "query_string", query: "search" },
+  filter:  { I64Range: { field: "year", min: 2023, max: 2025 } },
+  aggs:    { tags: { type: "terms", field: "tag", size: 5 } },
+  highlight_field: "title",
+  return_stored: true,
+  limit: 10,
+});
+
+console.log(response.hits);           // Each hit has doc_id, score, fields, snippet
+console.log(response.aggregations);   // { tags: { buckets: [...] } }
+```
+
+### Threaded queries
+
+Enable threading before the first search to let the engine use multiple cores.
+The build and the page both need extra configuration -- see the bullets below:
+
+```javascript
+await Searchlite.init_threads();                    // uses navigator.hardwareConcurrency
+// or:
+await Searchlite.init_threads(4);
+
+const db = await Searchlite.init("docs-demo", JSON.stringify(schema), "indexeddb");
+// subsequent searches will now run across threads
+```
+
+Requirements:
+- Build with `--features threads` (e.g.
+  `wasm-pack build searchlite-wasm --target web --release -- --features threads`).
+- Serve the page with COOP/COEP headers so `SharedArrayBuffer` is available.
+- Not available in service workers.
+
+### Memory-only mode for tests and previews
+
+If the index is purely ephemeral (demos, tests, iframes that should not
+persist data), pass `"memory"` instead of `"indexeddb"`:
+
+```javascript
+const db = await Searchlite.init("throwaway", JSON.stringify(schema), "memory");
+```
+
+Do not mix storage modes for the same `db_name`. Switching from
+`indexeddb` to `memory` silently ignores the previously-persisted state -- use
+a fresh `db_name` whenever you change the backend.

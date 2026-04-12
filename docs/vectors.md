@@ -142,3 +142,122 @@ with defaults and tune only if you see relevant documents missing from results.
 - Responses include `vector_score` alongside `_score` (the blended score) when vector search runs.
 - Cosine vectors are normalized automatically; vectors with the wrong dimension are rejected.
 - ANN (Approximate Nearest Neighbor) via HNSW is not exact -- it trades a small amount of recall for significant speed. For most applications this is the right tradeoff.
+
+---
+
+## End-to-end: a hybrid search walkthrough
+
+This example walks through building a small semantic-search index in Rust. It
+uses 4-dimensional toy vectors so you can follow the arithmetic by eye; in
+production you'd plug in a real embedding model (see [Generating embeddings](#generating-embeddings-in-practice)
+below).
+
+```rust
+use searchlite_core::api::{
+    builder::IndexBuilder,
+    types::{
+        Document, IndexOptions, Schema, SearchRequest, StorageType,
+        TextField, VectorField, VectorMetric, VectorQuery, VectorQuerySpec,
+    },
+};
+use std::path::Path;
+
+// 1. Define a schema with a single text field and a 4-D vector field
+let mut schema = Schema::default_text_body();
+schema.vector_fields.push(VectorField {
+    name:   "embedding".into(),
+    dim:    4,
+    metric: VectorMetric::Cosine,
+    ..Default::default()
+});
+
+let opts = IndexOptions {
+    path: Path::new("/tmp/hybrid_idx").to_path_buf(),
+    create_if_missing: true,
+    enable_positions:  true,
+    bm25_k1: 0.9,
+    bm25_b:  0.4,
+    storage: StorageType::InMemory,       // swap for Filesystem to persist
+    vector_defaults: None,
+};
+let index = IndexBuilder::create(Path::new("/tmp/hybrid_idx"), schema, opts)?;
+
+// 2. Add three documents, each with an embedding
+let mut writer = index.writer()?;
+let docs = [
+    ("a", "Noise cancelling headphones",  [0.10,  0.95, 0.05, 0.00]),
+    ("b", "Studio monitor speakers",      [0.20,  0.80, 0.10, 0.05]),
+    ("c", "Wireless mechanical keyboard", [0.70,  0.10, 0.15, 0.80]),
+];
+for (id, body, emb) in docs {
+    writer.add_document(&Document {
+        fields: [
+            ("_id".into(),       serde_json::json!(id)),
+            ("body".into(),      serde_json::json!(body)),
+            ("embedding".into(), serde_json::json!(emb)),
+        ].into_iter().collect(),
+    })?;
+}
+writer.commit()?;
+
+// 3. Hybrid search: "sound equipment" (lexical) + a vector similar to audio gear
+let reader = index.reader()?;
+let req = SearchRequest::new("sound equipment")
+    .with_limit(2)
+    .with_return_stored(true);
+let req = SearchRequest {
+    vector_query: Some(VectorQuerySpec::Structured(VectorQuery {
+        field:  "embedding".into(),
+        vector: vec![0.15, 0.90, 0.07, 0.02],
+        k:      Some(10),
+        alpha:  Some(0.3),        // 70% vector, 30% BM25
+        ..Default::default()
+    })),
+    ..req
+};
+
+for hit in reader.search(&req)?.hits {
+    println!("{:<3} score={:.3} vector_score={:?}",
+        hit.doc_id, hit.score, hit.vector_score);
+}
+```
+
+Expected ordering: documents `a` and `b` (audio gear) outrank `c`, even though
+`c`'s text field matches the word "wireless" which appears elsewhere. The
+vector similarity pulls audio equipment to the top.
+
+### Generating embeddings in practice
+
+Searchlite stores and searches vectors -- it does not produce them. You create
+embeddings outside of Searchlite using an embedding model and write the
+resulting numbers into the `embedding` field of each document.
+
+Popular options:
+
+| Model | Dim | Where it runs |
+|---|---|---|
+| `all-MiniLM-L6-v2` | 384 | Locally via Sentence Transformers / `fastembed-rs` / ONNX |
+| OpenAI `text-embedding-3-small` | 1536 | OpenAI API |
+| OpenAI `text-embedding-3-large` | 3072 | OpenAI API |
+| Cohere `embed-english-v3.0` | 1024 | Cohere API |
+
+A typical pipeline looks like this:
+
+```text
+doc text ─► embedding model ─► Vec<f32> (length = dim) ─► Searchlite document
+user query ─► same embedding model ─► query vector ─► Searchlite hybrid search
+```
+
+Whatever model you pick, the **index `dim` must match the model's output
+dimension exactly**, and the **same model must be used for both indexing and
+query time** -- embeddings from different models are not compatible.
+
+### Tuning for recall
+
+Start with the defaults and only tune if you see obviously-relevant documents
+missing from results:
+
+- Raise `candidate_size` first (more candidates before re-ranking).
+- Then raise `ef_search` (HNSW beam width).
+- Only increase `m` / `ef_construction` at schema creation if the above aren't
+  enough -- they cost memory and indexing time.
