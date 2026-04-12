@@ -239,10 +239,11 @@ for hit in &results.hits {
 ### Available builder methods
 
 The builder only covers the most common fields; for anything else, construct
-the `SearchRequest` directly and override fields. All fields listed in
-[Request-level tuning knobs](queries.md#request-level-tuning-knobs) (including
-`track_total_hits`, `bmw_block_size`, `candidate_size`, `explain`, `profile`,
-`return_hits`, `execution`) are set this way.
+the `SearchRequest` directly and override fields. This is how you set the
+tuning knobs from [queries.md#request-level-tuning-knobs](queries.md#request-level-tuning-knobs)
+(`track_total_hits`, `bmw_block_size`, `candidate_size`, `return_hits`,
+`execution`) as well as the debugging flags from
+[queries.md#debugging-aids](queries.md#debugging-aids) (`explain`, `profile`).
 
 | Method | Purpose |
 |---|---|
@@ -300,8 +301,10 @@ pub struct Hit {
 
 ### Pagination: cursor, search_after, offset
 
-`SearchResult` exposes three mutually-exclusive pagination tokens; pick the one
-that matches how your UI lets users move through results.
+Searchlite supports three mutually-exclusive pagination modes. Pick the one
+that matches how your UI lets users move through results. The first mode
+(offset) uses `from`/`limit` directly; the other two use response tokens
+exposed on `SearchResult` (`next_cursor` / `next_search_after`).
 
 ```rust
 // Offset: classic "page 1, 2, 3" navigation (from + limit <= 1000)
@@ -332,7 +335,9 @@ if let Some(after) = first.next_search_after.clone() {
 ```
 
 Offset pagination is capped at `from + limit <= 1000`. For anything beyond
-that, use `search_after` (stable, sortable) or `cursor` (opaque, sortless).
+that, use `search_after` (unbounded, requires a stable sort) or `cursor`
+(opaque hex token bounded to ~50K advance; works with or without a sort
+clause but can become stale across commits).
 
 ### Fetching documents by ID
 

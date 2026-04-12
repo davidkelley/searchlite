@@ -369,7 +369,7 @@ tune how the search engine runs. The most common are:
 | `track_total_hits` | `false` | When `true`, Searchlite counts every matching document, even with WAND pruning enabled. Set it when you need exact total counts (e.g., "Page 1 of 37"). Leave it off for infinite-scroll / "load more" UIs. |
 | `execution` | `"wand"` | Scoring strategy -- `"wand"`, `"bmw"`, or `"bm25"`. See [Query execution modes in the CLI guide](cli.md#query-execution-modes). |
 | `bmw_block_size` | engine default | Advanced: override the per-block posting size used by the `bmw` execution strategy. Only relevant when `"execution": "bmw"`. |
-| `candidate_size` | `limit` | Oversampling pool before re-ranking or collapsing (also used by hybrid vector search). Increase for better recall at the cost of latency. |
+| `candidate_size` | `from + limit` (the page window) | Oversampling pool before re-ranking or collapsing. When offset pagination is used the default grows to the page window so the engine can still fill `limit` hits after skipping `from`. Vector / hybrid queries compute their own default from `limit` and `k`. Increase explicitly for better recall at the cost of latency. |
 
 Example of "pure analytics" mode -- no hits, just facets:
 

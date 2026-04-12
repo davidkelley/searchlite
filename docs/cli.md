@@ -123,8 +123,10 @@ searchlite delete "$INDEX" /tmp/ids.txt
 searchlite commit "$INDEX"
 ```
 
-Blank lines and trailing whitespace are ignored, and IDs are validated before
-anything is queued.
+Blank lines are ignored, and IDs are validated before anything is queued.
+Note that surrounding whitespace is **not** stripped -- if a line has
+leading or trailing spaces, those spaces become part of the ID. Make sure
+your `ids.txt` has exactly the IDs you stored, with no accidental padding.
 
 ### Structured queries with filters
 

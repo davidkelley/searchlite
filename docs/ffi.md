@@ -64,10 +64,13 @@ Key notes:
 This is a minimal but complete C program that opens an index, adds two
 documents, commits, and runs a search. Save it as `demo.c`.
 
-> Before running it, initialize the index with the CLI so the schema is
-> already on disk (the FFI surface does not include schema creation). Run
-> `searchlite init /tmp/ffi_idx schema.json` where `schema.json` contains at
-> least a text `body` field.
+> The example below calls `searchlite_index_open(..., create_if_missing=true)`
+> which creates a new index with the built-in default schema
+> (`Schema::default_text_body()` -- a single text `body` field). The FFI surface
+> does not let you *customise* the schema, so if you need keyword fields,
+> numeric fields, nested fields, or analyzer configuration, initialise the
+> index first with the CLI (`searchlite init /tmp/ffi_idx schema.json`) or the
+> HTTP `/init` endpoint, then open it from C with `create_if_missing=false`.
 
 ```c
 #include <stdio.h>

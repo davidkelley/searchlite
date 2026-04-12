@@ -189,14 +189,15 @@ that best matches your UI:
 |---|---|---|
 | **Offset** (`from` + `size`) | Classic "page 1, 2, 3" navigation with a known page count. | Bounded to `from + size <= 1000`. Use cursor or search_after for deep pagination. |
 | **`search_after`** | "Next page" APIs that sort by stable fields (dates, IDs, prices). | Unbounded; requires an explicit `sort` clause. |
-| **`cursor`** | Infinite scroll or "load more" where you don't sort. | Unbounded; tokens are opaque and bounded to ~50K results per cursor. |
+| **`cursor`** | Infinite scroll or "load more". Works with or without an explicit `sort`. | Tokens are opaque hex strings bounded to ~50K results per cursor. Cursors can become stale if the index is committed to between pages. |
 
 ```bash
 # 1. Offset pagination
 curl -XPOST .../search -d '{"query": "rust", "from": 10, "size": 5}'
 
-# 2. Cursor -- pull next_cursor from the previous response
-curl -XPOST .../search -d '{"query": "rust", "limit": 5, "cursor": "AAEFMTIzNA=="}'
+# 2. Cursor -- pull next_cursor from the previous response and pass it through
+#    verbatim. Cursors are hex-encoded opaque tokens; do not hand-craft them.
+curl -XPOST .../search -d "{\"query\": \"rust\", \"limit\": 5, \"cursor\": \"$NEXT_CURSOR\"}"
 ```
 
 `search_after` tokens are opaque positional arrays whose exact shape depends
