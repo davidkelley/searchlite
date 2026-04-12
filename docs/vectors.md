@@ -131,9 +131,16 @@ content embedding):
 | `candidate_size` | -- | Oversampling during ANN search (higher = better recall, slower) |
 | `ef_search` | auto | HNSW beam width (higher = better recall, slower) |
 | `vector_filter` | -- | Pre-filter applied during vector candidate selection |
+| `max_global_vector_candidates` | server default | **Per-request** override of the server-wide cap on combined vector candidates across every clause in the query. Lower it to bound worst-case memory; raise it when a complex `bool`/`dis_max` with many vector subqueries is being unfairly truncated. |
 
 Raising `candidate_size` or `ef_search` improves recall at the cost of latency. Start
 with defaults and tune only if you see relevant documents missing from results.
+
+`max_global_vector_candidates` is a safety cap, not a recall lever. It is the
+per-request counterpart to the HTTP server's `--max-vector-candidates` flag
+(and `SEARCHLITE_MAX_VECTOR_CANDIDATES` env var): the server sets a ceiling,
+and an individual request can lower it further when you want tighter latency
+bounds on that one query.
 
 ---
 
