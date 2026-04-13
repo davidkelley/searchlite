@@ -71,6 +71,9 @@ pub struct ScoredTerm {
   pub b: f32,
   pub leaf: usize,
   pub doc_lengths: Option<Arc<Vec<f32>>>,
+  /// Precomputed minimum positive document length from `doc_lengths`.
+  /// Avoids a full scan of the lengths vector inside `TermState::new`.
+  pub min_doc_len: Option<f32>,
 }
 
 impl ScoredTerm {
@@ -108,21 +111,12 @@ impl TermState {
     let df = term.postings.len() as f32;
     let clamped_block = block_size.max(1);
     let (block_max_doc_ids, block_max_tfs) = build_block_meta(&term.postings, clamped_block);
-    let (doc_lengths, min_doc_len) = if let Some(lengths) = term.doc_lengths.as_ref() {
-      let min = lengths
-        .iter()
-        .copied()
-        .filter(|l| *l > 0.0)
-        .fold(f32::INFINITY, f32::min);
-      let hint = if min.is_finite() {
-        min
-      } else {
-        term.avgdl.max(1.0)
-      };
-      (Some(lengths.clone()), hint)
-    } else {
-      (None, term.avgdl.max(1.0))
-    };
+    let fallback = term.avgdl.max(1.0);
+    let min_doc_len = term
+      .min_doc_len
+      .filter(|v| v.is_finite() && *v > 0.0)
+      .unwrap_or(fallback);
+    let doc_lengths = term.doc_lengths.clone();
     let ub = upper_bound_tf(
       term.postings.max_tf,
       df,
@@ -909,6 +903,7 @@ mod tests {
       b: 0.75,
       leaf: 0,
       doc_lengths: Some(doc_lengths),
+      min_doc_len: Some(10.0),
     }
   }
 

@@ -537,6 +537,18 @@ impl FastFieldsReader {
   }
 
   pub fn matches_keyword_in(&self, field: &str, doc_id: DocId, values: &[String]) -> bool {
+    // For small value lists, linear scan is faster than building a HashSet.
+    // For larger lists, build a lowered HashSet once for O(1) per-value checks.
+    if values.len() <= 4 {
+      self.matches_keyword_in_linear(field, doc_id, values)
+    } else {
+      let set: std::collections::HashSet<String> =
+        values.iter().map(|v| v.to_lowercase()).collect();
+      self.matches_keyword_in_set(field, doc_id, &set)
+    }
+  }
+
+  fn matches_keyword_in_linear(&self, field: &str, doc_id: DocId, values: &[String]) -> bool {
     match self.fields.get(field) {
       Some(Column::Str {
         dict,
@@ -575,6 +587,65 @@ impl FastFieldsReader {
                 dict
                   .get(*idx as usize)
                   .map(|s| values.iter().any(|v| case_insensitive_equals(s, v)))
+                  .unwrap_or(false)
+              }) {
+                return true;
+              }
+            }
+          }
+        }
+        false
+      }
+      _ => false,
+    }
+  }
+
+  /// Like `matches_keyword_in`, but accepts a pre-lowered `HashSet` for O(1)
+  /// membership checks instead of O(n) linear scans.
+  pub fn matches_keyword_in_set(
+    &self,
+    field: &str,
+    doc_id: DocId,
+    lowered_values: &std::collections::HashSet<String>,
+  ) -> bool {
+    match self.fields.get(field) {
+      Some(Column::Str {
+        dict,
+        values: lookup,
+      }) => lookup
+        .get(doc_id as usize)
+        .and_then(|opt| opt.and_then(|idx| dict.get(idx as usize)))
+        .map(|s| lowered_values.contains(&s.to_lowercase()))
+        .unwrap_or(false),
+      Some(Column::StrList {
+        dict,
+        offsets,
+        values: lookup,
+      }) => {
+        if let Some((start, end)) = doc_range(offsets, doc_id as usize) {
+          lookup[start..end].iter().any(|idx| {
+            dict
+              .get(*idx as usize)
+              .map(|s| lowered_values.contains(&s.to_lowercase()))
+              .unwrap_or(false)
+          })
+        } else {
+          false
+        }
+      }
+      Some(Column::StrNested {
+        dict,
+        doc_offsets,
+        object_offsets,
+        values: lookup,
+      }) => {
+        if let Some((obj_start, obj_end)) = doc_range(doc_offsets, doc_id as usize) {
+          for obj_idx in obj_start..obj_end {
+            if let Some((start, end)) = object_range(object_offsets, obj_idx) {
+              if lookup[start..end].iter().any(|idx| {
+                dict
+                  .get(*idx as usize)
+                  .map(|s| lowered_values.contains(&s.to_lowercase()))
                   .unwrap_or(false)
               }) {
                 return true;
