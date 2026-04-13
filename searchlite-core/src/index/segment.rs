@@ -1343,7 +1343,7 @@ impl SegmentReader {
     read_doc_freq(&mut *file, offset).ok()
   }
 
-  pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+  pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     self.terms.0.iter_prefix(prefix).map(|(term, _)| term)
   }
 
