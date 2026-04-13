@@ -175,7 +175,7 @@ pub(crate) fn expand_term_groups(
                 qualified_terms.extend(scored);
               }
               for key in expanded_keys.drain(..) {
-                if seen_keys.insert(key.clone()) {
+                if seen_keys.insert(key.to_owned()) {
                   keys.push(key);
                 }
               }
@@ -201,7 +201,7 @@ pub(crate) fn expand_term_groups(
             qualified_terms.extend(scored);
           }
           for key in expanded_keys.drain(..) {
-            if seen_keys.insert(key.clone()) {
+            if seen_keys.insert(key.to_owned()) {
               keys.push(key);
             }
           }
@@ -329,7 +329,7 @@ fn expand_prefix(
       if key.len() <= field_prefix_len {
         continue;
       }
-      if !seen.insert(key.clone()) {
+      if !seen.insert(key.to_owned()) {
         continue;
       }
       let term = key[field_prefix_len..].to_string();
@@ -338,14 +338,14 @@ fn expand_prefix(
           qualified.push(QualifiedTerm {
             field: field.to_string(),
             term: term.clone(),
-            key: key.clone(),
+            key: key.to_owned(),
             weight: boost,
             leaf: idx,
             group_fields: group_fields.clone(),
           });
         }
       }
-      keys.push(key.clone());
+      keys.push(key.to_owned());
       expanded += 1;
     }
   }
@@ -406,7 +406,7 @@ fn expand_wildcard(
       if !regex.is_match(term) {
         continue;
       }
-      if !seen.insert(key.clone()) {
+      if !seen.insert(key.to_owned()) {
         continue;
       }
       if score {
@@ -414,14 +414,14 @@ fn expand_wildcard(
           qualified.push(QualifiedTerm {
             field: field.to_string(),
             term: term.to_string(),
-            key: key.clone(),
+            key: key.to_owned(),
             weight: boost,
             leaf: idx,
             group_fields: group_fields.clone(),
           });
         }
       }
-      keys.push(key.clone());
+      keys.push(key.to_owned());
       expanded += 1;
     }
   }
@@ -499,7 +499,7 @@ fn expand_regex(
       if !regex.is_match(term) {
         continue;
       }
-      if !seen.insert(key.clone()) {
+      if !seen.insert(key.to_owned()) {
         continue;
       }
       if score {
@@ -507,14 +507,14 @@ fn expand_regex(
           qualified.push(QualifiedTerm {
             field: field.to_string(),
             term: term.to_string(),
-            key: key.clone(),
+            key: key.to_owned(),
             weight: boost,
             leaf: idx,
             group_fields: group_fields.clone(),
           });
         }
       }
-      keys.push(key.clone());
+      keys.push(key.to_owned());
       expanded += 1;
     }
   }
@@ -533,7 +533,7 @@ fn expand_term_exact(
     vec![QualifiedTerm {
       field: field.to_string(),
       term: term.to_string(),
-      key: key.clone(),
+      key: key.to_owned(),
       weight: boost,
       leaf,
       group_fields,
@@ -556,12 +556,12 @@ fn expand_term_fuzzy(
   let mut qualified = vec![QualifiedTerm {
     field: field.to_string(),
     term: term.to_string(),
-    key: exact_key.clone(),
+    key: exact_key.to_owned(),
     weight: boost * distance_weight(0),
     leaf,
     group_fields: group_fields.clone(),
   }];
-  let mut keys = vec![exact_key.clone()];
+  let mut keys = vec![exact_key.to_owned()];
   if term_len < fuzzy.min_length || fuzzy.max_expansions == 0 {
     return (qualified, keys);
   }
@@ -598,16 +598,16 @@ fn expand_term_fuzzy(
       if distance == 0 {
         continue;
       }
-      if seen.insert(key.clone()) {
+      if seen.insert(key.to_owned()) {
         qualified.push(QualifiedTerm {
           field: field.to_string(),
           term: candidate.to_string(),
-          key: key.clone(),
+          key: key.to_owned(),
           weight: boost * distance_weight(distance),
           leaf,
           group_fields: group_fields.clone(),
         });
-        keys.push(key.clone());
+        keys.push(key.to_owned());
         expansions += 1;
         if expansions >= fuzzy.max_expansions {
           break 'segments;
