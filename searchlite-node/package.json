@@ -1,6 +1,6 @@
 {
 	"name": "searchlite-js",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
 	"napi": {
@@ -21,7 +21,15 @@
 	},
 	"homepage": "https://github.com/davidkelley/searchlite/tree/main/searchlite-node#readme",
 	"bugs": "https://github.com/davidkelley/searchlite/issues",
-	"keywords": ["search", "full-text", "index", "native", "rust", "napi", "embedded"],
+	"keywords": [
+		"search",
+		"full-text",
+		"index",
+		"native",
+		"rust",
+		"napi",
+		"embedded"
+	],
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
@@ -58,5 +66,9 @@
 		"lint": "biome check .",
 		"lint:fix": "biome check --write ."
 	},
-	"files": ["dist", "LICENSE", "*.node"]
+	"files": [
+		"dist",
+		"LICENSE",
+		"*.node"
+	]
 }
