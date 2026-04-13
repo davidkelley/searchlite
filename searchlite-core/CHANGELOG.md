@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.2...searchlite-core-v0.6.3) - 2026-04-13
+
+### Fixed
+
+- WAND inner-loop sort and highlight UTF-8 boundary safety ([#128](https://github.com/davidkelley/searchlite/pull/128))
+
 ## [0.6.2](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.1...searchlite-core-v0.6.2) - 2026-04-13
 
 ### Added
