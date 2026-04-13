@@ -1,3 +1,6 @@
+use std::borrow::Borrow;
+use std::borrow::Cow;
+
 use crate::api::types::Filter;
 use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
@@ -10,16 +13,17 @@ pub fn passes_filter(reader: &FastFieldsReader, doc_id: DocId, filter: &Filter) 
   filter_matches(reader, doc_id, filter, "", None)
 }
 
-fn passes_filters_at<'a>(
+/// Evaluate a slice of filters, accepting both `&[Filter]` and `&[&Filter]`.
+fn passes_filters_at<F: Borrow<Filter>>(
   reader: &FastFieldsReader,
   doc_id: DocId,
-  filters: &'a [Filter],
+  filters: &[F],
   base_path: &str,
   object_idx: Option<usize>,
 ) -> bool {
-  let mut nested: std::collections::HashMap<&str, Vec<&'a Filter>> =
-    std::collections::HashMap::new();
+  let mut nested: std::collections::HashMap<&str, Vec<&Filter>> = std::collections::HashMap::new();
   for filter in filters.iter() {
+    let filter = filter.borrow();
     match filter {
       Filter::Nested { path, filter } => {
         nested
@@ -57,16 +61,11 @@ fn nested_group_passes(
   parent_idx: Option<usize>,
   filters: &[&Filter],
 ) -> bool {
-  let full_path = if base_path.is_empty() {
-    path.to_string()
-  } else {
-    format!("{base_path}.{path}")
-  };
+  let full_path = join_path(base_path, path);
   let object_count = reader.nested_object_count(&full_path, doc_id);
   if object_count == 0 {
     return false;
   }
-  let owned: Vec<Filter> = filters.iter().map(|f| (*f).clone()).collect();
   let parents = reader.nested_parents(&full_path, doc_id);
   for idx in 0..object_count {
     if let Some(p) = parent_idx {
@@ -74,7 +73,7 @@ fn nested_group_passes(
         continue;
       }
     }
-    if passes_filters_at(reader, doc_id, &owned, &full_path, Some(idx)) {
+    if passes_filters_at(reader, doc_id, filters, &full_path, Some(idx)) {
       return true;
     }
   }
@@ -90,7 +89,7 @@ fn filter_matches(
 ) -> bool {
   match filter {
     Filter::KeywordEq { field, value } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
@@ -101,7 +100,7 @@ fn filter_matches(
       }
     }
     Filter::KeywordIn { field, values } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
@@ -116,7 +115,7 @@ fn filter_matches(
       }
     }
     Filter::I64Range { field, min, max } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_i64_values(&full, doc_id)
@@ -127,7 +126,7 @@ fn filter_matches(
       }
     }
     Filter::F64Range { field, min, max } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_f64_values(&full, doc_id)
@@ -156,11 +155,7 @@ fn nested_filter_passes(
   parent_idx: Option<usize>,
   filter: &Filter,
 ) -> bool {
-  let full_path = if base_path.is_empty() {
-    path.to_string()
-  } else {
-    format!("{base_path}.{path}")
-  };
+  let full_path = join_path(base_path, path);
   let object_count = reader.nested_object_count(&full_path, doc_id);
   if object_count == 0 {
     return false;
@@ -179,11 +174,12 @@ fn nested_filter_passes(
   false
 }
 
-fn qualified_field(base: &str, field: &str) -> String {
+/// Join two dot-separated path segments, borrowing when no join is needed.
+fn join_path<'a>(base: &str, child: &'a str) -> Cow<'a, str> {
   if base.is_empty() {
-    field.to_string()
+    Cow::Borrowed(child)
   } else {
-    format!("{base}.{field}")
+    Cow::Owned(format!("{base}.{child}"))
   }
 }
 
