@@ -1,17 +1,23 @@
-use std::collections::BTreeMap;
+use hashbrown::HashMap;
 
+/// Compact term dictionary with O(1) exact lookups and efficient prefix iteration.
+///
+/// Uses a `HashMap` for exact term lookups (the hot path during search) and a
+/// sorted `Vec` for ordered iteration and prefix queries. The sorted vec is
+/// built once at construction time and enables binary-search-based prefix
+/// scans without per-call allocations.
 #[derive(Debug, Clone, Default)]
 pub struct TinyFst {
-  map: BTreeMap<String, u64>,
+  map: HashMap<String, u64>,
+  sorted: Vec<(String, u64)>,
 }
 
 impl TinyFst {
   pub fn from_terms(terms: &[(String, u64)]) -> Self {
-    let mut map = BTreeMap::new();
-    for (t, off) in terms {
-      map.insert(t.clone(), *off);
-    }
-    Self { map }
+    let map: HashMap<String, u64> = terms.iter().cloned().collect();
+    let mut sorted: Vec<(String, u64)> = terms.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    Self { map, sorted }
   }
 
   pub fn get(&self, term: &str) -> Option<u64> {
@@ -19,17 +25,19 @@ impl TinyFst {
   }
 
   pub fn iter(&self) -> impl Iterator<Item = (&String, &u64)> {
-    self.map.iter()
+    self.sorted.iter().map(|(k, v)| (k, v))
   }
 
   pub fn iter_prefix<'a>(
     &'a self,
     prefix: &'a str,
   ) -> impl Iterator<Item = (&'a String, &'a u64)> + 'a {
-    self
-      .map
-      .range(prefix.to_string()..)
+    // Binary search for the first entry >= prefix, then take while matching.
+    let start = self.sorted.partition_point(|(k, _)| k.as_str() < prefix);
+    self.sorted[start..]
+      .iter()
       .take_while(move |(k, _)| k.starts_with(prefix))
+      .map(|(k, v)| (k, v))
   }
 }
 
@@ -55,5 +63,24 @@ mod tests {
         ("gamma".to_string(), 3)
       ]
     );
+  }
+
+  #[test]
+  fn prefix_iteration_finds_matching_terms() {
+    let fst = TinyFst::from_terms(&[
+      ("body:apple".to_string(), 10),
+      ("body:application".to_string(), 20),
+      ("body:banana".to_string(), 30),
+      ("title:apple".to_string(), 40),
+    ]);
+    let prefixed: Vec<_> = fst
+      .iter_prefix("body:app")
+      .map(|(k, v)| (k.as_str(), *v))
+      .collect();
+    assert_eq!(
+      prefixed,
+      vec![("body:apple", 10), ("body:application", 20)]
+    );
+    assert_eq!(fst.iter_prefix("missing").count(), 0);
   }
 }
