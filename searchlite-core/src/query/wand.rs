@@ -109,12 +109,15 @@ impl TermState {
     let df = term.postings.len() as f32;
     let clamped_block = block_size.max(1);
     let block_meta = build_block_meta(&term.postings, clamped_block);
-    let fallback = term.avgdl.max(1.0);
+    let doc_lengths = term.doc_lengths.clone();
+    // The minimum doc length feeds WAND upper-bound calculations. Using a
+    // value larger than the true minimum can underestimate bounds and cause
+    // incorrect pruning, so we fall back to the most conservative value
+    // (1.0) rather than avgdl when no precomputed hint is available.
     let min_doc_len = term
       .min_doc_len
       .filter(|v| v.is_finite() && *v > 0.0)
-      .unwrap_or(fallback);
-    let doc_lengths = term.doc_lengths.clone();
+      .unwrap_or(1.0);
     let ub = upper_bound_tf(
       term.postings.max_tf,
       df,

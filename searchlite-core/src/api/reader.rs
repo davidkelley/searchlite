@@ -1689,14 +1689,14 @@ impl IndexReader {
         // own postings separately via build_phrase_runtimes.
         postings.strip_positions();
         let (avgdl, doc_lengths, min_doc_len) = if let Some(fields) = group_fields.as_deref() {
-          let (avgdl, dl) = cross_fields_stats_for(
+          let (avgdl, dl, mdl) = cross_fields_stats_for(
             field_lengths_cache,
             cross_lengths_cache,
             cross_avgdl_cache,
             fields,
             seg,
           );
-          (avgdl, dl, None)
+          (avgdl, dl, mdl)
         } else {
           let (dl, mdl) = field_lengths_for(field_lengths_cache, field, seg);
           (seg.avg_field_length(field), dl, mdl)
@@ -2133,7 +2133,7 @@ fn cross_fields_stats_for(
   cross_avgdl_cache: &mut HashMap<String, f32>,
   fields: &[String],
   seg: &SegmentReader,
-) -> (f32, Option<Arc<Vec<f32>>>) {
+) -> (f32, Option<Arc<Vec<f32>>>, Option<f32>) {
   let key = cross_fields_cache_key(fields);
   let avgdl = if let Some(value) = cross_avgdl_cache.get(&key).copied() {
     value
@@ -2153,7 +2153,12 @@ fn cross_fields_stats_for(
     value
   };
   if let Some(lengths) = cross_lengths_cache.get(&key) {
-    return (avgdl, Some(lengths.clone()));
+    let min_pos = lengths
+      .iter()
+      .copied()
+      .filter(|v| *v > 0.0)
+      .reduce(f32::min);
+    return (avgdl, Some(lengths.clone()), min_pos);
   }
   let mut combined = vec![0.0_f32; seg.meta.doc_count as usize];
   let mut contributing = 0usize;
@@ -2172,14 +2177,19 @@ fn cross_fields_stats_for(
       *len /= denom;
     }
   }
+  let min_pos = combined
+    .iter()
+    .copied()
+    .filter(|v| *v > 0.0)
+    .reduce(f32::min);
   let arc = Arc::new(combined);
   cross_lengths_cache.insert(key, arc.clone());
-  (avgdl, Some(arc))
+  (avgdl, Some(arc), min_pos)
 }
 
 struct CachedFieldLengths {
   lengths: Arc<Vec<f32>>,
-  min_positive: f32,
+  min_positive: Option<f32>,
 }
 
 fn field_lengths_for(
@@ -2188,7 +2198,7 @@ fn field_lengths_for(
   seg: &SegmentReader,
 ) -> (Option<Arc<Vec<f32>>>, Option<f32>) {
   if let Some(existing) = cache.get(field) {
-    return (Some(existing.lengths.clone()), Some(existing.min_positive));
+    return (Some(existing.lengths.clone()), existing.min_positive);
   }
   let key = doc_length_key(field);
   let mut lengths = Vec::with_capacity(seg.meta.doc_count as usize);
@@ -2200,18 +2210,22 @@ fn field_lengths_for(
     }
     lengths.push(len);
   }
-  if !min_positive.is_finite() {
-    min_positive = 1.0;
-  }
+  // When no positive lengths exist, report None so TermState::new uses
+  // its own conservative fallback instead of a potentially misleading value.
+  let min_opt = if min_positive.is_finite() {
+    Some(min_positive)
+  } else {
+    None
+  };
   let arc = Arc::new(lengths);
   cache.insert(
     field.to_string(),
     CachedFieldLengths {
       lengths: arc.clone(),
-      min_positive,
+      min_positive: min_opt,
     },
   );
-  (Some(arc), Some(min_positive))
+  (Some(arc), min_opt)
 }
 
 fn combine_rescore_scores(mode: RescoreMode, original: f32, rescore: f32) -> f32 {
