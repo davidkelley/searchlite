@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::api::types::Filter;
 use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
@@ -57,16 +59,11 @@ fn nested_group_passes(
   parent_idx: Option<usize>,
   filters: &[&Filter],
 ) -> bool {
-  let full_path = if base_path.is_empty() {
-    path.to_string()
-  } else {
-    format!("{base_path}.{path}")
-  };
+  let full_path = join_path(base_path, path);
   let object_count = reader.nested_object_count(&full_path, doc_id);
   if object_count == 0 {
     return false;
   }
-  let owned: Vec<Filter> = filters.iter().map(|f| (*f).clone()).collect();
   let parents = reader.nested_parents(&full_path, doc_id);
   for idx in 0..object_count {
     if let Some(p) = parent_idx {
@@ -74,11 +71,51 @@ fn nested_group_passes(
         continue;
       }
     }
-    if passes_filters_at(reader, doc_id, &owned, &full_path, Some(idx)) {
+    if filters_ref_all_match(reader, doc_id, filters, &full_path, Some(idx)) {
       return true;
     }
   }
   false
+}
+
+/// Evaluate a slice of filter references without cloning them into owned values.
+fn filters_ref_all_match(
+  reader: &FastFieldsReader,
+  doc_id: DocId,
+  filters: &[&Filter],
+  base_path: &str,
+  object_idx: Option<usize>,
+) -> bool {
+  let mut nested: std::collections::HashMap<&str, Vec<&Filter>> =
+    std::collections::HashMap::new();
+  for filter in filters.iter() {
+    match filter {
+      Filter::Nested { path, filter } => {
+        nested
+          .entry(path.as_str())
+          .or_default()
+          .push(filter.as_ref());
+      }
+      _ => {
+        if !filter_matches(reader, doc_id, filter, base_path, object_idx) {
+          return false;
+        }
+      }
+    }
+  }
+  for (path, group) in nested.into_iter() {
+    if !nested_group_passes(
+      reader,
+      doc_id,
+      base_path,
+      path,
+      object_idx,
+      group.as_slice(),
+    ) {
+      return false;
+    }
+  }
+  true
 }
 
 fn filter_matches(
@@ -156,11 +193,7 @@ fn nested_filter_passes(
   parent_idx: Option<usize>,
   filter: &Filter,
 ) -> bool {
-  let full_path = if base_path.is_empty() {
-    path.to_string()
-  } else {
-    format!("{base_path}.{path}")
-  };
+  let full_path = join_path(base_path, path);
   let object_count = reader.nested_object_count(&full_path, doc_id);
   if object_count == 0 {
     return false;
@@ -179,11 +212,21 @@ fn nested_filter_passes(
   false
 }
 
-fn qualified_field(base: &str, field: &str) -> String {
+/// Build a qualified field path without allocating when `base` is empty.
+fn qualified_field<'a>(base: &str, field: &'a str) -> Cow<'a, str> {
   if base.is_empty() {
-    field.to_string()
+    Cow::Borrowed(field)
   } else {
-    format!("{base}.{field}")
+    Cow::Owned(format!("{base}.{field}"))
+  }
+}
+
+/// Join a base path with a child segment, borrowing when no join is needed.
+fn join_path<'a>(base: &str, child: &'a str) -> Cow<'a, str> {
+  if base.is_empty() {
+    Cow::Borrowed(child)
+  } else {
+    Cow::Owned(format!("{base}.{child}"))
   }
 }
 
