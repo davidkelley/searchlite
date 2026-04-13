@@ -24,10 +24,7 @@ impl TinyFst {
       .collect();
     // Build sorted from the deduplicated map so iter/iter_prefix stay
     // consistent with get — HashMap::collect already resolved duplicate keys.
-    let mut sorted: Vec<(Arc<str>, u64)> = map
-      .iter()
-      .map(|(k, v)| (Arc::clone(k), *v))
-      .collect();
+    let mut sorted: Vec<(Arc<str>, u64)> = map.iter().map(|(k, v)| (Arc::clone(k), *v)).collect();
     sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Self { map, sorted }
   }
@@ -85,10 +82,7 @@ mod tests {
       ("body:banana".to_string(), 30),
       ("title:apple".to_string(), 40),
     ]);
-    let prefixed: Vec<_> = fst
-      .iter_prefix("body:app")
-      .map(|(k, v)| (k, *v))
-      .collect();
+    let prefixed: Vec<_> = fst.iter_prefix("body:app").map(|(k, v)| (k, *v)).collect();
     assert_eq!(prefixed, vec![("body:apple", 10), ("body:application", 20)]);
     assert_eq!(fst.iter_prefix("missing").count(), 0);
   }
