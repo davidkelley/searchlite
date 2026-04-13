@@ -1683,7 +1683,11 @@ impl IndexReader {
     let docs = seg.live_docs() as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf, group_fields)) in term_weights.iter() {
-      if let Some(postings) = seg.postings(key) {
+      if let Some(mut postings) = seg.postings(key) {
+        // Scoring only needs doc_id + term_freq; drop position data to
+        // free memory on high-frequency terms. Phrase matching loads its
+        // own postings separately via build_phrase_runtimes.
+        postings.strip_positions();
         let (avgdl, doc_lengths, min_doc_len) = if let Some(fields) = group_fields.as_deref() {
           let (avgdl, dl) = cross_fields_stats_for(
             field_lengths_cache,
@@ -2011,7 +2015,8 @@ impl IndexReader {
       let docs_count = seg.live_docs() as f32;
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
-        if let Some(postings) = seg.postings(&key) {
+        if let Some(mut postings) = seg.postings(&key) {
+          postings.strip_positions();
           let (doc_lengths, min_doc_len) = field_lengths_for(&mut field_lengths_cache, &field, seg);
           terms.push(ScoredTerm {
             postings,

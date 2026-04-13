@@ -101,16 +101,14 @@ struct TermState {
   ub: f32,
   min_doc_len: f32,
   doc_lengths: Option<Arc<Vec<f32>>>,
-  block_max_doc_ids: Vec<DocId>,
-  block_max_tfs: Vec<f32>,
-  block_size: usize,
+  block_meta: Arc<crate::index::postings::BlockMeta>,
 }
 
 impl TermState {
   fn new(term: ScoredTerm, block_size: usize) -> Self {
     let df = term.postings.len() as f32;
     let clamped_block = block_size.max(1);
-    let (block_max_doc_ids, block_max_tfs) = build_block_meta(&term.postings, clamped_block);
+    let block_meta = build_block_meta(&term.postings, clamped_block);
     let fallback = term.avgdl.max(1.0);
     let min_doc_len = term
       .min_doc_len
@@ -140,9 +138,7 @@ impl TermState {
       ub,
       min_doc_len,
       doc_lengths,
-      block_max_doc_ids,
-      block_max_tfs,
-      block_size: clamped_block,
+      block_meta,
     }
   }
 
@@ -226,12 +222,12 @@ impl TermState {
   }
 
   fn block_index(&self) -> usize {
-    self.idx / self.block_size
+    self.idx / self.block_meta.block_size
   }
 
   fn block_upper_bound(&self) -> f32 {
     let block_idx = self.block_index();
-    let tf = self.block_max_tfs.get(block_idx).copied().unwrap_or(0.0);
+    let tf = self.block_meta.tfs.get(block_idx).copied().unwrap_or(0.0);
     score_tf(
       tf,
       self.df,
@@ -250,8 +246,8 @@ impl TermState {
 
   fn skip_to_block(&mut self, target: DocId) -> usize {
     let prev = self.idx;
-    let block_idx = self.block_max_doc_ids.partition_point(|doc| *doc < target);
-    let start = block_idx.saturating_mul(self.block_size);
+    let block_idx = self.block_meta.doc_ids.partition_point(|doc| *doc < target);
+    let start = block_idx.saturating_mul(self.block_meta.block_size);
     if start > self.idx {
       self.idx = start.min(self.postings.len());
     }
@@ -296,12 +292,14 @@ fn upper_bound_tf(
   score_tf(tf, df, doc_len, avgdl, docs, k1, b, weight)
 }
 
-fn build_block_meta(postings: &PostingsReader, block_size: usize) -> (Vec<DocId>, Vec<f32>) {
-  if block_size == postings.block_size && !postings.block_max_doc_ids.is_empty() {
-    return (
-      postings.block_max_doc_ids.clone(),
-      postings.block_max_tfs.clone(),
-    );
+fn build_block_meta(
+  postings: &PostingsReader,
+  block_size: usize,
+) -> Arc<crate::index::postings::BlockMeta> {
+  // When the requested block size matches what's already stored, share the
+  // existing Arc — no allocation or copying at all.
+  if block_size == postings.block_size() && !postings.block_max_doc_ids().is_empty() {
+    return postings.block_meta();
   }
   let mut block_max_doc_ids = Vec::new();
   let mut block_max_tfs = Vec::new();
@@ -320,7 +318,11 @@ fn build_block_meta(postings: &PostingsReader, block_size: usize) -> (Vec<DocId>
     block_max_tfs.push(tf_max);
     idx = end;
   }
-  (block_max_doc_ids, block_max_tfs)
+  Arc::new(crate::index::postings::BlockMeta {
+    doc_ids: block_max_doc_ids,
+    tfs: block_max_tfs,
+    block_size,
+  })
 }
 
 fn with_stats(stats: &mut Option<&mut QueryStats>, f: impl FnOnce(&mut QueryStats)) {
@@ -678,28 +680,10 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     if advanced == 0 || queue.len() <= 1 {
       return;
     }
-    if advanced >= queue.len() {
-      queue.sort_unstable_by_key(|t| t.doc_id());
-      return;
-    }
-    // Sort the modified prefix (typically 1-5 elements).
-    if advanced > 1 {
-      queue[..advanced].sort_unstable_by_key(|t| t.doc_id());
-    }
-    // Merge two sorted runs in-place. For each element from the suffix
-    // that belongs before the current prefix element, rotate it into
-    // place. Since `advanced` is small, this is effectively O(n).
-    let mut i = 0;
-    let mut j = advanced;
-    while i < j && j < queue.len() {
-      if queue[i].doc_id() <= queue[j].doc_id() {
-        i += 1;
-      } else {
-        queue[i..=j].rotate_right(1);
-        i += 1;
-        j += 1;
-      }
-    }
+    // The queue is typically 5–20 elements (one per query term).
+    // A full sort on such a small slice is faster than a manual merge,
+    // and sort_unstable recognises nearly-sorted runs efficiently.
+    queue.sort_unstable_by_key(|t| t.doc_id());
   }
 
   loop {

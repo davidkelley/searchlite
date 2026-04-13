@@ -476,7 +476,18 @@ pub(crate) fn case_insensitive_equals(a: &str, b: &str) -> bool {
   if a.is_ascii() && b.is_ascii() {
     a.eq_ignore_ascii_case(b)
   } else {
-    a.to_lowercase() == b.to_lowercase()
+    // Compare char-by-char via the Unicode lowercase mapping without
+    // allocating two temporary Strings. Each `char::to_lowercase()` yields
+    // an iterator of 1–3 chars; we flatten both sides and compare element-wise.
+    let mut a_lower = a.chars().flat_map(|c| c.to_lowercase());
+    let mut b_lower = b.chars().flat_map(|c| c.to_lowercase());
+    loop {
+      match (a_lower.next(), b_lower.next()) {
+        (Some(ac), Some(bc)) if ac == bc => continue,
+        (None, None) => return true,
+        _ => return false,
+      }
+    }
   }
 }
 
