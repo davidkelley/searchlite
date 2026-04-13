@@ -7,6 +7,11 @@ use crate::api::types::Filter;
 use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
 
+/// Stack-friendly grouping of nested filters by path.
+/// Typical queries have 0–2 distinct nested paths, so `SmallVec`
+/// avoids heap allocation in the common case.
+type NestedFilterGroups<'a> = SmallVec<[(&'a str, SmallVec<[&'a Filter; 4]>); 4]>;
+
 pub fn passes_filters(reader: &FastFieldsReader, doc_id: DocId, filters: &[Filter]) -> bool {
   passes_filters_at(reader, doc_id, filters, "", None)
 }
@@ -28,9 +33,7 @@ fn passes_filters_at<F: Borrow<Filter>>(
   base_path: &str,
   object_idx: Option<usize>,
 ) -> bool {
-  // Stack-allocated grouping for nested filters. Typical queries have 0–2
-  // distinct nested paths, so SmallVec<[_; 4]> avoids heap allocation.
-  let mut nested: SmallVec<[(&str, SmallVec<[&Filter; 4]>); 4]> = SmallVec::new();
+  let mut nested: NestedFilterGroups<'_> = SmallVec::new();
   for filter in filters.iter() {
     let filter = filter.borrow();
     match filter {
@@ -52,7 +55,14 @@ fn passes_filters_at<F: Borrow<Filter>>(
     }
   }
   for (path, group) in nested.iter() {
-    if !nested_group_passes(reader, doc_id, base_path, path, object_idx, group.as_slice()) {
+    if !nested_group_passes(
+      reader,
+      doc_id,
+      base_path,
+      path,
+      object_idx,
+      group.as_slice(),
+    ) {
       return false;
     }
   }
@@ -108,27 +118,15 @@ fn filter_matches(
     Filter::KeywordIn { field, values } => {
       let full = join_path(base_path, field);
       match object_idx {
-        Some(idx) => {
-          if values.len() <= 4 {
-            reader
-              .nested_str_values(&full, doc_id)
-              .get(idx)
-              .map(|vals| {
-                vals
-                  .iter()
-                  .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
-              })
-              .unwrap_or(false)
-          } else {
-            let set: std::collections::HashSet<String> =
-              values.iter().map(|v| v.to_lowercase()).collect();
-            reader
-              .nested_str_values(&full, doc_id)
-              .get(idx)
-              .map(|vals| vals.iter().any(|v| set.contains(&v.to_lowercase())))
-              .unwrap_or(false)
-          }
-        }
+        Some(idx) => reader
+          .nested_str_values(&full, doc_id)
+          .get(idx)
+          .map(|vals| {
+            vals
+              .iter()
+              .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
+          })
+          .unwrap_or(false),
         None => reader.matches_keyword_in(&full, doc_id, values),
       }
     }
@@ -834,5 +832,113 @@ mod tests {
       }),
     }));
     assert!(passes_filter(&reader, 0, &accepting));
+  }
+
+  #[test]
+  fn keyword_in_with_many_values_matches_case_insensitively() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set("cat", 0, FastValue::Str("Science".into()));
+    writer.set(
+      "tags",
+      0,
+      FastValue::StrList(vec!["Rust".into(), "Wasm".into()]),
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    // More than 4 values to exercise the large-list path.
+    let many_values: Vec<String> = vec!["sports", "news", "tech", "health", "science", "music"]
+      .into_iter()
+      .map(String::from)
+      .collect();
+    let passing = Filter::KeywordIn {
+      field: "cat".into(),
+      values: many_values.clone(),
+    };
+    assert!(passes_filter(&reader, 0, &passing));
+
+    let failing = Filter::KeywordIn {
+      field: "cat".into(),
+      values: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+    };
+    assert!(!passes_filter(&reader, 0, &failing));
+
+    // StrList field with many values.
+    let list_passing = Filter::KeywordIn {
+      field: "tags".into(),
+      values: vec![
+        "go".into(),
+        "python".into(),
+        "java".into(),
+        "c++".into(),
+        "rust".into(),
+      ],
+    };
+    assert!(passes_filter(&reader, 0, &list_passing));
+  }
+
+  #[test]
+  fn nested_keyword_in_with_many_values_scopes_to_object() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.json");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let mut writer = FastFieldsWriter::new();
+    writer.set(
+      &nested_count_key("item"),
+      0,
+      FastValue::NestedCount { objects: 2 },
+    );
+    writer.set(
+      "item.color",
+      0,
+      FastValue::StrNested {
+        object: 0,
+        values: vec!["Red".into()],
+      },
+    );
+    writer.set(
+      "item.color",
+      0,
+      FastValue::StrNested {
+        object: 1,
+        values: vec!["Blue".into()],
+      },
+    );
+    writer.write_to(&storage, &path).unwrap();
+    let reader = FastFieldsReader::open(&storage, &path).unwrap();
+
+    // >4 values in a nested KeywordIn filter.
+    let passing = Filter::Nested {
+      path: "item".into(),
+      filter: Box::new(Filter::KeywordIn {
+        field: "color".into(),
+        values: vec![
+          "green".into(),
+          "yellow".into(),
+          "orange".into(),
+          "purple".into(),
+          "red".into(),
+        ],
+      }),
+    };
+    assert!(passes_filter(&reader, 0, &passing));
+
+    let failing = Filter::Nested {
+      path: "item".into(),
+      filter: Box::new(Filter::KeywordIn {
+        field: "color".into(),
+        values: vec![
+          "green".into(),
+          "yellow".into(),
+          "orange".into(),
+          "purple".into(),
+          "white".into(),
+        ],
+      }),
+    };
+    assert!(!passes_filter(&reader, 0, &failing));
   }
 }
