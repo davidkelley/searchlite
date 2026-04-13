@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.3...searchlite-core-v0.6.4) - 2026-04-13
+
+### Other
+
+- replace TinyFst BTreeMap with HashMap + sorted Vec ([#129](https://github.com/davidkelley/searchlite/pull/129))
+- eliminate per-document String allocations in filter evaluation ([#130](https://github.com/davidkelley/searchlite/pull/130))
+
 ## [0.6.3](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.2...searchlite-core-v0.6.3) - 2026-04-13
 
 ### Fixed
