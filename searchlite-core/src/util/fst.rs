@@ -89,10 +89,7 @@ mod tests {
       .iter_prefix("body:app")
       .map(|(k, v)| (k, *v))
       .collect();
-    assert_eq!(
-      prefixed,
-      vec![("body:apple", 10), ("body:application", 20)]
-    );
+    assert_eq!(prefixed, vec![("body:apple", 10), ("body:application", 20)]);
     assert_eq!(fst.iter_prefix("missing").count(), 0);
   }
 
