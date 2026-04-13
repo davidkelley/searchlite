@@ -681,8 +681,31 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   let mut prune_done = false;
 
   fn bubble_reposition(queue: &mut [TermState], advanced: usize) {
-    let _ = advanced;
-    queue.sort_unstable_by_key(|t| t.doc_id());
+    if advanced == 0 || queue.len() <= 1 {
+      return;
+    }
+    if advanced >= queue.len() {
+      queue.sort_unstable_by_key(|t| t.doc_id());
+      return;
+    }
+    // Sort the modified prefix (typically 1-5 elements).
+    if advanced > 1 {
+      queue[..advanced].sort_unstable_by_key(|t| t.doc_id());
+    }
+    // Merge two sorted runs in-place. For each element from the suffix
+    // that belongs before the current prefix element, rotate it into
+    // place. Since `advanced` is small, this is effectively O(n).
+    let mut i = 0;
+    let mut j = advanced;
+    while i < j && j < queue.len() {
+      if queue[i].doc_id() <= queue[j].doc_id() {
+        i += 1;
+      } else {
+        queue[i..=j].rotate_right(1);
+        i += 1;
+        j += 1;
+      }
+    }
   }
 
   loop {
