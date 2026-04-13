@@ -149,9 +149,7 @@ jobs:
           fi
 
           echo "Syncing package.json $node_version -> $cargo_version"
-          cd searchlite-node
-          npm version "$cargo_version" --no-git-tag-version --allow-same-version
-          cd ..
+          sed -i "s/\"version\": \"$node_version\"/\"version\": \"$cargo_version\"/" searchlite-node/package.json
 
           git add searchlite-node/package.json
           if git diff --cached --quiet; then
