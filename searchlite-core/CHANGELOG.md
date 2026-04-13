@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.4...searchlite-core-v0.7.0) - 2026-04-13
+
+### Fixed
+
+- address perf PR review feedback — correctness and tests ([#137](https://github.com/davidkelley/searchlite/pull/137))
+
+### Other
+
+- optimize scoring and filter hot paths ([#135](https://github.com/davidkelley/searchlite/pull/135))
+
 ## [0.6.4](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.6.3...searchlite-core-v0.6.4) - 2026-04-13
 
 ### Other
