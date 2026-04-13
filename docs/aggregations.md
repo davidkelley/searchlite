@@ -189,8 +189,165 @@ For very large result sets, aggregations can be sampled to trade precision for s
 }
 ```
 
+The sampling block accepts three optional fields:
+
+- **`probability`** -- fraction of matching documents to sample (e.g., `0.1` = 10%).
+- **`size`** -- hard cap on the number of documents sampled, regardless of `probability`.
+- **`seed`** -- deterministic seed so repeated runs sample the same documents.
+
 Responses include `sampled: true` when sampling is active. Counts become approximate
 but ordering remains deterministic for a fixed seed.
+
+---
+
+## Worked examples
+
+These examples focus on the aggregation types that were summarised above but
+didn't have a concrete payload. Paste them into your search request's `aggs`
+map -- each top-level key is the aggregation's name (it can be anything you
+like) and appears in the response under the same name.
+
+### `percentiles` — response time distribution
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 0,
+  "aggs": {
+    "latency_percentiles": {
+      "type": "percentiles",
+      "field": "latency_ms",
+      "percents": [50, 90, 95, 99, 99.9]
+    }
+  }
+}
+```
+
+### `percentile_ranks` — "what percent of prices are below $50?"
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 0,
+  "aggs": {
+    "price_ranks": {
+      "type": "percentile_ranks",
+      "field": "price_cents",
+      "values": [2500, 5000, 10000]
+    }
+  }
+}
+```
+
+### `top_hits` — showcase the best result per bucket
+
+```json
+{
+  "query": "wireless headphones",
+  "limit": 0,
+  "aggs": {
+    "by_brand": {
+      "type": "terms", "field": "brand", "size": 5,
+      "aggs": {
+        "best": {
+          "type": "top_hits",
+          "size": 1,
+          "sort": [{ "field": "_score", "order": "desc" }]
+        }
+      }
+    }
+  }
+}
+```
+
+The result has one "best" hit per brand bucket -- ideal for a "top seller per
+category" strip on a search results page.
+
+### `significant_terms` — what's unusual about this subset?
+
+```json
+{
+  "query": { "type": "query_string", "query": "tag:ai" },
+  "limit": 0,
+  "aggs": {
+    "trending_authors": {
+      "type": "significant_terms",
+      "field": "author",
+      "size": 5
+    }
+  }
+}
+```
+
+Returns authors who appear disproportionately often in AI-tagged articles
+compared to the rest of the index -- useful for "who are the experts on X?"
+and discovery UIs.
+
+### `rare_terms` — surface long-tail categories
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 0,
+  "aggs": {
+    "rare_languages": {
+      "type": "rare_terms",
+      "field": "language",
+      "max_doc_count": 3
+    }
+  }
+}
+```
+
+### `bucket_sort` — reorder or paginate a bucket list
+
+```json
+{
+  "aggs": {
+    "by_brand": {
+      "type": "terms", "field": "brand", "size": 50,
+      "aggs": {
+        "avg_price": { "type": "stats", "field": "price_cents" },
+        "sort_by_avg": {
+          "type": "bucket_sort",
+          "sort": [ { "avg_price.avg": "desc" } ],
+          "from": 0,
+          "size": 5
+        }
+      }
+    }
+  }
+}
+```
+
+`bucket_sort` runs *after* the parent aggregation: the 50 brand buckets get
+re-ordered by average price descending, then the first 5 are returned.
+
+### `bucket_script` — arithmetic over bucket values
+
+```json
+{
+  "aggs": {
+    "daily": {
+      "type": "date_histogram",
+      "field": "timestamp_ms",
+      "fixed_interval": "1d",
+      "aggs": {
+        "revenue":   { "type": "stats", "field": "order_cents" },
+        "customers": { "type": "cardinality", "field": "customer_id" },
+        "revenue_per_customer": {
+          "type": "bucket_script",
+          "buckets_path": { "rev": "revenue.sum", "custs": "customers" },
+          "script": "rev / custs"
+        }
+      }
+    }
+  }
+}
+```
+
+Every bucket gains a synthetic `revenue_per_customer` value computed from its
+siblings -- perfect for dashboards.
 
 ---
 

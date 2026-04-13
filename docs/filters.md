@@ -207,3 +207,57 @@ You can freely combine top-level field filters with nested filters.
 - For nested filters, wrap each condition in its own `Nested` block to enforce per-object binding.
 - Stored nested fields preserve their original structure in results; unstored fields are omitted.
 - Filters are applied after scoring, so they don't affect relevance rankings -- they only include/exclude documents.
+
+---
+
+## Filter cheat sheet
+
+A single glance reference for every variant shipped with Searchlite. Every
+filter is a JSON object keyed by its variant name -- Searchlite dispatches on
+the key.
+
+| Variant | Shape | Typical use |
+|---|---|---|
+| `KeywordEq` | `{ field, value }` | Single exact match on a keyword field |
+| `KeywordIn` | `{ field, values[] }` | Multi-select checkboxes ("red OR blue") |
+| `I64Range` | `{ field, min, max }` | Inclusive integer range, e.g. year/count |
+| `F64Range` | `{ field, min, max }` | Inclusive float range, e.g. price/rating |
+| `Nested` | `{ path, filter }` | Enforce per-object binding on nested arrays |
+| `And` | `[filter, filter, ...]` | All clauses must match |
+| `Or` | `[filter, filter, ...]` | Any clause must match |
+| `Not` | `filter` | Invert a filter (useful for "hide archived") |
+
+### A tour in one request
+
+Below is a single request that uses nearly every filter variant. Read it as a
+realistic "e-commerce catalog" request:
+
+```json
+{
+  "query": "wireless headphones",
+  "filter": {
+    "And": [
+      { "KeywordEq": { "field": "category", "value": "electronics" } },
+      { "Or": [
+        { "KeywordIn": { "field": "brand", "values": ["AudioCo", "SoundPro"] } },
+        { "F64Range":  { "field": "rating", "min": 4.5, "max": 5.0 } }
+      ]},
+      { "Not": { "KeywordEq": { "field": "status", "value": "archived" } } },
+      { "I64Range": { "field": "price_cents", "min": 2000, "max": 25000 } },
+      { "Nested": {
+          "path": "review",
+          "filter": { "And": [
+            { "KeywordEq": { "field": "author", "value": "alice" } },
+            { "I64Range":  { "field": "rating", "min": 4, "max": 5 } }
+          ]}
+      }}
+    ]
+  },
+  "limit": 10,
+  "return_stored": true
+}
+```
+
+In plain English: *show me electronics in stock for $20-$250, either from an
+approved brand OR with a rating >= 4.5, excluding anything archived, where
+Alice left a 4- or 5-star review on the same product.*

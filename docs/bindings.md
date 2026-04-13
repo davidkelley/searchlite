@@ -37,7 +37,7 @@ All FFI functions that return `c_int` use the following codes:
 
 ### WASM threading
 
-Call `await Searchlite.init_threads(threads?)` before any search if you want multi-threaded execution. The optional `threads` parameter defaults to `navigator.hardwareConcurrency`. Threading requires:
+Call `await db.init_threads(threads?)` on the index instance (returned from `Searchlite.init(...)`) before any search if you want multi-threaded execution. The optional `threads` parameter defaults to `navigator.hardwareConcurrency`. Threading requires:
 
 - The `threads` crate feature enabled at build time (`--features threads`).
 - The page served with COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`) so that `SharedArrayBuffer` is available.

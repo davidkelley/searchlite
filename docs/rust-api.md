@@ -238,6 +238,13 @@ for hit in &results.hits {
 
 ### Available builder methods
 
+The builder only covers the most common fields; for anything else, construct
+the `SearchRequest` directly and override fields. This is how you set the
+tuning knobs from [queries.md#request-level-tuning-knobs](queries.md#request-level-tuning-knobs)
+(`track_total_hits`, `bmw_block_size`, `candidate_size`, `return_hits`,
+`execution`) as well as the debugging flags from
+[queries.md#debugging-aids](queries.md#debugging-aids) (`explain`, `profile`).
+
 | Method | Purpose |
 |---|---|
 | `SearchRequest::new(query)` | Create with a query (string or `QueryNode`) and sensible defaults |
@@ -250,6 +257,20 @@ for hit in &results.hits {
 | `.with_aggs(map)` | Add aggregations |
 | `.with_fuzzy(options)` | Enable typo-tolerant matching |
 | `.with_sort(specs)` | Custom sort order |
+
+For fields without a dedicated builder method, set them after construction:
+
+```rust
+let mut req = SearchRequest::new("rust search")
+    .with_limit(20)
+    .with_return_stored(true);
+req.explain = true;                                    // per-hit score breakdown
+req.profile = true;                                    // execution profile
+req.track_total_hits = Some(true);                     // exact total
+req.execution = ExecutionStrategy::Bmw;                // BMW pruning
+req.collapse = Some(CollapseRequest { /* ... */ });    // field collapsing
+req.rescore  = Some(RescoreRequest  { /* ... */ });    // two-pass re-ranking
+```
 
 ### Understanding search results
 
@@ -277,6 +298,46 @@ pub struct Hit {
     pub inner_hits: Option<Vec<Hit>>,         // when using collapse with inner_hits
 }
 ```
+
+### Pagination: cursor, search_after, offset
+
+Searchlite supports three mutually-exclusive pagination modes. Pick the one
+that matches how your UI lets users move through results. The first mode
+(offset) uses `from`/`limit` directly; the other two use response tokens
+exposed on `SearchResult` (`next_cursor` / `next_search_after`).
+
+```rust
+// Offset: classic "page 1, 2, 3" navigation (from + limit <= 1000)
+let page2 = reader.search(
+    &SearchRequest::new("rust").with_from(10).with_limit(10),
+)?;
+
+// Cursor: "load more" / infinite scroll -- opaque token
+let first = reader.search(&SearchRequest::new("rust").with_limit(10))?;
+if let Some(tok) = first.next_cursor.clone() {
+    let mut req = SearchRequest::new("rust").with_limit(10);
+    req.cursor = Some(tok);
+    let next = reader.search(&req)?;
+}
+
+// search_after: unbounded, needs a stable sort on at least one field
+let mut req = SearchRequest::new("rust")
+    .with_limit(10)
+    .with_sort(vec![
+        SortSpec { field: "year".into(), order: Some(SortOrder::Desc) },
+        SortSpec { field: "_id".into(),  order: Some(SortOrder::Asc)  },
+    ]);
+let first = reader.search(&req)?;
+if let Some(after) = first.next_search_after.clone() {
+    req.search_after = Some(after);
+    let next = reader.search(&req)?;
+}
+```
+
+Offset pagination is capped at `from + limit <= 1000`. For anything beyond
+that, use `search_after` (unbounded, requires a stable sort) or `cursor`
+(opaque hex token bounded to ~50K advance; works with or without a sort
+clause but can become stale across commits).
 
 ### Fetching documents by ID
 

@@ -26,6 +26,7 @@ The `query_string` node supports field-scoped terms (`title:rust`), phrases in q
 
 | Type | Purpose | Example use case |
 |---|---|---|
+| `match_all` | Match every document in the index | Pure aggregation requests, "browse all" UIs |
 | `query_string` | Free-text search across fields | Search bar in any application |
 | `term` | Exact match on a single analyzed term | Internal lookups by known token |
 | `prefix` | Match terms starting with a prefix | Autocomplete in a search box |
@@ -39,6 +40,80 @@ The `query_string` node supports field-scoped terms (`title:rust`), phrases in q
 | `function_score` | Customize scoring with functions | Boost popular or recent results |
 | `rank_feature` | Boost by a numeric field value | Sort-by-popularity without losing relevance |
 | `script_score` | Arithmetic expressions over fields | Custom ranking formulas |
+| `vector` ⚙️ | ANN search over an embedding field (requires `vectors` feature) | Semantic search / "find similar" |
+
+---
+
+## Simple queries, step by step
+
+If you're new to search engines, start here. Every example below produces a
+complete request body you can paste into `/indexes/{name}/search`.
+
+### `match_all` — "every document"
+
+Useful when you only care about aggregations, or when you need a paginated
+browse page with no search term entered yet:
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 20,
+  "return_stored": true
+}
+```
+
+### `query_string` — "the usual search bar"
+
+The input in most UIs. It tokenises the query with the target field's analyzer,
+supports field-scoped terms (`title:rust`), quoted phrases (`"machine learning"`),
+and negation (`-draft`):
+
+```json
+{
+  "query": {
+    "type": "query_string",
+    "query": "\"machine learning\" -draft title:rust",
+    "fields": ["title", "body"]
+  },
+  "limit": 10
+}
+```
+
+### `term` — "exact analyzed match on one field"
+
+Unlike `query_string`, `term` runs a single analyzed token straight against the
+inverted index. Use it when you already know the token you want (from a filter,
+an autocomplete suggestion, a link click, etc.):
+
+```json
+{ "query": { "type": "term", "field": "title", "value": "rust" } }
+```
+
+The value is still passed through the field's analyzer -- so for most text
+fields `"Rust"` and `"rust"` are equivalent.
+
+### `bool` — "combine clauses"
+
+`bool` is the workhorse of non-trivial search. Each slot has a defined role:
+
+- **`must`** -- clauses that *must* match and contribute to the score
+- **`should`** -- optional boosts; non-matching documents are still returned
+- **`must_not`** -- exclusions; non-scoring
+- **`filter`** -- *must* match, but does not affect scores. Unlike `must`/`should`/`must_not`, each entry here is a `Filter` variant (`KeywordEq`, `I64Range`, `Nested`, …), not a query node.
+
+```json
+{
+  "query": {
+    "type": "bool",
+    "must":     [ { "type": "query_string", "query": "laptop" } ],
+    "should":   [ { "type": "term",         "field": "brand", "value": "framework" } ],
+    "must_not": [ { "type": "term",         "field": "status", "value": "archived" } ],
+    "filter":   [
+      { "KeywordEq": { "field": "in_stock", "value": "true" } }
+    ]
+  }
+}
+```
 
 ---
 
@@ -280,6 +355,36 @@ re-ranks them with phrase proximity. This gives you phrase-quality results at BM
 
 ---
 
+## Request-level tuning knobs
+
+Beyond the query itself, a `SearchRequest` exposes a handful of fields that
+tune how the search engine runs. The most common are:
+
+| Field | Default | What it does |
+|---|---|---|
+| `limit` | `10` | Max hits returned (alias: `size`). Set to `0` to skip hit ranking and only run aggregations. |
+| `from` | `0` | Offset-pagination skip count; `from + limit` must not exceed `1000`. |
+| `return_hits` | `true` | When `false`, omits the `hits` array from the response. Perfect for pure aggregation requests where you want the facets but not the documents. |
+| `return_stored` | `false` | When `true`, each hit includes the stored fields (title, body, price, …). Off by default so responses stay compact. |
+| `track_total_hits` | `false` | When `true`, Searchlite counts every matching document, even with WAND pruning enabled. Set it when you need exact total counts (e.g., "Page 1 of 37"). Leave it off for infinite-scroll / "load more" UIs. |
+| `execution` | `"wand"` | Scoring strategy -- `"wand"`, `"bmw"`, or `"bm25"`. See [Query execution modes in the CLI guide](cli.md#query-execution-modes). |
+| `bmw_block_size` | engine default | Advanced: override the per-block posting size used by the `bmw` execution strategy. Only relevant when `"execution": "bmw"`. |
+| `candidate_size` | `from + limit` (the page window) | Oversampling pool before re-ranking or collapsing. When offset pagination is used the default grows to the page window so the engine can still fill `limit` hits after skipping `from`. Vector / hybrid queries compute their own default from `limit` and `k`. Increase explicitly for better recall at the cost of latency. |
+
+Example of "pure analytics" mode -- no hits, just facets:
+
+```json
+{
+  "query": { "type": "match_all" },
+  "limit": 0,
+  "return_hits": false,
+  "aggs": {
+    "tags":     { "type": "terms", "field": "tag", "size": 10 },
+    "by_year":  { "type": "histogram", "field": "year", "interval": 1 }
+  }
+}
+```
+
 ## Debugging aids
 
 When results don't look right, these flags help you understand what's happening:
@@ -290,5 +395,9 @@ When results don't look right, these flags help you understand what's happening:
 - **`profile: true`** -- attaches execution stats (`candidates_examined`, `scored_docs`,
   postings advances) and timing buckets (`search_ms`, `rescore_ms`). Useful for
   identifying slow queries.
+- **`track_total_hits: true`** -- when the `total_hits_estimate` you're seeing
+  doesn't match what you expected, this disables WAND's pruning shortcuts and
+  computes the exact total. Use it only while diagnosing -- it's measurably slower
+  on large indexes.
 
-Both flags are off by default to avoid overhead in production.
+All three flags are off by default to avoid overhead in production.

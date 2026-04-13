@@ -37,25 +37,66 @@ You can mount multiple indexes with repeated `--index` flags (e.g., `--index pro
 
 ## Configuration
 
-| Flag / Env Var | Default | Purpose |
-|---|---|---|
-| `--index` / `SEARCHLITE_INDEX_MAP` | -- | NAME:PATH index mounts (repeatable; semicolon-delimited for env). Per-index overrides: `--index "items:/data,auto_commit=30,auto_refresh=10"` |
-| `--alias` / `SEARCHLITE_INDEX_ALIASES` | -- | ALIAS:TARGET indirections (semicolon-delimited for env) |
-| `--bind` / `SEARCHLITE_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
-| `--require-existing-index` | false | Fail at startup if manifest is missing |
-| `--auto-commit-interval-secs` / `SEARCHLITE_AUTO_COMMIT_INTERVAL_SECS` | `0` (disabled) | Global auto-commit interval. Disabled on write-key-protected indexes |
-| `--auto-refresh-interval-secs` / `SEARCHLITE_AUTO_REFRESH_INTERVAL_SECS` | `0` (disabled) | Global auto-refresh interval |
-| `--max-body-bytes` | -- | Max request body size |
-| `--max-concurrency` | -- | Max concurrent requests |
-| `--request-timeout-secs` | -- | Per-request timeout |
-| `--shutdown-grace-secs` | -- | Graceful shutdown window |
-| `--refresh-on-commit` | false | Auto-refresh readers after each commit |
+| Flag | Env Var | Default | Purpose |
+|---|---|---|---|
+| `--index`, `-I` | `SEARCHLITE_INDEX_MAP` | *(required)* | `NAME:PATH` index mount (repeatable; semicolon-delimited for env). Supports per-index overrides, see below. |
+| `--alias` | `SEARCHLITE_INDEX_ALIASES` | -- | `ALIAS:TARGET` indirections that point one name at another mounted index (semicolon-delimited for env) |
+| `--bind` | `SEARCHLITE_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
+| `--require-existing-index` | `SEARCHLITE_REQUIRE_EXISTING_INDEX` | `false` | Fail at startup if an index's manifest is missing |
+| `--max-body-bytes` | `SEARCHLITE_MAX_BODY_BYTES` | `52428800` (50 MiB) | Max request body size in bytes |
+| `--max-concurrency` | `SEARCHLITE_MAX_CONCURRENCY` | `64` | Max concurrent in-flight requests |
+| `--request-timeout-secs` | `SEARCHLITE_REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout in seconds |
+| `--shutdown-grace-secs` | `SEARCHLITE_GRACEFUL_SHUTDOWN_SECS` | `5` | Graceful shutdown window after a SIGTERM/SIGINT |
+| `--refresh-on-commit` | `SEARCHLITE_REFRESH_ON_COMMIT` | `false` | Auto-refresh readers after each commit so writes become searchable immediately |
+| `--auto-commit-interval-secs` | `SEARCHLITE_AUTO_COMMIT_INTERVAL_SECS` | `0` (disabled) | Default auto-commit interval for all indexes (seconds). Disabled on write-key-protected indexes. |
+| `--auto-refresh-interval-secs` | `SEARCHLITE_AUTO_REFRESH_INTERVAL_SECS` | `0` (disabled) | Default auto-refresh interval for all indexes (seconds) |
+| `--max-vector-candidates`&nbsp;⚙️ | `SEARCHLITE_MAX_VECTOR_CANDIDATES` | *(vectors feature only)* | Global cap on combined vector candidates across clauses |
 
 All errors return `{"error": {"type": "...", "reason": "..."}}`.
+
+### Per-index overrides
+
+The `--index` flag accepts a comma-delimited tail that overrides global settings
+for a single mount. Useful when you want different refresh cadences per index:
+
+```bash
+# Two indexes with different auto-commit/auto-refresh cadences:
+searchlite http \
+  --index "orders:/data/orders,auto_commit=5,auto_refresh=5" \
+  --index "catalog:/data/catalog,auto_commit=300"
+```
+
+Supported override keys:
+- `auto_commit=<seconds>` -- overrides `--auto-commit-interval-secs` for this index
+- `auto_refresh=<seconds>` -- overrides `--auto-refresh-interval-secs` for this index
+
+Per-index values take precedence over the global defaults.
+
+### Environment variables
+
+Every CLI flag can be set via environment variable. This is the typical pattern
+for containerised deployments:
+
+```bash
+export SEARCHLITE_INDEX_MAP="default:/data;orders:/data/orders"
+export SEARCHLITE_BIND_ADDR="0.0.0.0:8080"
+export SEARCHLITE_REFRESH_ON_COMMIT=true
+searchlite http
+```
+
+Use `;` (semicolon) to separate multiple entries in `SEARCHLITE_INDEX_MAP` and
+`SEARCHLITE_INDEX_ALIASES`.
 
 ---
 
 ## API endpoints
+
+### Service-level
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/healthz` | Liveness probe. Returns `{ "status": "ok" }` — use it from load balancers and Kubernetes liveness/readiness checks. |
+| GET | `/indexes` | List every mounted index and alias, with document counts, last commit times, and per-index auto-commit/auto-refresh settings. |
 
 ### Index lifecycle
 
@@ -82,11 +123,23 @@ All errors return `{"error": {"type": "...", "reason": "..."}}`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| POST | `/indexes/{name}/update` | Partial update (set/unset fields) |
-| POST | `/indexes/{name}/_bulk_update` | Batch partial updates (NDJSON) |
+| POST | `/indexes/{name}/update` | Partial update (set/unset fields on a single document) |
+| POST | `/indexes/{name}/_bulk_update` | Batch partial updates (NDJSON action/patch pairs) |
 | POST | `/indexes/{name}/delete` | Delete documents by ID |
 
 Writes are **buffered** -- documents are not visible to search until you call `/commit`.
+
+### Request body formats at a glance
+
+| Endpoint | Content-Type | Body shape |
+|---|---|---|
+| `/init` | `application/json` | A `Schema` object (see [schema.md](schema.md)) |
+| `/add` | `application/x-ndjson` | One JSON document per line (NDJSON) |
+| `/bulk` | `application/json` | `{ "docs": [ {...}, {...} ] }` -- must contain at least one document |
+| `/update` | `application/json` | `{ "id": "...", "set": {...}, "unset": [...] }` -- at least one of set/unset required |
+| `/_bulk_update` | `application/x-ndjson` | Alternating lines: an action (`{"update": {"_id":"..."}}`) followed by the patch body |
+| `/delete` | `application/json` | `{ "ids": ["id1", "id2"] }` -- at least one id required |
+| `/search`, `/multi_search`, `/mget` | `application/json` | Fully-typed request objects (see below) |
 
 ---
 
@@ -129,18 +182,50 @@ curl -XPOST http://localhost:8080/indexes/products/search \
 
 ### Pagination
 
-Three mutually exclusive pagination modes:
+Searchlite supports three mutually exclusive pagination modes. Pick the one
+that best matches your UI:
+
+| Mode | Best for | Scaling |
+|---|---|---|
+| **Offset** (`from` + `size`) | Classic "page 1, 2, 3" navigation with a known page count. | Bounded to `from + size <= 1000`. Use cursor or search_after for deep pagination. |
+| **`search_after`** | "Next page" APIs that sort by stable fields (dates, IDs, prices). | Unbounded; requires an explicit `sort` clause. |
+| **`cursor`** | Infinite scroll or "load more". Works with or without an explicit `sort`. | Tokens are opaque hex strings bounded to ~50K results per cursor. Cursors can become stale if the index is committed to between pages. |
 
 ```bash
-# Offset pagination (from + size, max 1000)
+# 1. Offset pagination
 curl -XPOST .../search -d '{"query": "rust", "from": 10, "size": 5}'
 
-# search_after (use next_search_after from previous response)
-curl -XPOST .../search -d '{"query": "rust", "sort": [{"field": "year", "order": "asc"}], "size": 5, "search_after": [2024, "doc-42", 0]}'
-
-# Cursor (use next_cursor from previous response)
-curl -XPOST .../search -d '{"query": "rust", "limit": 5, "cursor": "..."}'
+# 2. Cursor -- pull next_cursor from the previous response and pass it through
+#    verbatim. Cursors are hex-encoded opaque tokens; do not hand-craft them.
+curl -XPOST .../search -d "{\"query\": \"rust\", \"limit\": 5, \"cursor\": \"$NEXT_CURSOR\"}"
 ```
+
+`search_after` tokens are opaque positional arrays whose exact shape depends
+on your `sort` clause (one entry per sort field, plus the document ID and
+segment ordinal that uniquely anchor the cursor on the previous page's last
+hit). Treat them as black boxes: always lift `next_search_after` verbatim
+from the previous response and hand it back to the next request. Hand-crafting
+the values is error-prone and will be rejected.
+
+```bash
+# page 1
+resp=$(curl -s -XPOST .../search -d '{
+  "query": "rust",
+  "sort":  [{"field": "year", "order": "asc"}, {"field": "_id", "order": "asc"}],
+  "size":  5
+}')
+after=$(echo "$resp" | jq -c '.next_search_after')
+
+# page 2 — pass the token through unchanged
+curl -s -XPOST .../search -d "{
+  \"query\": \"rust\",
+  \"sort\":  [{\"field\":\"year\",\"order\":\"asc\"},{\"field\":\"_id\",\"order\":\"asc\"}],
+  \"size\":  5,
+  \"search_after\": $after
+}"
+```
+
+When `next_search_after` is `null`, you've reached the last page.
 
 ### Fetch documents by ID
 
@@ -152,10 +237,46 @@ curl -XPOST http://localhost:8080/indexes/products/mget \
 
 ### Partial update
 
+A single-document patch. `set` writes or overwrites fields, `unset` removes
+them. You must provide at least one of the two.
+
 ```bash
 curl -XPOST http://localhost:8080/indexes/products/update \
   -H 'Content-Type: application/json' \
-  -d '{"id": "product-1", "set": {"in_stock": true, "price_cents": 2499}, "unset": ["sale_label"]}'
+  -d '{
+    "id": "product-1",
+    "set":   { "in_stock": true, "price_cents": 2499 },
+    "unset": ["sale_label"]
+  }'
+```
+
+### Bulk updates (NDJSON action stream)
+
+For updating many documents in one request, use `_bulk_update`. The body is
+NDJSON with two lines per operation: an action descriptor followed by the
+patch body.
+
+```bash
+cat > /tmp/bulk.ndjson <<'EOF'
+{"update":{"_id":"product-1"}}
+{"set":{"in_stock":true,"price_cents":2499}}
+{"update":{"_id":"product-2"}}
+{"set":{"price_cents":3499},"unset":["sale_label"]}
+EOF
+
+curl -XPOST http://localhost:8080/indexes/products/_bulk_update \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @/tmp/bulk.ndjson
+curl -XPOST http://localhost:8080/indexes/products/commit
+```
+
+### Delete documents
+
+```bash
+curl -XPOST http://localhost:8080/indexes/products/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"ids": ["product-discontinued-1", "product-discontinued-2"]}'
+curl -XPOST http://localhost:8080/indexes/products/commit
 ```
 
 ### Multi-search
@@ -184,6 +305,80 @@ curl -XPOST .../indexes/products/refresh   # reload readers
 curl -XPOST .../indexes/products/compact    # merge segments
 curl -XGET  .../indexes/products/inspect    # view manifest
 curl -XGET  .../indexes/products/stats      # doc/segment counts
+```
+
+### Service-level: health and discovery
+
+```bash
+# Liveness probe (no index required)
+curl -s http://localhost:8080/healthz
+# -> {"status":"ok"}
+
+# List every mounted index (and aliases)
+curl -s http://localhost:8080/indexes
+# -> {
+#      "indexes": [
+#        { "name": "products", "path": "/data/products", "exists": true,
+#          "doc_count": 1042, "committed_at": "2025-01-03T12:01:04Z",
+#          "auto_commit_secs": 0, "auto_refresh_secs": 0,
+#          "refresh_on_commit": false }
+#      ],
+#      "aliases": []
+#    }
+```
+
+`/healthz` is cheap and never touches the indexes -- wire it into your load
+balancer's health check. `/indexes` is ideal for building admin UIs or
+verifying a deployment mounted what you expected.
+
+---
+
+## End-to-end: a minimal HTTP tour
+
+This is a complete, copy-paste-able script that exercises most of the HTTP API.
+It assumes a server running on `localhost:8080` with `--index default:/tmp/http_tour`.
+
+```bash
+BASE=http://localhost:8080/indexes/default
+
+# 1. Schema: one text field, one keyword field, one numeric
+cat > /tmp/schema.json <<'EOF'
+{
+  "doc_id_field": "_id",
+  "text_fields":    [{"name": "body", "analyzer": "default", "stored": true, "indexed": true}],
+  "keyword_fields": [{"name": "tag",  "stored": true, "indexed": true, "fast": true}],
+  "numeric_fields": [{"name": "year", "i64": true,  "fast": true, "stored": true}]
+}
+EOF
+curl -s -XPOST "$BASE/init" -H 'Content-Type: application/json' --data-binary @/tmp/schema.json
+
+# 2. Ingest via NDJSON
+cat > /tmp/docs.ndjson <<'EOF'
+{"_id":"a","body":"Rust search","tag":"rust","year":2024}
+{"_id":"b","body":"SQLite internals","tag":"data","year":2023}
+{"_id":"c","body":"BM25 explained","tag":"search","year":2024}
+EOF
+curl -s -XPOST "$BASE/add" -H 'Content-Type: application/x-ndjson' --data-binary @/tmp/docs.ndjson
+curl -s -XPOST "$BASE/commit"
+
+# 3. Search with a filter and an aggregation
+curl -s -XPOST "$BASE/search" -H 'Content-Type: application/json' -d '{
+  "query": "search",
+  "filter": { "I64Range": { "field": "year", "min": 2024, "max": 2024 } },
+  "return_stored": true,
+  "aggs": { "tags": { "type": "terms", "field": "tag", "size": 5 } }
+}'
+
+# 4. Patch one document
+curl -s -XPOST "$BASE/update" -H 'Content-Type: application/json' \
+  -d '{"id":"a","set":{"year":2025}}'
+curl -s -XPOST "$BASE/commit"
+
+# 5. Clean up stale content
+curl -s -XPOST "$BASE/delete" -H 'Content-Type: application/json' \
+  -d '{"ids":["b"]}'
+curl -s -XPOST "$BASE/commit"
+curl -s -XPOST "$BASE/compact"
 ```
 
 The full API surface is also documented in `openapi.yaml` at the repo root.

@@ -57,11 +57,25 @@ curl -XPOST http://localhost:8080/indexes/secure/init \
 
 ### CLI
 
-The CLI passes the write key via environment variable:
+Every write-capable CLI command accepts `--write-key <KEY>`:
 
 ```bash
-SEARCHLITE_WRITE_KEY=my-secret-key searchlite init /tmp/secure-idx schema.json
+# Create a protected index
+searchlite init /tmp/secure-idx schema.json --write-key "my-secret-key"
+
+# Every write command from here on must pass the same key
+searchlite add    /tmp/secure-idx docs.jsonl --write-key "my-secret-key"
+searchlite commit /tmp/secure-idx            --write-key "my-secret-key"
+searchlite delete /tmp/secure-idx ids.txt    --write-key "my-secret-key"
+searchlite compact /tmp/secure-idx           --write-key "my-secret-key"
+
+# Read commands never need it
+searchlite search  /tmp/secure-idx -q "example"
+searchlite inspect /tmp/secure-idx
 ```
+
+Supplying the wrong key (or forgetting it) fails with an authorization error
+and no changes are applied.
 
 ---
 
