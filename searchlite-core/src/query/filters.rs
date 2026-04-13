@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::borrow::Cow;
 
 use crate::api::types::Filter;
@@ -12,16 +13,17 @@ pub fn passes_filter(reader: &FastFieldsReader, doc_id: DocId, filter: &Filter) 
   filter_matches(reader, doc_id, filter, "", None)
 }
 
-fn passes_filters_at<'a>(
+/// Evaluate a slice of filters, accepting both `&[Filter]` and `&[&Filter]`.
+fn passes_filters_at<F: Borrow<Filter>>(
   reader: &FastFieldsReader,
   doc_id: DocId,
-  filters: &'a [Filter],
+  filters: &[F],
   base_path: &str,
   object_idx: Option<usize>,
 ) -> bool {
-  let mut nested: std::collections::HashMap<&str, Vec<&'a Filter>> =
-    std::collections::HashMap::new();
+  let mut nested: std::collections::HashMap<&str, Vec<&Filter>> = std::collections::HashMap::new();
   for filter in filters.iter() {
+    let filter = filter.borrow();
     match filter {
       Filter::Nested { path, filter } => {
         nested
@@ -71,51 +73,11 @@ fn nested_group_passes(
         continue;
       }
     }
-    if filters_ref_all_match(reader, doc_id, filters, &full_path, Some(idx)) {
+    if passes_filters_at(reader, doc_id, filters, &full_path, Some(idx)) {
       return true;
     }
   }
   false
-}
-
-/// Evaluate a slice of filter references without cloning them into owned values.
-fn filters_ref_all_match(
-  reader: &FastFieldsReader,
-  doc_id: DocId,
-  filters: &[&Filter],
-  base_path: &str,
-  object_idx: Option<usize>,
-) -> bool {
-  let mut nested: std::collections::HashMap<&str, Vec<&Filter>> =
-    std::collections::HashMap::new();
-  for filter in filters.iter() {
-    match filter {
-      Filter::Nested { path, filter } => {
-        nested
-          .entry(path.as_str())
-          .or_default()
-          .push(filter.as_ref());
-      }
-      _ => {
-        if !filter_matches(reader, doc_id, filter, base_path, object_idx) {
-          return false;
-        }
-      }
-    }
-  }
-  for (path, group) in nested.into_iter() {
-    if !nested_group_passes(
-      reader,
-      doc_id,
-      base_path,
-      path,
-      object_idx,
-      group.as_slice(),
-    ) {
-      return false;
-    }
-  }
-  true
 }
 
 fn filter_matches(
@@ -127,7 +89,7 @@ fn filter_matches(
 ) -> bool {
   match filter {
     Filter::KeywordEq { field, value } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
@@ -138,7 +100,7 @@ fn filter_matches(
       }
     }
     Filter::KeywordIn { field, values } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_str_values(&full, doc_id)
@@ -153,7 +115,7 @@ fn filter_matches(
       }
     }
     Filter::I64Range { field, min, max } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_i64_values(&full, doc_id)
@@ -164,7 +126,7 @@ fn filter_matches(
       }
     }
     Filter::F64Range { field, min, max } => {
-      let full = qualified_field(base_path, field);
+      let full = join_path(base_path, field);
       match object_idx {
         Some(idx) => reader
           .nested_f64_values(&full, doc_id)
@@ -212,16 +174,7 @@ fn nested_filter_passes(
   false
 }
 
-/// Build a qualified field path without allocating when `base` is empty.
-fn qualified_field<'a>(base: &str, field: &'a str) -> Cow<'a, str> {
-  if base.is_empty() {
-    Cow::Borrowed(field)
-  } else {
-    Cow::Owned(format!("{base}.{field}"))
-  }
-}
-
-/// Join a base path with a child segment, borrowing when no join is needed.
+/// Join two dot-separated path segments, borrowing when no join is needed.
 fn join_path<'a>(base: &str, child: &'a str) -> Cow<'a, str> {
   if base.is_empty() {
     Cow::Borrowed(child)
