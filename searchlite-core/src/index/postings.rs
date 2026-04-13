@@ -1,4 +1,5 @@
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use anyhow::Result;
 use hashbrown::HashMap;
@@ -129,13 +130,43 @@ impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
   }
 }
 
+/// Pre-computed per-block upper bounds, shared via `Arc` so that cloning
+/// a `PostingsReader` (or extracting block metadata in the WAND loop)
+/// is an O(1) reference-count bump instead of a full vector copy.
+#[derive(Debug, Clone)]
+pub struct BlockMeta {
+  pub doc_ids: Vec<DocId>,
+  pub tfs: Vec<f32>,
+  pub block_size: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PostingsReader {
   data: Vec<PostingEntry>,
   pub max_tf: f32,
-  pub block_max_doc_ids: Vec<DocId>,
-  pub block_max_tfs: Vec<f32>,
-  pub block_size: usize,
+  block_meta: Arc<BlockMeta>,
+}
+
+impl PostingsReader {
+  /// Block-max doc IDs (one per block).
+  pub fn block_max_doc_ids(&self) -> &[DocId] {
+    &self.block_meta.doc_ids
+  }
+
+  /// Block-max term frequencies (one per block).
+  pub fn block_max_tfs(&self) -> &[f32] {
+    &self.block_meta.tfs
+  }
+
+  /// Block size used when computing block metadata.
+  pub fn block_size(&self) -> usize {
+    self.block_meta.block_size
+  }
+
+  /// Cheaply share the block metadata via `Arc`.
+  pub fn block_meta(&self) -> Arc<BlockMeta> {
+    Arc::clone(&self.block_meta)
+  }
 }
 
 impl PostingsReader {
@@ -205,9 +236,11 @@ impl PostingsReader {
     Ok(Self {
       data,
       max_tf,
-      block_max_doc_ids,
-      block_max_tfs,
-      block_size,
+      block_meta: Arc::new(BlockMeta {
+        doc_ids: block_max_doc_ids,
+        tfs: block_max_tfs,
+        block_size,
+      }),
     })
   }
 
@@ -227,31 +260,47 @@ impl PostingsReader {
     self.data.len()
   }
 
+  /// Drop all per-entry position data, freeing memory.
+  ///
+  /// Call this when only `doc_id` and `term_freq` are needed (e.g., BM25/WAND
+  /// scoring). Positions are only required for phrase matching and are often
+  /// the largest component of high-frequency postings lists.
+  pub fn strip_positions(&mut self) {
+    for entry in self.data.iter_mut() {
+      if !entry.positions.is_empty() {
+        entry.positions = SmallVec::new();
+      }
+    }
+  }
+
   #[cfg(test)]
   pub fn from_entries_for_test(entries: Vec<PostingEntry>, block_size: usize) -> Self {
-    let mut reader = Self {
-      max_tf: 0.0,
-      block_max_doc_ids: Vec::new(),
-      block_max_tfs: Vec::new(),
-      block_size: block_size.max(1),
-      data: entries,
-    };
-    reader.max_tf = reader
-      .data
+    let block_size = block_size.max(1);
+    let max_tf = entries
       .iter()
       .map(|p| p.term_freq as f32)
       .fold(0.0_f32, f32::max);
-    for chunk in reader.data.chunks(reader.block_size) {
+    let mut block_max_doc_ids = Vec::new();
+    let mut block_max_tfs = Vec::new();
+    for chunk in entries.chunks(block_size) {
       if let Some(last) = chunk.last() {
-        reader.block_max_doc_ids.push(last.doc_id);
+        block_max_doc_ids.push(last.doc_id);
       }
       let tf_max = chunk
         .iter()
         .map(|p| p.term_freq as f32)
         .fold(0.0_f32, f32::max);
-      reader.block_max_tfs.push(tf_max);
+      block_max_tfs.push(tf_max);
     }
-    reader
+    Self {
+      data: entries,
+      max_tf,
+      block_meta: Arc::new(BlockMeta {
+        doc_ids: block_max_doc_ids,
+        tfs: block_max_tfs,
+        block_size,
+      }),
+    }
   }
 }
 
@@ -300,8 +349,8 @@ mod tests {
     let reader = PostingsReader::read_at(&mut reader_file, offset, true).unwrap();
     assert_eq!(reader.len(), 2);
     assert!(reader.max_tf >= 2.0);
-    assert_eq!(reader.block_max_doc_ids.len(), 1);
-    assert_eq!(reader.block_max_tfs.len(), 1);
+    assert_eq!(reader.block_max_doc_ids().len(), 1);
+    assert_eq!(reader.block_max_tfs().len(), 1);
     let collected: Vec<_> = reader
       .iter()
       .map(|p| (p.doc_id, p.positions.iter().copied().collect::<Vec<_>>()))

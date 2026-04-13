@@ -1,6 +1,8 @@
 use std::borrow::Borrow;
 use std::borrow::Cow;
 
+use smallvec::SmallVec;
+
 use crate::api::types::Filter;
 use crate::index::fastfields::{case_insensitive_equals, FastFieldsReader};
 use crate::DocId;
@@ -14,6 +16,11 @@ pub fn passes_filter(reader: &FastFieldsReader, doc_id: DocId, filter: &Filter) 
 }
 
 /// Evaluate a slice of filters, accepting both `&[Filter]` and `&[&Filter]`.
+///
+/// Nested filters sharing the same path are grouped together so that all
+/// conditions in the group are evaluated against the same nested object.
+/// A `SmallVec` of `(path, filters)` pairs avoids a `HashMap` allocation
+/// in the common case of 0–2 nested paths.
 fn passes_filters_at<F: Borrow<Filter>>(
   reader: &FastFieldsReader,
   doc_id: DocId,
@@ -21,15 +28,21 @@ fn passes_filters_at<F: Borrow<Filter>>(
   base_path: &str,
   object_idx: Option<usize>,
 ) -> bool {
-  let mut nested: std::collections::HashMap<&str, Vec<&Filter>> = std::collections::HashMap::new();
+  // Stack-allocated grouping for nested filters. Typical queries have 0–2
+  // distinct nested paths, so SmallVec<[_; 4]> avoids heap allocation.
+  let mut nested: SmallVec<[(&str, SmallVec<[&Filter; 4]>); 4]> = SmallVec::new();
   for filter in filters.iter() {
     let filter = filter.borrow();
     match filter {
       Filter::Nested { path, filter } => {
-        nested
-          .entry(path.as_str())
-          .or_default()
-          .push(filter.as_ref());
+        let key = path.as_str();
+        if let Some(entry) = nested.iter_mut().find(|(p, _)| *p == key) {
+          entry.1.push(filter.as_ref());
+        } else {
+          let mut group = SmallVec::new();
+          group.push(filter.as_ref());
+          nested.push((key, group));
+        }
       }
       _ => {
         if !filter_matches(reader, doc_id, filter, base_path, object_idx) {
@@ -38,15 +51,8 @@ fn passes_filters_at<F: Borrow<Filter>>(
       }
     }
   }
-  for (path, group) in nested.into_iter() {
-    if !nested_group_passes(
-      reader,
-      doc_id,
-      base_path,
-      path,
-      object_idx,
-      group.as_slice(),
-    ) {
+  for (path, group) in nested.iter() {
+    if !nested_group_passes(reader, doc_id, base_path, path, object_idx, group.as_slice()) {
       return false;
     }
   }
@@ -102,15 +108,27 @@ fn filter_matches(
     Filter::KeywordIn { field, values } => {
       let full = join_path(base_path, field);
       match object_idx {
-        Some(idx) => reader
-          .nested_str_values(&full, doc_id)
-          .get(idx)
-          .map(|vals| {
-            vals
-              .iter()
-              .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
-          })
-          .unwrap_or(false),
+        Some(idx) => {
+          if values.len() <= 4 {
+            reader
+              .nested_str_values(&full, doc_id)
+              .get(idx)
+              .map(|vals| {
+                vals
+                  .iter()
+                  .any(|v| values.iter().any(|t| case_insensitive_equals(t, v)))
+              })
+              .unwrap_or(false)
+          } else {
+            let set: std::collections::HashSet<String> =
+              values.iter().map(|v| v.to_lowercase()).collect();
+            reader
+              .nested_str_values(&full, doc_id)
+              .get(idx)
+              .map(|vals| vals.iter().any(|v| set.contains(&v.to_lowercase())))
+              .unwrap_or(false)
+          }
+        }
         None => reader.matches_keyword_in(&full, doc_id, values),
       }
     }

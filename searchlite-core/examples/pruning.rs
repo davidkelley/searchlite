@@ -170,6 +170,7 @@ fn run_strategy(
             b: opts.bm25_b,
             leaf: 0,
             doc_lengths,
+            min_doc_len: None,
           });
         }
       }

@@ -278,7 +278,7 @@ enum RootFilter<'a> {
 struct SegmentSearchParams<'a> {
   qualified_terms: &'a [QualifiedTerm],
   term_weights: &'a HashMap<String, WeightedTermEntry>,
-  field_lengths_cache: &'a mut HashMap<String, Arc<Vec<f32>>>,
+  field_lengths_cache: &'a mut HashMap<String, CachedFieldLengths>,
   cross_lengths_cache: &'a mut HashMap<String, Arc<Vec<f32>>>,
   cross_avgdl_cache: &'a mut HashMap<String, f32>,
   matcher: &'a QueryMatcher,
@@ -1196,7 +1196,7 @@ impl IndexReader {
         entry.3 = term.group_fields.clone();
       }
     }
-    let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+    let mut field_lengths_cache: HashMap<String, CachedFieldLengths> = HashMap::new();
     let mut cross_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
     let mut cross_avgdl_cache: HashMap<String, f32> = HashMap::new();
     for (segment_ord, seg) in self.segments.iter().enumerate() {
@@ -1683,20 +1683,23 @@ impl IndexReader {
     let docs = seg.live_docs() as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf, group_fields)) in term_weights.iter() {
-      if let Some(postings) = seg.postings(key) {
-        let (avgdl, doc_lengths) = if let Some(fields) = group_fields.as_deref() {
-          cross_fields_stats_for(
+      if let Some(mut postings) = seg.postings(key) {
+        // Scoring only needs doc_id + term_freq; drop position data to
+        // free memory on high-frequency terms. Phrase matching loads its
+        // own postings separately via build_phrase_runtimes.
+        postings.strip_positions();
+        let (avgdl, doc_lengths, min_doc_len) = if let Some(fields) = group_fields.as_deref() {
+          let (avgdl, dl) = cross_fields_stats_for(
             field_lengths_cache,
             cross_lengths_cache,
             cross_avgdl_cache,
             fields,
             seg,
-          )
+          );
+          (avgdl, dl, None)
         } else {
-          (
-            seg.avg_field_length(field),
-            field_lengths_for(field_lengths_cache, field, seg),
-          )
+          let (dl, mdl) = field_lengths_for(field_lengths_cache, field, seg);
+          (seg.avg_field_length(field), dl, mdl)
         };
         terms.push(ScoredTerm {
           postings,
@@ -1707,6 +1710,7 @@ impl IndexReader {
           b: self.options.bm25_b,
           leaf: *leaf,
           doc_lengths,
+          min_doc_len,
         });
       }
     }
@@ -1999,7 +2003,7 @@ impl IndexReader {
         phrase_postings: &phrase_postings,
         fast_fields: seg.fast_fields(),
       };
-      let mut field_lengths_cache: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+      let mut field_lengths_cache: HashMap<String, CachedFieldLengths> = HashMap::new();
       let mut term_weights: HashMap<String, (String, f32, usize)> = HashMap::new();
       for term in qualified_terms.iter() {
         let entry =
@@ -2011,8 +2015,9 @@ impl IndexReader {
       let docs_count = seg.live_docs() as f32;
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
-        if let Some(postings) = seg.postings(&key) {
-          let doc_lengths = field_lengths_for(&mut field_lengths_cache, &field, seg);
+        if let Some(mut postings) = seg.postings(&key) {
+          postings.strip_positions();
+          let (doc_lengths, min_doc_len) = field_lengths_for(&mut field_lengths_cache, &field, seg);
           terms.push(ScoredTerm {
             postings,
             weight,
@@ -2022,6 +2027,7 @@ impl IndexReader {
             b: self.options.bm25_b,
             leaf,
             doc_lengths,
+            min_doc_len,
           });
         }
       }
@@ -2122,7 +2128,7 @@ fn cross_fields_cache_key(fields: &[String]) -> String {
 }
 
 fn cross_fields_stats_for(
-  field_lengths_cache: &mut HashMap<String, Arc<Vec<f32>>>,
+  field_lengths_cache: &mut HashMap<String, CachedFieldLengths>,
   cross_lengths_cache: &mut HashMap<String, Arc<Vec<f32>>>,
   cross_avgdl_cache: &mut HashMap<String, f32>,
   fields: &[String],
@@ -2152,7 +2158,8 @@ fn cross_fields_stats_for(
   let mut combined = vec![0.0_f32; seg.meta.doc_count as usize];
   let mut contributing = 0usize;
   for field in fields.iter() {
-    if let Some(lengths) = field_lengths_for(field_lengths_cache, field, seg) {
+    let (lengths, _) = field_lengths_for(field_lengths_cache, field, seg);
+    if let Some(lengths) = lengths {
       contributing += 1;
       for (idx, len) in lengths.iter().enumerate().take(combined.len()) {
         combined[idx] += *len;
@@ -2170,23 +2177,41 @@ fn cross_fields_stats_for(
   (avgdl, Some(arc))
 }
 
+struct CachedFieldLengths {
+  lengths: Arc<Vec<f32>>,
+  min_positive: f32,
+}
+
 fn field_lengths_for(
-  cache: &mut HashMap<String, Arc<Vec<f32>>>,
+  cache: &mut HashMap<String, CachedFieldLengths>,
   field: &str,
   seg: &SegmentReader,
-) -> Option<Arc<Vec<f32>>> {
+) -> (Option<Arc<Vec<f32>>>, Option<f32>) {
   if let Some(existing) = cache.get(field) {
-    return Some(existing.clone());
+    return (Some(existing.lengths.clone()), Some(existing.min_positive));
   }
   let key = doc_length_key(field);
   let mut lengths = Vec::with_capacity(seg.meta.doc_count as usize);
+  let mut min_positive = f32::INFINITY;
   for doc_id in 0..seg.meta.doc_count {
     let len = seg.fast_fields().i64_value(&key, doc_id).unwrap_or(0) as f32;
+    if len > 0.0 {
+      min_positive = min_positive.min(len);
+    }
     lengths.push(len);
   }
+  if !min_positive.is_finite() {
+    min_positive = 1.0;
+  }
   let arc = Arc::new(lengths);
-  cache.insert(field.to_string(), arc.clone());
-  Some(arc)
+  cache.insert(
+    field.to_string(),
+    CachedFieldLengths {
+      lengths: arc.clone(),
+      min_positive,
+    },
+  );
+  (Some(arc), Some(min_positive))
 }
 
 fn combine_rescore_scores(mode: RescoreMode, original: f32, rescore: f32) -> f32 {
@@ -3649,6 +3674,7 @@ mod tests {
           b: reader.options.bm25_b,
           leaf,
           doc_lengths: None,
+          min_doc_len: None,
         });
       }
     }
