@@ -131,6 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           branch="${{ steps.release-pr.outputs.branch }}"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch origin "$branch"
           git checkout "$branch"
 
