@@ -276,6 +276,13 @@
                 <option value="memory">Memory (session)</option>
               </select>
             </label>
+            <label class="select-label" for="execution-mode">
+              Execution
+              <select id="execution-mode" class="select">
+                <option value="worker" selected>Worker (recommended)</option>
+                <option value="main">Main thread fallback</option>
+              </select>
+            </label>
             <span class="hint"
               >Defaults to a single text field named "body".</span
             >
@@ -329,7 +336,21 @@
             </div>
           </div>
           <div class="actions">
-            <button id="search-btn" type="button">Run search</button>
+            <div class="load-block">
+              <label class="select-label" for="search-timeout-ms">
+                Timeout (ms)
+                <input
+                  id="search-timeout-ms"
+                  class="select"
+                  type="number"
+                  min="0"
+                  step="1"
+                  placeholder="none"
+                />
+              </label>
+              <button id="search-btn" type="button">Run search</button>
+              <button id="cancel-search-btn" type="button">Cancel search</button>
+            </div>
             <div id="status" class="status">Initializing…</div>
           </div>
         </section>
@@ -360,6 +381,10 @@
     ></script>
     <script type="module">
       import init, { Searchlite } from "./pkg/searchlite_wasm.js";
+      import {
+        SearchliteWorkerClient,
+        supportsModuleWorkers,
+      } from "./searchlite-worker-client.mjs";
 
       const defaultRequest = {
         query: {
@@ -382,6 +407,7 @@
       const loadBtn = document.getElementById("load-btn");
       const resetBtn = document.getElementById("reset-btn");
       const searchBtn = document.getElementById("search-btn");
+      const cancelSearchBtn = document.getElementById("cancel-search-btn");
       const applySchemaBtn = document.getElementById("apply-schema-btn");
       const pageResetBtn = document.getElementById("page-reset-btn");
       const statusEl = document.getElementById("status");
@@ -389,12 +415,16 @@
       const indexNameEl = document.getElementById("index-name");
       const schemaNameEl = document.getElementById("schema-name");
       const storageModeEl = document.getElementById("storage-mode");
+      const executionModeEl = document.getElementById("execution-mode");
+      const searchTimeoutEl = document.getElementById("search-timeout-ms");
 
       let idx = null;
       let docCount = 0;
       let currentDb = "";
       let currentSchema = null;
       let busy = false;
+      let workerClient = null;
+      let activeSearchController = null;
       schemaNameEl.dataset.label = "none";
       requestInput.value = JSON.stringify(defaultRequest, null, 2);
 
@@ -417,9 +447,12 @@
         loadBtn.disabled = busy || !currentSchema;
         resetBtn.disabled = busy || !currentSchema;
         searchBtn.disabled = busy || !currentSchema;
+        cancelSearchBtn.disabled = !busy || !activeSearchController;
         applySchemaBtn.disabled = busy;
         pageResetBtn.disabled = busy;
         storageModeEl.disabled = busy;
+        executionModeEl.disabled = busy;
+        searchTimeoutEl.disabled = busy && !activeSearchController;
       }
 
       function toggleBusy(state) {
@@ -460,6 +493,29 @@
         }
       }
 
+      function formatError(err) {
+        if (!err) return "unknown error";
+        if (typeof err === "string") return err;
+        if (typeof err.reason === "string") {
+          const type = typeof err.type === "string" ? err.type : "wasm_error";
+          return `${type}: ${err.reason}`;
+        }
+        if (typeof err.message === "string") return err.message;
+        return String(err);
+      }
+
+      function parseTimeoutMs() {
+        const raw = (searchTimeoutEl.value || "").trim();
+        if (!raw) {
+          return null;
+        }
+        const ms = Number(raw);
+        if (!Number.isFinite(ms) || ms < 0) {
+          throw new Error("Timeout must be a non-negative number.");
+        }
+        return ms;
+      }
+
       function parseDocuments(raw) {
         try {
           const parsed = JSON.parse(raw);
@@ -494,6 +550,40 @@
         return docs;
       }
 
+      async function disposeWorkerClient() {
+        if (!workerClient) {
+          return;
+        }
+        try {
+          await workerClient.dispose();
+        } catch (err) {
+          console.warn("Failed to dispose worker client", err);
+        }
+        workerClient = null;
+      }
+
+      function canUseWorkerSearch() {
+        if (executionModeEl.value !== "worker") {
+          return false;
+        }
+        if (!supportsModuleWorkers()) {
+          return false;
+        }
+        if ((storageModeEl?.value || "indexeddb") !== "indexeddb") {
+          return false;
+        }
+        return true;
+      }
+
+      async function ensureWorkerClient() {
+        if (!workerClient) {
+          workerClient = new SearchliteWorkerClient(
+            new URL("./searchlite-demo-worker.mjs", import.meta.url)
+          );
+        }
+        return workerClient;
+      }
+
       async function ensureIndex(reset = false) {
         if (!currentSchema) {
           throw new Error("Upload a schema first.");
@@ -514,6 +604,7 @@
           JSON.stringify(currentSchema),
           storageMode
         );
+        await disposeWorkerClient();
         docCount = 0;
         updateIndexInfo();
         setStatus("Index ready");
@@ -541,7 +632,7 @@
           setStatus(`Loaded ${docs.length} documents from ${file.name}.`);
         } catch (err) {
           console.error(err);
-          setStatus(`Load failed: ${err.message || err}`, true);
+          setStatus(`Load failed: ${formatError(err)}`, true);
         } finally {
           toggleBusy(false);
         }
@@ -567,7 +658,7 @@
           renderResponse(`Schema "${file.name}" applied. Index reset.`);
         } catch (err) {
           console.error(err);
-          setStatus(`Schema load failed: ${err.message || err}`, true);
+          setStatus(`Schema load failed: ${formatError(err)}`, true);
         } finally {
           toggleBusy(false);
         }
@@ -583,21 +674,25 @@
               console.warn("Failed to free index on reset", err);
             }
           }
+          await disposeWorkerClient();
           idx = null;
           currentSchema = null;
           currentDb = "";
           docCount = 0;
+          activeSearchController = null;
           schemaNameEl.dataset.label = "none";
           requestInput.value = JSON.stringify(defaultRequest, null, 2);
           datasetInput.value = "";
           schemaInput.value = "";
           storageModeEl.value = "indexeddb";
+          executionModeEl.value = "worker";
+          searchTimeoutEl.value = "";
           renderResponse(defaultResponse);
           setStatus("Page reset. Upload a schema to start.");
           updateIndexInfo();
         } catch (err) {
           console.error(err);
-          setStatus(`Page reset failed: ${err.message || err}`, true);
+          setStatus(`Page reset failed: ${formatError(err)}`, true);
         } finally {
           syncDisabled();
           toggleBusy(false);
@@ -606,20 +701,49 @@
 
       async function runSearch() {
         toggleBusy(true);
+        activeSearchController = new AbortController();
+        syncDisabled();
         try {
           await ensureIndex();
           const requestJson = requestInput.value;
+          const timeoutMs = parseTimeoutMs();
           setStatus("Searching…");
-          const result = idx.search_request(requestJson);
-          console.log(result);
+          let result = null;
+          if (canUseWorkerSearch()) {
+            const client = await ensureWorkerClient();
+            await client.initIndex(
+              currentDb,
+              JSON.stringify(currentSchema),
+              storageModeEl?.value || "indexeddb"
+            );
+            const requestObject = JSON.parse(requestJson);
+            result = await client.searchRequest(requestObject, {
+              signal: activeSearchController.signal,
+              timeoutMs,
+            });
+          } else {
+            if (executionModeEl.value === "worker") {
+              setStatus(
+                "Worker mode unavailable for this configuration; using main-thread fallback.",
+                false
+              );
+            }
+            result = idx.search_request_controlled(
+              requestJson,
+              activeSearchController.signal,
+              timeoutMs
+            );
+          }
           renderResponse(result);
           setStatus("Search complete.");
         } catch (err) {
           console.error(err);
-          const message = err?.message ?? String(err);
+          const message = formatError(err);
           renderResponse(message);
           setStatus(`Search failed: ${message}`, true);
         } finally {
+          activeSearchController = null;
+          syncDisabled();
           toggleBusy(false);
         }
       }
@@ -640,10 +764,24 @@
           setStatus("Index reset. Load data to continue.");
         } catch (err) {
           console.error(err);
-          setStatus(`Reset failed: ${err.message || err}`, true);
+          setStatus(`Reset failed: ${formatError(err)}`, true);
         } finally {
           toggleBusy(false);
         }
+      });
+
+      cancelSearchBtn.addEventListener("click", () => {
+        if (activeSearchController) {
+          activeSearchController.abort();
+        }
+      });
+
+      storageModeEl.addEventListener("change", async () => {
+        await disposeWorkerClient();
+      });
+
+      executionModeEl.addEventListener("change", async () => {
+        await disposeWorkerClient();
       });
 
       pageResetBtn.addEventListener("click", () => {
@@ -663,7 +801,7 @@
           syncDisabled();
         } catch (err) {
           console.error(err);
-          setStatus(`Init failed: ${err.message || err}`, true);
+          setStatus(`Init failed: ${formatError(err)}`, true);
         }
       })();
     </script>

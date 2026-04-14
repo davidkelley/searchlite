@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +54,26 @@ use super::phrase::{
 pub(crate) const MAX_CURSOR_ADVANCE: usize = 50_000;
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_MGET_IDS: usize = 1_024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn monotonic_now_ms() -> f64 {
+  static START: OnceLock<Instant> = OnceLock::new();
+  START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(target_arch = "wasm32")]
+fn monotonic_now_ms() -> f64 {
+  js_sys::Date::now()
+}
+
+fn elapsed_ms_since(start_ms: f64) -> f64 {
+  let elapsed = monotonic_now_ms() - start_ms;
+  if elapsed.is_sign_negative() {
+    0.0
+  } else {
+    elapsed
+  }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
@@ -1178,7 +1199,7 @@ impl IndexReader {
     let mut total_matches: u64 = 0;
     let mut skipped_by_cursor: u64 = 0;
     let mut saw_cursor = cursor_state.is_none() || !req.return_hits;
-    let search_start = Instant::now();
+    let search_start_ms = req.profile.then(monotonic_now_ms);
     let mut timings: BTreeMap<String, f64> = BTreeMap::new();
     let mut search_stats = QueryStats::default();
     validate_aggregations(&self.manifest.schema, &req.aggs)?;
@@ -1324,15 +1345,15 @@ impl IndexReader {
     if req.return_hits {
       hits.sort_by(|a, b| a.key.cmp(&b.key));
     }
-    let search_phase_end = if req.profile {
-      Some(Instant::now())
+    let search_phase_end_ms = if req.profile {
+      Some(monotonic_now_ms())
     } else {
       None
     };
     let mut rescore_stats = QueryStats::default();
     if req.return_hits {
       if let Some(rescore_req) = req.rescore.as_ref() {
-        let rescore_start = Instant::now();
+        let rescore_start_ms = monotonic_now_ms();
         self.rescore_hits(
           &mut hits,
           rescore_req,
@@ -1342,10 +1363,7 @@ impl IndexReader {
           &mut rescore_stats,
         )?;
         if req.profile {
-          timings.insert(
-            "rescore_ms".to_string(),
-            rescore_start.elapsed().as_secs_f64() * 1000.0,
-          );
+          timings.insert("rescore_ms".to_string(), elapsed_ms_since(rescore_start_ms));
         }
       }
       if req.explain {
@@ -1363,12 +1381,9 @@ impl IndexReader {
         }
       }
     }
-    if req.profile {
-      let end = search_phase_end.unwrap_or_else(Instant::now);
-      timings.insert(
-        "search_ms".to_string(),
-        end.duration_since(search_start).as_secs_f64() * 1000.0,
-      );
+    if let Some(start_ms) = search_start_ms {
+      let end_ms = search_phase_end_ms.unwrap_or_else(monotonic_now_ms);
+      timings.insert("search_ms".to_string(), (end_ms - start_ms).max(0.0));
     }
     let search_after_mode = req.search_after.is_some() && req.cursor.is_none();
     let total_hits_value = total_matches

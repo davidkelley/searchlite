@@ -31,9 +31,49 @@ All FFI functions that return `c_int` use the following codes:
 ## WASM
 
 - `add_document` / `add_documents` queue writes; `commit()` persists them and makes them searchable. `flush_storage()` only drains pending storage writes if you need it.
+- `delete_document(id)` queues a single delete by doc id; `delete_documents(ids)` accepts a string or array of strings for batch deletes. Both require `commit()` to persist.
+- `update_document({ id, set?, unset? })` queues partial updates by doc id; `set` and `unset` follow core patch semantics and require `commit()` to persist.
+- `mget({ ids, return_stored? })` returns `{ docs: [...] }` in input order with per-id `found` and optional `_source`.
+- `multi_search({ searches, parallel?, max_concurrency? })` returns `{ results: [...] }` preserving request order.
+- Maintenance helpers: `compact()` -> `{ compacted }`, `inspect()` -> `{ manifest }` (write-key fields redacted), and `stats()` -> index-level counts and metadata.
 - `search(query, limit, returnStored?)` takes an optional third argument; omit it for the default (`false`) or pass `true` to fetch stored fields.
 - `search_request` accepts a JSON string; `search_request_value` takes a JS object. Both support the full `SearchRequest` surface with the same `return_stored` default of `false`.
-- Reusing a `db_name` reopens an existing index; schema mismatches return an error (there is no migration path; use a new `db_name` or delete the stored index).
+- Package target note: `wasm-pack build --target web` exposes a default init export; the default bundler target auto-initializes and only exposes named exports (for example `Searchlite`).
+- Controlled search variants accept cancellation and timeout controls:
+  - `search_controlled(query, limit, returnStored?, abortSignal?, timeoutMs?)`
+  - `search_request_controlled(json, abortSignal?, timeoutMs?)`
+  - `search_request_value_controlled(value, abortSignal?, timeoutMs?)`
+  - `search_request_value_async(value, abortSignal?, timeoutMs?)` (Promise-based worker-oriented entrypoint)
+- Lifecycle helpers are exposed as static methods: `Searchlite.list_indexes()`, `Searchlite.clear_index(name)`, and `Searchlite.drop_index(name)`.
+- Storage helpers: `Searchlite.storage_usage()` reports usage/quota when the browser exposes it; `Searchlite.cleanup_indexes(stale_older_than_ms, dry_run?)` removes stale persisted indexes by age.
+- Index cleanup helper: `db.cleanup_orphaned_files(dry_run?)` removes IndexedDB blobs not referenced by the active manifest.
+- `Searchlite.plan_migration(name, schemaJson)` reports `missing`, `compatible`, or `rebuild_required` without mutating state.
+- `Searchlite.migrate_index(name, schemaJson)` applies migration planning and returns `created`, `compatible`, or `rebuilt`; on rebuild failure it restores the previous snapshot before returning a typed error.
+- Reusing a `db_name` reopens an existing index; schema mismatches still return `schema_mismatch` if you call `init` directly.
+
+### WASM error shape
+
+WASM methods return structured errors instead of plain strings:
+
+```json
+{
+  "type": "invalid_search_request",
+  "reason": "..."
+}
+```
+
+Use `error.type` for programmatic handling and `error.reason` for logging/UI.
+
+`quota_exceeded` is returned when IndexedDB rejects writes due to storage limits; the reason includes recovery guidance (`compact`, stale-index cleanup, or clearing/dropping unused data).
+`aborted` is returned when an `AbortSignal` is already aborted (or becomes aborted at a control check).
+`timeout` is returned when `timeoutMs` is exceeded at a control check.
+
+### Worker-first demo notes
+
+- `searchlite-wasm/searchlite-worker-client.mjs` provides a worker-first search wrapper over `searchlite-wasm/searchlite-demo-worker.mjs`.
+- The client restarts workers after timeout/abort to stop in-flight operations.
+- Worker client options validate `timeoutMs` and `delayMs` as non-negative finite numbers and return typed `invalid_timeout` / `invalid_argument` errors when invalid.
+- With `indexeddb` storage this preserves state on restart; with `memory` storage it does not, so the demo falls back to main-thread execution.
 
 ### WASM threading
 
