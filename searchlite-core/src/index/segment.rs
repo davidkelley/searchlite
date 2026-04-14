@@ -1114,12 +1114,36 @@ fn read_vector_file(
     bail!("vector doc count mismatch for {path:?}: expected {expected_docs}, found {doc_count}");
   }
   let vector_count = cursor.read_u32::<LittleEndian>()? as usize;
+  // `vector_count` is the number of dense rows stored in the values block.
+  // Every row is pointed at by at most one u32 offset in the `offsets` table,
+  // so it can never legally exceed `doc_count`. Rejecting early prevents a
+  // crafted/corrupt header from driving the capacity / read-loop bound off a
+  // multi-gigabyte allocation before we discover the file is too short.
+  if vector_count > doc_count {
+    bail!("vector file {path:?}: vector_count {vector_count} exceeds doc_count {doc_count}");
+  }
   let mut offsets = Vec::with_capacity(doc_count);
   for _ in 0..doc_count {
     offsets.push(cursor.read_u32::<LittleEndian>()?);
   }
-  let mut values = Vec::with_capacity(vector_count.saturating_mul(dim));
-  for _ in 0..vector_count.saturating_mul(dim) {
+  // Validate the implied `vector_count * dim * sizeof(f32)` byte footprint
+  // against the bytes still in the buffer. This catches both `usize` overflow
+  // (via `checked_mul`) and a header whose counts would require more bytes
+  // than the file actually contains, before any allocation happens.
+  let values_len = vector_count
+    .checked_mul(dim)
+    .ok_or_else(|| anyhow!("vector file {path:?}: vector_count * dim overflows usize"))?;
+  let values_bytes = values_len
+    .checked_mul(std::mem::size_of::<f32>())
+    .ok_or_else(|| anyhow!("vector file {path:?}: values byte size overflows usize"))?;
+  let total_len = cursor.get_ref().len();
+  let position = cursor.position() as usize;
+  let remaining = total_len.saturating_sub(position);
+  if values_bytes > remaining {
+    bail!("vector file {path:?} claims {values_bytes} value bytes but only {remaining} remain");
+  }
+  let mut values = Vec::with_capacity(values_len);
+  for _ in 0..values_len {
     values.push(cursor.read_f32::<LittleEndian>()?);
   }
   Ok(VectorStore::new(dim, metric, offsets, values))
@@ -1574,5 +1598,114 @@ mod tests {
       err.to_string().contains("zstd"),
       "expected a clear zstd feature error, got {err}"
     );
+  }
+
+  #[cfg(feature = "vectors")]
+  mod vector_file_bounds {
+    use super::*;
+    use crate::api::types::VectorMetric as ApiVectorMetric;
+    use crate::vectors::VectorStore;
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    /// Build a minimal vector file header with caller-chosen counts. Does not
+    /// append the offsets/values payload — callers that want a syntactically
+    /// complete file append it themselves.
+    fn build_header(dim: u32, metric_code: u8, doc_count: u32, vector_count: u32) -> Vec<u8> {
+      let mut buf = Vec::new();
+      buf.write_u32::<LittleEndian>(VECTOR_FILE_MAGIC).unwrap();
+      buf.write_u32::<LittleEndian>(VECTOR_FILE_VERSION).unwrap();
+      buf.write_u32::<LittleEndian>(dim).unwrap();
+      buf.write_u8(metric_code).unwrap();
+      buf.write_u8(0).unwrap();
+      buf.write_u16::<LittleEndian>(0).unwrap();
+      buf.write_u32::<LittleEndian>(doc_count).unwrap();
+      buf.write_u32::<LittleEndian>(vector_count).unwrap();
+      buf
+    }
+
+    #[test]
+    fn round_trip_preserves_vectors() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let path = dir.path().join("vec.bin");
+      let store = VectorStore::new(
+        2,
+        ApiVectorMetric::Cosine,
+        vec![0, u32::MAX, 1],
+        vec![0.1, 0.2, 0.3, 0.4],
+      );
+      write_vector_file(&storage, &path, &store).unwrap();
+      let loaded = read_vector_file(&storage, &path, 3, 2, &ApiVectorMetric::Cosine).unwrap();
+      assert_eq!(loaded.offsets(), &[0, u32::MAX, 1]);
+      assert_eq!(loaded.values().as_slice(), &[0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn rejects_vector_count_exceeding_doc_count() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let path = dir.path().join("vec.bin");
+      // doc_count = 2, but header claims 100 dense rows — enough that a naive
+      // reader would allocate 100 * dim * sizeof(f32) before the short read
+      // fires.
+      let mut buf = build_header(4, metric_code(&ApiVectorMetric::Cosine), 2, 100);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
+      }
+      std::fs::write(&path, &buf).unwrap();
+      let err = read_vector_file(&storage, &path, 2, 4, &ApiVectorMetric::Cosine)
+        .expect_err("must reject vector_count > doc_count");
+      let msg = err.to_string();
+      assert!(
+        msg.contains("vector_count 100") && msg.contains("doc_count 2"),
+        "unexpected error: {msg}"
+      );
+    }
+
+    #[test]
+    fn rejects_values_block_larger_than_remaining_bytes() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let path = dir.path().join("vec.bin");
+      // vector_count = doc_count = 2 (passes the first guard), dim = 1024.
+      // The values block should be 2 * 1024 * 4 = 8192 bytes, but we only
+      // write 12 value bytes (3 f32s) so remaining < claimed.
+      let mut buf = build_header(1024, metric_code(&ApiVectorMetric::Cosine), 2, 2);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
+      }
+      for _ in 0..3 {
+        buf.write_f32::<LittleEndian>(0.0).unwrap();
+      }
+      std::fs::write(&path, &buf).unwrap();
+      let err = read_vector_file(&storage, &path, 2, 1024, &ApiVectorMetric::Cosine)
+        .expect_err("must reject file when values bytes exceed remaining");
+      let msg = err.to_string();
+      assert!(
+        msg.contains("value bytes") && msg.contains("remain"),
+        "unexpected error: {msg}"
+      );
+    }
+
+    #[test]
+    fn rejects_near_u32_max_vector_count_without_allocating() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let path = dir.path().join("vec.bin");
+      // Exact reproducer shape from BUG-014: header advertises a huge
+      // vector_count that would previously drive
+      // `Vec::with_capacity(vector_count * dim)` into an allocator abort.
+      // After the fix, the `vector_count > doc_count` guard fires first so
+      // the test terminates in constant memory.
+      let mut buf = build_header(1024, metric_code(&ApiVectorMetric::Cosine), 2, u32::MAX);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
+      }
+      std::fs::write(&path, &buf).unwrap();
+      let err = read_vector_file(&storage, &path, 2, 1024, &ApiVectorMetric::Cosine)
+        .expect_err("must reject crafted u32::MAX vector_count");
+      let msg = err.to_string();
+      assert!(msg.contains("exceeds doc_count"), "unexpected error: {msg}");
+    }
   }
 }
