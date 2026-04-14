@@ -811,6 +811,9 @@ struct InspectResponse {
   manifest: Manifest,
 }
 
+// Note: `index_path` was removed from this response as a Security fix (BUG-015).
+// The on-disk filesystem path of an index is an operator-side implementation
+// detail and must not be exposed to unauthenticated callers of `/stats`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StatsResponse {
   documents: u64,
@@ -818,7 +821,6 @@ struct StatsResponse {
   segments: usize,
   committed_at: String,
   index_uuid: String,
-  index_path: String,
   index_name: String,
 }
 
@@ -2290,7 +2292,6 @@ async fn stats(
     segments: manifest.segments.len(),
     committed_at: manifest.committed_at.clone(),
     index_uuid: manifest.uuid.to_string(),
-    index_path: managed.path.display().to_string(),
     index_name: managed.name.clone(),
   }))
 }
@@ -2615,6 +2616,66 @@ mod tests {
     assert_eq!(first_after["exists"], true);
     assert!(first_after["committed_at"].as_str().is_some());
     assert_eq!(first_after["doc_count"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  // Regression test for BUG-015: the public `/stats` endpoint must not leak
+  // the on-disk filesystem path of the index. Operator-only details are
+  // confined to server logs / admin tooling.
+  #[tokio::test]
+  async fn stats_response_does_not_expose_filesystem_path() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-stats-no-path");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/add"))
+      .body("{\"_id\":\"1\",\"body\":\"doc\"}\n")
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let stats: serde_json::Value = client
+      .get(format!("{index_base}/stats"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+
+    // Path-leaking fields must not appear in the serialized body under any
+    // alias — check the literal field name and the raw path as a safety net.
+    let stats_obj = stats.as_object().expect("stats body is a JSON object");
+    assert!(
+      !stats_obj.contains_key("index_path"),
+      "stats response must not include `index_path` (leaks FS layout): {stats_obj:?}"
+    );
+    let raw_body = serde_json::to_string(&stats).unwrap();
+    let fs_path_str = index_path.display().to_string();
+    assert!(
+      !raw_body.contains(fs_path_str.as_str()),
+      "stats response must not contain the raw index filesystem path: {raw_body}"
+    );
+
+    // Sanity: the public fields are still present.
+    assert_eq!(stats["index_name"], INDEX_NAME);
+    assert!(stats["index_uuid"].as_str().is_some());
+    assert_eq!(stats["documents"], 1);
 
     handle.abort();
     let _ = handle.await;
