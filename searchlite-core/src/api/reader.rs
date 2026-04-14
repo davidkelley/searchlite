@@ -55,12 +55,19 @@ pub(crate) const MAX_CURSOR_ADVANCE: usize = 50_000;
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_MGET_IDS: usize = 1_024;
 
+/// Returns a timing baseline in milliseconds for profiling.
+///
+/// On native targets this uses `std::time::Instant` (truly monotonic).
+/// On wasm32 this falls back to `js_sys::Date::now()` which is wall-clock
+/// time and can jump on clock adjustments. The `elapsed_ms_since` helper
+/// clamps negative deltas to zero as a safety net.
 #[cfg(not(target_arch = "wasm32"))]
 fn monotonic_now_ms() -> f64 {
   static START: OnceLock<Instant> = OnceLock::new();
   START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
+/// See `monotonic_now_ms` doc on the native variant for caveats.
 #[cfg(target_arch = "wasm32")]
 fn monotonic_now_ms() -> f64 {
   js_sys::Date::now()

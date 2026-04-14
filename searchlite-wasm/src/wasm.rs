@@ -655,11 +655,12 @@ async fn clear_data_store(db_name: &str) -> Result<()> {
   let store = tx
     .object_store(STORE_NAME)
     .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
+  let tx_done = transaction_future(&tx);
   let req = store
     .clear()
     .map_err(|e| anyhow!("clear failed for {STORE_NAME}: {:?}", e))?;
   request_future(&req).await?;
-  Ok(())
+  tx_done.await
 }
 
 async fn upsert_registry_entry(entry: &IndexRegistryEntry) -> Result<()> {
@@ -678,11 +679,12 @@ async fn upsert_registry_entry(entry: &IndexRegistryEntry) -> Result<()> {
   let key = JsValue::from_str(&entry.db_name);
   let value = serde_wasm_bindgen::to_value(entry)
     .map_err(|e| anyhow!("serializing registry entry failed: {e}"))?;
+  let tx_done = transaction_future(&tx);
   let req = store
     .put_with_key(&value, &key)
     .map_err(|e| anyhow!("put registry entry failed: {:?}", e))?;
   request_future(&req).await?;
-  Ok(())
+  tx_done.await
 }
 
 async fn remove_registry_entry(db_name: &str) -> Result<()> {
@@ -695,6 +697,7 @@ async fn remove_registry_entry(db_name: &str) -> Result<()> {
         e
       )
     })?;
+  let tx_done = transaction_future(&tx);
   let store = tx
     .object_store(REGISTRY_STORE_NAME)
     .map_err(|e| anyhow!("opening object store {REGISTRY_STORE_NAME}: {:?}", e))?;
@@ -703,7 +706,7 @@ async fn remove_registry_entry(db_name: &str) -> Result<()> {
     .delete(&key)
     .map_err(|e| anyhow!("delete registry entry failed: {:?}", e))?;
   request_future(&req).await?;
-  Ok(())
+  tx_done.await
 }
 
 async fn get_registry_entry(db_name: &str) -> Result<Option<IndexRegistryEntry>> {
@@ -1047,6 +1050,15 @@ async fn persist_queue_worker(db_name: String, state: Arc<Mutex<PendingQueueStat
     let err_msg = result.as_ref().err().map(|err| err.to_string());
     if let Some(msg) = &err_msg {
       web_sys::console::error_1(&JsValue::from_str(&format!("persist batch error: {msg}")));
+      // Re-insert failed operations so a subsequent flush can retry.
+      // Do not overwrite entries added concurrently during this batch.
+      let mut guard = state.lock();
+      for (path, op) in operations {
+        guard.queue.entry(path).or_insert_with(|| PendingEntry {
+          operation: op,
+          waiters: Vec::new(),
+        });
+      }
     }
     for waiters in waiter_sets {
       for tx in waiters {
@@ -1570,6 +1582,14 @@ impl Searchlite {
     schema_json: String,
     storage_mode: StorageMode,
   ) -> Result<Searchlite, JsValue> {
+    if db_name == REGISTRY_DB_NAME {
+      return Err(js_error(
+        "reserved_name",
+        format!(
+          "'{REGISTRY_DB_NAME}' is reserved for internal use and cannot be used as an index name"
+        ),
+      ));
+    }
     let schema: Schema = serde_json::from_str(&schema_json)
       .map_err(|err| typed_js_error("invalid_schema_json", err))?;
     let requested_schema_hash = schema_hash(&schema)?;
@@ -1667,18 +1687,17 @@ impl Searchlite {
     clear_data_store(&db_name)
       .await
       .map_err(|err| typed_js_error("storage_clear_error", err))?;
-    remove_registry_entry(&db_name)
-      .await
-      .map_err(|err| typed_js_error("registry_delete_error", err))?;
     Ok(())
   }
 
   #[wasm_bindgen(js_name = drop_index)]
   pub async fn drop_index(db_name: String) -> Result<(), JsValue> {
-    let _ = remove_registry_entry(&db_name).await;
     delete_database(&db_name)
       .await
       .map_err(|err| typed_js_error("storage_delete_error", err))?;
+    remove_registry_entry(&db_name)
+      .await
+      .map_err(|err| typed_js_error("registry_delete_error", err))?;
     Ok(())
   }
 
@@ -2012,6 +2031,8 @@ impl Searchlite {
 
   /// Queue deletion for a single `_id`/doc id. Call `commit` to persist removal.
   pub fn delete_document(&self, doc_id: String) -> Result<(), JsValue> {
+    validate_doc_id(&doc_id)
+      .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
     self.delete_documents_internal(vec![doc_id])
   }
 
@@ -2020,7 +2041,12 @@ impl Searchlite {
   pub fn delete_documents(&self, doc_ids: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value = serde_wasm_bindgen::from_value(doc_ids)
       .map_err(|err| typed_js_error("invalid_doc_id_batch", err))?;
-    self.delete_documents_internal(value_to_doc_ids(value)?)
+    let ids = value_to_doc_ids(value)?;
+    for id in ids.iter() {
+      validate_doc_id(id)
+        .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
+    }
+    self.delete_documents_internal(ids)
   }
 
   /// Queue a partial document update by id using set/unset patch semantics.
@@ -2859,6 +2885,29 @@ mod tests {
       .unwrap_err();
     let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
     assert_eq!(payload.error_type, "invalid_doc_id_batch");
+  }
+
+  #[wasm_bindgen_test]
+  async fn delete_document_rejects_invalid_id() {
+    let db = unique_db("searchlite-del-invalid-id");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let err = idx.delete_document("  ".to_string()).unwrap_err();
+    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+    assert_eq!(payload.error_type, "invalid_id");
+  }
+
+  #[wasm_bindgen_test]
+  async fn delete_documents_rejects_invalid_ids() {
+    let db = unique_db("searchlite-dels-invalid-id");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let ids = vec!["valid-doc", "\n"];
+    let err = idx
+      .delete_documents(serde_wasm_bindgen::to_value(&ids).unwrap())
+      .unwrap_err();
+    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+    assert_eq!(payload.error_type, "invalid_id");
   }
 
   #[wasm_bindgen_test]
@@ -3732,6 +3781,14 @@ mod tests {
 
     Searchlite::clear_index(db.clone()).await.unwrap();
 
+    // Verify the index remains discoverable in the registry after clear.
+    let indexes_js = Searchlite::list_indexes().await.unwrap();
+    let indexes: Vec<IndexRegistryEntry> = serde_wasm_bindgen::from_value(indexes_js).unwrap();
+    assert!(
+      indexes.iter().any(|entry| entry.db_name == db),
+      "clear_index should preserve the registry entry"
+    );
+
     let reopened = Searchlite::init(db, schema_json, None).await.unwrap();
     let result = reopened.search("clear".to_string(), 5, None).unwrap();
     let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
@@ -3757,6 +3814,16 @@ mod tests {
     // Can recreate after deletion.
     let recreated = Searchlite::init(db, schema_json, None).await.unwrap();
     recreated.commit().await.unwrap();
+  }
+
+  #[wasm_bindgen_test]
+  async fn init_rejects_reserved_registry_name() {
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let result = Searchlite::init(REGISTRY_DB_NAME.to_string(), schema_json, None).await;
+    assert!(result.is_err(), "expected reserved_name error");
+    let err = result.err().unwrap();
+    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+    assert_eq!(payload.error_type, "reserved_name");
   }
 
   #[wasm_bindgen_test]
