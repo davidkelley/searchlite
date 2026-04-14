@@ -117,9 +117,23 @@ impl<'a, W: Write + Seek + ?Sized> PostingsWriter<'a, W> {
       write_u32_var(p.term_freq, &mut buf);
       if self.keep_positions {
         write_u32_var(p.positions.len() as u32, &mut buf);
-        let mut prev = 0;
+        let mut prev = 0u32;
         for pos in p.positions.iter().copied() {
-          let delta = pos - prev;
+          // Positions must be non-decreasing so that delta encoding is
+          // reversible. `PostingEntry` is a public type and its `positions`
+          // field is directly constructible by external callers, so we
+          // cannot rely on convention — reject out-of-order input here
+          // rather than producing a segment that silently fails to decode
+          // (debug: subtract-overflow panic; release: wrapped delta that
+          // decodes into garbage positions — see BUG-003 / BUG-004).
+          let delta = pos.checked_sub(prev).ok_or_else(|| {
+            anyhow::anyhow!(
+              "positions must be non-decreasing (doc {} pos {} after {})",
+              p.doc_id,
+              pos,
+              prev
+            )
+          })?;
           write_u32_var(delta, &mut buf);
           prev = pos;
         }
@@ -448,6 +462,73 @@ mod tests {
     let collected: Vec<(u32, u32)> = reader.iter().map(|p| (p.doc_id, p.term_freq)).collect();
     assert_eq!(collected, expected);
     assert!(reader.iter().all(|p| p.positions.is_empty()));
+  }
+
+  /// Regression for BUG-004: writing a posting entry with non-monotonic
+  /// positions must return an error rather than panicking in debug or
+  /// silently producing a corrupt (un-decodable) segment in release.
+  #[test]
+  fn write_term_rejects_non_monotonic_positions() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut file = tmp.reopen().unwrap();
+    let postings = vec![PostingEntry {
+      doc_id: 0,
+      term_freq: 2,
+      positions: smallvec![5, 3], // out of order
+    }];
+    let mut writer = PostingsWriter::new(&mut file, true);
+    let err = writer
+      .write_term(&postings)
+      .expect_err("non-monotonic positions must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("non-decreasing"),
+      "unexpected error message: {msg}"
+    );
+  }
+
+  /// Regression for BUG-004: unchecked subtraction previously panicked in
+  /// debug builds when the first position was smaller than the implicit
+  /// starting value of zero — make sure a leading zero-prev is still fine,
+  /// but a subsequent backward step at any offset is rejected.
+  #[test]
+  fn write_term_rejects_backward_step_mid_list() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut file = tmp.reopen().unwrap();
+    let postings = vec![PostingEntry {
+      doc_id: 7,
+      term_freq: 3,
+      positions: smallvec![0, 10, 4],
+    }];
+    let mut writer = PostingsWriter::new(&mut file, true);
+    let err = writer
+      .write_term(&postings)
+      .expect_err("backward-step positions must be rejected");
+    assert!(err.to_string().contains("non-decreasing"));
+  }
+
+  /// Equal consecutive positions (delta = 0) are legal; the encoder must
+  /// accept them and the round-trip must preserve them.
+  #[test]
+  fn write_term_allows_equal_consecutive_positions() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut file = tmp.reopen().unwrap();
+    let postings = vec![PostingEntry {
+      doc_id: 1,
+      term_freq: 3,
+      positions: smallvec![2, 2, 5],
+    }];
+    let mut writer = PostingsWriter::new(&mut file, true);
+    let offset = writer.write_term(&postings).unwrap();
+
+    let mut reader_file = std::fs::File::open(path).unwrap();
+    let reader = PostingsReader::read_at(&mut reader_file, offset, true).unwrap();
+    let round_tripped: Vec<_> = reader
+      .iter()
+      .map(|p| p.positions.iter().copied().collect::<Vec<_>>())
+      .collect();
+    assert_eq!(round_tripped, vec![vec![2, 2, 5]]);
   }
 
   /// Sanity: when the segment was written without positions, reading with
