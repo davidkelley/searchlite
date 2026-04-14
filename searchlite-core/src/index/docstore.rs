@@ -45,11 +45,28 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
         MAX_DOCSTORE_BYTES
       );
     }
-    self.offsets.push(offset);
     let len = data.len() as u32;
-    self.file.write_all(&len.to_le_bytes())?;
-    self.file.write_all(&data)?;
-    Ok(())
+    // Only publish the offset once both writes succeed. On IO failure rewind
+    // the file cursor so a retry or the next `add_document` call overwrites
+    // the partial record instead of leaving a torn header/payload that would
+    // desynchronise doc ids from offsets on the next write.
+    match self
+      .file
+      .write_all(&len.to_le_bytes())
+      .and_then(|_| self.file.write_all(&data))
+    {
+      Ok(()) => {
+        self.offsets.push(offset);
+        Ok(())
+      }
+      Err(e) => {
+        // Best-effort: put the cursor back where it was so the partial record
+        // is overwritten on the next write. If this rewind itself fails the
+        // writer is abandoned and the original IO error is what callers see.
+        let _ = self.file.seek(SeekFrom::Start(offset));
+        Err(e.into())
+      }
+    }
   }
 
   pub fn offsets(&self) -> &[u64] {
@@ -147,6 +164,118 @@ mod tests {
     let huge = serde_json::json!(inner);
     let err = writer.add_document(&huge).unwrap_err();
     assert!(err.to_string().contains("too large"));
+  }
+
+  /// Write + Seek shim that fails the Nth byte of output, used to simulate a
+  /// mid-record IO failure during `add_document`.
+  struct FailingWriter {
+    inner: std::io::Cursor<Vec<u8>>,
+    fail_after: usize,
+    written: usize,
+  }
+
+  impl FailingWriter {
+    fn new(fail_after: usize) -> Self {
+      Self {
+        inner: std::io::Cursor::new(Vec::new()),
+        fail_after,
+        written: 0,
+      }
+    }
+  }
+
+  impl Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      if self.written >= self.fail_after {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "injected failure",
+        ));
+      }
+      let remaining = self.fail_after - self.written;
+      let to_write = buf.len().min(remaining);
+      let n = self.inner.write(&buf[..to_write])?;
+      self.written += n;
+      if n < buf.len() {
+        // Part of the buffer was written; the next call will observe the
+        // injected failure. Return what we managed to flush so `write_all`
+        // loops and eventually surfaces the error, matching how a real
+        // half-failing IO device behaves.
+        Ok(n)
+      } else {
+        Ok(n)
+      }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.inner.flush()
+    }
+  }
+
+  impl Seek for FailingWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+      self.inner.seek(pos)
+    }
+  }
+
+  #[test]
+  fn add_document_preserves_offsets_on_io_failure() {
+    // The first document is small; the second will be forced to fail mid-write
+    // by the injected writer. After the failure the offsets vector must still
+    // describe only the first successful document so the caller can retry the
+    // second add_document with the original doc_id.
+    // Build the writer with a healthy cap; the second add_document will be
+    // forced to fail by narrowing the cap below the record length.
+    let mut file = FailingWriter::new(usize::MAX);
+    let mut writer = DocStoreWriter::new(&mut file, false);
+    writer
+      .add_document(&serde_json::json!({"title": "Rust"}))
+      .unwrap();
+    assert_eq!(writer.offsets().len(), 1);
+
+    // Lock the failure threshold to the current position so the next write
+    // partially succeeds then errors.
+    let pos_after_first = writer.file.inner.position() as usize;
+    writer.file.fail_after = pos_after_first + 2;
+    writer.file.written = pos_after_first;
+
+    let err = writer
+      .add_document(&serde_json::json!({"title": "Search"}))
+      .unwrap_err();
+    assert!(
+      err.to_string().to_lowercase().contains("pipe") || err.to_string().contains("injected")
+    );
+    // Critically: offsets was NOT advanced, so the next successful add_document
+    // re-uses doc_id == 1 (not 2).
+    assert_eq!(writer.offsets().len(), 1);
+    // And the cursor was rewound so the partial bytes get overwritten.
+    assert_eq!(
+      writer.file.inner.position() as usize,
+      pos_after_first,
+      "cursor should be rewound to the pre-failed-write position"
+    );
+
+    // Retry with a healthy cap and confirm doc_id 1 is assigned.
+    writer.file.fail_after = usize::MAX;
+    writer.file.written = pos_after_first;
+    writer
+      .add_document(&serde_json::json!({"title": "Retry"}))
+      .unwrap();
+    assert_eq!(writer.offsets().len(), 2);
+
+    let offsets = writer.offsets().to_vec();
+    drop(writer);
+    // Read back both docs from the in-memory buffer via a cursor.
+    let buffer = file.inner.into_inner();
+    let cursor = std::io::Cursor::new(buffer);
+    let mut reader = DocStoreReader::new(cursor, offsets, false);
+    let first = reader.get(0).unwrap();
+    assert_eq!(first["title"], "Rust");
+    let second = reader.get(1).unwrap();
+    assert_eq!(
+      second["title"], "Retry",
+      "doc_id 1 must resolve to the retried document, not the abandoned one"
+    );
   }
 
   #[test]
