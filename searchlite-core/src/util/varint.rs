@@ -24,6 +24,9 @@ pub fn read_u64(buf: &[u8]) -> Result<(u64, usize)> {
       return Ok((value, i + 1));
     }
     shift += 7;
+    if shift > 63 {
+      return Err(anyhow!("varint too long"));
+    }
   }
   Err(anyhow!("unterminated varint"))
 }
@@ -60,5 +63,53 @@ mod tests {
       let (decoded, _len) = read_u64(&buf).unwrap();
       assert_eq!(decoded as u32, val);
     }
+  }
+
+  #[test]
+  fn roundtrip_u64() {
+    for val in [0u64, 1, 127, 128, 16384, u32::MAX as u64, u64::MAX] {
+      let mut buf = Vec::new();
+      write_u64(val, &mut buf);
+      let (decoded, len) = read_u64(&buf).unwrap();
+      assert_eq!(decoded, val);
+      assert_eq!(len, buf.len());
+    }
+  }
+
+  #[test]
+  fn read_u64_rejects_overlong_varint() {
+    // A stream of bytes all setting the continuation bit — never terminates
+    // and would shift past 63 bits of a u64. Must return an error instead
+    // of panicking (debug) or silently corrupting the value (release).
+    let buf = vec![0xFFu8; 20];
+    let err = read_u64(&buf).expect_err("overlong varint must be rejected");
+    assert_eq!(err.to_string(), "varint too long");
+  }
+
+  #[test]
+  fn read_u64_rejects_unterminated_varint() {
+    // A short buffer whose bytes all have the continuation bit set but is
+    // not long enough to trigger the shift guard must still report the
+    // underlying framing problem.
+    let buf = vec![0x80u8; 3];
+    let err = read_u64(&buf).expect_err("unterminated varint must be rejected");
+    assert_eq!(err.to_string(), "unterminated varint");
+  }
+
+  #[test]
+  fn read_u64_empty_buffer_errors() {
+    let err = read_u64(&[]).expect_err("empty buffer must be rejected");
+    assert_eq!(err.to_string(), "unterminated varint");
+  }
+
+  #[test]
+  fn read_u64_accepts_max_length_valid_varint() {
+    // u64::MAX encodes to exactly 10 LEB128 bytes — the boundary case.
+    let mut buf = Vec::new();
+    write_u64(u64::MAX, &mut buf);
+    assert_eq!(buf.len(), 10);
+    let (decoded, len) = read_u64(&buf).unwrap();
+    assert_eq!(decoded, u64::MAX);
+    assert_eq!(len, 10);
   }
 }
