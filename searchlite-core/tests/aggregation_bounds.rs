@@ -131,6 +131,100 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
   }
 }
 
+/// End-to-end coverage for the validator-permitted configuration where
+/// `extended_bounds` is nested inside `hard_bounds`. The `collect()` path
+/// still applies the `hard_bounds` gate per-document, and the fill path
+/// populates empty buckets across `extended_bounds`. The direct BUG-188
+/// clipping invariant (when `extended_bounds` extends past `hard_bounds`) is
+/// pinned by the `intersect_fill_range_*` unit tests in
+/// `searchlite-core/src/query/aggs/mod.rs` — that case is unreachable from
+/// here because the request validator rejects it up front.
+#[test]
+fn histogram_nested_bounds_produce_expected_buckets() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // 25 is inside hard_bounds [20, 80] but outside extended_bounds [30, 70]
+    // — it seeds a collected bucket at key 20 that sits outside the fill
+    // window. 60 is inside both. 95 is past hard_bounds.max and must be
+    // discarded by the collect-path gate.
+    for val in [25_i64, 60, 95] {
+      writer
+        .add_document(&doc(
+          &format!("hist-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "score".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(0),
+      extended_bounds: Some(HistogramBounds {
+        min: 30.0,
+        max: 70.0,
+      }),
+      hard_bounds: Some(HistogramBounds {
+        min: 20.0,
+        max: 80.0,
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let hist = resp.aggregations.get("hist").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // Collected bucket at 20 (from the score=25 doc), the collected bucket
+    // at 60 (from score=60), and empty-fill buckets across
+    // `extended_bounds` [30, 70]. No bucket at key 80/90 must appear
+    // because the score=95 doc was dropped by the hard_bounds gate and
+    // the fill range never reaches into that grid cell.
+    assert_eq!(
+      keys,
+      vec![
+        json!(20.0),
+        json!(30.0),
+        json!(40.0),
+        json!(50.0),
+        json!(60.0),
+        json!(70.0),
+      ]
+    );
+    assert_eq!(buckets[0].doc_count, 1); // key 20 — collected from score=25
+    assert_eq!(buckets[1].doc_count, 0); // key 30 — empty fill
+    assert_eq!(buckets[2].doc_count, 0); // key 40 — empty fill
+    assert_eq!(buckets[3].doc_count, 0); // key 50 — empty fill
+    assert_eq!(buckets[4].doc_count, 1); // key 60 — collected from score=60
+    assert_eq!(buckets[5].doc_count, 0); // key 70 — empty fill
+  } else {
+    panic!("unexpected histogram response");
+  }
+}
+
 #[test]
 fn histogram_requires_positive_interval() {
   let tmp = tempfile::tempdir().unwrap();
@@ -759,6 +853,101 @@ fn date_histogram_calendar_month_interval() {
     assert_eq!(buckets[0].doc_count, 2);
     assert_eq!(buckets[1].doc_count, 1);
     assert_eq!(buckets[2].doc_count, 0);
+  } else {
+    panic!("expected date histogram response");
+  }
+}
+
+/// End-to-end coverage for `DateHistogramCollector` with `extended_bounds`
+/// nested inside `hard_bounds` — the configuration the validator permits.
+/// Like the numeric counterpart, the direct BUG-188 clipping invariant is
+/// exercised by the `intersect_fill_range_*` unit tests; this test pins the
+/// search-path contract that the `hard_bounds` gate still drops
+/// out-of-range docs and the fill range stays inside `extended_bounds`.
+#[test]
+fn date_histogram_nested_bounds_produce_expected_buckets() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+  {
+    let mut writer = idx.writer().unwrap();
+    // Jan 10 is inside hard_bounds [Jan 1, May 1] but outside extended_bounds
+    // [Feb 1, Apr 1] — it seeds a collected Jan 1 bucket outside the fill
+    // window. Feb 5 / Mar 10 fall inside both. Jun 1 is past hard_bounds.max
+    // and must be dropped by the collect-path gate.
+    for t in [
+      "2024-01-10T00:00:00Z",
+      "2024-02-05T00:00:00Z",
+      "2024-03-10T00:00:00Z",
+      "2024-06-01T00:00:00Z",
+    ] {
+      writer
+        .add_document(&doc(
+          &format!("ts-{t}"),
+          vec![("body", json!("rust")), ("ts", json!(ts(t)))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "dates".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("month".into()),
+      fixed_interval: None,
+      offset: None,
+      format: None,
+      min_doc_count: Some(0),
+      extended_bounds: Some(DateHistogramBounds {
+        min: "2024-02-01T00:00:00Z".into(),
+        max: "2024-04-01T00:00:00Z".into(),
+      }),
+      hard_bounds: Some(DateHistogramBounds {
+        min: "2024-01-01T00:00:00Z".into(),
+        max: "2024-05-01T00:00:00Z".into(),
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let agg = resp.aggregations.get("dates").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // Collected Jan 1 (from the Jan 10 doc), Feb 1 + Mar 1 (from Feb 5 /
+    // Mar 10), and an empty Apr 1 from the fill. No bucket for May 1, and
+    // nothing for Jun 1 — the latter was dropped by the hard_bounds gate.
+    assert_eq!(
+      keys,
+      vec![
+        json!(ts("2024-01-01T00:00:00Z")),
+        json!(ts("2024-02-01T00:00:00Z")),
+        json!(ts("2024-03-01T00:00:00Z")),
+        json!(ts("2024-04-01T00:00:00Z")),
+      ]
+    );
+    assert_eq!(buckets[0].doc_count, 1);
+    assert_eq!(buckets[1].doc_count, 1);
+    assert_eq!(buckets[2].doc_count, 1);
+    assert_eq!(buckets[3].doc_count, 0);
   } else {
     panic!("expected date histogram response");
   }
