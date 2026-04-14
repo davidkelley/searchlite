@@ -1052,13 +1052,24 @@ async fn persist_queue_worker(db_name: String, state: Arc<Mutex<PendingQueueStat
       web_sys::console::error_1(&JsValue::from_str(&format!("persist batch error: {msg}")));
       // Re-insert failed operations so a subsequent flush can retry.
       // Do not overwrite entries added concurrently during this batch.
-      let mut guard = state.lock();
-      for (path, op) in operations {
-        guard.queue.entry(path).or_insert_with(|| PendingEntry {
-          operation: op,
-          waiters: Vec::new(),
-        });
+      // Stop the worker after re-queuing to avoid an infinite retry loop;
+      // the next explicit flush() will spawn a new worker.
+      {
+        let mut guard = state.lock();
+        for (path, op) in operations {
+          guard.queue.entry(path).or_insert_with(|| PendingEntry {
+            operation: op,
+            waiters: Vec::new(),
+          });
+        }
+        guard.worker_running = false;
       }
+      for waiters in waiter_sets {
+        for tx in waiters {
+          let _ = tx.send(Err(anyhow!(msg.clone())));
+        }
+      }
+      return;
     }
     for waiters in waiter_sets {
       for tx in waiters {
