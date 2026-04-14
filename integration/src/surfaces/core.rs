@@ -148,7 +148,6 @@ impl SurfaceHarness for CoreHarness {
       "segments": manifest.segments.len(),
       "committed_at": manifest.committed_at,
       "index_uuid": manifest.uuid.to_string(),
-      "index_path": self.index_path.display().to_string(),
       "index_name": "core",
     }))
   }
