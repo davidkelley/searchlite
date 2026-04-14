@@ -60,14 +60,17 @@ impl PaginationCursor {
     }
     let mut bytes = [0u8; CURSOR_BYTES];
     for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-      // SAFETY of correctness: `raw.is_ascii()` guarantees each byte is ASCII,
-      // so every two-byte chunk is valid UTF-8. `from_utf8` cannot fail here,
-      // but we propagate the error via `?` rather than `unwrap()` to avoid a
-      // panic if the guard above ever regresses.
-      let hex = std::str::from_utf8(chunk)
-        .map_err(|_| anyhow::anyhow!("cursor contains non-ASCII bytes at index {i}"))?;
+      // Report positions against the raw input string so diagnostics point the
+      // caller at the offending character, not the decoded byte slot.
+      let raw_offset = 2 * i;
+      // `raw.is_ascii()` guarantees each byte is ASCII, so every two-byte
+      // chunk is valid UTF-8. We propagate via `?` rather than `unwrap()` so a
+      // future regression of the guard remains non-fatal.
+      let hex = std::str::from_utf8(chunk).map_err(|_| {
+        anyhow::anyhow!("cursor contains non-ASCII bytes at raw offset {raw_offset}")
+      })?;
       let value = u8::from_str_radix(hex, 16)
-        .with_context(|| format!("decoding cursor at byte index {i}"))?;
+        .with_context(|| format!("decoding cursor at raw offset {raw_offset}"))?;
       bytes[i] = value;
     }
     let version = bytes[0];
@@ -160,12 +163,15 @@ pub(crate) fn hex_decode(raw: &str) -> Result<Vec<u8>> {
   }
   let mut bytes = Vec::with_capacity(raw.len() / 2);
   for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+    // Report positions against the raw input so diagnostics point the caller
+    // at the offending character, not the decoded byte slot.
+    let raw_offset = 2 * i;
     // Guarded by `is_ascii()` above, so every two-byte chunk is valid UTF-8.
     // Propagate via `?` instead of `unwrap()` to avoid a panic on regression.
     let hex = std::str::from_utf8(chunk)
-      .map_err(|_| anyhow::anyhow!("cursor contains non-ASCII bytes at index {i}"))?;
-    let value =
-      u8::from_str_radix(hex, 16).with_context(|| format!("decoding cursor at byte index {i}"))?;
+      .map_err(|_| anyhow::anyhow!("cursor contains non-ASCII bytes at raw offset {raw_offset}"))?;
+    let value = u8::from_str_radix(hex, 16)
+      .with_context(|| format!("decoding cursor at raw offset {raw_offset}"))?;
     bytes.push(value);
   }
   Ok(bytes)
