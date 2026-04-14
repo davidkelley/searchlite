@@ -131,6 +131,95 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
   }
 }
 
+/// BUG-188: empty-bucket fill in `HistogramCollector::finish` must respect
+/// `hard_bounds` as an absolute cap. With `extended_bounds` fully inside
+/// `hard_bounds` (the configuration the validator currently allows), the
+/// emitted keys must stay inside the `extended_bounds` window — no bucket
+/// should leak past `hard_bounds.max` or before `hard_bounds.min`.
+#[test]
+fn histogram_extended_bounds_respects_hard_bounds_cap() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // A doc within the hard range but outside `extended_bounds` seeds a
+    // collected bucket at key 60; a doc beyond `hard_bounds.max` is dropped
+    // by the `collect` path's hard-bounds gate.
+    for val in [35_i64, 60, 95] {
+      writer
+        .add_document(&doc(
+          &format!("hist-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "score".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(0),
+      extended_bounds: Some(HistogramBounds {
+        min: 30.0,
+        max: 70.0,
+      }),
+      hard_bounds: Some(HistogramBounds {
+        min: 20.0,
+        max: 80.0,
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let hist = resp.aggregations.get("hist").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // Collected bucket at 60 (from the doc at score=60) plus empty-fill
+    // buckets across `extended_bounds` [30, 70]. The 95-doc is discarded
+    // because it falls outside `hard_bounds.max`, so no bucket at key 90
+    // must appear.
+    assert_eq!(
+      keys,
+      vec![
+        json!(30.0),
+        json!(40.0),
+        json!(50.0),
+        json!(60.0),
+        json!(70.0),
+      ]
+    );
+    // Bucket 30 picks up the doc at score=35; bucket 60 picks up score=60;
+    // 40/50/70 stay empty because extended_bounds forces min_doc_count=0.
+    assert_eq!(buckets[0].doc_count, 1);
+    assert_eq!(buckets[1].doc_count, 0);
+    assert_eq!(buckets[2].doc_count, 0);
+    assert_eq!(buckets[3].doc_count, 1);
+    assert_eq!(buckets[4].doc_count, 0);
+  } else {
+    panic!("unexpected histogram response");
+  }
+}
+
 #[test]
 fn histogram_requires_positive_interval() {
   let tmp = tempfile::tempdir().unwrap();
@@ -757,6 +846,91 @@ fn date_histogram_calendar_month_interval() {
       ]
     );
     assert_eq!(buckets[0].doc_count, 2);
+    assert_eq!(buckets[1].doc_count, 1);
+    assert_eq!(buckets[2].doc_count, 0);
+  } else {
+    panic!("expected date histogram response");
+  }
+}
+
+/// BUG-188: same guarantee as `histogram_extended_bounds_respects_hard_bounds_cap`
+/// but for `DateHistogramCollector::finish`. The empty-bucket fill range must
+/// be clipped against `hard_bounds`.
+#[test]
+fn date_histogram_extended_bounds_respects_hard_bounds_cap() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+  {
+    let mut writer = idx.writer().unwrap();
+    for t in [
+      "2024-02-05T00:00:00Z",
+      "2024-03-10T00:00:00Z",
+      "2024-06-01T00:00:00Z",
+    ] {
+      writer
+        .add_document(&doc(
+          &format!("ts-{t}"),
+          vec![("body", json!("rust")), ("ts", json!(ts(t)))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "dates".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("month".into()),
+      fixed_interval: None,
+      offset: None,
+      format: None,
+      min_doc_count: Some(0),
+      extended_bounds: Some(DateHistogramBounds {
+        min: "2024-02-01T00:00:00Z".into(),
+        max: "2024-04-01T00:00:00Z".into(),
+      }),
+      hard_bounds: Some(DateHistogramBounds {
+        min: "2024-01-01T00:00:00Z".into(),
+        max: "2024-05-01T00:00:00Z".into(),
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let agg = resp.aggregations.get("dates").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // The June doc is dropped by hard_bounds. Fill range stays within
+    // extended_bounds [Feb, Apr] — no bucket for Jan or May should appear,
+    // and no bucket past `hard_bounds.max`.
+    assert_eq!(
+      keys,
+      vec![
+        json!(ts("2024-02-01T00:00:00Z")),
+        json!(ts("2024-03-01T00:00:00Z")),
+        json!(ts("2024-04-01T00:00:00Z")),
+      ]
+    );
+    assert_eq!(buckets[0].doc_count, 1);
     assert_eq!(buckets[1].doc_count, 1);
     assert_eq!(buckets[2].doc_count, 0);
   } else {

@@ -1295,8 +1295,17 @@ impl<'a> HistogramCollector<'a> {
     // entirely in the unlikely case we got here with a degenerate interval so
     // that the loop below cannot become unbounded (BUG-027).
     let bounds_materializable = interval.is_finite() && interval > 0.0;
+    // Compute the effective fill range as the intersection of `extended_bounds`
+    // with `hard_bounds`. `hard_bounds` is an absolute cap on emitted buckets,
+    // so any empty buckets materialized from `extended_bounds` must be clipped
+    // to stay within it. A plain `extended_bounds.or(hard_bounds)` fallback
+    // would emit buckets outside `hard_bounds` whenever both are set (BUG-188).
+    // The request validator already forbids `extended_bounds` from exceeding
+    // `hard_bounds`, but we intersect here defensively so the collector cannot
+    // violate the hard cap even if that validation is ever weakened or bypassed.
+    let fill_range = intersect_fill_range_f64(extended_bounds, hard_bounds);
     if bounds_materializable {
-      if let Some((min, max)) = extended_bounds.or(hard_bounds) {
+      if let Some((min, max)) = fill_range {
         let mut bucket_id = bucket_key(min);
         let end = bucket_key(max);
         let mut materialized: usize = 0;
@@ -1459,7 +1468,13 @@ impl<'a> DateHistogramCollector<'a> {
 
   fn finish(self) -> AggregationIntermediate {
     let mut buckets = self.buckets;
-    if let Some((min, max)) = self.extended_bounds.or(self.hard_bounds) {
+    // Intersect `extended_bounds` with `hard_bounds` before materializing empty
+    // buckets so the hard cap is honored even when both are specified. The plain
+    // `.or()` fallback would emit buckets outside `hard_bounds` whenever
+    // `extended_bounds` was present (BUG-188). See the matching
+    // `HistogramCollector::finish` comment for the full rationale.
+    let fill_range = intersect_fill_range_i64(self.extended_bounds, self.hard_bounds);
+    if let Some((min, max)) = fill_range {
       if let (Some(mut start), Some(mut end)) = (
         bucket_start(min, self.offset_millis, &self.interval),
         bucket_start(max, self.offset_millis, &self.interval),
@@ -3597,6 +3612,55 @@ fn default_percentiles_list() -> Vec<f64> {
   vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
 }
 
+/// Compute the effective fill range for `HistogramCollector::finish`.
+///
+/// When both `extended_bounds` and `hard_bounds` are set, the empty-bucket fill
+/// range is clipped to the intersection so that `hard_bounds` is honored as an
+/// absolute cap on emitted buckets (BUG-188). Returns `None` when there are no
+/// bounds to materialize or when the ranges do not overlap.
+fn intersect_fill_range_f64(
+  extended: Option<(f64, f64)>,
+  hard: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+  match (extended, hard) {
+    (Some((emin, emax)), Some((hmin, hmax))) => {
+      let lo = emin.max(hmin);
+      let hi = emax.min(hmax);
+      if lo <= hi {
+        Some((lo, hi))
+      } else {
+        None
+      }
+    }
+    (Some(eb), None) => Some(eb),
+    (None, Some(hb)) => Some(hb),
+    (None, None) => None,
+  }
+}
+
+/// Integer-millisecond counterpart of [`intersect_fill_range_f64`] used by
+/// [`DateHistogramCollector::finish`]. See that function for the full
+/// rationale (BUG-188).
+fn intersect_fill_range_i64(
+  extended: Option<(i64, i64)>,
+  hard: Option<(i64, i64)>,
+) -> Option<(i64, i64)> {
+  match (extended, hard) {
+    (Some((emin, emax)), Some((hmin, hmax))) => {
+      let lo = emin.max(hmin);
+      let hi = emax.min(hmax);
+      if lo <= hi {
+        Some((lo, hi))
+      } else {
+        None
+      }
+    }
+    (Some(eb), None) => Some(eb),
+    (None, Some(hb)) => Some(hb),
+    (None, None) => None,
+  }
+}
+
 pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
   match spec.to_ascii_lowercase().as_str() {
     "day" | "1d" => Some(CalendarUnit::Day),
@@ -3796,6 +3860,91 @@ mod tests {
     let a = sampler.sample_value(0, 42);
     let b = sampler.sample_value(1, 42);
     assert_ne!(a, b);
+  }
+
+  #[test]
+  fn intersect_fill_range_f64_clips_extended_to_hard() {
+    // BUG-188: `extended_bounds` extending past `hard_bounds` must be clipped
+    // to the hard range, not used verbatim.
+    assert_eq!(
+      intersect_fill_range_f64(Some((0.0, 100.0)), Some((20.0, 50.0))),
+      Some((20.0, 50.0))
+    );
+    // Asymmetric overflow on the upper bound only.
+    assert_eq!(
+      intersect_fill_range_f64(Some((25.0, 80.0)), Some((20.0, 50.0))),
+      Some((25.0, 50.0))
+    );
+    // Asymmetric overflow on the lower bound only.
+    assert_eq!(
+      intersect_fill_range_f64(Some((10.0, 45.0)), Some((20.0, 50.0))),
+      Some((20.0, 45.0))
+    );
+  }
+
+  #[test]
+  fn intersect_fill_range_f64_falls_back_when_one_side_unset() {
+    assert_eq!(
+      intersect_fill_range_f64(Some((10.0, 40.0)), None),
+      Some((10.0, 40.0))
+    );
+    assert_eq!(
+      intersect_fill_range_f64(None, Some((5.0, 25.0))),
+      Some((5.0, 25.0))
+    );
+    assert_eq!(intersect_fill_range_f64(None, None), None);
+  }
+
+  #[test]
+  fn intersect_fill_range_f64_returns_none_for_disjoint_ranges() {
+    // Disjoint ranges produce no fill at all — emitting phantom buckets
+    // between them would violate hard_bounds.
+    assert_eq!(
+      intersect_fill_range_f64(Some((0.0, 10.0)), Some((20.0, 50.0))),
+      None
+    );
+    assert_eq!(
+      intersect_fill_range_f64(Some((60.0, 100.0)), Some((20.0, 50.0))),
+      None
+    );
+  }
+
+  #[test]
+  fn intersect_fill_range_f64_preserves_ext_when_contained_in_hard() {
+    // When `extended_bounds` is fully inside `hard_bounds` (the case the
+    // request validator currently enforces), the intersection is exactly
+    // `extended_bounds` — so the fix is a no-op for the validated path.
+    assert_eq!(
+      intersect_fill_range_f64(Some((25.0, 45.0)), Some((20.0, 50.0))),
+      Some((25.0, 45.0))
+    );
+  }
+
+  #[test]
+  fn intersect_fill_range_i64_clips_extended_to_hard() {
+    // Same BUG-188 guarantee for `DateHistogramCollector` (millisecond ints).
+    assert_eq!(
+      intersect_fill_range_i64(Some((0, 1_000)), Some((200, 500))),
+      Some((200, 500))
+    );
+    assert_eq!(
+      intersect_fill_range_i64(Some((100, 800)), Some((200, 500))),
+      Some((200, 500))
+    );
+  }
+
+  #[test]
+  fn intersect_fill_range_i64_handles_missing_sides_and_disjoint() {
+    assert_eq!(
+      intersect_fill_range_i64(Some((10, 40)), None),
+      Some((10, 40))
+    );
+    assert_eq!(intersect_fill_range_i64(None, Some((5, 25))), Some((5, 25)));
+    assert_eq!(intersect_fill_range_i64(None, None), None);
+    assert_eq!(
+      intersect_fill_range_i64(Some((0, 10)), Some((20, 50))),
+      None
+    );
   }
 
   #[test]
