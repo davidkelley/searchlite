@@ -3611,7 +3611,11 @@ pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
 fn bucket_start(value: i64, offset: i64, interval: &DateInterval) -> Option<i64> {
   match interval {
     DateInterval::Fixed(step) => {
-      let bucket = ((value - offset) as f64 / *step as f64).ceil() as i64;
+      // NOTE: must use `.floor()` to match Elasticsearch semantics and the
+      // behavior of the regular `HistogramCollector::bucket_key`. Using
+      // `.ceil()` places any timestamp that is not exactly on a bucket
+      // boundary into the *next* bucket (see BUG-030, issue #186).
+      let bucket = ((value - offset) as f64 / *step as f64).floor() as i64;
       Some(bucket.saturating_mul(*step) + offset)
     }
     DateInterval::Calendar(unit) => {

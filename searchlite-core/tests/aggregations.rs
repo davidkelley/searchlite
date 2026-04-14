@@ -2508,14 +2508,24 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
   let hist = resp.aggregations.get("hist").unwrap();
   if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // With offset=500ms and interval=1s, buckets are the half-open ranges
+    // [-500, 500), [500, 1500), [1500, 2500), [2500, 3500). A timestamp
+    // should land in the bucket whose `key` is the floor of
+    // `(value - offset) / interval * interval + offset`:
+    //   ts=0       -> bucket -500 (in [-500, 500))
+    //   ts=500     -> bucket  500 (from the `missing` substitute)
+    //   ts=1000    -> bucket  500 (in [500, 1500))
+    //   ts=1600    -> bucket 1500 (in [1500, 2500))
+    // extended_bounds [0, 3000] then fills empty buckets between
+    // bucket_start(0)=-500 and bucket_start(3000)=2500.
     assert_eq!(
       keys,
-      vec![json!(500), json!(1500), json!(2500), json!(3500)]
+      vec![json!(-500), json!(500), json!(1500), json!(2500)]
     );
-    assert_eq!(buckets[0].doc_count, 2); // ts=0 and missing->500
-    assert_eq!(buckets[1].doc_count, 1);
-    assert_eq!(buckets[2].doc_count, 1);
-    assert_eq!(buckets[3].doc_count, 0);
+    assert_eq!(buckets[0].doc_count, 1); // ts=0
+    assert_eq!(buckets[1].doc_count, 2); // missing->500 and ts=1000
+    assert_eq!(buckets[2].doc_count, 1); // ts=1600
+    assert_eq!(buckets[3].doc_count, 0); // empty fill from extended_bounds
   } else {
     panic!("expected date histogram response");
   }
