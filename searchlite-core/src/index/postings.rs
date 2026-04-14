@@ -173,11 +173,17 @@ impl PostingsReader {
   pub fn read_at<R: Read + Seek>(file: &mut R, offset: u64, keep_positions: bool) -> Result<Self> {
     file.seek(SeekFrom::Start(offset))?;
     let doc_freq = read_u32(file)? as usize;
-    let has_positions = {
+    // Track the on-disk flag independently of the caller's preference so that
+    // we always consume the bytes that are actually present in the file.
+    // Conflating these two concerns previously caused position bytes to be
+    // left in the stream when `stored_positions == true` and
+    // `keep_positions == false`, corrupting every subsequent entry.
+    let stored_positions = {
       let mut flag = [0u8; 1];
       file.read_exact(&mut flag)?;
-      flag[0] == 1 && keep_positions
+      flag[0] == 1
     };
+    let keep_in_memory = stored_positions && keep_positions;
     let raw_block = read_u32(file)?;
     let has_block_meta = raw_block & BLOCK_META_FLAG != 0;
     let block_count = (raw_block & (!BLOCK_META_FLAG)) as usize;
@@ -203,12 +209,14 @@ impl PostingsReader {
       let doc_id = read_u32_var(file)?;
       let term_freq = read_u32_var(file)?;
       let mut positions = SmallVec::new();
-      if has_positions {
+      if stored_positions {
         let count = read_u32_var(file)? as usize;
         let mut acc = 0u32;
         for _ in 0..count {
           acc += read_u32_var(file)?;
-          positions.push(acc);
+          if keep_in_memory {
+            positions.push(acc);
+          }
         }
       }
       data.push(PostingEntry {
@@ -356,5 +364,113 @@ mod tests {
       .map(|p| (p.doc_id, p.positions.iter().copied().collect::<Vec<_>>()))
       .collect();
     assert_eq!(collected, vec![(1, vec![1, 3]), (2, vec![4])]);
+  }
+
+  /// Regression for BUG-001: when postings are written with positions stored on
+  /// disk but read with `keep_positions = false`, the reader must still advance
+  /// the file cursor past the position block. Otherwise position bytes bleed
+  /// into subsequent entries and every posting after the first is corrupt.
+  #[test]
+  fn reads_positioned_postings_with_keep_positions_false() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut file = tmp.reopen().unwrap();
+    let postings = vec![
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 2,
+        positions: smallvec![1, 3],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![4],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 3,
+        positions: smallvec![7, 9, 12],
+      },
+    ];
+    let mut writer = PostingsWriter::new(&mut file, true);
+    let offset = writer.write_term(&postings).unwrap();
+
+    let mut reader_file = std::fs::File::open(path).unwrap();
+    let reader = PostingsReader::read_at(&mut reader_file, offset, false).unwrap();
+    assert_eq!(reader.len(), 3);
+    let collected: Vec<_> = reader
+      .iter()
+      .map(|p| (p.doc_id, p.term_freq, p.positions.len()))
+      .collect();
+    // doc_ids and term_freqs must survive intact; positions are skipped in
+    // memory (hence `len == 0`) but must have been fully consumed from disk.
+    assert_eq!(collected, vec![(1, 2, 0), (2, 1, 0), (5, 3, 0)]);
+    assert!(
+      reader.iter().all(|p| p.positions.is_empty()),
+      "positions must not be materialised when keep_positions = false"
+    );
+  }
+
+  /// Larger variant of the regression: with enough entries to force the
+  /// corruption to surface as a varint decode error rather than a plausible
+  /// (but wrong) doc_id. This guards against a future regression where an
+  /// off-by-one on the skip logic looks correct on small inputs.
+  #[test]
+  fn reads_many_positioned_postings_with_keep_positions_false() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut file = tmp.reopen().unwrap();
+    let mut postings = Vec::new();
+    for i in 0..64u32 {
+      let base = i * 10;
+      postings.push(PostingEntry {
+        doc_id: i + 1,
+        term_freq: (i % 5) + 1,
+        positions: smallvec![base, base + 2, base + 4],
+      });
+    }
+    let expected: Vec<(u32, u32)> = postings.iter().map(|p| (p.doc_id, p.term_freq)).collect();
+
+    let mut writer = PostingsWriter::new(&mut file, true);
+    let offset = writer.write_term(&postings).unwrap();
+
+    let mut reader_file = std::fs::File::open(path).unwrap();
+    let reader = PostingsReader::read_at(&mut reader_file, offset, false).unwrap();
+    assert_eq!(reader.len(), expected.len());
+    let collected: Vec<(u32, u32)> = reader.iter().map(|p| (p.doc_id, p.term_freq)).collect();
+    assert_eq!(collected, expected);
+    assert!(reader.iter().all(|p| p.positions.is_empty()));
+  }
+
+  /// Sanity: when the segment was written without positions, reading with
+  /// `keep_positions = true` must not attempt to decode a position block.
+  #[test]
+  fn reads_unpositioned_postings_with_keep_positions_true() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut file = tmp.reopen().unwrap();
+    let postings = vec![
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 2,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 7,
+        term_freq: 4,
+        positions: smallvec![],
+      },
+    ];
+    let mut writer = PostingsWriter::new(&mut file, false);
+    let offset = writer.write_term(&postings).unwrap();
+
+    let mut reader_file = std::fs::File::open(path).unwrap();
+    let reader = PostingsReader::read_at(&mut reader_file, offset, true).unwrap();
+    assert_eq!(reader.len(), 2);
+    let collected: Vec<(u32, u32, usize)> = reader
+      .iter()
+      .map(|p| (p.doc_id, p.term_freq, p.positions.len()))
+      .collect();
+    assert_eq!(collected, vec![(1, 2, 0), (7, 4, 0)]);
   }
 }
