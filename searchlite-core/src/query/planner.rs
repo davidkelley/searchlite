@@ -13,6 +13,23 @@ const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
 const DEFAULT_WILDCARD_MAX_EXPANSIONS: usize = 100;
 const DEFAULT_REGEX_MAX_EXPANSIONS: usize = 100;
 
+/// Absolute ceiling on `max_expansions` for `QueryNode::Prefix`. The default
+/// is intentionally small because the planner enumerates matching terms from
+/// the FST and builds an OR fan-out whose postings reads, memory, and WAND
+/// heap costs scale linearly with the expansion size. A caller can raise
+/// `max_expansions` above the default up to this ceiling; requests beyond
+/// it are rejected rather than silently expanded, so a short HTTP body can
+/// no longer translate into an unbounded server-side workload (BUG-022).
+pub(crate) const MAX_PREFIX_EXPANSIONS_HARD: usize = 10_000;
+
+/// Absolute ceiling on `max_expansions` for `QueryNode::Wildcard`.
+/// See `MAX_PREFIX_EXPANSIONS_HARD` for rationale.
+pub(crate) const MAX_WILDCARD_EXPANSIONS_HARD: usize = 10_000;
+
+/// Absolute ceiling on `max_expansions` for `QueryNode::Regex`.
+/// See `MAX_PREFIX_EXPANSIONS_HARD` for rationale.
+pub(crate) const MAX_REGEX_EXPANSIONS_HARD: usize = 10_000;
+
 /// Upper bound on phrase `slop` applied at query planning time. User-supplied
 /// values (which flow in as `usize`) are saturated to this ceiling before
 /// being narrowed to `u32` for the matcher. The ceiling is `i32::MAX` — the
@@ -559,7 +576,12 @@ impl<'a> QueryPlanBuilder<'a> {
           }],
           value.clone(),
           TermExpansion::Prefix {
-            max_expansions: max_expansions.unwrap_or(DEFAULT_PREFIX_MAX_EXPANSIONS),
+            max_expansions: clamp_expansions(
+              *max_expansions,
+              DEFAULT_PREFIX_MAX_EXPANSIONS,
+              MAX_PREFIX_EXPANSIONS_HARD,
+              "prefix",
+            )?,
           },
           boost * node_boost,
           score,
@@ -590,7 +612,12 @@ impl<'a> QueryPlanBuilder<'a> {
           }],
           value.clone(),
           TermExpansion::Wildcard {
-            max_expansions: max_expansions.unwrap_or(DEFAULT_WILDCARD_MAX_EXPANSIONS),
+            max_expansions: clamp_expansions(
+              *max_expansions,
+              DEFAULT_WILDCARD_MAX_EXPANSIONS,
+              MAX_WILDCARD_EXPANSIONS_HARD,
+              "wildcard",
+            )?,
           },
           boost * node_boost,
           score,
@@ -622,7 +649,12 @@ impl<'a> QueryPlanBuilder<'a> {
           }],
           value.clone(),
           TermExpansion::Regex {
-            max_expansions: max_expansions.unwrap_or(DEFAULT_REGEX_MAX_EXPANSIONS),
+            max_expansions: clamp_expansions(
+              *max_expansions,
+              DEFAULT_REGEX_MAX_EXPANSIONS,
+              MAX_REGEX_EXPANSIONS_HARD,
+              "regex",
+            )?,
           },
           boost * node_boost,
           score,
@@ -871,6 +903,29 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
   Ok(value)
 }
 
+/// Resolve a caller-supplied `max_expansions` against the per-kind default and
+/// hard ceiling, rejecting any value above the ceiling.
+///
+/// `requested.unwrap_or(default)` would normally suffice, but
+/// `QueryNode::{Prefix, Wildcard, Regex}` deserialize `max_expansions`
+/// directly from the wire, so a hostile client can supply `usize::MAX` (or
+/// any value much larger than the index could reasonably expand to) and
+/// force the planner into an unbounded fan-out. See BUG-022. The hard
+/// ceiling is an absolute cap applied independently of the default so the
+/// default can remain conservatively small without also being the ceiling.
+fn clamp_expansions(
+  requested: Option<usize>,
+  default: usize,
+  hard: usize,
+  kind: &str,
+) -> Result<usize> {
+  let value = requested.unwrap_or(default);
+  if value > hard {
+    bail!("{kind} max_expansions {value} exceeds hard limit {hard}");
+  }
+  Ok(value)
+}
+
 fn validate_tie_breaker(tie: &Option<f32>) -> Result<f32> {
   let value = tie.unwrap_or(0.0);
   if value < 0.0 {
@@ -1095,5 +1150,235 @@ mod tests {
     let group = &plan.term_groups[0];
     let field_names: Vec<_> = group.fields.iter().map(|f| f.field.as_str()).collect();
     assert_eq!(field_names, vec!["title", "body"]);
+  }
+
+  // -------- BUG-022 regression tests --------
+  //
+  // `QueryNode::{Prefix,Wildcard,Regex}::max_expansions` is deserialized
+  // directly from the wire. Before the fix, any caller-supplied value was
+  // forwarded verbatim to the term-expansion stage, turning a small HTTP body
+  // (`max_expansions: usize::MAX`) into an unbounded server-side fan-out.
+  //
+  // The planner now clamps the requested expansion against a per-kind hard
+  // ceiling (`MAX_{PREFIX,WILDCARD,REGEX}_EXPANSIONS_HARD`) and rejects any
+  // value above the ceiling with an error that names both the offending
+  // value and the limit.
+
+  fn term_group_prefix_expansion(plan: &QueryPlan) -> usize {
+    assert_eq!(plan.term_groups.len(), 1, "expected single term group");
+    match plan.term_groups[0].expansion {
+      TermExpansion::Prefix { max_expansions } => max_expansions,
+      ref other => panic!("expected Prefix expansion, got {other:?}"),
+    }
+  }
+
+  fn term_group_wildcard_expansion(plan: &QueryPlan) -> usize {
+    assert_eq!(plan.term_groups.len(), 1, "expected single term group");
+    match plan.term_groups[0].expansion {
+      TermExpansion::Wildcard { max_expansions } => max_expansions,
+      ref other => panic!("expected Wildcard expansion, got {other:?}"),
+    }
+  }
+
+  fn term_group_regex_expansion(plan: &QueryPlan) -> usize {
+    assert_eq!(plan.term_groups.len(), 1, "expected single term group");
+    match plan.term_groups[0].expansion {
+      TermExpansion::Regex { max_expansions } => max_expansions,
+      ref other => panic!("expected Regex expansion, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn prefix_max_expansions_defaults_and_passes_through_within_ceiling() {
+    // None → default.
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Prefix {
+        field: "body".into(),
+        value: "ru".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &["body".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+      term_group_prefix_expansion(&plan),
+      DEFAULT_PREFIX_MAX_EXPANSIONS
+    );
+
+    // In-range values up to and including the ceiling pass through unchanged.
+    for input in [
+      0usize,
+      1,
+      DEFAULT_PREFIX_MAX_EXPANSIONS,
+      5_000,
+      MAX_PREFIX_EXPANSIONS_HARD,
+    ] {
+      let plan = build_query_plan(
+        &Query::Node(QueryNode::Prefix {
+          field: "body".into(),
+          value: "ru".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .unwrap();
+      assert_eq!(term_group_prefix_expansion(&plan), input);
+    }
+  }
+
+  #[test]
+  fn prefix_max_expansions_rejects_above_ceiling() {
+    // Values above the hard ceiling — including the pathological
+    // `usize::MAX` — are rejected with a descriptive error rather than
+    // silently expanding into an unbounded OR.
+    for input in [MAX_PREFIX_EXPANSIONS_HARD + 1, 1_000_000, usize::MAX] {
+      let err = build_query_plan(
+        &Query::Node(QueryNode::Prefix {
+          field: "body".into(),
+          value: "ru".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .expect_err("prefix max_expansions above the ceiling must be rejected");
+      let msg = err.to_string();
+      assert!(
+        msg.contains("prefix"),
+        "error should mention query kind: {msg}"
+      );
+      assert!(
+        msg.contains("exceeds hard limit"),
+        "error should name the limit: {msg}"
+      );
+    }
+  }
+
+  #[test]
+  fn wildcard_max_expansions_defaults_and_passes_through_within_ceiling() {
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "ru*".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &["body".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+      term_group_wildcard_expansion(&plan),
+      DEFAULT_WILDCARD_MAX_EXPANSIONS
+    );
+
+    for input in [
+      0usize,
+      1,
+      DEFAULT_WILDCARD_MAX_EXPANSIONS,
+      5_000,
+      MAX_WILDCARD_EXPANSIONS_HARD,
+    ] {
+      let plan = build_query_plan(
+        &Query::Node(QueryNode::Wildcard {
+          field: "body".into(),
+          value: "ru*".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .unwrap();
+      assert_eq!(term_group_wildcard_expansion(&plan), input);
+    }
+  }
+
+  #[test]
+  fn wildcard_max_expansions_rejects_above_ceiling() {
+    for input in [MAX_WILDCARD_EXPANSIONS_HARD + 1, 1_000_000, usize::MAX] {
+      let err = build_query_plan(
+        &Query::Node(QueryNode::Wildcard {
+          field: "body".into(),
+          value: "ru*".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .expect_err("wildcard max_expansions above the ceiling must be rejected");
+      let msg = err.to_string();
+      assert!(
+        msg.contains("wildcard"),
+        "error should mention query kind: {msg}"
+      );
+      assert!(
+        msg.contains("exceeds hard limit"),
+        "error should name the limit: {msg}"
+      );
+    }
+  }
+
+  #[test]
+  fn regex_max_expansions_defaults_and_passes_through_within_ceiling() {
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "ru.*".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &["body".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+      term_group_regex_expansion(&plan),
+      DEFAULT_REGEX_MAX_EXPANSIONS
+    );
+
+    for input in [
+      0usize,
+      1,
+      DEFAULT_REGEX_MAX_EXPANSIONS,
+      5_000,
+      MAX_REGEX_EXPANSIONS_HARD,
+    ] {
+      let plan = build_query_plan(
+        &Query::Node(QueryNode::Regex {
+          field: "body".into(),
+          value: "ru.*".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .unwrap();
+      assert_eq!(term_group_regex_expansion(&plan), input);
+    }
+  }
+
+  #[test]
+  fn regex_max_expansions_rejects_above_ceiling() {
+    for input in [MAX_REGEX_EXPANSIONS_HARD + 1, 1_000_000, usize::MAX] {
+      let err = build_query_plan(
+        &Query::Node(QueryNode::Regex {
+          field: "body".into(),
+          value: "ru.*".into(),
+          max_expansions: Some(input),
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .expect_err("regex max_expansions above the ceiling must be rejected");
+      let msg = err.to_string();
+      assert!(
+        msg.contains("regex"),
+        "error should mention query kind: {msg}"
+      );
+      assert!(
+        msg.contains("exceeds hard limit"),
+        "error should name the limit: {msg}"
+      );
+    }
   }
 }
