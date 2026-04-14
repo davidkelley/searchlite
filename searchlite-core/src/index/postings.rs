@@ -211,11 +211,19 @@ impl PostingsReader {
       let mut positions = SmallVec::new();
       if stored_positions {
         let count = read_u32_var(file)? as usize;
-        let mut acc = 0u32;
-        for _ in 0..count {
-          acc += read_u32_var(file)?;
-          if keep_in_memory {
+        if keep_in_memory {
+          let mut acc = 0u32;
+          for _ in 0..count {
+            acc = acc
+              .checked_add(read_u32_var(file)?)
+              .ok_or_else(|| anyhow::anyhow!("position delta overflow while decoding postings"))?;
             positions.push(acc);
+          }
+        } else {
+          // Caller doesn't want positions in memory, but the bytes are on
+          // disk and the file cursor must still be advanced past them.
+          for _ in 0..count {
+            read_u32_var(file)?;
           }
         }
       }
