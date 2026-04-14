@@ -928,7 +928,7 @@ mod bug_027 {
       "h".into(),
       Aggregation::Histogram(Box::new(HistogramAggregation {
         field: "score".into(),
-        // 1_000_000 / 1.0 = 1_000_000 buckets — well above the 65_536 cap.
+        // 1_000_000 / 1.0 = 1_000_000 buckets — well above the cap.
         interval: 1.0,
         offset: None,
         min_doc_count: None,
@@ -945,6 +945,135 @@ mod bug_027 {
 
     let err = search_with_agg(&idx, aggs).expect_err("excessive bounds span must be rejected");
     assert_invalid_histogram(err, "too many empty buckets");
+  }
+
+  /// Codex P1 regression: validation and the runtime `MAX_BUCKETS` cap must
+  /// agree, otherwise a request sitting between the two caps would pass
+  /// validation and then silently truncate at collection time. 15_000 buckets
+  /// is above the 10_000 runtime cap but below the previous (draft) 65_536
+  /// validation cap — it must be rejected, not truncated.
+  #[test]
+  fn bounds_span_between_runtime_cap_and_draft_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 1.0,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: 15_000.0,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("bounds span above the runtime cap must be rejected, not silently truncated");
+    assert_invalid_histogram(err, "too many empty buckets");
+  }
+
+  /// Copilot regression: the bucket-count check must mirror the collector's
+  /// `bucket_key(min)..=bucket_key(max)` (inclusive) formula so the
+  /// fence-post bucket is not double-counted as "within cap". With
+  /// interval=1.0 and bounds=[0.0, 10000.0], the collector would materialize
+  /// 10_001 buckets; a naïve `(max-min)/interval = 10_000` check would
+  /// (incorrectly) allow it.
+  #[test]
+  fn bounds_span_fence_post_respects_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 1.0,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: 10_000.0,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("10_001 inclusive buckets must be rejected (fence-post), not accepted as 10_000");
+    assert_invalid_histogram(err, "too many empty buckets");
+  }
+
+  /// Copilot regression: `offset` shifts the bucket grid, which the old
+  /// formula ignored. This test locks in that a request sitting exactly at
+  /// the cap (accounting for offset) is still accepted.
+  #[test]
+  fn bounds_span_with_offset_at_cap_boundary_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 1.0,
+        // floor((0 - 0.5)/1) = -1, floor((9998.5 - 0.5)/1) = 9998,
+        // span = 9998 - (-1) + 1 = 10_000 — exactly at the cap.
+        offset: Some(0.5),
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: 9998.5,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    search_with_agg(&idx, aggs).expect("bounds span exactly at cap must be accepted");
+  }
+
+  /// Guard against a non-finite `offset` slipping through — otherwise the
+  /// bucket-count computation becomes NaN and the cap check becomes
+  /// meaningless.
+  #[test]
+  fn non_finite_offset_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 10.0,
+        offset: Some(f64::NAN),
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("NaN offset must be rejected");
+    assert_invalid_histogram(err, "offset");
   }
 
   #[test]

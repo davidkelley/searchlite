@@ -41,7 +41,7 @@ pub struct AggregationContext<'a> {
 /// `10_000` is a pragmatic default that keeps memory bounded for typical analytics workloads while
 /// still allowing thousands of buckets. Deployments that need a different limit can adjust this
 /// constant at compile time.
-const MAX_BUCKETS: usize = 10_000;
+pub(crate) const MAX_BUCKETS: usize = 10_000;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
 

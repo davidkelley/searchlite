@@ -2859,6 +2859,15 @@ fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<(
       .into(),
     );
   }
+  let offset = agg.offset.unwrap_or(0.0);
+  if !offset.is_finite() {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("histogram `{name}` requires offset to be finite (got {offset})"),
+      }
+      .into(),
+    );
+  }
   if let Some(bounds) = &agg.extended_bounds {
     validate_histogram_bounds(name, "extended_bounds", bounds.min, bounds.max)?;
   }
@@ -2876,13 +2885,23 @@ fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<(
     }
   }
   if let Some(bounds) = agg.extended_bounds.as_ref().or(agg.hard_bounds.as_ref()) {
-    let span_buckets = ((bounds.max - bounds.min) / agg.interval).floor();
-    if !span_buckets.is_finite() || span_buckets >= MAX_HISTOGRAM_BOUND_BUCKETS as f64 {
+    // Mirror the collector's bucket-id formula so the count we compare against
+    // the cap is exactly what `HistogramCollector::finish` would materialize:
+    //   bucket_id = floor((val - offset) / interval)
+    //   count     = end - start + 1   (inclusive range `start..=end`)
+    // Using `(max - min) / interval` here would miss the fence-post bucket and
+    // ignore `offset`, letting a request sneak past the cap by 1-2 buckets.
+    let start_bucket = ((bounds.min - offset) / agg.interval).floor();
+    let end_bucket = ((bounds.max - offset) / agg.interval).floor();
+    let span_buckets = (end_bucket - start_bucket) + 1.0;
+    // Align the validator with the runtime cap (`MAX_BUCKETS`) so requests that
+    // would silently truncate at collection time are rejected up front.
+    if !span_buckets.is_finite() || span_buckets > crate::query::aggs::MAX_BUCKETS as f64 {
       return Err(
         AggregationError::InvalidConfig {
           reason: format!(
             "histogram `{name}` bounds span produces too many empty buckets (limit {})",
-            MAX_HISTOGRAM_BOUND_BUCKETS
+            crate::query::aggs::MAX_BUCKETS
           ),
         }
         .into(),
@@ -2911,12 +2930,6 @@ fn validate_histogram_bounds(name: &str, which: &str, min: f64, max: f64) -> Res
   }
   Ok(())
 }
-
-/// Hard limit on the number of empty buckets a histogram's
-/// `extended_bounds`/`hard_bounds` span may materialize. Prevents pathological
-/// `(max - min) / interval` ratios (including those produced by crafted tiny
-/// intervals) from exhausting memory.
-const MAX_HISTOGRAM_BOUND_BUCKETS: i64 = 65_536;
 
 fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) -> Result<()> {
   let has_calendar = agg.calendar_interval.is_some();
