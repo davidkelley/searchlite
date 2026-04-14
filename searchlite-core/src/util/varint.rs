@@ -19,6 +19,13 @@ pub fn read_u64(buf: &[u8]) -> Result<(u64, usize)> {
   let mut value = 0u64;
   for (i, b) in buf.iter().enumerate() {
     let part = (b & 0x7F) as u64;
+    // On the final possible byte (shift == 63) only the low bit of `part`
+    // can fit in a u64; higher bits would be silently truncated by the
+    // shift. Reject such inputs as overflowing u64 rather than decoding
+    // to a lossy value.
+    if shift == 63 && part > 1 {
+      return Err(anyhow!("varint overflows u64"));
+    }
     value |= part << shift;
     if b & 0x80 == 0 {
       return Ok((value, i + 1));
@@ -78,10 +85,11 @@ mod tests {
 
   #[test]
   fn read_u64_rejects_overlong_varint() {
-    // A stream of bytes all setting the continuation bit — never terminates
-    // and would shift past 63 bits of a u64. Must return an error instead
-    // of panicking (debug) or silently corrupting the value (release).
-    let buf = vec![0xFFu8; 20];
+    // A stream of continuation-only bytes (no value bits set) would shift
+    // past 63 bits of a u64 without ever terminating. Must return an
+    // error instead of panicking (debug) or silently corrupting the
+    // value (release).
+    let buf = vec![0x80u8; 20];
     let err = read_u64(&buf).expect_err("overlong varint must be rejected");
     assert_eq!(err.to_string(), "varint too long");
   }
@@ -111,5 +119,25 @@ mod tests {
     let (decoded, len) = read_u64(&buf).unwrap();
     assert_eq!(decoded, u64::MAX);
     assert_eq!(len, 10);
+  }
+
+  #[test]
+  fn read_u64_rejects_final_byte_overflow() {
+    // A 10-byte varint whose first 9 bytes are continuation (shift = 63)
+    // and whose final byte has any value bit above bit 0 set represents
+    // a value > u64::MAX. It must be rejected rather than silently
+    // truncating the high bits.
+    let mut buf = vec![0x80u8; 9];
+    // Final byte: no continuation bit, but value bits beyond bit 0 set —
+    // 0x02 would shift to bit 64, which doesn't fit in a u64.
+    buf.push(0x02);
+    let err = read_u64(&buf).expect_err("u64-overflowing varint must be rejected");
+    assert_eq!(err.to_string(), "varint overflows u64");
+
+    // Also reject when the overflow bits coexist with a continuation bit.
+    let mut buf = vec![0x80u8; 9];
+    buf.push(0x82);
+    let err = read_u64(&buf).expect_err("u64-overflowing varint must be rejected");
+    assert_eq!(err.to_string(), "varint overflows u64");
   }
 }
