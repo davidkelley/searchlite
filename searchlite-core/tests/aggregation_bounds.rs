@@ -1373,12 +1373,19 @@ mod bug_030 {
   /// — dividing by zero in `bucket_start` and never advancing in
   /// `add_interval` during empty-bucket fill. Config validation must reject
   /// non-positive fixed intervals up front.
+  ///
+  /// The collector also materializes intervals as integer milliseconds via
+  /// `(secs * 1000.0) as i64`, so sub-millisecond specs like `"0.5ms"`
+  /// previously slipped past a `secs > 0.0` gate but truncated to
+  /// `Fixed(0)` — producing an empty-result silent regression. Validation
+  /// now rejects anything that doesn't survive the ms conversion with at
+  /// least a 1ms step.
   #[test]
-  fn zero_fixed_interval_is_rejected_by_validation() {
+  fn invalid_fixed_interval_is_rejected_by_validation() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = timestamp_index(tmp.path());
 
-    for spec in ["0ms", "0s", "0d"] {
+    for spec in ["0ms", "0s", "0d", "0.5ms", "0.0009s"] {
       let mut aggs = BTreeMap::new();
       aggs.insert(
         "hist".into(),
@@ -1406,8 +1413,8 @@ mod bug_030 {
         .expect_err(&format!("fixed_interval {spec:?} must be rejected"));
       let msg = err.to_string();
       assert!(
-        msg.contains("positive duration"),
-        "expected positive-duration error for {spec:?}, got: {msg}"
+        msg.contains("at least 1ms"),
+        "expected at-least-1ms error for {spec:?}, got: {msg}"
       );
     }
   }

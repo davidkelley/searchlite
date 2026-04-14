@@ -2953,18 +2953,24 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
     }
   }
   if let Some(fixed) = &agg.fixed_interval {
-    match parse_interval_seconds(fixed) {
-      Some(secs) if secs.is_finite() && secs > 0.0 => {}
-      _ => {
-        return Err(
-          AggregationError::InvalidConfig {
-            reason: format!(
-              "date_histogram `{name}` fixed_interval `{fixed}` must be a positive duration"
-            ),
-          }
-          .into(),
-        );
-      }
+    // The collector materializes intervals as integer milliseconds via
+    // `(secs * 1000.0) as i64`, so anything that truncates to `0ms`
+    // (e.g. `"0.5ms"`) would silently bypass the step > 0 guard in
+    // `bucket_start` and drop every document. Require that the parsed
+    // interval survives the millisecond conversion with >= 1ms.
+    let accepted = matches!(
+      parse_interval_seconds(fixed),
+      Some(secs) if secs.is_finite() && secs > 0.0 && (secs * 1000.0) as i64 >= 1,
+    );
+    if !accepted {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "date_histogram `{name}` fixed_interval `{fixed}` must be a positive duration of at least 1ms"
+          ),
+        }
+        .into(),
+      );
     }
   }
   if let Some(offset) = &agg.offset {
