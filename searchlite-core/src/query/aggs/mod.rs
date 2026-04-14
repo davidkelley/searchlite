@@ -1290,19 +1290,37 @@ impl<'a> HistogramCollector<'a> {
     let mut buckets = self.buckets;
     let bucket_key = |val: f64| ((val - offset) / interval).floor() as i64;
     let bucket_value = |bucket_id: i64| bucket_id as f64 * interval + offset;
-    if let Some((min, max)) = extended_bounds.or(hard_bounds) {
-      let mut bucket_id = bucket_key(min);
-      let end = bucket_key(max);
-      while bucket_id <= end {
-        buckets.entry(bucket_id).or_insert_with(|| BucketState {
-          key: serde_json::Value::Number(
-            serde_json::Number::from_f64(bucket_value(bucket_id))
-              .unwrap_or_else(|| serde_json::Number::from(0)),
-          ),
-          doc_count: 0,
-          aggs: BTreeMap::new(),
-        });
-        bucket_id += 1;
+    // Defense-in-depth: the request validator rejects non-finite / non-positive
+    // intervals (see `validate_histogram_config`). Skip bounds materialization
+    // entirely in the unlikely case we got here with a degenerate interval so
+    // that the loop below cannot become unbounded (BUG-027).
+    let bounds_materializable = interval.is_finite() && interval > 0.0;
+    if bounds_materializable {
+      if let Some((min, max)) = extended_bounds.or(hard_bounds) {
+        let mut bucket_id = bucket_key(min);
+        let end = bucket_key(max);
+        let mut materialized: usize = 0;
+        while bucket_id <= end {
+          buckets.entry(bucket_id).or_insert_with(|| BucketState {
+            key: serde_json::Value::Number(
+              serde_json::Number::from_f64(bucket_value(bucket_id))
+                .unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
+            doc_count: 0,
+            aggs: BTreeMap::new(),
+          });
+          // Guard against saturating-cast + wrapping addition producing an
+          // infinite loop if somehow `end == i64::MAX` (belt-and-braces: the
+          // validator caps the span well below this).
+          let Some(next) = bucket_id.checked_add(1) else {
+            break;
+          };
+          bucket_id = next;
+          materialized = materialized.saturating_add(1);
+          if materialized >= MAX_BUCKETS {
+            break;
+          }
+        }
       }
     }
     let mut buckets: Vec<BucketIntermediate> = buckets

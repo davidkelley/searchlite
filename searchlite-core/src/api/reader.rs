@@ -2355,8 +2355,20 @@ fn validate_aggregations_in_scope(
             crate::api::types::CompositeSource::Terms { field, .. } => {
               ensure_keyword_fast(schema, field, name, scope_path)?
             }
-            crate::api::types::CompositeSource::Histogram { field, .. } => {
-              ensure_numeric_fast(schema, field, name, scope_path)?
+            crate::api::types::CompositeSource::Histogram {
+              field, interval, ..
+            } => {
+              ensure_numeric_fast(schema, field, name, scope_path)?;
+              if !interval.is_finite() || *interval <= 0.0 {
+                return Err(
+                  AggregationError::InvalidConfig {
+                    reason: format!(
+                      "composite `{name}` histogram source requires interval to be a finite positive number (got {interval})"
+                    ),
+                  }
+                  .into(),
+                );
+              }
             }
           }
         }
@@ -2836,33 +2848,22 @@ fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Resu
 }
 
 fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<()> {
-  if agg.interval <= 0.0 {
+  if !agg.interval.is_finite() || agg.interval <= 0.0 {
     return Err(
       AggregationError::InvalidConfig {
-        reason: format!("histogram `{name}` requires interval > 0"),
+        reason: format!(
+          "histogram `{name}` requires interval to be a finite positive number (got {})",
+          agg.interval
+        ),
       }
       .into(),
     );
   }
   if let Some(bounds) = &agg.extended_bounds {
-    if bounds.min > bounds.max {
-      return Err(
-        AggregationError::InvalidConfig {
-          reason: format!("histogram `{name}` extended_bounds.min > max"),
-        }
-        .into(),
-      );
-    }
+    validate_histogram_bounds(name, "extended_bounds", bounds.min, bounds.max)?;
   }
   if let Some(bounds) = &agg.hard_bounds {
-    if bounds.min > bounds.max {
-      return Err(
-        AggregationError::InvalidConfig {
-          reason: format!("histogram `{name}` hard_bounds.min > max"),
-        }
-        .into(),
-      );
-    }
+    validate_histogram_bounds(name, "hard_bounds", bounds.min, bounds.max)?;
     if let Some(ext) = &agg.extended_bounds {
       if ext.min < bounds.min || ext.max > bounds.max {
         return Err(
@@ -2874,8 +2875,48 @@ fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<(
       }
     }
   }
+  if let Some(bounds) = agg.extended_bounds.as_ref().or(agg.hard_bounds.as_ref()) {
+    let span_buckets = ((bounds.max - bounds.min) / agg.interval).floor();
+    if !span_buckets.is_finite() || span_buckets >= MAX_HISTOGRAM_BOUND_BUCKETS as f64 {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "histogram `{name}` bounds span produces too many empty buckets (limit {})",
+            MAX_HISTOGRAM_BOUND_BUCKETS
+          ),
+        }
+        .into(),
+      );
+    }
+  }
   Ok(())
 }
+
+fn validate_histogram_bounds(name: &str, which: &str, min: f64, max: f64) -> Result<()> {
+  if !min.is_finite() || !max.is_finite() {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("histogram `{name}` {which} must be finite (got min={min}, max={max})"),
+      }
+      .into(),
+    );
+  }
+  if min > max {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("histogram `{name}` {which}.min > max"),
+      }
+      .into(),
+    );
+  }
+  Ok(())
+}
+
+/// Hard limit on the number of empty buckets a histogram's
+/// `extended_bounds`/`hard_bounds` span may materialize. Prevents pathological
+/// `(max - min) / interval` ratios (including those produced by crafted tiny
+/// intervals) from exhausting memory.
+const MAX_HISTOGRAM_BOUND_BUCKETS: i64 = 65_536;
 
 fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) -> Result<()> {
   let has_calendar = agg.calendar_interval.is_some();

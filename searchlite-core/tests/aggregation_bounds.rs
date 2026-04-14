@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use chrono::DateTime;
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
-  Aggregation, DateHistogramAggregation, DateHistogramBounds, Document, ExecutionStrategy,
-  HistogramAggregation, HistogramBounds, IndexOptions, KeywordField, MetricAggregation,
-  NumericField, Schema, SearchRequest, SortOrder, SortSpec, StorageType, TermsAggregation,
-  TopHitsAggregation,
+  Aggregation, CompositeAggregation, CompositeSource, DateHistogramAggregation,
+  DateHistogramBounds, Document, ExecutionStrategy, HistogramAggregation, HistogramBounds,
+  IndexOptions, KeywordField, MetricAggregation, NumericField, Schema, SearchRequest, SortOrder,
+  SortSpec, StorageType, TermsAggregation, TopHitsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -195,7 +195,10 @@ fn histogram_requires_positive_interval() {
   });
   assert!(resp.is_err());
   let msg = resp.err().unwrap().to_string();
-  assert!(msg.contains("interval > 0"));
+  assert!(
+    msg.contains("finite positive number"),
+    "expected error to mention finite positive interval, got: {msg}"
+  );
 }
 
 #[test]
@@ -758,5 +761,241 @@ fn date_histogram_calendar_month_interval() {
     assert_eq!(buckets[2].doc_count, 0);
   } else {
     panic!("expected date histogram response");
+  }
+}
+
+/// Regression tests for BUG-027 — `HistogramAggregation` with a degenerate
+/// (zero / NaN / infinite) `interval` combined with `extended_bounds` or
+/// `hard_bounds` previously drove `HistogramCollector::finish` into an
+/// unbounded bucket-insertion loop that exhausted memory.
+mod bug_027 {
+  use super::*;
+
+  fn numeric_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&doc(
+          "doc-1",
+          vec![("body", json!("rust")), ("score", json!(1))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  fn assert_invalid_histogram(err: anyhow::Error, expected_substr: &str) {
+    let msg = err.to_string();
+    assert!(
+      msg.contains(expected_substr),
+      "expected error message to contain {expected_substr:?}, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn zero_interval_with_extended_bounds_is_rejected_without_infinite_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 0.0,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: 100.0,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("zero interval must be rejected");
+    assert_invalid_histogram(err, "finite positive number");
+  }
+
+  #[test]
+  fn nan_interval_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: f64::NAN,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("NaN interval must be rejected");
+    assert_invalid_histogram(err, "finite positive number");
+  }
+
+  #[test]
+  fn positive_infinite_interval_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: f64::INFINITY,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("infinite interval must be rejected");
+    assert_invalid_histogram(err, "finite positive number");
+  }
+
+  #[test]
+  fn non_finite_bounds_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval: 10.0,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: f64::INFINITY,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("non-finite bounds must be rejected");
+    assert_invalid_histogram(err, "finite");
+  }
+
+  #[test]
+  fn bounds_span_exceeding_bucket_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "h".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        // 1_000_000 / 1.0 = 1_000_000 buckets — well above the 65_536 cap.
+        interval: 1.0,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: Some(HistogramBounds {
+          min: 0.0,
+          max: 1_000_000.0,
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err("excessive bounds span must be rejected");
+    assert_invalid_histogram(err, "too many empty buckets");
+  }
+
+  #[test]
+  fn composite_histogram_source_rejects_zero_interval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "c".into(),
+      Aggregation::Composite(Box::new(CompositeAggregation {
+        sources: vec![CompositeSource::Histogram {
+          name: "score_buckets".into(),
+          field: "score".into(),
+          interval: 0.0,
+        }],
+        size: 10,
+        after: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("composite histogram source with zero interval must be rejected");
+    assert_invalid_histogram(err, "finite positive number");
+  }
+
+  #[test]
+  fn composite_histogram_source_rejects_nan_interval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = numeric_score_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "c".into(),
+      Aggregation::Composite(Box::new(CompositeAggregation {
+        sources: vec![CompositeSource::Histogram {
+          name: "score_buckets".into(),
+          field: "score".into(),
+          interval: f64::NAN,
+        }],
+        size: 10,
+        after: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("composite histogram source with NaN interval must be rejected");
+    assert_invalid_histogram(err, "finite positive number");
   }
 }
