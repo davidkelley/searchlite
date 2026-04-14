@@ -3611,12 +3611,21 @@ pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
 fn bucket_start(value: i64, offset: i64, interval: &DateInterval) -> Option<i64> {
   match interval {
     DateInterval::Fixed(step) => {
-      // NOTE: must use `.floor()` to match Elasticsearch semantics and the
-      // behavior of the regular `HistogramCollector::bucket_key`. Using
-      // `.ceil()` places any timestamp that is not exactly on a bucket
-      // boundary into the *next* bucket (see BUG-030, issue #186).
-      let bucket = ((value - offset) as f64 / *step as f64).floor() as i64;
-      Some(bucket.saturating_mul(*step) + offset)
+      // Guard against non-positive steps: the parser accepts `0ms` (and a
+      // `DateInterval::Fixed(0)` step), which would divide by zero here and
+      // make `add_interval` never advance during empty-bucket fill.
+      if *step <= 0 {
+        return None;
+      }
+      // NOTE: must use floor-style bucketing to match Elasticsearch
+      // semantics and the behavior of the regular
+      // `HistogramCollector::bucket_key`. Using `.ceil()` placed any
+      // timestamp not exactly on a bucket boundary into the *next* bucket
+      // (BUG-030, issue #186). Integer `div_euclid` rounds toward
+      // negative infinity — identical to `.floor()` for this purpose —
+      // and, unlike `as f64`, keeps full `i64` precision beyond 2^53.
+      let bucket = value.saturating_sub(offset).div_euclid(*step);
+      Some(bucket.saturating_mul(*step).saturating_add(offset))
     }
     DateInterval::Calendar(unit) => {
       truncate_calendar(value - offset, *unit).map(|start| start + offset)

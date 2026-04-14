@@ -2510,8 +2510,8 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
     // With offset=500ms and interval=1s, buckets are the half-open ranges
     // [-500, 500), [500, 1500), [1500, 2500), [2500, 3500). A timestamp
-    // should land in the bucket whose `key` is the floor of
-    // `(value - offset) / interval * interval + offset`:
+    // should land in the bucket whose `key` is
+    // `floor((value - offset) / interval) * interval + offset`:
     //   ts=0       -> bucket -500 (in [-500, 500))
     //   ts=500     -> bucket  500 (from the `missing` substitute)
     //   ts=1000    -> bucket  500 (in [500, 1500))

@@ -2953,13 +2953,18 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
     }
   }
   if let Some(fixed) = &agg.fixed_interval {
-    if parse_interval_seconds(fixed).is_none() {
-      return Err(
-        AggregationError::InvalidConfig {
-          reason: format!("date_histogram `{name}` fixed_interval `{fixed}` is invalid"),
-        }
-        .into(),
-      );
+    match parse_interval_seconds(fixed) {
+      Some(secs) if secs.is_finite() && secs > 0.0 => {}
+      _ => {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!(
+              "date_histogram `{name}` fixed_interval `{fixed}` must be a positive duration"
+            ),
+          }
+          .into(),
+        );
+      }
     }
   }
   if let Some(offset) = &agg.offset {

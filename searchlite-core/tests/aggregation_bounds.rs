@@ -1367,4 +1367,49 @@ mod bug_030 {
       panic!("expected date histogram response");
     }
   }
+
+  /// Defense-in-depth: `parse_interval_seconds` accepts `"0ms"` and returns
+  /// `Some(0.0)`, which would previously produce a `DateInterval::Fixed(0)`
+  /// — dividing by zero in `bucket_start` and never advancing in
+  /// `add_interval` during empty-bucket fill. Config validation must reject
+  /// non-positive fixed intervals up front.
+  #[test]
+  fn zero_fixed_interval_is_rejected_by_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    for spec in ["0ms", "0s", "0d"] {
+      let mut aggs = BTreeMap::new();
+      aggs.insert(
+        "hist".into(),
+        Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+          field: "ts".into(),
+          calendar_interval: None,
+          fixed_interval: Some(spec.into()),
+          offset: None,
+          format: None,
+          min_doc_count: Some(0),
+          extended_bounds: None,
+          hard_bounds: None,
+          missing: None,
+          sampling: None,
+          aggs: BTreeMap::new(),
+        })),
+      );
+
+      let mut req = SearchRequest::new("rust");
+      req.aggs = aggs;
+      let err = idx
+        .reader()
+        .unwrap()
+        .search(&req)
+        .expect_err(&format!("fixed_interval {spec:?} must be rejected"));
+      let msg = err.to_string();
+      assert!(
+        msg.contains("positive duration"),
+        "expected positive-duration error for {spec:?}, got: {msg}"
+      );
+    }
+  }
+
 }
