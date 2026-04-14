@@ -20,15 +20,15 @@ const DEFAULT_REGEX_MAX_EXPANSIONS: usize = 100;
 /// `max_expansions` above the default up to this ceiling; requests beyond
 /// it are rejected rather than silently expanded, so a short HTTP body can
 /// no longer translate into an unbounded server-side workload (BUG-022).
-pub(crate) const MAX_PREFIX_EXPANSIONS_HARD: usize = 10_000;
+const MAX_PREFIX_EXPANSIONS_HARD: usize = 10_000;
 
 /// Absolute ceiling on `max_expansions` for `QueryNode::Wildcard`.
 /// See `MAX_PREFIX_EXPANSIONS_HARD` for rationale.
-pub(crate) const MAX_WILDCARD_EXPANSIONS_HARD: usize = 10_000;
+const MAX_WILDCARD_EXPANSIONS_HARD: usize = 10_000;
 
 /// Absolute ceiling on `max_expansions` for `QueryNode::Regex`.
 /// See `MAX_PREFIX_EXPANSIONS_HARD` for rationale.
-pub(crate) const MAX_REGEX_EXPANSIONS_HARD: usize = 10_000;
+const MAX_REGEX_EXPANSIONS_HARD: usize = 10_000;
 
 /// Upper bound on phrase `slop` applied at query planning time. User-supplied
 /// values (which flow in as `usize`) are saturated to this ceiling before
@@ -38,7 +38,7 @@ pub(crate) const MAX_REGEX_EXPANSIONS_HARD: usize = 10_000;
 /// beyond what the matcher could respect anyway get capped. Together with the
 /// saturating `i32` cast inside `matches_phrase` this preserves the "more
 /// slop → looser match" invariant for every input value.
-pub(crate) const MAX_PHRASE_SLOP: u32 = i32::MAX as u32;
+const MAX_PHRASE_SLOP: u32 = i32::MAX as u32;
 
 /// Expands query terms into field-qualified terms using default fields when no explicit field is given.
 pub fn expand_terms(query: &ParsedQuery, default_fields: &[String]) -> Vec<(String, String)> {
@@ -1253,6 +1253,20 @@ mod tests {
         msg.contains("exceeds hard limit"),
         "error should name the limit: {msg}"
       );
+      // The full diagnostic is part of the contract — the error must name both
+      // the offending value and the numeric ceiling so operators can spot
+      // which client is tripping it and what the current cap is. Asserting
+      // just "exceeds hard limit" leaves room for a future regression that
+      // drops the numbers while keeping the phrase.
+      assert!(
+        msg.contains(&input.to_string()),
+        "error should include offending value {input}: {msg}"
+      );
+      assert!(
+        msg.contains(&MAX_PREFIX_EXPANSIONS_HARD.to_string()),
+        "error should include hard ceiling {}: {msg}",
+        MAX_PREFIX_EXPANSIONS_HARD
+      );
     }
   }
 
@@ -1316,6 +1330,15 @@ mod tests {
         msg.contains("exceeds hard limit"),
         "error should name the limit: {msg}"
       );
+      assert!(
+        msg.contains(&input.to_string()),
+        "error should include offending value {input}: {msg}"
+      );
+      assert!(
+        msg.contains(&MAX_WILDCARD_EXPANSIONS_HARD.to_string()),
+        "error should include hard ceiling {}: {msg}",
+        MAX_WILDCARD_EXPANSIONS_HARD
+      );
     }
   }
 
@@ -1378,6 +1401,15 @@ mod tests {
       assert!(
         msg.contains("exceeds hard limit"),
         "error should name the limit: {msg}"
+      );
+      assert!(
+        msg.contains(&input.to_string()),
+        "error should include offending value {input}: {msg}"
+      );
+      assert!(
+        msg.contains(&MAX_REGEX_EXPANSIONS_HARD.to_string()),
+        "error should include hard ceiling {}: {msg}",
+        MAX_REGEX_EXPANSIONS_HARD
       );
     }
   }
