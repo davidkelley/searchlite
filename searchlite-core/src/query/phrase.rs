@@ -38,10 +38,12 @@ pub fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId, slop: u32) 
     }
     false
   }
-  // Saturate to i32::MAX: callers should clamp well below this at the query
-  // planning boundary (see planner::MAX_PHRASE_SLOP), but using `as i32` here
-  // would wrap values >= 2^31 to a negative remaining budget and silently
-  // reject every document, the opposite of the caller's intent.
+  // Saturate to i32::MAX: callers already saturate at the query planning
+  // boundary (see planner::MAX_PHRASE_SLOP), but using `as i32` here would
+  // wrap values >= 2^31 to a negative remaining budget and silently reject
+  // every document — the opposite of the caller's intent — so we keep the
+  // saturating cast as defence-in-depth for any future caller that reaches
+  // the matcher without going through the planner.
   let remaining = i32::try_from(slop).unwrap_or(i32::MAX);
   for start in positions_per_term[0].iter().copied() {
     if search(&positions_per_term, 1, start, remaining) {
