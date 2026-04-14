@@ -55,11 +55,22 @@ impl PaginationCursor {
         raw.len()
       );
     }
+    if !raw.is_ascii() {
+      bail!("invalid cursor: must be ASCII hex");
+    }
     let mut bytes = [0u8; CURSOR_BYTES];
     for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-      let hex = std::str::from_utf8(chunk).unwrap();
+      // Report positions against the raw input string so diagnostics point the
+      // caller at the offending character, not the decoded byte slot.
+      let raw_offset = 2 * i;
+      // `raw.is_ascii()` guarantees each byte is ASCII, so every two-byte
+      // chunk is valid UTF-8. We propagate via `?` rather than `unwrap()` so a
+      // future regression of the guard remains non-fatal.
+      let hex = std::str::from_utf8(chunk).map_err(|_| {
+        anyhow::anyhow!("cursor contains non-ASCII bytes at raw offset {raw_offset}")
+      })?;
       let value = u8::from_str_radix(hex, 16)
-        .with_context(|| format!("decoding cursor at byte index {i}"))?;
+        .with_context(|| format!("decoding cursor at raw offset {raw_offset}"))?;
       bytes[i] = value;
     }
     let version = bytes[0];
@@ -147,11 +158,20 @@ pub(crate) fn hex_decode(raw: &str) -> Result<Vec<u8>> {
   if raw.len() & 1 != 0 {
     bail!("invalid cursor: expected even-length hex string");
   }
+  if !raw.is_ascii() {
+    bail!("invalid cursor: must be ASCII hex");
+  }
   let mut bytes = Vec::with_capacity(raw.len() / 2);
   for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-    let hex = std::str::from_utf8(chunk).unwrap();
-    let value =
-      u8::from_str_radix(hex, 16).with_context(|| format!("decoding cursor at byte index {i}"))?;
+    // Report positions against the raw input so diagnostics point the caller
+    // at the offending character, not the decoded byte slot.
+    let raw_offset = 2 * i;
+    // Guarded by `is_ascii()` above, so every two-byte chunk is valid UTF-8.
+    // Propagate via `?` instead of `unwrap()` to avoid a panic on regression.
+    let hex = std::str::from_utf8(chunk)
+      .map_err(|_| anyhow::anyhow!("cursor contains non-ASCII bytes at raw offset {raw_offset}"))?;
+    let value = u8::from_str_radix(hex, 16)
+      .with_context(|| format!("decoding cursor at raw offset {raw_offset}"))?;
     bytes.push(value);
   }
   Ok(bytes)
@@ -395,5 +415,38 @@ mod tests {
     buf[17..].copy_from_slice(&returned.to_be_bytes());
     let encoded = hex_encode(&buf);
     assert!(PaginationCursor::decode(&encoded).is_err());
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_multibyte_utf8_without_panic() {
+    // 14 × U+4E16 ("世") = 42 bytes of valid UTF-8 that happens to match
+    // `CURSOR_HEX_LEN`, so the length check passes. Every two-byte chunk
+    // lands inside a three-byte UTF-8 sequence, which used to panic at
+    // `from_utf8(..).unwrap()`. The fix must surface an error instead.
+    let input: String = "\u{4E16}".repeat(14);
+    assert_eq!(input.len(), CURSOR_HEX_LEN);
+    let result = PaginationCursor::decode(&input);
+    assert!(
+      result.is_err(),
+      "expected Err for non-ASCII cursor, got {result:?}"
+    );
+  }
+
+  #[test]
+  fn hex_decode_rejects_multibyte_utf8_without_panic() {
+    // Two multi-byte characters produce 6 bytes — even-length, passes the
+    // original gate, and every chunk straddles a UTF-8 boundary.
+    let result = hex_decode("\u{4E16}\u{4E16}");
+    assert!(
+      result.is_err(),
+      "expected Err for non-ASCII hex input, got {result:?}"
+    );
+  }
+
+  #[test]
+  fn hex_decode_accepts_valid_ascii_hex() {
+    // Positive control: ensure the added ASCII guard doesn't break the happy path.
+    let decoded = hex_decode("deadbeef").expect("valid ASCII hex decodes");
+    assert_eq!(decoded, vec![0xde, 0xad, 0xbe, 0xef]);
   }
 }
