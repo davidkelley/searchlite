@@ -744,11 +744,9 @@ components:
           type: string
         index_uuid:
           type: string
-        index_path:
-          type: string
         index_name:
           type: string
-      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_path, index_name]
+      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_name]
     SearchResult:
       type: object
       properties:
