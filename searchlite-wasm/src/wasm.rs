@@ -1009,6 +1009,46 @@ impl PendingWrites {
         }
       }
     }
+    // If previous batches failed and re-queued operations, ensure a worker
+    // is running so those entries are retried before we return.
+    {
+      let mut guard = self.state.lock();
+      if !guard.queue.is_empty() && !guard.worker_running {
+        let (tx, rx) = oneshot::channel();
+        // Attach a waiter to the first queued entry so we can await it.
+        if let Some(entry) = guard.queue.values_mut().next() {
+          entry.waiters.push(tx);
+          self.pending.lock().push(rx);
+        } else {
+          drop(tx);
+        }
+        guard.worker_running = true;
+        let db_name = self.db_name.clone();
+        let state = self.state.clone();
+        spawn_local(async move {
+          persist_queue_worker(db_name, state).await;
+        });
+      }
+    }
+    let retry_receivers = {
+      let mut guard = self.pending.lock();
+      std::mem::take(&mut *guard)
+    };
+    for rx in retry_receivers {
+      match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+          if first_error.is_none() {
+            first_error = Some(err);
+          }
+        }
+        Err(_) => {
+          if first_error.is_none() {
+            first_error = Some(anyhow!("pending persist dropped"));
+          }
+        }
+      }
+    }
     if let Some(err) = first_error {
       Err(err)
     } else {
@@ -1695,6 +1735,12 @@ impl Searchlite {
 
   #[wasm_bindgen(js_name = clear_index)]
   pub async fn clear_index(db_name: String) -> Result<(), JsValue> {
+    if db_name == REGISTRY_DB_NAME {
+      return Err(js_error(
+        "reserved_name",
+        format!("'{REGISTRY_DB_NAME}' is reserved for internal use"),
+      ));
+    }
     clear_data_store(&db_name)
       .await
       .map_err(|err| typed_js_error("storage_clear_error", err))?;
@@ -1703,6 +1749,12 @@ impl Searchlite {
 
   #[wasm_bindgen(js_name = drop_index)]
   pub async fn drop_index(db_name: String) -> Result<(), JsValue> {
+    if db_name == REGISTRY_DB_NAME {
+      return Err(js_error(
+        "reserved_name",
+        format!("'{REGISTRY_DB_NAME}' is reserved for internal use"),
+      ));
+    }
     delete_database(&db_name)
       .await
       .map_err(|err| typed_js_error("storage_delete_error", err))?;
@@ -1751,10 +1803,12 @@ impl Searchlite {
       matched += 1;
       let db_name = entry.db_name.clone();
       if !dry_run {
-        let _ = remove_registry_entry(&db_name).await;
         delete_database(&db_name)
           .await
           .map_err(|err| typed_js_error("storage_delete_error", err))?;
+        remove_registry_entry(&db_name)
+          .await
+          .map_err(|err| typed_js_error("registry_delete_error", err))?;
       }
       dropped.push(db_name);
     }
