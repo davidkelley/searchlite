@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::storage::Storage;
 use crate::util::checksum::checksum;
@@ -47,9 +47,14 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
     if end > data.len() {
       bail!("terms file at {path:?} ended unexpectedly while reading term");
     }
+    // `buf` prepended an 8-byte term_count header before this payload, so translate
+    // the payload-relative `cursor` to an absolute file offset to help operators
+    // locate the corruption. `with_context` preserves the underlying `Utf8Error`
+    // so the error chain keeps the low-level failure as a source.
+    let file_offset = cursor + 8;
     let term = std::str::from_utf8(&data[cursor..end])
-      .map_err(|e| {
-        anyhow::anyhow!("terms file at {path:?} contains non-UTF-8 term at offset {cursor}: {e}")
+      .with_context(|| {
+        format!("terms file at {path:?} contains non-UTF-8 term at file offset {file_offset}")
       })?
       .to_string();
     cursor = end;
@@ -117,26 +122,28 @@ mod tests {
 
     // Write a valid terms file containing a single ASCII term, then overwrite
     // its payload with invalid UTF-8 bytes while keeping the CRC consistent.
-    write_terms(&storage, &path, &[("valid".to_string(), 1)]).unwrap();
+    let original_term = "valid";
+    write_terms(&storage, &path, &[(original_term.to_string(), 1)]).unwrap();
     let raw = std::fs::read(&path).unwrap();
 
     // Layout: [term_count:u64][payload][crc32:u32]
     let header_len = 8;
-    let payload = &raw[header_len..raw.len() - 4];
-    let mut payload = payload.to_vec();
+    let mut payload = raw[header_len..raw.len() - 4].to_vec();
 
-    // Locate the first byte of the term bytes: after the varint-encoded length.
-    // `write_u64(5, ..)` emits a single byte (0x05), followed by the 5 term bytes.
-    // Replace them with an overlong / invalid UTF-8 sequence (0xC3 is a 2-byte
-    // UTF-8 lead but is followed by ASCII bytes that are not valid continuation
-    // bytes, producing an ill-formed sequence that `from_utf8_lossy` would
-    // coerce to U+FFFD).
-    let term_offset = 1; // byte index within `payload` where the term bytes start
-    payload[term_offset] = 0xC3;
-    payload[term_offset + 1] = 0x28;
-    payload[term_offset + 2] = 0xA0;
-    payload[term_offset + 3] = 0xA1;
-    payload[term_offset + 4] = 0xFF;
+    // Locate the term bytes by parsing the varint-encoded length prefix so the
+    // test stays correct regardless of how many bytes the varint encoding uses.
+    let (term_len, varint_len) = read_u64(&payload).unwrap();
+    assert_eq!(term_len as usize, original_term.len());
+    let term_start = varint_len;
+    let term_end = term_start + term_len as usize;
+
+    // Overwrite the term bytes with an ill-formed UTF-8 sequence: 0xC3 is a
+    // 2-byte UTF-8 lead followed by bytes that are not valid continuation
+    // bytes. `from_utf8_lossy` would coerce this to U+FFFD; strict `from_utf8`
+    // must reject it.
+    let invalid = [0xC3, 0x28, 0xA0, 0xA1, 0xFF];
+    assert_eq!(term_end - term_start, invalid.len());
+    payload[term_start..term_end].copy_from_slice(&invalid);
 
     // Recompute CRC over the mutated payload so the checksum check passes and
     // the decoder actually reaches the UTF-8 validation step.
@@ -149,10 +156,15 @@ mod tests {
     std::fs::write(&path, rebuilt).unwrap();
 
     let err = read_terms(&storage, &path).unwrap_err();
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
     assert!(
       msg.contains("non-UTF-8 term"),
       "expected non-UTF-8 term error, got: {msg}"
+    );
+    // The underlying Utf8Error should be preserved as the source of the chain.
+    assert!(
+      err.chain().any(|cause| cause.is::<std::str::Utf8Error>()),
+      "expected Utf8Error in error chain, got: {msg}"
     );
   }
 }
