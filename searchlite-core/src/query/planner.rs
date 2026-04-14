@@ -13,6 +13,14 @@ const DEFAULT_PREFIX_MAX_EXPANSIONS: usize = 50;
 const DEFAULT_WILDCARD_MAX_EXPANSIONS: usize = 100;
 const DEFAULT_REGEX_MAX_EXPANSIONS: usize = 100;
 
+/// Upper bound on phrase `slop` applied at query planning time. User-supplied
+/// values (which flow in as `usize`) are clamped to this ceiling before being
+/// narrowed to `u32` for the matcher. This prevents the cast from silently
+/// truncating and — together with the saturating `i32` cast inside
+/// `matches_phrase` — preserves the "more slop → looser match" invariant for
+/// every input value. 256 is well above the 0-20 range real callers use.
+pub(crate) const MAX_PHRASE_SLOP: u32 = 256;
+
 /// Expands query terms into field-qualified terms using default fields when no explicit field is given.
 pub fn expand_terms(query: &ParsedQuery, default_fields: &[String]) -> Vec<(String, String)> {
   let mut out = Vec::new();
@@ -639,7 +647,11 @@ impl<'a> QueryPlanBuilder<'a> {
           Some(field) => vec![field.clone()],
           None => self.default_fields.to_vec(),
         };
-        let idx = self.push_phrase(fields, terms.clone(), slop.unwrap_or(0) as u32);
+        let slop_raw = slop.unwrap_or(0);
+        let slop = u32::try_from(slop_raw)
+          .unwrap_or(MAX_PHRASE_SLOP)
+          .min(MAX_PHRASE_SLOP);
+        let idx = self.push_phrase(fields, terms.clone(), slop);
         Ok((QueryMatcher::Phrase(idx), None, ScoreNode::Empty))
       }
       QueryNode::Bool {
@@ -1002,6 +1014,47 @@ mod tests {
         ("body".to_string(), "boring".to_string())
       ]
     );
+  }
+
+  #[test]
+  fn phrase_slop_is_clamped_to_ceiling() {
+    // Regression test for BUG-026. User-supplied `slop` is a `usize`; before
+    // the fix it was narrowed with `as u32`, which truncated high bits on
+    // 64-bit platforms and then wrapped to a negative `i32` inside
+    // `matches_phrase`. Every out-of-range value now collapses to the same
+    // `MAX_PHRASE_SLOP` ceiling.
+    for input in [
+      Some(MAX_PHRASE_SLOP as usize + 1),
+      Some(usize::MAX),
+      Some(u32::MAX as usize),
+      Some((i32::MAX as usize) + 1),
+    ] {
+      let plan = build_query_plan(
+        &Query::Node(QueryNode::Phrase {
+          field: Some("body".into()),
+          terms: vec!["hello".into(), "world".into()],
+          slop: input,
+          boost: None,
+        }),
+        &["body".to_string()],
+      )
+      .unwrap();
+      assert_eq!(plan.phrase_specs.len(), 1);
+      assert_eq!(plan.phrase_specs[0].slop, MAX_PHRASE_SLOP);
+    }
+
+    // In-range values pass through unchanged.
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Phrase {
+        field: Some("body".into()),
+        terms: vec!["hello".into(), "world".into()],
+        slop: Some(5),
+        boost: None,
+      }),
+      &["body".to_string()],
+    )
+    .unwrap();
+    assert_eq!(plan.phrase_specs[0].slop, 5);
   }
 
   #[test]
