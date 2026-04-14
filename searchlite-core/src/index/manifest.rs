@@ -720,6 +720,220 @@ mod tests {
     let err = schema.validate_document(&bad_type).unwrap_err();
     assert!(err.to_string().contains("must be a number"));
   }
+
+  #[test]
+  fn nested_keyword_rejects_non_string_array_elements() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "tags".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "value".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    // Array of numbers must be rejected for a keyword field.
+    let bad_numbers = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        ("tags".into(), serde_json::json!({ "value": [1, 2, 3] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&bad_numbers).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of strings")),
+      "unexpected error chain: {messages:?}"
+    );
+    // Error message should include the fully-qualified nested path so
+    // sibling nested objects sharing property names stay distinguishable.
+    assert!(
+      messages.iter().any(|m| m.contains("tags.value")),
+      "error chain should include the fully-qualified path: {messages:?}"
+    );
+
+    // Mixed string/non-string elements must also be rejected.
+    let mixed = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        (
+          "tags".into(),
+          serde_json::json!({ "value": ["ok", 1, true] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    assert!(schema.validate_document(&mixed).is_err());
+
+    // A pure array of strings continues to be accepted.
+    let good = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d3")),
+        ("tags".into(), serde_json::json!({ "value": ["a", "b"] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema.validate_document(&good).expect("string array ok");
+  }
+
+  #[test]
+  fn nested_text_rejects_non_string_array_elements() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comments".into(),
+        fields: vec![NestedProperty::Text(TextField {
+          name: "body".into(),
+          analyzer: "default".into(),
+          search_analyzer: None,
+          stored: true,
+          indexed: true,
+          nullable: false,
+          search_as_you_type: None,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    let bad = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        (
+          "comments".into(),
+          serde_json::json!({ "body": [{ "x": 1 }, null] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&bad).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of strings")),
+      "unexpected error chain: {messages:?}"
+    );
+
+    let ok = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        (
+          "comments".into(),
+          serde_json::json!({ "body": ["hello", "world"] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema.validate_document(&ok).expect("string array ok");
+  }
+
+  #[test]
+  fn nested_numeric_rejects_non_number_array_elements() {
+    fn schema_with(use_i64: bool) -> Schema {
+      Schema {
+        doc_id_field: default_doc_id_field(),
+        analyzers: Vec::new(),
+        text_fields: Vec::new(),
+        keyword_fields: Vec::new(),
+        numeric_fields: Vec::new(),
+        nested_fields: vec![NestedField {
+          name: "metrics".into(),
+          fields: vec![NestedProperty::Numeric(NumericField {
+            name: "values".into(),
+            i64: use_i64,
+            fast: false,
+            stored: false,
+            nullable: false,
+          })],
+          nullable: false,
+        }],
+        #[cfg(feature = "vectors")]
+        vector_fields: Vec::new(),
+      }
+    }
+
+    let i64_schema = schema_with(true);
+    let bad_strings = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        (
+          "metrics".into(),
+          serde_json::json!({ "values": ["1", "2"] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = i64_schema.validate_document(&bad_strings).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of numbers")),
+      "unexpected error chain: {messages:?}"
+    );
+
+    // i64 fields must reject floats mixed into the array.
+    let bad_floats = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        ("metrics".into(), serde_json::json!({ "values": [1, 2.5] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    assert!(i64_schema.validate_document(&bad_floats).is_err());
+
+    let good_ints = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d3")),
+        ("metrics".into(), serde_json::json!({ "values": [1, 2, 3] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    i64_schema
+      .validate_document(&good_ints)
+      .expect("integer array ok");
+
+    // f64 fields accept integers and floats but still reject strings.
+    let f64_schema = schema_with(false);
+    let good_floats = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d4")),
+        (
+          "metrics".into(),
+          serde_json::json!({ "values": [1, 2.5, 3] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    f64_schema
+      .validate_document(&good_floats)
+      .expect("number array ok");
+    assert!(f64_schema.validate_document(&bad_strings).is_err());
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,9 +1095,9 @@ impl NestedField {
       serde_json::Value::Object(map) => {
         for (k, v) in map.iter() {
           let Some(prop) = self.fields.iter().find(|p| p.name() == k) else {
-            return Err(anyhow!("unknown nested field {k}"));
+            return Err(anyhow!("unknown nested field {}.{}", self.name, k));
           };
-          prop.validate_value(k, v)?;
+          prop.validate_value(&format!("{}.{}", self.name, k), v)?;
         }
         for prop in self.fields.iter() {
           if map.contains_key(prop.name()) {
@@ -956,8 +1170,10 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_string() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be string or array"));
+        if !is_string_or_string_array(v) {
+          return Err(anyhow!(
+            "nested field {key} must be a string or array of strings"
+          ));
         }
         Ok(())
       }
@@ -968,8 +1184,10 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_string() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be string or array"));
+        if !is_string_or_string_array(v) {
+          return Err(anyhow!(
+            "nested field {key} must be a string or array of strings"
+          ));
         }
         Ok(())
       }
@@ -980,8 +1198,15 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_number() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be number or array"));
+        let ok = if f.i64 {
+          is_i64_or_array(v)
+        } else {
+          is_f64_or_array(v)
+        };
+        if !ok {
+          return Err(anyhow!(
+            "nested field {key} must be a number or array of numbers"
+          ));
         }
         Ok(())
       }
