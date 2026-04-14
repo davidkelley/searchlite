@@ -2658,18 +2658,33 @@ mod tests {
       .await
       .unwrap();
 
-    // Path-leaking fields must not appear in the serialized body under any
-    // alias — check the literal field name and the raw path as a safety net.
+    // Path-leaking fields must not appear in the response under any alias.
+    // Walk the parsed JSON and check string values directly so we are not
+    // tricked by JSON escaping (e.g. Windows backslashes are doubled in the
+    // raw serialized form, which would let a regression slip past a naive
+    // substring check on the wire bytes).
+    fn json_contains_string_value(value: &serde_json::Value, target: &str) -> bool {
+      match value {
+        serde_json::Value::String(s) => s == target,
+        serde_json::Value::Array(values) => values
+          .iter()
+          .any(|value| json_contains_string_value(value, target)),
+        serde_json::Value::Object(map) => map
+          .values()
+          .any(|value| json_contains_string_value(value, target)),
+        _ => false,
+      }
+    }
+
     let stats_obj = stats.as_object().expect("stats body is a JSON object");
     assert!(
       !stats_obj.contains_key("index_path"),
       "stats response must not include `index_path` (leaks FS layout): {stats_obj:?}"
     );
-    let raw_body = serde_json::to_string(&stats).unwrap();
     let fs_path_str = index_path.display().to_string();
     assert!(
-      !raw_body.contains(fs_path_str.as_str()),
-      "stats response must not contain the raw index filesystem path: {raw_body}"
+      !json_contains_string_value(&stats, fs_path_str.as_str()),
+      "stats response must not contain the raw index filesystem path: {stats:?}"
     );
 
     // Sanity: the public fields are still present.
