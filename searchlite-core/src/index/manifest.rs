@@ -759,6 +759,12 @@ mod tests {
       messages.iter().any(|m| m.contains("array of strings")),
       "unexpected error chain: {messages:?}"
     );
+    // Error message should include the fully-qualified nested path so
+    // sibling nested objects sharing property names stay distinguishable.
+    assert!(
+      messages.iter().any(|m| m.contains("tags.value")),
+      "error chain should include the fully-qualified path: {messages:?}"
+    );
 
     // Mixed string/non-string elements must also be rejected.
     let mixed = crate::api::types::Document {
@@ -845,7 +851,7 @@ mod tests {
 
   #[test]
   fn nested_numeric_rejects_non_number_array_elements() {
-    fn schema_with(i64: bool) -> Schema {
+    fn schema_with(use_i64: bool) -> Schema {
       Schema {
         doc_id_field: default_doc_id_field(),
         analyzers: Vec::new(),
@@ -856,7 +862,7 @@ mod tests {
           name: "metrics".into(),
           fields: vec![NestedProperty::Numeric(NumericField {
             name: "values".into(),
-            i64,
+            i64: use_i64,
             fast: false,
             stored: false,
             nullable: false,
@@ -1089,9 +1095,9 @@ impl NestedField {
       serde_json::Value::Object(map) => {
         for (k, v) in map.iter() {
           let Some(prop) = self.fields.iter().find(|p| p.name() == k) else {
-            return Err(anyhow!("unknown nested field {k}"));
+            return Err(anyhow!("unknown nested field {}.{}", self.name, k));
           };
-          prop.validate_value(k, v)?;
+          prop.validate_value(&format!("{}.{}", self.name, k), v)?;
         }
         for prop in self.fields.iter() {
           if map.contains_key(prop.name()) {
