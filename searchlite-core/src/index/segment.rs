@@ -1648,9 +1648,9 @@ mod tests {
       // doc_count = 2, but header claims 100 dense rows — enough that a naive
       // reader would allocate 100 * dim * sizeof(f32) before the short read
       // fires.
-      let mut buf = build_header(4, 0, 2, 100);
-      for _ in 0..2 {
-        buf.write_u32::<LittleEndian>(0).unwrap();
+      let mut buf = build_header(4, metric_code(&ApiVectorMetric::Cosine), 2, 100);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
       }
       std::fs::write(&path, &buf).unwrap();
       let err = read_vector_file(&storage, &path, 2, 4, &ApiVectorMetric::Cosine)
@@ -1670,9 +1670,9 @@ mod tests {
       // vector_count = doc_count = 2 (passes the first guard), dim = 1024.
       // The values block should be 2 * 1024 * 4 = 8192 bytes, but we only
       // write 12 value bytes (3 f32s) so remaining < claimed.
-      let mut buf = build_header(1024, 0, 2, 2);
-      for _ in 0..2 {
-        buf.write_u32::<LittleEndian>(0).unwrap();
+      let mut buf = build_header(1024, metric_code(&ApiVectorMetric::Cosine), 2, 2);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
       }
       for _ in 0..3 {
         buf.write_f32::<LittleEndian>(0.0).unwrap();
@@ -1697,9 +1697,9 @@ mod tests {
       // `Vec::with_capacity(vector_count * dim)` into an allocator abort.
       // After the fix, the `vector_count > doc_count` guard fires first so
       // the test terminates in constant memory.
-      let mut buf = build_header(1024, 0, 2, u32::MAX);
-      for _ in 0..2 {
-        buf.write_u32::<LittleEndian>(0).unwrap();
+      let mut buf = build_header(1024, metric_code(&ApiVectorMetric::Cosine), 2, u32::MAX);
+      for offset in [0u32, 1u32] {
+        buf.write_u32::<LittleEndian>(offset).unwrap();
       }
       std::fs::write(&path, &buf).unwrap();
       let err = read_vector_file(&storage, &path, 2, 1024, &ApiVectorMetric::Cosine)
