@@ -272,17 +272,28 @@ impl Index {
       .iter()
       .filter(|s| merge_set.contains(s.id.as_str()))
       .collect();
-    if merge_metas.len() < 2 {
-      // Nothing useful to merge.
-      return Ok(());
-    }
-    // Verify all unique requested segment IDs exist.
+    // Verify all unique requested segment IDs exist before deciding there is
+    // nothing to merge, so typo'd or half-committed IDs surface as errors
+    // rather than being silently swallowed by the `< 2` early return below.
     if merge_metas.len() != merge_set.len() {
+      let found: std::collections::HashSet<&str> =
+        merge_metas.iter().map(|s| s.id.as_str()).collect();
+      let mut missing: Vec<&str> = merge_set
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect();
+      missing.sort_unstable();
       bail!(
-        "some segment IDs not found in manifest (requested {}, found {})",
+        "some segment IDs not found in manifest: {:?} (requested {}, found {})",
+        missing,
         merge_set.len(),
         merge_metas.len()
       );
+    }
+    if merge_metas.len() < 2 {
+      // Nothing useful to merge.
+      return Ok(());
     }
 
     // Handle write-key bindings.
@@ -732,6 +743,62 @@ mod tests {
         result.total_hits_estimate
       );
     }
+  }
+
+  #[test]
+  fn merge_segments_errors_when_any_id_missing() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Create two real segments so the manifest has something to look up.
+    for (i, word) in ["alpha", "bravo"].iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 2);
+    let real_id = idx.manifest().segments[0].id.clone();
+
+    // Requesting a merge of one real segment and one typo'd ID must fail
+    // rather than silently returning Ok. Before BUG-028 was fixed, the
+    // `merge_metas.len() < 2` early return masked the missing ID.
+    let err = idx
+      .merge_segments(&[real_id.clone(), "does-not-exist".into()], None)
+      .expect_err("expected merge_segments to error on unknown segment id");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("does-not-exist"),
+      "error should name the missing segment: {msg}"
+    );
+
+    // A request that names only missing IDs should also error (previously
+    // silent-Ok because the filtered set had fewer than two entries).
+    let err = idx
+      .merge_segments(&["missing-a".into(), "missing-b".into()], None)
+      .expect_err("expected merge_segments to error when all ids missing");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("missing-a") && msg.contains("missing-b"),
+      "error should name both missing segments: {msg}"
+    );
+
+    // Sanity check: the no-op paths we intentionally keep still succeed.
+    idx.merge_segments(&[], None).unwrap(); // empty input
+    idx
+      .merge_segments(std::slice::from_ref(&real_id), None)
+      .unwrap(); // single real id
+                 // The manifest must be unchanged by the no-op / error cases.
+    assert_eq!(idx.manifest().segments.len(), 2);
   }
 
   #[test]
