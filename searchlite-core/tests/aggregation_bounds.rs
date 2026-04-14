@@ -131,13 +131,16 @@ fn histogram_respects_extended_bounds_and_empty_buckets() {
   }
 }
 
-/// BUG-188: empty-bucket fill in `HistogramCollector::finish` must respect
-/// `hard_bounds` as an absolute cap. With `extended_bounds` fully inside
-/// `hard_bounds` (the configuration the validator currently allows), the
-/// emitted keys must stay inside the `extended_bounds` window — no bucket
-/// should leak past `hard_bounds.max` or before `hard_bounds.min`.
+/// End-to-end coverage for the validator-permitted configuration where
+/// `extended_bounds` is nested inside `hard_bounds`. The `collect()` path
+/// still applies the `hard_bounds` gate per-document, and the fill path
+/// populates empty buckets across `extended_bounds`. The direct BUG-188
+/// clipping invariant (when `extended_bounds` extends past `hard_bounds`) is
+/// pinned by the `intersect_fill_range_*` unit tests in
+/// `searchlite-core/src/query/aggs/mod.rs` — that case is unreachable from
+/// here because the request validator rejects it up front.
 #[test]
-fn histogram_extended_bounds_respects_hard_bounds_cap() {
+fn histogram_nested_bounds_produce_expected_buckets() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
@@ -151,10 +154,11 @@ fn histogram_extended_bounds_respects_hard_bounds_cap() {
   let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
   {
     let mut writer = idx.writer().unwrap();
-    // A doc within the hard range but outside `extended_bounds` seeds a
-    // collected bucket at key 60; a doc beyond `hard_bounds.max` is dropped
-    // by the `collect` path's hard-bounds gate.
-    for val in [35_i64, 60, 95] {
+    // 25 is inside hard_bounds [20, 80] but outside extended_bounds [30, 70]
+    // — it seeds a collected bucket at key 20 that sits outside the fill
+    // window. 60 is inside both. 95 is past hard_bounds.max and must be
+    // discarded by the collect-path gate.
+    for val in [25_i64, 60, 95] {
       writer
         .add_document(&doc(
           &format!("hist-{val}"),
@@ -194,13 +198,15 @@ fn histogram_extended_bounds_respects_hard_bounds_cap() {
   let hist = resp.aggregations.get("hist").unwrap();
   if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
-    // Collected bucket at 60 (from the doc at score=60) plus empty-fill
-    // buckets across `extended_bounds` [30, 70]. The 95-doc is discarded
-    // because it falls outside `hard_bounds.max`, so no bucket at key 90
-    // must appear.
+    // Collected bucket at 20 (from the score=25 doc), the collected bucket
+    // at 60 (from score=60), and empty-fill buckets across
+    // `extended_bounds` [30, 70]. No bucket at key 80/90 must appear
+    // because the score=95 doc was dropped by the hard_bounds gate and
+    // the fill range never reaches into that grid cell.
     assert_eq!(
       keys,
       vec![
+        json!(20.0),
         json!(30.0),
         json!(40.0),
         json!(50.0),
@@ -208,13 +214,12 @@ fn histogram_extended_bounds_respects_hard_bounds_cap() {
         json!(70.0),
       ]
     );
-    // Bucket 30 picks up the doc at score=35; bucket 60 picks up score=60;
-    // 40/50/70 stay empty because extended_bounds forces min_doc_count=0.
-    assert_eq!(buckets[0].doc_count, 1);
-    assert_eq!(buckets[1].doc_count, 0);
-    assert_eq!(buckets[2].doc_count, 0);
-    assert_eq!(buckets[3].doc_count, 1);
-    assert_eq!(buckets[4].doc_count, 0);
+    assert_eq!(buckets[0].doc_count, 1); // key 20 — collected from score=25
+    assert_eq!(buckets[1].doc_count, 0); // key 30 — empty fill
+    assert_eq!(buckets[2].doc_count, 0); // key 40 — empty fill
+    assert_eq!(buckets[3].doc_count, 0); // key 50 — empty fill
+    assert_eq!(buckets[4].doc_count, 1); // key 60 — collected from score=60
+    assert_eq!(buckets[5].doc_count, 0); // key 70 — empty fill
   } else {
     panic!("unexpected histogram response");
   }
@@ -853,11 +858,14 @@ fn date_histogram_calendar_month_interval() {
   }
 }
 
-/// BUG-188: same guarantee as `histogram_extended_bounds_respects_hard_bounds_cap`
-/// but for `DateHistogramCollector::finish`. The empty-bucket fill range must
-/// be clipped against `hard_bounds`.
+/// End-to-end coverage for `DateHistogramCollector` with `extended_bounds`
+/// nested inside `hard_bounds` — the configuration the validator permits.
+/// Like the numeric counterpart, the direct BUG-188 clipping invariant is
+/// exercised by the `intersect_fill_range_*` unit tests; this test pins the
+/// search-path contract that the `hard_bounds` gate still drops
+/// out-of-range docs and the fill range stays inside `extended_bounds`.
 #[test]
-fn date_histogram_extended_bounds_respects_hard_bounds_cap() {
+fn date_histogram_nested_bounds_produce_expected_buckets() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
@@ -873,7 +881,12 @@ fn date_histogram_extended_bounds_respects_hard_bounds_cap() {
   let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
   {
     let mut writer = idx.writer().unwrap();
+    // Jan 10 is inside hard_bounds [Jan 1, May 1] but outside extended_bounds
+    // [Feb 1, Apr 1] — it seeds a collected Jan 1 bucket outside the fill
+    // window. Feb 5 / Mar 10 fall inside both. Jun 1 is past hard_bounds.max
+    // and must be dropped by the collect-path gate.
     for t in [
+      "2024-01-10T00:00:00Z",
       "2024-02-05T00:00:00Z",
       "2024-03-10T00:00:00Z",
       "2024-06-01T00:00:00Z",
@@ -919,12 +932,13 @@ fn date_histogram_extended_bounds_respects_hard_bounds_cap() {
   let agg = resp.aggregations.get("dates").unwrap();
   if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
-    // The June doc is dropped by hard_bounds. Fill range stays within
-    // extended_bounds [Feb, Apr] — no bucket for Jan or May should appear,
-    // and no bucket past `hard_bounds.max`.
+    // Collected Jan 1 (from the Jan 10 doc), Feb 1 + Mar 1 (from Feb 5 /
+    // Mar 10), and an empty Apr 1 from the fill. No bucket for May 1, and
+    // nothing for Jun 1 — the latter was dropped by the hard_bounds gate.
     assert_eq!(
       keys,
       vec![
+        json!(ts("2024-01-01T00:00:00Z")),
         json!(ts("2024-02-01T00:00:00Z")),
         json!(ts("2024-03-01T00:00:00Z")),
         json!(ts("2024-04-01T00:00:00Z")),
@@ -932,7 +946,8 @@ fn date_histogram_extended_bounds_respects_hard_bounds_cap() {
     );
     assert_eq!(buckets[0].doc_count, 1);
     assert_eq!(buckets[1].doc_count, 1);
-    assert_eq!(buckets[2].doc_count, 0);
+    assert_eq!(buckets[2].doc_count, 1);
+    assert_eq!(buckets[3].doc_count, 0);
   } else {
     panic!("expected date histogram response");
   }
