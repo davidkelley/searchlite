@@ -1128,3 +1128,294 @@ mod bug_027 {
     assert_invalid_histogram(err, "finite positive number");
   }
 }
+
+/// Regression tests for BUG-030 (#186) — `bucket_start` for
+/// `DateInterval::Fixed` used `.ceil()` instead of `.floor()`, causing every
+/// timestamp that did not fall exactly on a bucket boundary to be mis-assigned
+/// to the *next* bucket. A noon timestamp was placed in the following day's
+/// bucket; a timestamp 1ms past midnight was placed in the day-after-next's
+/// bucket.
+mod bug_030 {
+  use super::*;
+
+  fn timestamp_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "ts".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn run_date_histogram(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let resp = idx
+      .reader()
+      .unwrap()
+      .search(&SearchRequest {
+        query: "rust".into(),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        track_total_hits: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs,
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+    resp.aggregations.get("hist").cloned().unwrap()
+  }
+
+  const DAY_MS: i64 = 86_400_000;
+
+  /// A timestamp at noon on day 1 must land in day 1's bucket, not day 2's.
+  /// Timestamp 1ms past midnight on day 2 must land in day 2's bucket, not
+  /// day 3's. Boundary timestamps (exactly on midnight) stay put.
+  #[test]
+  fn fixed_interval_places_non_boundary_timestamps_in_current_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, ts) in [
+        ("day1-midnight", 0_i64),
+        ("day1-noon", DAY_MS / 2),
+        ("day2-midnight", DAY_MS),
+        ("day2-1ms", DAY_MS + 1),
+        ("day2-noon", DAY_MS + DAY_MS / 2),
+      ] {
+        writer
+          .add_document(&doc(id, vec![("body", json!("rust")), ("ts", json!(ts))]))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1d".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(
+        observed,
+        vec![
+          // day 1: midnight + noon
+          (json!(0), 2),
+          // day 2: midnight + 1ms + noon
+          (json!(DAY_MS), 3),
+        ]
+      );
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
+  /// A non-zero offset must still place non-boundary timestamps into the
+  /// current bucket. With `offset = 500ms` and `interval = 1s`, bucket
+  /// boundaries are at `..., -500, 500, 1500, 2500, ...`. A timestamp of
+  /// `1000ms` belongs in the `[500, 1500)` bucket (key = 500), not the
+  /// `[1500, 2500)` bucket.
+  #[test]
+  fn fixed_interval_with_offset_floors_rather_than_ceils() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      // ts=600ms falls inside [500, 1500); ts=1400ms also falls inside
+      // [500, 1500). ts=1600ms falls inside [1500, 2500).
+      for (id, ts) in [("a", 600_i64), ("b", 1_400_i64), ("c", 1_600_i64)] {
+        writer
+          .add_document(&doc(id, vec![("body", json!("rust")), ("ts", json!(ts))]))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1s".into()),
+        offset: Some("0.5s".into()),
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(observed, vec![(json!(500), 2), (json!(1500), 1)]);
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
+  /// `extended_bounds` drives empty-bucket fill via `bucket_start`. With the
+  /// previous `.ceil()` implementation, the bounds themselves were rounded
+  /// up, so fills spilled into the bucket *beyond* `max`. With `.floor()`
+  /// the range is clipped to the enclosing bucket keys, as expected.
+  #[test]
+  fn extended_bounds_fill_range_uses_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&doc(
+          "seed",
+          vec![("body", json!("rust")), ("ts", json!(DAY_MS / 2))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1d".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "1970-01-01T00:00:00Z".into(),
+          // Noon on day 3. With `.floor()` this clamps to `bucket_start =
+          // 2 * DAY_MS` (day 3's bucket key). With the old `.ceil()` it
+          // rounded up to day 4's key (`3 * DAY_MS`), emitting a spurious
+          // empty bucket past `max`.
+          max: "1970-01-03T12:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+      assert_eq!(
+        keys,
+        vec![json!(0), json!(DAY_MS), json!(2 * DAY_MS)],
+        "extended_bounds max at noon day 3 must clip to day 3's key, \
+         not spill into day 4"
+      );
+      // Seed doc is at noon on day 1 -> day 1's bucket.
+      assert_eq!(buckets[0].doc_count, 1);
+      assert_eq!(buckets[1].doc_count, 0);
+      assert_eq!(buckets[2].doc_count, 0);
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
+  /// Defense-in-depth: `parse_interval_seconds` accepts `"0ms"` and returns
+  /// `Some(0.0)`, which would previously produce a `DateInterval::Fixed(0)`
+  /// — dividing by zero in `bucket_start` and never advancing in
+  /// `add_interval` during empty-bucket fill. Config validation must reject
+  /// non-positive fixed intervals up front.
+  ///
+  /// The collector also materializes intervals as integer milliseconds via
+  /// `(secs * 1000.0) as i64`, so sub-millisecond specs like `"0.5ms"`
+  /// previously slipped past a `secs > 0.0` gate but truncated to
+  /// `Fixed(0)` — producing an empty-result silent regression. Validation
+  /// now rejects anything that doesn't survive the ms conversion with at
+  /// least a 1ms step.
+  #[test]
+  fn invalid_fixed_interval_is_rejected_by_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    for spec in ["0ms", "0s", "0d", "0.5ms", "0.0009s"] {
+      let mut aggs = BTreeMap::new();
+      aggs.insert(
+        "hist".into(),
+        Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+          field: "ts".into(),
+          calendar_interval: None,
+          fixed_interval: Some(spec.into()),
+          offset: None,
+          format: None,
+          min_doc_count: Some(0),
+          extended_bounds: None,
+          hard_bounds: None,
+          missing: None,
+          sampling: None,
+          aggs: BTreeMap::new(),
+        })),
+      );
+
+      let mut req = SearchRequest::new("rust");
+      req.aggs = aggs;
+      let err = idx
+        .reader()
+        .unwrap()
+        .search(&req)
+        .expect_err(&format!("fixed_interval {spec:?} must be rejected"));
+      let msg = err.to_string();
+      assert!(
+        msg.contains("at least 1ms"),
+        "expected at-least-1ms error for {spec:?}, got: {msg}"
+      );
+    }
+  }
+}
