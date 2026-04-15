@@ -102,6 +102,9 @@ impl Wal {
     let mut cursor = 0usize;
     let mut entries = Vec::new();
     while cursor < data.len() {
+      // Remember where this entry started so diagnostics can point at it
+      // regardless of how far the cursor is advanced below.
+      let entry_start = cursor;
       let (len, len_bytes) = match read_u64(&data[cursor..]) {
         Ok(v) => v,
         Err(_) => break,
@@ -141,17 +144,30 @@ impl Wal {
       if checksum.to_le_bytes() != checksum_bytes {
         break;
       }
+      // Past this point the framing and CRC32 both check out, so the payload
+      // is bit-for-bit what was written. A decode failure here cannot be
+      // confused with a torn/truncated tail — it indicates a real semantic
+      // mismatch (e.g. a schema change between versions). Surface those
+      // failures rather than silently dropping the entry; see BUG-007.
       match entry_type {
         1 => {
-          if let Ok(doc) = serde_json::from_slice::<Document>(payload) {
-            entries.push(WalEntry::AddDoc(doc));
-          }
+          let doc = serde_json::from_slice::<Document>(payload).with_context(|| {
+            format!(
+              "WAL AddDoc entry at offset {entry_start} is checksum-valid but failed to deserialize"
+            )
+          })?;
+          entries.push(WalEntry::AddDoc(doc));
         }
         2 => entries.push(WalEntry::Commit),
         3 => {
-          if let Ok(id) = std::str::from_utf8(payload) {
-            entries.push(WalEntry::DeleteDocId(id.to_string()));
-          }
+          let id = std::str::from_utf8(payload)
+            .with_context(|| {
+              format!(
+                "WAL DeleteDocId entry at offset {entry_start} is checksum-valid but is not valid UTF-8"
+              )
+            })?
+            .to_string();
+          entries.push(WalEntry::DeleteDocId(id));
         }
         4 => entries.push(WalEntry::WriteBinding(payload.to_vec())),
         _ => {}
@@ -282,6 +298,107 @@ mod tests {
     assert!(!wal.is_empty().unwrap());
     wal.truncate().unwrap();
     assert!(wal.is_empty().unwrap());
+  }
+
+  /// Regression for BUG-007: a CRC-valid `AddDoc` payload that fails to
+  /// deserialize into `Document` must surface an error instead of being
+  /// silently dropped. The CRC has already guaranteed the bytes are
+  /// bit-for-bit what was written, so decode failure is a real semantic
+  /// mismatch (schema drift) that the operator must see.
+  #[test]
+  fn replay_surfaces_crc_valid_adddoc_decode_failure() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let mut buf = Vec::new();
+    // Hand-craft an AddDoc entry (type 1) whose payload is valid bytes but
+    // not a valid `Document` JSON (a bare integer is not an object).
+    let payload: &[u8] = b"123";
+    crate::util::varint::write_u64(payload.len() as u64, &mut buf);
+    buf.push(1u8);
+    buf.extend_from_slice(payload);
+    let mut hasher = Hasher::new();
+    hasher.update(&[1u8]);
+    hasher.update(payload);
+    let checksum = hasher.finalize();
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    std::fs::write(&path, buf).unwrap();
+
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let err = Wal::replay(&storage, &path).expect_err(
+      "CRC-valid but undecodable AddDoc payload must be surfaced, not silently dropped",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("AddDoc") && msg.contains("checksum-valid"),
+      "unexpected error message: {msg}"
+    );
+  }
+
+  /// Regression for BUG-007: a CRC-valid `DeleteDocId` payload that is not
+  /// valid UTF-8 must surface an error. Same reasoning as the AddDoc case —
+  /// CRC already confirmed the bytes are authentic, so the failure is real.
+  #[test]
+  fn replay_surfaces_crc_valid_delete_decode_failure() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let mut buf = Vec::new();
+    // 0xFF is never valid UTF-8 on its own.
+    let payload: &[u8] = &[0xFFu8];
+    crate::util::varint::write_u64(payload.len() as u64, &mut buf);
+    buf.push(3u8);
+    buf.extend_from_slice(payload);
+    let mut hasher = Hasher::new();
+    hasher.update(&[3u8]);
+    hasher.update(payload);
+    let checksum = hasher.finalize();
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    std::fs::write(&path, buf).unwrap();
+
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+    let err = Wal::replay(&storage, &path).expect_err(
+      "CRC-valid but non-UTF-8 DeleteDocId payload must be surfaced, not silently dropped",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("DeleteDocId") && msg.contains("checksum-valid"),
+      "unexpected error message: {msg}"
+    );
+  }
+
+  /// A genuinely torn / truncated tail (bad checksum) must still stop replay
+  /// cleanly without surfacing an error — BUG-007 is specifically about
+  /// entries that pass the CRC but cannot be decoded.
+  #[test]
+  fn replay_still_stops_silently_on_bad_checksum_tail() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("good"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    // Flip a trailing byte to corrupt the checksum on a synthetic second
+    // entry appended by hand.
+    let mut raw = std::fs::read(&path).unwrap();
+    let mut bad = Vec::new();
+    let payload = serde_json::to_vec(&doc).unwrap();
+    crate::util::varint::write_u64(payload.len() as u64, &mut bad);
+    bad.push(1u8);
+    bad.extend_from_slice(&payload);
+    // Intentionally wrong checksum bytes.
+    bad.extend_from_slice(&[0u8, 0, 0, 0]);
+    raw.extend_from_slice(&bad);
+    std::fs::write(&path, &raw).unwrap();
+
+    let entries = Wal::replay(storage.as_ref(), &path).unwrap();
+    assert_eq!(
+      entries.len(),
+      1,
+      "bad-checksum tail must stop replay silently, not abort",
+    );
   }
 
   #[test]
