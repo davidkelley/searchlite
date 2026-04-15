@@ -428,41 +428,135 @@ fn expand_wildcard(
   Ok((qualified, keys))
 }
 
+/// Extracts a safe literal prefix from a regex pattern for use as a
+/// term-dictionary scan bound.
+///
+/// The returned prefix is guaranteed to be a prefix of every string the
+/// compiled regex can match (anchored via [`anchored_regex`]), so
+/// `terms_with_prefix(field:<prefix>)` can be used to skip terms that
+/// could not possibly match without missing any that could.
+///
+/// To preserve that invariant, the walker must account for two regex
+/// constructs that make the *last* accumulated character (or the whole
+/// accumulated branch) optional — and therefore not a guaranteed prefix of
+/// matching terms:
+///
+/// * Quantifiers that permit zero occurrences of the preceding atom
+///   (`*`, `?`, `{0,…}`, `{,…}`, `{0}`). The preceding literal must be
+///   dropped: e.g. `colou?r` requires prefix `colo`, not `colou`.
+/// * Top-level alternation (`|`). No single literal prefix is shared by
+///   every branch (e.g. `foo|bar` shares no common first character), so the
+///   prefix must be cleared entirely.
+///
+/// Alternation, groups, and character classes *inside* `(`, `[`, or `{`
+/// never affect the running prefix because the walker already breaks at
+/// those metacharacters. Only top-level constructs reach this logic.
 fn regex_literal_prefix(pattern: &str) -> String {
+  let chars: Vec<(usize, char)> = pattern.char_indices().collect();
   let mut prefix = String::new();
   let mut escaped = false;
-  for (i, ch) in pattern.char_indices() {
+  let mut i = 0usize;
+  while i < chars.len() {
+    let (pos, ch) = chars[i];
     if escaped {
       match ch {
         '\\' => {
-          // Escaped backslash is a literal backslash in the prefix.
-          let end = i + ch.len_utf8();
-          prefix.push_str(&pattern[i..end]);
+          // Escaped backslash is a literal backslash. If a zero-permitting
+          // quantifier follows, the backslash is optional and must not be
+          // committed to the prefix.
+          if quantifier_allows_zero(&chars, i + 1) {
+            break;
+          }
+          let end = pos + ch.len_utf8();
+          prefix.push_str(&pattern[pos..end]);
           escaped = false;
+          i += 1;
           continue;
         }
         // Escape classes/boundaries mean we cannot keep extending the literal prefix.
         'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' => break,
         'p' | 'P' => break,
         _ => {
-          let end = i + ch.len_utf8();
-          prefix.push_str(&pattern[i..end]);
+          // Escaped literal (e.g. `\.`, `\+`, `\?`). The same
+          // quantifier-lookahead rule applies.
+          if quantifier_allows_zero(&chars, i + 1) {
+            break;
+          }
+          let end = pos + ch.len_utf8();
+          prefix.push_str(&pattern[pos..end]);
           escaped = false;
+          i += 1;
           continue;
         }
       }
     }
     match ch {
-      '\\' => escaped = true,
-      '^' if prefix.is_empty() => continue,
-      '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '$' => break,
+      '\\' => {
+        escaped = true;
+        i += 1;
+      }
+      '^' if prefix.is_empty() => {
+        i += 1;
+      }
+      '|' => {
+        // Top-level alternation: no literal prefix is guaranteed to appear
+        // across every branch, so invalidate anything accumulated so far.
+        prefix.clear();
+        break;
+      }
+      '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '$' => break,
       _ => {
-        let end = i + ch.len_utf8();
-        prefix.push_str(&pattern[i..end]);
+        if quantifier_allows_zero(&chars, i + 1) {
+          break;
+        }
+        let end = pos + ch.len_utf8();
+        prefix.push_str(&pattern[pos..end]);
+        i += 1;
       }
     }
   }
   prefix
+}
+
+/// Returns true when `chars[pos]` starts a quantifier that permits zero
+/// occurrences of the preceding atom (`*`, `?`, `{0,…}`, `{,…}`, `{0}`).
+/// Any other char, or a `{…}` whose lower bound is ≥ 1, returns false.
+fn quantifier_allows_zero(chars: &[(usize, char)], pos: usize) -> bool {
+  if pos >= chars.len() {
+    return false;
+  }
+  match chars[pos].1 {
+    '*' | '?' => true,
+    '{' => {
+      // Parse the minimum-occurrences digits; anything that isn't a valid
+      // `{n…}` form is treated as "unknown" (conservative: return false).
+      let digits_start = pos + 1;
+      let mut j = digits_start;
+      while j < chars.len() && chars[j].1.is_ascii_digit() {
+        j += 1;
+      }
+      if j >= chars.len() {
+        return false;
+      }
+      match chars[j].1 {
+        ',' | '}' => {
+          // Empty lower bound (e.g. `{,5}`) is treated as 0.
+          if digits_start == j {
+            return true;
+          }
+          let lower: u64 = chars[digits_start..j]
+            .iter()
+            .map(|(_, c)| *c)
+            .collect::<String>()
+            .parse()
+            .unwrap_or(u64::MAX);
+          lower == 0
+        }
+        _ => false,
+      }
+    }
+    _ => false,
+  }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,4 +710,186 @@ fn expand_term_fuzzy(
     }
   }
   (qualified, keys)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{quantifier_allows_zero, regex_literal_prefix};
+  use crate::util::regex::anchored_regex;
+
+  /// Pins the invariant the whole helper exists to uphold: every term the
+  /// anchored regex could match must start with the returned prefix. If this
+  /// property regresses, `expand_regex` silently drops matching terms.
+  fn assert_prefix_is_safe(pattern: &str, matching: &[&str]) {
+    let regex = anchored_regex(pattern).expect("valid regex");
+    let prefix = regex_literal_prefix(pattern);
+    for term in matching {
+      assert!(
+        regex.is_match(term),
+        "test bug: pattern `{pattern}` must match `{term}`"
+      );
+      assert!(
+        term.starts_with(&prefix),
+        "prefix `{prefix}` is not a prefix of matching term `{term}` (pattern `{pattern}`)"
+      );
+    }
+  }
+
+  #[test]
+  fn plain_literal_is_kept() {
+    assert_eq!(regex_literal_prefix("color"), "color");
+    assert_prefix_is_safe("color", &["color"]);
+  }
+
+  #[test]
+  fn caret_anchor_is_stripped_from_prefix() {
+    assert_eq!(regex_literal_prefix("^color"), "color");
+    assert_prefix_is_safe("^color", &["color"]);
+  }
+
+  #[test]
+  fn optional_char_is_not_committed() {
+    // BUG-202 repro: `colou?r` must match both `color` and `colour`, so the
+    // literal prefix cannot extend past `colo`.
+    assert_eq!(regex_literal_prefix("colou?r"), "colo");
+    assert_prefix_is_safe("colou?r", &["color", "colour"]);
+  }
+
+  #[test]
+  fn question_at_end_trims_last_char() {
+    assert_eq!(regex_literal_prefix("ab?"), "a");
+    assert_prefix_is_safe("ab?", &["a", "ab"]);
+  }
+
+  #[test]
+  fn star_quantifier_trims_last_char() {
+    // `foo*` matches `fo`, `foo`, `fooo`, ... — common prefix is `fo`.
+    assert_eq!(regex_literal_prefix("foo*"), "fo");
+    assert_prefix_is_safe("foo*", &["fo", "foo", "fooo"]);
+  }
+
+  #[test]
+  fn plus_quantifier_keeps_last_char() {
+    // `+` requires at least one occurrence, so `foo+` still implies `foo`.
+    assert_eq!(regex_literal_prefix("foo+"), "foo");
+    assert_prefix_is_safe("foo+", &["foo", "fooo"]);
+  }
+
+  #[test]
+  fn bounded_quantifier_with_zero_lower_trims_last_char() {
+    assert_eq!(regex_literal_prefix("foo{0,3}"), "fo");
+    assert_prefix_is_safe("foo{0,3}", &["fo", "foo", "fooo"]);
+  }
+
+  #[test]
+  fn bounded_quantifier_with_empty_lower_trims_last_char() {
+    // `{,n}` isn't accepted by the regex crate, but treating it as
+    // zero-permitting is still the correct conservative choice: if a future
+    // parser accepts it, the returned prefix must stay safe. So just assert
+    // the computed prefix directly (no compilation through `anchored_regex`).
+    assert_eq!(regex_literal_prefix("foo{,3}"), "fo");
+  }
+
+  #[test]
+  fn bounded_quantifier_with_zero_exact_trims_last_char() {
+    // `{0}` means "zero occurrences of the preceding atom" — the last char
+    // is effectively removed. We still stop there to stay safe.
+    assert_eq!(regex_literal_prefix("foo{0}"), "fo");
+    assert_prefix_is_safe("foo{0}", &["fo"]);
+  }
+
+  #[test]
+  fn bounded_quantifier_with_nonzero_lower_keeps_last_char() {
+    // `{1,3}` and `{5}` both require at least one occurrence, so the last
+    // literal char is still guaranteed to appear.
+    assert_eq!(regex_literal_prefix("foo{1,3}"), "foo");
+    assert_prefix_is_safe("foo{1,3}", &["foo", "fooo"]);
+    assert_eq!(regex_literal_prefix("foo{5}"), "foo");
+    assert_prefix_is_safe("foo{5}", &["foooooo"]);
+  }
+
+  #[test]
+  fn top_level_alternation_clears_prefix() {
+    // BUG-202 repro: `foo|bar` shares no common first character.
+    assert_eq!(regex_literal_prefix("foo|bar"), "");
+    assert_prefix_is_safe("foo|bar", &["foo", "bar"]);
+    assert_eq!(regex_literal_prefix("rust|ruby"), "");
+    assert_prefix_is_safe("rust|ruby", &["rust", "ruby"]);
+  }
+
+  #[test]
+  fn grouped_alternation_keeps_outer_literal_prefix() {
+    // `(` terminates the walk, so everything before it is preserved. The
+    // existing `r(ust|uby)` expansion test relies on this.
+    assert_eq!(regex_literal_prefix("r(ust|uby)"), "r");
+    assert_prefix_is_safe("r(ust|uby)", &["rust", "ruby"]);
+  }
+
+  #[test]
+  fn character_class_terminates_walk() {
+    assert_eq!(regex_literal_prefix("fo[ou]"), "fo");
+    assert_prefix_is_safe("fo[ou]", &["foo", "fou"]);
+  }
+
+  #[test]
+  fn escaped_literal_followed_by_optional_is_dropped() {
+    // `colou\??` is `colou` + literal `?` + optional-quantifier on that `?`.
+    // The literal `?` is therefore optional, so it cannot extend the prefix.
+    assert_eq!(regex_literal_prefix("colou\\??"), "colou");
+    assert_prefix_is_safe("colou\\??", &["colou", "colou?"]);
+  }
+
+  #[test]
+  fn escaped_literal_without_quantifier_is_kept() {
+    assert_eq!(regex_literal_prefix("foo\\.bar"), "foo.bar");
+    assert_prefix_is_safe("foo\\.bar", &["foo.bar"]);
+  }
+
+  #[test]
+  fn escape_class_terminates_walk() {
+    assert_eq!(regex_literal_prefix("foo\\d"), "foo");
+    assert_prefix_is_safe("foo\\d", &["foo0", "foo9"]);
+  }
+
+  #[test]
+  fn dollar_anchor_terminates_walk() {
+    assert_eq!(regex_literal_prefix("foo$"), "foo");
+    assert_prefix_is_safe("foo$", &["foo"]);
+  }
+
+  #[test]
+  fn dot_terminates_walk() {
+    assert_eq!(regex_literal_prefix("foo.bar"), "foo");
+    assert_prefix_is_safe("foo.bar", &["fooxbar", "foo!bar"]);
+  }
+
+  #[test]
+  fn unicode_literal_is_preserved() {
+    assert_eq!(regex_literal_prefix("café"), "café");
+    assert_prefix_is_safe("café", &["café"]);
+  }
+
+  #[test]
+  fn quantifier_allows_zero_covers_bounded_forms() {
+    fn chars(pattern: &str) -> Vec<(usize, char)> {
+      pattern.char_indices().collect()
+    }
+    // Position is the *quantifier* char (or `{`), not the preceding atom.
+    assert!(quantifier_allows_zero(&chars("?"), 0));
+    assert!(quantifier_allows_zero(&chars("*"), 0));
+    assert!(!quantifier_allows_zero(&chars("+"), 0));
+    assert!(quantifier_allows_zero(&chars("{0}"), 0));
+    assert!(quantifier_allows_zero(&chars("{0,3}"), 0));
+    assert!(quantifier_allows_zero(&chars("{0,}"), 0));
+    assert!(quantifier_allows_zero(&chars("{,5}"), 0));
+    assert!(!quantifier_allows_zero(&chars("{1}"), 0));
+    assert!(!quantifier_allows_zero(&chars("{1,3}"), 0));
+    assert!(!quantifier_allows_zero(&chars("{2,}"), 0));
+    assert!(!quantifier_allows_zero(&chars("foo"), 0));
+    // Unterminated / malformed `{…` — conservatively false.
+    assert!(!quantifier_allows_zero(&chars("{"), 0));
+    assert!(!quantifier_allows_zero(&chars("{0"), 0));
+    // Position past the end is false.
+    assert!(!quantifier_allows_zero(&chars("?"), 1));
+  }
 }
