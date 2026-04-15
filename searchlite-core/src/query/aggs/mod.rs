@@ -1483,12 +1483,22 @@ impl<'a> DateHistogramCollector<'a> {
           std::mem::swap(&mut start, &mut end);
         }
         let mut current = start;
+        // Defense-in-depth: cap materialization at `MAX_BUCKETS` so a small
+        // `fixed_interval` combined with a wide `extended_bounds` span cannot
+        // push the process into an unbounded `HashMap` insert loop even if the
+        // request validator is bypassed or weakened (BUG-200). Matches the
+        // runtime cap already present in `HistogramCollector::finish`.
+        let mut materialized: usize = 0;
         while current <= end {
           buckets.entry(current).or_insert_with(|| BucketState {
             key: serde_json::Value::Number(serde_json::Number::from(current)),
             doc_count: 0,
             aggs: BTreeMap::new(),
           });
+          materialized = materialized.saturating_add(1);
+          if materialized >= MAX_BUCKETS {
+            break;
+          }
           current = match add_interval(current, &self.interval) {
             Some(next) => next,
             None => break,
@@ -3661,6 +3671,74 @@ fn intersect_fill_range_i64(
   }
 }
 
+/// Returns `true` when the inclusive bucket count implied by a date_histogram's
+/// `extended_bounds` (clipped to `hard_bounds`, if any) exceeds [`MAX_BUCKETS`].
+///
+/// The computation mirrors [`DateHistogramCollector::finish`] exactly: both
+/// sides of the range are pushed through [`bucket_start`] first, then for
+/// `Calendar` intervals we walk the range with [`add_interval`] (bailing out
+/// the moment we cross `MAX_BUCKETS`), and for `Fixed` intervals we divide the
+/// inclusive span by the step. Using a naive `(max - min) / interval` here
+/// would miss the fence-post bucket and ignore `offset`, letting a pathological
+/// request slip past the cap by one or two buckets.
+///
+/// Returns `false` when there are no bounds to materialize, when the parsed
+/// interval is degenerate, or when the implied span is at or below the cap.
+/// Callers are expected to have already rejected degenerate intervals.
+pub(crate) fn date_histogram_span_exceeds_cap(
+  extended: Option<(i64, i64)>,
+  hard: Option<(i64, i64)>,
+  offset_ms: i64,
+  fixed_millis: Option<i64>,
+  calendar: Option<CalendarUnit>,
+) -> bool {
+  let interval = if let Some(cal) = calendar {
+    DateInterval::Calendar(cal)
+  } else if let Some(millis) = fixed_millis {
+    if millis <= 0 {
+      return false;
+    }
+    DateInterval::Fixed(millis)
+  } else {
+    return false;
+  };
+  let Some((min, max)) = intersect_fill_range_i64(extended, hard) else {
+    return false;
+  };
+  let (Some(mut start), Some(mut end)) = (
+    bucket_start(min, offset_ms, &interval),
+    bucket_start(max, offset_ms, &interval),
+  ) else {
+    return false;
+  };
+  if start > end {
+    std::mem::swap(&mut start, &mut end);
+  }
+  match &interval {
+    DateInterval::Fixed(step) => {
+      let diff = end.saturating_sub(start);
+      // `step > 0` guaranteed above; inclusive count = (end - start)/step + 1.
+      let span = (diff / *step).saturating_add(1);
+      span > MAX_BUCKETS as i64
+    }
+    DateInterval::Calendar(_) => {
+      let mut cur = start;
+      let mut count: usize = 1;
+      while cur < end {
+        cur = match add_interval(cur, &interval) {
+          Some(next) => next,
+          None => break,
+        };
+        count = count.saturating_add(1);
+        if count > MAX_BUCKETS {
+          return true;
+        }
+      }
+      false
+    }
+  }
+}
+
 pub(crate) fn parse_calendar_interval(spec: &str) -> Option<CalendarUnit> {
   match spec.to_ascii_lowercase().as_str() {
     "day" | "1d" => Some(CalendarUnit::Day),
@@ -3945,6 +4023,115 @@ mod tests {
       intersect_fill_range_i64(Some((0, 10)), Some((20, 50))),
       None
     );
+  }
+
+  /// BUG-200: the helper feeding `validate_date_histogram_config` must use the
+  /// same inclusive `bucket_start(min)..=bucket_start(max)` span the collector
+  /// materializes — otherwise a pathologically small `fixed_interval` + wide
+  /// bounds can either slip past validation by one bucket (fence-post) or
+  /// silently allow a request that the runtime cap will later truncate.
+  #[test]
+  fn date_histogram_span_exceeds_cap_flags_wide_fixed_interval() {
+    // 4-year span at 1ms — the exact repro from the issue.
+    let four_years_ms: i64 = 4 * 365 * 86_400_000;
+    let extended = Some((0_i64, four_years_ms));
+    assert!(date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_fence_post_rejected() {
+    // 10_000 seconds at 1s → inclusive count = 10_001 (one above cap).
+    let extended = Some((0_i64, 10_000_000_i64));
+    assert!(date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1_000),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_exact_boundary_accepted() {
+    // 9_999 seconds at 1s → inclusive count = 10_000 (exactly at cap).
+    let extended = Some((0_i64, 9_999_000_i64));
+    assert!(!date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1_000),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_honors_intersection_with_hard_bounds() {
+    // extended is huge, but hard_bounds clips it to a tiny sub-range —
+    // materialization is bounded by the intersection, not the union.
+    let huge: (i64, i64) = (0, 4 * 365 * 86_400_000);
+    let tiny_hard: (i64, i64) = (0, 1_000); // 1s at 1ms step = 1001 buckets.
+    assert!(!date_histogram_span_exceeds_cap(
+      Some(huge),
+      Some(tiny_hard),
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_no_bounds_is_safe() {
+    // With neither bound set, no empty buckets are materialized — safe.
+    assert!(!date_histogram_span_exceeds_cap(
+      None,
+      None,
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_calendar_day_wide_range_rejected() {
+    // ~100 years of day buckets is well above MAX_BUCKETS.
+    let start = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap()
+      .and_utc()
+      .timestamp_millis();
+    let end = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap()
+      .and_utc()
+      .timestamp_millis();
+    assert!(date_histogram_span_exceeds_cap(
+      Some((start, end)),
+      None,
+      0,
+      None,
+      Some(CalendarUnit::Day)
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_degenerate_fixed_is_safe() {
+    // A `Fixed(0)` is rejected earlier in the validator chain; if it ever
+    // reaches the span helper, return `false` rather than dividing by zero.
+    assert!(!date_histogram_span_exceeds_cap(
+      Some((0_i64, 1_000)),
+      None,
+      0,
+      Some(0),
+      None
+    ));
   }
 
   #[test]
