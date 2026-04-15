@@ -24,7 +24,9 @@ use crate::index::postings::PostingsReader;
 use crate::index::segment::SegmentReader;
 use crate::index::InnerIndex;
 use crate::query::aggregation::AggregationPipeline;
-use crate::query::aggs::{parse_calendar_interval, parse_date, parse_interval_seconds};
+use crate::query::aggs::{
+  date_histogram_span_exceeds_cap, parse_calendar_interval, parse_date, parse_interval_seconds,
+};
 use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
 use crate::query::planner::{build_query_plan, QueryMatcher, ScorePlan};
@@ -3037,6 +3039,50 @@ fn validate_date_histogram_config(name: &str, agg: &DateHistogramAggregation) ->
           .into(),
         );
       }
+    }
+  }
+  // Reject requests whose implied empty-bucket span exceeds the runtime cap.
+  // Mirrors the histogram-side check (`validate_histogram_config`) and closes
+  // the unbounded materialization window in `DateHistogramCollector::finish`
+  // reachable via a small `fixed_interval` + wide `extended_bounds` (BUG-200).
+  if agg.extended_bounds.is_some() || agg.hard_bounds.is_some() {
+    let extended = agg
+      .extended_bounds
+      .as_ref()
+      .and_then(|b| Some((parse_date(&b.min)? as i64, parse_date(&b.max)? as i64)));
+    let hard = agg
+      .hard_bounds
+      .as_ref()
+      .and_then(|b| Some((parse_date(&b.min)? as i64, parse_date(&b.max)? as i64)));
+    let offset_ms = agg
+      .offset
+      .as_ref()
+      .and_then(|s| parse_interval_seconds(s))
+      .map(|s| (s * 1_000.0) as i64)
+      .unwrap_or(0);
+    let calendar = agg
+      .calendar_interval
+      .as_ref()
+      .and_then(|s| parse_calendar_interval(s));
+    let fixed_millis = if calendar.is_some() {
+      None
+    } else {
+      agg
+        .fixed_interval
+        .as_ref()
+        .and_then(|s| parse_interval_seconds(s))
+        .map(|s| (s * 1_000.0) as i64)
+    };
+    if date_histogram_span_exceeds_cap(extended, hard, offset_ms, fixed_millis, calendar) {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "date_histogram `{name}` bounds span produces too many empty buckets (limit {})",
+            crate::query::aggs::MAX_BUCKETS
+          ),
+        }
+        .into(),
+      );
     }
   }
   Ok(())

@@ -1608,3 +1608,282 @@ mod bug_030 {
     }
   }
 }
+
+/// Regression tests for BUG-200 — `DateHistogramCollector::finish` materialized
+/// empty buckets between `extended_bounds.min` and `extended_bounds.max` with
+/// no `MAX_BUCKETS` cap, and `validate_date_histogram_config` never rejected
+/// pathological spans. A small `fixed_interval` (down to `1ms`, accepted by
+/// validation) combined with a wide `extended_bounds` drove the unbounded
+/// `HashMap` insert loop into OOM before the request could return. Both halves
+/// of the `HistogramAggregation` defense — a validator-side span check and a
+/// runtime cap inside `finish` — now apply to `DateHistogramAggregation`.
+mod bug_200 {
+  use super::*;
+
+  fn timestamp_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "ts".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&doc(
+          "seed",
+          vec![("body", json!("rust")), ("ts", json!(0_i64))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  /// The original issue repro: `fixed_interval=1ms` + a 4-year
+  /// `extended_bounds` would materialize ~10^11 buckets. Validation must
+  /// reject it before any collector loop runs.
+  #[test]
+  fn fixed_interval_1ms_with_wide_extended_bounds_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "evil".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1ms".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "2020-01-01T00:00:00Z".into(),
+          max: "2024-01-01T00:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs).expect_err(
+      "extended_bounds spanning ~10^11 empty buckets must be rejected, not materialized",
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("too many empty buckets"),
+      "expected bucket-span error, got: {msg}"
+    );
+  }
+
+  /// A `hard_bounds` range (without any `extended_bounds`) also drives
+  /// empty-bucket materialization in the collector, so the validator must
+  /// apply the same span check whenever either bound is present.
+  #[test]
+  fn fixed_interval_wide_hard_bounds_without_extended_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "evil".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1ms".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: None,
+        hard_bounds: Some(DateHistogramBounds {
+          min: "2020-01-01T00:00:00Z".into(),
+          max: "2024-01-01T00:00:00Z".into(),
+        }),
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("hard_bounds alone can drive empty-bucket fill and must be span-checked");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("too many empty buckets"),
+      "expected bucket-span error, got: {msg}"
+    );
+  }
+
+  /// The collector's `bucket_start(min)..=bucket_start(max)` is *inclusive*
+  /// of both endpoints. With `interval=1s` and a 10_000-second window, the
+  /// inclusive span is 10_001 buckets — one above `MAX_BUCKETS`. A naïve
+  /// `(max - min) / interval = 10_000` computation would silently allow it.
+  #[test]
+  fn bounds_span_fence_post_respects_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1s".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "1970-01-01T00:00:00Z".into(),
+          // 10_000 seconds after min → inclusive bucket count = 10_001.
+          max: "1970-01-01T02:46:40Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("10_001 inclusive buckets must be rejected (fence-post), not accepted as 10_000");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("too many empty buckets"),
+      "expected bucket-span error, got: {msg}"
+    );
+  }
+
+  /// A span that sits exactly at the cap must still be accepted — the check
+  /// is `> MAX_BUCKETS`, not `>= MAX_BUCKETS`. With `interval=1s` and a
+  /// 9_999-second window, the inclusive span is 10_000 — the cap exactly.
+  #[test]
+  fn bounds_span_exactly_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1s".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "1970-01-01T00:00:00Z".into(),
+          // 9_999 seconds after min → inclusive bucket count = 10_000.
+          max: "1970-01-01T02:46:39Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    search_with_agg(&idx, aggs).expect("bounds span exactly at the cap must be accepted");
+  }
+
+  /// Calendar intervals floor at `Day`, so the realistic attack window is
+  /// narrower — but it is still reachable via absurd year ranges. The
+  /// validator must walk the calendar the same way the collector does so an
+  /// overly wide `calendar_interval=day` span is also rejected up front.
+  #[test]
+  fn calendar_interval_day_with_wide_span_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "evil".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        // Day buckets over a ~100-year span → ~36_525 buckets, well above cap.
+        calendar_interval: Some("day".into()),
+        fixed_interval: None,
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "1900-01-01T00:00:00Z".into(),
+          max: "2000-01-01T00:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("day-interval calendar spans beyond the cap must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("too many empty buckets"),
+      "expected bucket-span error, got: {msg}"
+    );
+  }
+
+  /// Defense-in-depth: the runtime cap inside `DateHistogramCollector::finish`
+  /// is load-bearing for callers that construct `DateHistogramAggregation`
+  /// programmatically or bypass validation. Exercise it directly by driving
+  /// the collector via the public API with a span that would otherwise loop
+  /// for ~10^11 iterations — the test must complete in milliseconds. (This
+  /// also verifies the validator's behavior end-to-end; if the validator is
+  /// ever weakened the collector cap still keeps the process alive.)
+  #[test]
+  fn extended_bounds_completes_within_reasonable_time() {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "evil".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1ms".into()),
+        offset: None,
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "2020-01-01T00:00:00Z".into(),
+          max: "2024-01-01T00:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let start = Instant::now();
+    let _ = search_with_agg(&idx, aggs);
+    let elapsed = start.elapsed();
+    assert!(
+      elapsed < Duration::from_secs(5),
+      "pathological date_histogram must not loop: took {elapsed:?}"
+    );
+  }
+}

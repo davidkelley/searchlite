@@ -1483,12 +1483,22 @@ impl<'a> DateHistogramCollector<'a> {
           std::mem::swap(&mut start, &mut end);
         }
         let mut current = start;
+        // Defense-in-depth: cap materialization at `MAX_BUCKETS` so a small
+        // `fixed_interval` combined with a wide `extended_bounds` span cannot
+        // push the process into an unbounded `HashMap` insert loop even if the
+        // request validator is bypassed or weakened (BUG-200). Matches the
+        // runtime cap already present in `HistogramCollector::finish`.
+        let mut materialized: usize = 0;
         while current <= end {
           buckets.entry(current).or_insert_with(|| BucketState {
             key: serde_json::Value::Number(serde_json::Number::from(current)),
             doc_count: 0,
             aggs: BTreeMap::new(),
           });
+          materialized = materialized.saturating_add(1);
+          if materialized >= MAX_BUCKETS {
+            break;
+          }
           current = match add_interval(current, &self.interval) {
             Some(next) => next,
             None => break,
@@ -3658,6 +3668,74 @@ fn intersect_fill_range_i64(
     (Some(eb), None) => Some(eb),
     (None, Some(hb)) => Some(hb),
     (None, None) => None,
+  }
+}
+
+/// Returns `true` when the inclusive bucket count implied by a date_histogram's
+/// `extended_bounds` (clipped to `hard_bounds`, if any) exceeds [`MAX_BUCKETS`].
+///
+/// The computation mirrors [`DateHistogramCollector::finish`] exactly: both
+/// sides of the range are pushed through [`bucket_start`] first, then for
+/// `Calendar` intervals we walk the range with [`add_interval`] (bailing out
+/// the moment we cross `MAX_BUCKETS`), and for `Fixed` intervals we divide the
+/// inclusive span by the step. Using a naive `(max - min) / interval` here
+/// would miss the fence-post bucket and ignore `offset`, letting a pathological
+/// request slip past the cap by one or two buckets.
+///
+/// Returns `false` when there are no bounds to materialize, when the parsed
+/// interval is degenerate, or when the implied span is at or below the cap.
+/// Callers are expected to have already rejected degenerate intervals.
+pub(crate) fn date_histogram_span_exceeds_cap(
+  extended: Option<(i64, i64)>,
+  hard: Option<(i64, i64)>,
+  offset_ms: i64,
+  fixed_millis: Option<i64>,
+  calendar: Option<CalendarUnit>,
+) -> bool {
+  let interval = if let Some(cal) = calendar {
+    DateInterval::Calendar(cal)
+  } else if let Some(millis) = fixed_millis {
+    if millis <= 0 {
+      return false;
+    }
+    DateInterval::Fixed(millis)
+  } else {
+    return false;
+  };
+  let Some((min, max)) = intersect_fill_range_i64(extended, hard) else {
+    return false;
+  };
+  let (Some(mut start), Some(mut end)) = (
+    bucket_start(min, offset_ms, &interval),
+    bucket_start(max, offset_ms, &interval),
+  ) else {
+    return false;
+  };
+  if start > end {
+    std::mem::swap(&mut start, &mut end);
+  }
+  match &interval {
+    DateInterval::Fixed(step) => {
+      let diff = end.saturating_sub(start);
+      // `step > 0` guaranteed above; inclusive count = (end - start)/step + 1.
+      let span = (diff / *step).saturating_add(1);
+      span > MAX_BUCKETS as i64
+    }
+    DateInterval::Calendar(_) => {
+      let mut cur = start;
+      let mut count: usize = 1;
+      while cur < end {
+        cur = match add_interval(cur, &interval) {
+          Some(next) => next,
+          None => break,
+        };
+        count = count.saturating_add(1);
+        if count > MAX_BUCKETS {
+          return true;
+        }
+      }
+      false
+    }
   }
 }
 
