@@ -114,24 +114,35 @@ fn to_js_error(err: impl std::fmt::Display) -> JsValue {
 /// `candidate_size` exceed [`WASM_MAX_PAGE_SIZE`]. A JS caller that passes
 /// `limit = u32::MAX` would otherwise drive the result heap until the
 /// WebAssembly linear memory aborts the module with no recovery path.
+///
+/// The `limit`/`from`/`from + limit` caps are gated on `req.return_hits`
+/// to mirror `IndexReader::search()` in `searchlite-core`: those values
+/// only drive the top-k result heap when hits are actually returned, so
+/// aggregation-only or metadata queries (which set `return_hits = false`)
+/// can legitimately use larger pagination values without WASM rejecting
+/// requests that core and HTTP would accept. `candidate_size` is checked
+/// unconditionally because it shapes the WAND/BMW candidate buffer
+/// regardless of whether hits are returned.
 fn validate_search_limits(req: &SearchRequest) -> Result<(), JsValue> {
-  if req.limit > WASM_MAX_PAGE_SIZE {
-    return Err(JsValue::from_str(&format!(
-      "limit {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
-      req.limit
-    )));
-  }
-  if req.from > WASM_MAX_PAGE_SIZE {
-    return Err(JsValue::from_str(&format!(
-      "from {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
-      req.from
-    )));
-  }
-  if req.from.saturating_add(req.limit) > WASM_MAX_PAGE_SIZE {
-    return Err(JsValue::from_str(&format!(
-      "from + limit ({}) exceeds max page size {WASM_MAX_PAGE_SIZE}",
-      req.from.saturating_add(req.limit),
-    )));
+  if req.return_hits {
+    if req.limit > WASM_MAX_PAGE_SIZE {
+      return Err(JsValue::from_str(&format!(
+        "limit {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+        req.limit
+      )));
+    }
+    if req.from > WASM_MAX_PAGE_SIZE {
+      return Err(JsValue::from_str(&format!(
+        "from {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+        req.from
+      )));
+    }
+    if req.from.saturating_add(req.limit) > WASM_MAX_PAGE_SIZE {
+      return Err(JsValue::from_str(&format!(
+        "from + limit ({}) exceeds max page size {WASM_MAX_PAGE_SIZE}",
+        req.from.saturating_add(req.limit),
+      )));
+    }
   }
   if let Some(candidate_size) = req.candidate_size {
     if candidate_size > WASM_MAX_PAGE_SIZE {
@@ -1298,6 +1309,53 @@ mod tests {
     let err = idx
       .search_request_value(request_js)
       .expect_err("oversized limit must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
+  }
+
+  // BUG-025 follow-up: aggregation-only / metadata queries that disable
+  // hits don't grow the result heap, so the page-size cap must mirror
+  // core's behavior and skip the `limit`/`from`/`from + limit` checks
+  // when `return_hits = false`. `candidate_size` is still capped because
+  // it shapes the WAND/BMW candidate buffer either way.
+  #[wasm_bindgen_test]
+  async fn search_request_skips_page_cap_when_return_hits_false() {
+    let db = unique_db("searchlite-bug-025-no-hits");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    // `from + limit` well above the cap, but `return_hits = false` — must
+    // be accepted, matching `IndexReader::search()`.
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "from": WASM_MAX_PAGE_SIZE + 1,
+      "return_hits": false,
+    });
+    idx
+      .search_request(request.to_string())
+      .expect("oversized limit/from must be allowed when return_hits=false");
+
+    // `candidate_size` cap still applies, since the candidate buffer is
+    // shaped by `candidate_size` regardless of whether hits are returned.
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": 1,
+      "return_hits": false,
+      "candidate_size": WASM_MAX_PAGE_SIZE + 1,
+    });
+    let err = idx
+      .search_request(request.to_string())
+      .expect_err("oversized candidate_size must be rejected even when return_hits=false");
     assert!(
       err
         .as_string()
