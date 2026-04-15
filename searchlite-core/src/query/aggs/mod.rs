@@ -589,7 +589,12 @@ impl QuantileState {
       return 0.0;
     };
     let min_val = digest.estimate_quantile(0.0);
-    if target <= min_val {
+    // Use a strict `<` here so that `target == min_val` falls through to the
+    // binary search, which matches the exact path's inclusive semantics
+    // (`count of v <= target`). A `<=` comparison would incorrectly short-circuit
+    // to 0.0 whenever the caller targeted the observed minimum, even though one
+    // or more values in the population are equal to it.
+    if target < min_val {
       return 0.0;
     }
     let max_val = digest.estimate_quantile(1.0);
@@ -2121,11 +2126,14 @@ impl<'a> TopHitsCollector<'a> {
   fn finish(mut self) -> TopHitsState {
     let mut ranked: Vec<RankedDoc> = self.heap.drain().collect();
     ranked.sort_by(|a, b| a.key.cmp(&b.key));
-    let start = self.from.min(ranked.len());
-    let end = (start + self.size).min(ranked.len());
-    let mut hits = Vec::with_capacity(end.saturating_sub(start));
-    for doc in ranked.into_iter().skip(start).take(self.size) {
-      let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    // Keep all top `(from + size)` ranked items for this segment; the final
+    // `from` skip is applied once globally after segments are merged in
+    // `finalize_response`. Applying the skip here would discard items whose
+    // segment-local rank is `< from` but whose global rank is within the
+    // requested `[from, from + size)` page — see BUG-215 for details.
+    let mut hits = Vec::with_capacity(ranked.len());
+    let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    for doc in ranked.into_iter() {
       let fetched = if need_doc {
         self.ctx.segment.get_doc(doc.doc_id).ok()
       } else {
@@ -2682,8 +2690,11 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
   }
   let mut hits: Vec<_> = heap.into_iter().collect();
   hits.sort_by(|a, b| a.key.cmp(&b.key));
-  let start = target.from.min(hits.len());
-  target.hits = hits.into_iter().skip(start).take(target.size).collect();
+  // Keep the full merged top `(from + size)` window; the `from` skip is
+  // applied once in `finalize_response` so that per-segment items at ranks
+  // `[0, from)` are not discarded before the merge can compare them against
+  // other segments (BUG-215).
+  target.hits = hits;
 }
 
 fn bucket_key_string(key: &serde_json::Value) -> String {
@@ -2928,10 +2939,24 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
         values: compute_percentile_ranks_from_state(state),
       })
     }
-    AggregationIntermediate::TopHits(state) => AggregationResponse::TopHits(TopHitsResponse {
-      total: state.total,
-      hits: state.hits.into_iter().map(|h| h.hit).collect(),
-    }),
+    AggregationIntermediate::TopHits(state) => {
+      // `state.hits` holds the top `(from + size)` merged hits; apply the
+      // final `from` skip and truncate to `size` to produce the response
+      // page. Doing the skip here (instead of per-segment) ensures items at
+      // segment-local ranks `[0, from)` can still win the global `[from,
+      // from + size)` window after cross-segment merging.
+      let start = state.from.min(state.hits.len());
+      AggregationResponse::TopHits(TopHitsResponse {
+        total: state.total,
+        hits: state
+          .hits
+          .into_iter()
+          .skip(start)
+          .take(state.size)
+          .map(|h| h.hit)
+          .collect(),
+      })
+    }
     AggregationIntermediate::Filter {
       bucket,
       pipeline,

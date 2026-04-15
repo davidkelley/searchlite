@@ -10,6 +10,7 @@ use crate::api::types::{FuzzyOptions, MultiMatchFuzziness};
 use crate::index::manifest::{FieldKind, Schema, SchemaAnalyzers};
 use crate::index::segment::SegmentReader;
 use crate::query::planner::{TermExpansion, TermGroupMode, TermGroupSpec};
+use crate::util::case_fold::fold_keyword;
 use crate::util::regex::anchored_regex;
 
 use super::phrase::TermMatchGroup;
@@ -183,7 +184,7 @@ pub(crate) fn expand_term_groups(
           }
         }
         FieldKind::Keyword => {
-          let term = group.term.to_ascii_lowercase();
+          let term = fold_keyword(&group.term).into_owned();
           let term_fuzzy =
             resolve_multi_match_fuzzy_options(group.fuzziness.as_ref(), request_fuzzy, &term);
           let (scored, mut expanded_keys) = expand_term_for_group(

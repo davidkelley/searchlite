@@ -1896,3 +1896,213 @@ mod bug_200 {
     );
   }
 }
+
+/// Regression coverage for BUG-215: `top_hits` with `from > 0` on a
+/// multi-segment index must return the globally `from`-th through
+/// `(from + size - 1)`-th best documents.
+///
+/// Before the fix, `TopHitsCollector::finish` dropped items at per-segment
+/// ranks `[0, from)` *before* `merge_top_hits` could compare them across
+/// segments. On a two-segment index that produced an answer drawn from the
+/// per-segment `[from, from + size)` window of each segment, which is not
+/// the same as the global top `(from + size)` window.
+mod bug_215 {
+  use super::*;
+
+  #[test]
+  fn top_hits_from_offset_is_global_across_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Segment A: scores 10, 8, 6, 4, 2.
+      for (id, s) in [(1_i64, 10_i64), (2, 8), (3, 6), (4, 4), (5, 2)] {
+        writer
+          .add_document(&doc(
+            &format!("a-{id}"),
+            vec![("body", json!("rust")), ("score", json!(s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      // Segment B: scores 9, 7, 5, 3, 1. Separate commit creates a second
+      // segment, which is the precondition for the bug.
+      for (id, s) in [(6_i64, 9_i64), (7, 7), (8, 5), (9, 3), (10, 1)] {
+        writer
+          .add_document(&doc(
+            &format!("b-{id}"),
+            vec![("body", json!("rust")), ("score", json!(s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size: 2,
+        from: 1,
+        fields: Some(vec!["score".into()]),
+        sort: vec![SortSpec {
+          field: "score".into(),
+          order: Some(SortOrder::Desc),
+        }],
+        highlight_field: None,
+      }),
+    );
+
+    let resp = idx
+      .reader()
+      .unwrap()
+      .search(&SearchRequest {
+        query: "rust".into(),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        track_total_hits: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs,
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let agg = resp.aggregations.get("hits").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::TopHits(top_hits) = agg {
+      assert_eq!(top_hits.total, 10);
+      let scores: Vec<_> = top_hits
+        .hits
+        .iter()
+        .map(|h| {
+          h.fields
+            .as_ref()
+            .and_then(|f| f.get("score"))
+            .and_then(|v| v.as_i64())
+            .unwrap()
+        })
+        .collect();
+      // Global sorted order is [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]; skipping
+      // `from = 1` and taking `size = 2` yields [9, 8]. The pre-fix
+      // behaviour returned [7, 6] because segment B's top-ranked doc
+      // (score 9) was discarded by the per-segment `from` skip before the
+      // cross-segment merge ever saw it.
+      assert_eq!(scores, vec![9, 8]);
+    } else {
+      panic!("expected top hits response");
+    }
+  }
+
+  /// Deep `from` (larger than any single segment's per-segment `from`
+  /// window alone) still returns globally-correct results.
+  #[test]
+  fn top_hits_deep_from_across_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Segment A: odd scores 1, 3, ..., 19.
+      let odd: Vec<i64> = (1..=19).filter(|s| s % 2 == 1).collect();
+      for s in &odd {
+        writer
+          .add_document(&doc(
+            &format!("a-{s}"),
+            vec![("body", json!("rust")), ("score", json!(*s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      // Segment B: even scores 2, 4, ..., 20.
+      let even: Vec<i64> = (2..=20).filter(|s| s % 2 == 0).collect();
+      for s in &even {
+        writer
+          .add_document(&doc(
+            &format!("b-{s}"),
+            vec![("body", json!("rust")), ("score", json!(*s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size: 3,
+        from: 4,
+        fields: Some(vec!["score".into()]),
+        sort: vec![SortSpec {
+          field: "score".into(),
+          order: Some(SortOrder::Desc),
+        }],
+        highlight_field: None,
+      }),
+    );
+
+    let mut req = SearchRequest::new("rust");
+    req.limit = 1;
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).unwrap();
+
+    let agg = resp.aggregations.get("hits").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::TopHits(top_hits) = agg {
+      assert_eq!(top_hits.total, 20);
+      let scores: Vec<_> = top_hits
+        .hits
+        .iter()
+        .map(|h| {
+          h.fields
+            .as_ref()
+            .and_then(|f| f.get("score"))
+            .and_then(|v| v.as_i64())
+            .unwrap()
+        })
+        .collect();
+      // Global descending order is 20, 19, ..., 1. Skipping `from = 4`
+      // and taking `size = 3` yields [16, 15, 14].
+      assert_eq!(scores, vec![16, 15, 14]);
+    } else {
+      panic!("expected top hits response");
+    }
+  }
+}
