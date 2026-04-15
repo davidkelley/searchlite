@@ -30,6 +30,7 @@ use crate::index::manifest::{
 use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
 use crate::storage::{Storage, StorageFile};
+use crate::util::case_fold::fold_keyword;
 use crate::util::checksum::checksum;
 #[cfg(feature = "vectors")]
 use crate::vectors::hnsw::HnswParams;
@@ -720,8 +721,8 @@ impl<'a> SegmentWriter<'a> {
         let is_nested_field = field.contains('.');
         for value in values.iter() {
           if indexed {
-            let lower = value.to_ascii_lowercase();
-            if seen_terms.insert(lower.clone()) {
+            let lower = fold_keyword(value);
+            if seen_terms.insert(lower.clone().into_owned()) {
               let mut term_key = String::with_capacity(field.len() + lower.len() + 1);
               term_key.push_str(field);
               term_key.push(':');

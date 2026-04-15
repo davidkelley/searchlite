@@ -12,6 +12,7 @@ use crate::api::reader::IndexReader;
 use crate::api::types::{FuzzyOptions, SuggestOption, SuggestRequest, SuggestResult};
 use crate::index::manifest::FieldKind;
 use crate::index::segment::SegmentReader;
+use crate::util::case_fold::fold_keyword;
 
 #[derive(Default)]
 struct SuggestCandidate {
@@ -133,7 +134,7 @@ impl IndexReader {
         inputs.dedup();
         Ok(inputs)
       }
-      FieldKind::Keyword => Ok(vec![prefix.to_ascii_lowercase()]),
+      FieldKind::Keyword => Ok(vec![fold_keyword(prefix).into_owned()]),
       FieldKind::Numeric | FieldKind::Unknown => {
         bail!("completion suggest is only supported on text/keyword fields")
       }
