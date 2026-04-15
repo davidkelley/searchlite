@@ -380,8 +380,8 @@ mod tests {
         .collect(),
     };
     wal.append_add_doc(&doc).unwrap();
-    // Flip a trailing byte to corrupt the checksum on a synthetic second
-    // entry appended by hand.
+    // Append a synthetic second entry by hand with intentionally invalid
+    // checksum bytes so replay stops at the bad tail entry.
     let mut raw = std::fs::read(&path).unwrap();
     let mut bad = Vec::new();
     let payload = serde_json::to_vec(&doc).unwrap();
