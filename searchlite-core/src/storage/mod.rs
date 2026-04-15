@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
+use uuid::Uuid;
 
 pub trait StorageFile: Read + Write + Seek + Send {
   fn set_len(&mut self, len: u64) -> Result<()>;
@@ -102,16 +103,37 @@ impl Storage for FsStorage {
   }
 
   fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // The staging file must not collide with any other in-flight `atomic_write`
+    // targeting a sibling file. `Path::with_extension("tmp")` replaces the
+    // existing extension, so `foo.json` and `foo.meta` both reduce to
+    // `foo.tmp` and race on the same file — one caller's payload can end up
+    // under the other caller's final path (see BUG-019 / #157). Appending a
+    // per-call UUID suffix to the full file name keeps siblings isolated while
+    // still placing the staging file next to the target so the `rename` stays
+    // on the same filesystem (and therefore atomic).
+    let file_name = path
+      .file_name()
+      .ok_or_else(|| anyhow!("atomic_write target has no file name: {path:?}"))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".tmp-{}", Uuid::new_v4()));
+    let tmp = path.with_file_name(tmp_name);
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
+    // RAII guard: if any step between `File::create` and a successful `rename`
+    // returns early, the staging file is best-effort removed so repeated I/O
+    // failures (disk full, EIO, interrupted sync) don't accumulate stale
+    // `.tmp-<uuid>` entries next to the target.
+    let mut guard = TmpCleanup::new(&tmp);
     {
       let mut file = File::create(&tmp)?;
       file.write_all(data)?;
       file.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    // Rename succeeded: the staging name no longer refers to our bytes, so
+    // there is nothing for the guard to clean up.
+    guard.disarm();
     sync_dir(path)?;
     Ok(())
   }
@@ -144,6 +166,36 @@ fn sync_dir(path: &Path) -> Result<()> {
     dir.sync_all()?;
   }
   Ok(())
+}
+
+/// Drop-guard that best-effort removes an `atomic_write` staging file if the
+/// caller returns early (create / write / sync / rename failure). After a
+/// successful rename the guard is disarmed because the staging name no longer
+/// refers to the bytes we wrote.
+struct TmpCleanup<'a> {
+  path: &'a Path,
+  armed: bool,
+}
+
+impl<'a> TmpCleanup<'a> {
+  fn new(path: &'a Path) -> Self {
+    Self { path, armed: true }
+  }
+
+  fn disarm(&mut self) {
+    self.armed = false;
+  }
+}
+
+impl Drop for TmpCleanup<'_> {
+  fn drop(&mut self) {
+    if self.armed {
+      // Best-effort: we're already unwinding or returning an error, so a
+      // cleanup failure is just a leaked staging file — strictly worse to
+      // mask the original error by propagating this one.
+      let _ = fs::remove_file(self.path);
+    }
+  }
 }
 
 pub struct InMemoryStorage {
@@ -306,5 +358,137 @@ impl StorageFile for MemFile {
 
   fn sync_all(&mut self) -> Result<()> {
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::Barrier;
+  use std::thread;
+
+  #[test]
+  fn atomic_write_persists_payload_under_target_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path().to_path_buf());
+    let target = dir.path().join("foo.json");
+    storage.atomic_write(&target, b"hello").unwrap();
+    let got = fs::read(&target).unwrap();
+    assert_eq!(got, b"hello");
+  }
+
+  /// Regression for BUG-019: `Path::with_extension("tmp")` collapsed siblings
+  /// that share a stem onto the same staging path, so interleaved writes could
+  /// swap payloads or leave a target missing. The staging path must now be
+  /// unique per call, so concurrent writes to sibling files both land intact.
+  #[test]
+  fn atomic_write_isolates_concurrent_sibling_writes() {
+    // Repeat a few times so interleavings that the old implementation would
+    // lose are very likely to surface if the fix regresses.
+    for _ in 0..16 {
+      let dir = tempfile::tempdir().unwrap();
+      let storage = Arc::new(FsStorage::new(dir.path().to_path_buf()));
+      let a = dir.path().join("shared.json");
+      let b = dir.path().join("shared.meta");
+      let c = dir.path().join("shared.checksum");
+      let barrier = Arc::new(Barrier::new(3));
+
+      let handles: Vec<_> = [
+        (a.clone(), b"A-payload".to_vec()),
+        (b.clone(), b"B-payload".to_vec()),
+        (c.clone(), b"C-payload".to_vec()),
+      ]
+      .into_iter()
+      .map(|(path, data)| {
+        let storage = Arc::clone(&storage);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+          barrier.wait();
+          storage.atomic_write(&path, &data).unwrap();
+        })
+      })
+      .collect();
+
+      for h in handles {
+        h.join().unwrap();
+      }
+
+      assert_eq!(fs::read(&a).unwrap(), b"A-payload");
+      assert_eq!(fs::read(&b).unwrap(), b"B-payload");
+      assert_eq!(fs::read(&c).unwrap(), b"C-payload");
+
+      // No staging files should be left behind after a successful run.
+      let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .collect();
+      assert!(
+        leftovers.is_empty(),
+        "unexpected staging files left behind: {leftovers:?}"
+      );
+    }
+  }
+
+  /// Regression for Copilot feedback on BUG-019: when any step between
+  /// `File::create` and a successful `rename` fails (write, sync, rename), the
+  /// staging file must be cleaned up — otherwise repeated I/O failures (disk
+  /// full, EIO, interrupted sync) accumulate stale `.tmp-<uuid>` files next to
+  /// the target. We drive the failure by pointing `atomic_write` at a target
+  /// path that is an existing non-empty directory: `File::create` on the
+  /// staging path still succeeds, but `fs::rename(tmp, target)` fails because
+  /// the target directory is not empty. After the failure the parent must
+  /// contain no leftover staging files.
+  #[test]
+  fn atomic_write_removes_staging_file_on_rename_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path().to_path_buf());
+    let target = dir.path().join("occupied");
+    fs::create_dir(&target).unwrap();
+    // Put a child inside the target directory so the eventual rename fails
+    // with ENOTEMPTY / EISDIR on every supported platform.
+    fs::write(target.join("bystander"), b"child").unwrap();
+
+    let err = storage
+      .atomic_write(&target, b"payload")
+      .expect_err("rename over a non-empty directory must fail");
+    // Surface the error to the assertion message if anything changes.
+    let _ = err;
+
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.file_name().to_string_lossy().starts_with("occupied.tmp-"))
+      .collect();
+    assert!(
+      leftovers.is_empty(),
+      "staging file was not cleaned up after rename failure: {leftovers:?}"
+    );
+    // The pre-existing target directory and its child must be untouched.
+    assert!(target.is_dir(), "target directory unexpectedly removed");
+    assert_eq!(fs::read(target.join("bystander")).unwrap(), b"child");
+  }
+
+  /// The staging file must not reuse the target's stem in a way that removes
+  /// the original extension — otherwise callers who rely on the extension to
+  /// disambiguate sibling files can still collide.
+  #[test]
+  fn atomic_write_staging_path_preserves_target_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path().to_path_buf());
+    // Writing "shared.meta" while "shared.tmp" pre-exists on disk must not
+    // clobber the pre-existing `shared.tmp`. The pre-existing file is our
+    // stand-in for another writer's unrelated file that happens to sit at the
+    // old (buggy) staging location.
+    let bystander = dir.path().join("shared.tmp");
+    fs::write(&bystander, b"bystander").unwrap();
+    let target = dir.path().join("shared.meta");
+    storage.atomic_write(&target, b"payload").unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"payload");
+    assert_eq!(
+      fs::read(&bystander).unwrap(),
+      b"bystander",
+      "atomic_write must not touch an unrelated sibling file sharing the stem"
+    );
   }
 }
