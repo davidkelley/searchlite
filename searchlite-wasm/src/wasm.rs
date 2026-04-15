@@ -1902,6 +1902,23 @@ impl Searchlite {
     requested_schema: &Schema,
   ) -> Result<MigrationPlan, JsValue> {
     let requested_schema_hash = schema_hash(requested_schema)?;
+    // Registry check before opening IndexedDB: avoid creating an empty
+    // database/object store just to report "missing". All indexes created
+    // by this binding register themselves on init(), so the registry is
+    // the source of truth for known indexes.
+    let registry_entry = get_registry_entry(db_name)
+      .await
+      .map_err(|err| typed_js_error("registry_read_error", err))?;
+    if registry_entry.is_none() {
+      return Ok(MigrationPlan {
+        db_name: db_name.to_string(),
+        status: "missing".to_string(),
+        rebuild_required: false,
+        schema_version: SCHEMA_VERSION_V1,
+        existing_schema_hash: None,
+        requested_schema_hash,
+      });
+    }
     let root = PathBuf::from(db_name.to_string());
     let storage = Arc::new(
       JsStorage::new(db_name.to_string(), root.clone())

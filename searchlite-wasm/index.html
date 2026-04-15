@@ -709,20 +709,51 @@
           const timeoutMs = parseTimeoutMs();
           setStatus("Searching…");
           let result = null;
+          let workerFailed = false;
           if (canUseWorkerSearch()) {
-            const client = await ensureWorkerClient();
-            await client.initIndex(
-              currentDb,
-              JSON.stringify(currentSchema),
-              storageModeEl?.value || "indexeddb"
-            );
-            const requestObject = JSON.parse(requestJson);
-            result = await client.searchRequest(requestObject, {
-              signal: activeSearchController.signal,
-              timeoutMs,
-            });
-          } else {
-            if (executionModeEl.value === "worker") {
+            try {
+              const client = await ensureWorkerClient();
+              await client.initIndex(
+                currentDb,
+                JSON.stringify(currentSchema),
+                storageModeEl?.value || "indexeddb"
+              );
+              const requestObject = JSON.parse(requestJson);
+              result = await client.searchRequest(requestObject, {
+                signal: activeSearchController.signal,
+                timeoutMs,
+              });
+            } catch (err) {
+              // Distinguish user-driven cancellation/timeout from worker
+              // runtime failures. Propagate aborted/timeout to the outer
+              // catch; fall back to main-thread for everything else so a
+              // broken worker path (CSP, policy, missing asset) doesn't
+              // render search unusable.
+              const errType = typeof err?.type === "string" ? err.type : "";
+              if (
+                errType === "aborted" ||
+                errType === "timeout" ||
+                errType === "invalid_timeout" ||
+                errType === "invalid_argument" ||
+                activeSearchController.signal.aborted
+              ) {
+                throw err;
+              }
+              console.warn(
+                "Worker search failed; falling back to main thread:",
+                err
+              );
+              workerFailed = true;
+              await disposeWorkerClient();
+            }
+          }
+          if (result === null) {
+            if (workerFailed) {
+              setStatus(
+                "Worker search failed; using main-thread fallback.",
+                false
+              );
+            } else if (executionModeEl.value === "worker") {
               setStatus(
                 "Worker mode unavailable for this configuration; using main-thread fallback.",
                 false
