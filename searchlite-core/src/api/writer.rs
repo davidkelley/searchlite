@@ -680,9 +680,13 @@ fn validate_patch_fields(
   // round-tripped data. Unsetting a nested sub-path is still caught by
   // `NestedField::validate` in `validate_document` when the container is
   // present.
+  //
+  // `apply_patch` applies `unset` first and then `set`, so a payload
+  // that unsets a required field and re-sets it in the same patch ends
+  // up with the field present again; allow that overlap case.
   let non_nullable_tops = non_nullable_top_level_field_names(schema);
   for path in unset.iter() {
-    if non_nullable_tops.contains(path) {
+    if non_nullable_tops.contains(path) && !set.contains_key(path) {
       bail!("cannot unset non-nullable field `{path}`");
     }
   }

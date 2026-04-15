@@ -106,6 +106,51 @@ fn update_rejects_unset_on_non_nullable_top_level_field() {
 }
 
 #[test]
+fn update_allows_unset_of_non_nullable_when_reset_in_same_patch() {
+  // `apply_patch` applies `unset` first and then `set`, so a payload
+  // that unsets a required field and re-sets it in the same patch ends
+  // up with the field present. The BUG-224 patch-path guard must not
+  // reject that overlap case.
+  let dir = tempdir().unwrap();
+  let schema: Schema = serde_json::from_value(serde_json::json!({
+    "type": "object",
+    "properties": {
+      "body": { "type": "string" },
+      "count": { "type": "integer", "searchlite:stored": true, "searchlite:fast": false }
+    }
+  }))
+  .unwrap();
+  let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-overlap")),
+        ("body".into(), serde_json::json!("initial")),
+        ("count".into(), serde_json::json!(1)),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+
+  let mut set = BTreeMap::new();
+  set.insert("body".to_string(), serde_json::json!("replacement"));
+  let unset = vec!["body".to_string()];
+
+  let mut writer = idx.writer().unwrap();
+  writer.apply_patch("doc-overlap", &set, &unset).unwrap();
+  writer.commit().unwrap();
+
+  let reader = idx.reader().unwrap();
+  let res = reader.mget(&["doc-overlap".to_string()], true).unwrap();
+  let doc = res[0]._source.clone().unwrap();
+  assert_eq!(doc["body"], "replacement");
+}
+
+#[test]
 fn update_supports_nested_paths() {
   let dir = tempdir().unwrap();
   let schema: Schema = serde_json::from_value(serde_json::json!({
