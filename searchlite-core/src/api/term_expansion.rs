@@ -524,6 +524,18 @@ fn regex_branch_literal_prefix(pattern: &str) -> String {
       '|' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '$' => break,
       _ => {
         if quantifier_allows_zero(&chars, i + 1) {
+          // The preceding literal `ch` is optional, so it cannot extend
+          // the prefix on its own. But if the next required atom is the
+          // same literal `ch` (e.g. `ab?b`, `a*a`, `a{0,3}a`), then that
+          // character is guaranteed at the current position regardless
+          // of whether the optional was taken, so we can commit one
+          // copy before stopping. We must stop here because the two
+          // branches diverge in position after this, so subsequent
+          // pattern chars no longer line up across both cases.
+          if let Some(commit) = collapsed_literal_after_optional(&chars, i) {
+            let end = commit + ch.len_utf8();
+            prefix.push_str(&pattern[commit..end]);
+          }
           break;
         }
         let end = pos + ch.len_utf8();
@@ -533,6 +545,65 @@ fn regex_branch_literal_prefix(pattern: &str) -> String {
     }
   }
   prefix
+}
+
+/// When `chars[i]` is a literal `x` followed by a zero-permitting
+/// quantifier, checks whether the atom immediately after the quantifier
+/// is also a required literal `x`. If so, returns the byte offset of
+/// that second `x` (so the caller can commit it to the prefix). Returns
+/// `None` otherwise.
+///
+/// The required-literal check:
+///
+/// * Must be a plain literal char (no backslash-escape, no metachar),
+///   because anything else (wildcards, classes, groups, alternation)
+///   doesn't guarantee a single specific byte at that position.
+/// * Must not itself be followed by a zero-permitting quantifier — if
+///   the second `x` is also optional, it isn't guaranteed to appear.
+fn collapsed_literal_after_optional(chars: &[(usize, char)], i: usize) -> Option<usize> {
+  let ch = chars.get(i)?.1;
+  let q_end = quantifier_end(chars, i + 1)?;
+  let (pos, next) = *chars.get(q_end)?;
+  if !is_plain_literal(next) || next != ch {
+    return None;
+  }
+  if quantifier_allows_zero(chars, q_end + 1) {
+    return None;
+  }
+  Some(pos)
+}
+
+/// Returns the index in `chars` immediately after the quantifier that
+/// starts at `pos`, or `None` if there is no quantifier at `pos`.
+fn quantifier_end(chars: &[(usize, char)], pos: usize) -> Option<usize> {
+  match chars.get(pos)?.1 {
+    '*' | '?' | '+' => Some(pos + 1),
+    '{' => {
+      // Scan for the matching `}`; quantifier bodies contain only
+      // digits and at most one `,`, but we stay tolerant and just look
+      // for the terminator.
+      let mut k = pos + 1;
+      while k < chars.len() && chars[k].1 != '}' {
+        k += 1;
+      }
+      if k < chars.len() {
+        Some(k + 1)
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Returns true when `c` can safely be compared as a literal byte for
+/// the `x?x`-style prefix extension — i.e. not a regex metacharacter,
+/// escape prefix, or anchor.
+fn is_plain_literal(c: char) -> bool {
+  !matches!(
+    c,
+    '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '$' | '^'
+  )
 }
 
 /// Splits `pattern` at every `|` that sits at the top level — i.e. not
@@ -902,6 +973,51 @@ mod tests {
     assert_prefix_is_safe("foo{1,3}", &["foo", "fooo"]);
     assert_eq!(regex_literal_prefix("foo{5}"), "foo");
     assert_prefix_is_safe("foo{5}", &["foooooo"]);
+  }
+
+  #[test]
+  fn optional_followed_by_matching_required_keeps_one_copy() {
+    // When an optional atom is followed by the same required literal
+    // (e.g. `ab?b`, `a*a`, `a{0,3}a`), the position after the earlier
+    // literals is guaranteed to be that char regardless of whether the
+    // optional was taken. We commit one copy and stop.
+    assert_eq!(regex_literal_prefix("ab?b"), "ab");
+    assert_prefix_is_safe("ab?b", &["ab", "abb"]);
+    assert_eq!(regex_literal_prefix("a*a"), "a");
+    assert_prefix_is_safe("a*a", &["a", "aa", "aaa"]);
+    assert_eq!(regex_literal_prefix("a?a"), "a");
+    assert_prefix_is_safe("a?a", &["a", "aa"]);
+    assert_eq!(regex_literal_prefix("ab{0,3}b"), "ab");
+    assert_prefix_is_safe("ab{0,3}b", &["ab", "abb", "abbb", "abbbb"]);
+  }
+
+  #[test]
+  fn optional_followed_by_different_required_stops() {
+    // `ab?c` diverges at position 1 (`c` vs `b`), so the prefix is just
+    // `a`. `a*b` shares nothing, so prefix is empty.
+    assert_eq!(regex_literal_prefix("ab?c"), "a");
+    assert_prefix_is_safe("ab?c", &["ac", "abc"]);
+    assert_eq!(regex_literal_prefix("a*b"), "");
+    assert_prefix_is_safe("a*b", &["b", "ab", "aab"]);
+  }
+
+  #[test]
+  fn optional_followed_by_optional_does_not_collapse() {
+    // The required-literal check must reject the case where the char
+    // after the first quantifier is itself optional (`ab?b?c`). The
+    // second `b` isn't guaranteed to appear, so we can't commit it.
+    assert_eq!(regex_literal_prefix("ab?b?c"), "a");
+    assert_prefix_is_safe("ab?b?c", &["ac", "abc", "abbc"]);
+  }
+
+  #[test]
+  fn optional_followed_by_metachar_stops() {
+    // `.`, `\`, `[`, `(` etc. after the quantifier don't represent a
+    // concrete literal, so no collapse can be applied.
+    assert_eq!(regex_literal_prefix("ab?."), "a");
+    assert_prefix_is_safe("ab?.", &["ax", "abx"]);
+    assert_eq!(regex_literal_prefix("ab?\\."), "a");
+    assert_prefix_is_safe("ab?\\.", &["a.", "ab."]);
   }
 
   #[test]
