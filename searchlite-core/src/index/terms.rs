@@ -1,11 +1,36 @@
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::storage::Storage;
 use crate::util::checksum::checksum;
 use crate::util::fst::TinyFst;
 use crate::util::varint::{read_u64, write_u64};
+
+/// Reject `term_count` values that cannot possibly be backed by the bytes
+/// still available in the terms payload. `term_count` is an 8-byte header
+/// read directly from the file and is **not** covered by the inner CRC
+/// (the CRC is scoped to the payload only), so a single-byte flip in that
+/// header — or a legacy/merge-produced segment with an empty outer
+/// checksum map — would otherwise drive a multi-gigabyte
+/// `Vec::with_capacity` before the per-entry read loop ever discovered
+/// the file is too short. The minimum per-term stride is 9 bytes: a
+/// 1-byte varint length (smallest LEB128 encoding) + 0 bytes for an
+/// empty term + 8 bytes for the `u64` offset. Mirrors the helper
+/// introduced by BUG-012 for `fastfields::read_fields`.
+fn checked_count(count: u64, min_stride: u64, remaining: usize) -> Result<usize> {
+  let needed = count
+    .checked_mul(min_stride)
+    .ok_or_else(|| anyhow!("term_count {count} * stride {min_stride} overflows u64"))?;
+  if needed > remaining as u64 {
+    return Err(anyhow!(
+      "term_count {count} would need {needed} bytes but only {remaining} remain in terms payload"
+    ));
+  }
+  // At this point `count * min_stride <= remaining` and `remaining: usize`,
+  // so `count` fits in a `usize` without truncation.
+  Ok(count as usize)
+}
 
 pub fn write_terms(storage: &dyn Storage, path: &Path, terms: &[(String, u64)]) -> Result<()> {
   let mut file = storage.open_write(path)?;
@@ -38,27 +63,29 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   if expected != actual {
     bail!("terms file at {path:?} failed checksum validation");
   }
-
-  // Reject term counts that cannot possibly be backed by the bytes available in the
-  // payload. Each term entry consists of at minimum a 1-byte varint length and an
-  // 8-byte offset. This prevents a tampered file from driving a multi-gigabyte
-  // allocation via `Vec::with_capacity` before the read loop surfaces the truncation.
-  let min_stride = 9u64;
-  let needed = term_count
-    .checked_mul(min_stride)
-    .ok_or_else(|| anyhow::anyhow!("terms count {term_count} overflows u64"))?;
-  if needed > data.len() as u64 {
-    bail!(
-      "terms count {term_count} would need {needed} bytes but only {data.len()} remain"
-    );
-  }
-
+  // Validate the untrusted `term_count` header against the bytes still
+  // available in the payload before it reaches `Vec::with_capacity`. The
+  // payload excludes the 8-byte header and the trailing 4-byte CRC, so
+  // `data.len()` is the exact byte budget the per-entry loop has left to
+  // work with. See BUG-207; the header is not covered by the inner CRC.
+  let term_count = checked_count(term_count, 9, data.len())?;
   let mut cursor = 0usize;
-  let mut pairs = Vec::with_capacity(term_count as usize);
+  let mut pairs = Vec::with_capacity(term_count);
   for _ in 0..term_count {
     let (len, consumed) = read_u64(&data[cursor..])?;
     cursor += consumed;
-    let end = cursor + len as usize;
+    // `len` is read from an untrusted varint on disk. On 32-bit targets
+    // `len as usize` would truncate; on any target `cursor + len as usize`
+    // could wrap past `usize::MAX` for a crafted `u64::MAX`-ish length,
+    // letting the subsequent bounds check pass on the wrapped value and
+    // panicking the slice index below. Use `try_from` + `checked_add` so
+    // the overflow surfaces as a structured error instead.
+    let len_usize = usize::try_from(len).map_err(|_| {
+      anyhow!("terms file at {path:?} declares term length {len} that exceeds usize")
+    })?;
+    let end = cursor.checked_add(len_usize).ok_or_else(|| {
+      anyhow!("terms file at {path:?} declares term length {len} that overflows cursor")
+    })?;
     if end > data.len() {
       bail!("terms file at {path:?} ended unexpectedly while reading term");
     }
@@ -73,7 +100,13 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
       })?
       .to_string();
     cursor = end;
-    if cursor + 8 > data.len() {
+    // Same wrap concern as above, but with a fixed 8-byte stride — still
+    // worth guarding defensively so the bounds check cannot be bypassed
+    // by a `cursor` near `usize::MAX`.
+    let offset_end = cursor
+      .checked_add(8)
+      .ok_or_else(|| anyhow!("terms file at {path:?} cursor overflow reading offset"))?;
+    if offset_end > data.len() {
       bail!("terms file at {path:?} ended unexpectedly while reading offset");
     }
     let offset = u64::from_le_bytes([
@@ -183,16 +216,30 @@ mod tests {
     );
   }
 
+<<<<<<< HEAD
   #[test]
   fn read_terms_rejects_oversized_count_on_short_file() {
     // Regression for #207: a tampered terms file that claims an enormous number
     // of entries must be rejected before `Vec::with_capacity` commits a large
     // allocation. The check happens *after* CRC validation but *before* the
     // loop, so we must ensure the CRC is valid for the payload.
+=======
+  /// Regression for BUG-207: a tampered terms file whose 8-byte
+  /// `term_count` header claims `u64::MAX` entries must be rejected
+  /// before `Vec::with_capacity` commits a multi-gigabyte allocation.
+  /// The inner CRC intentionally does not cover the header, so
+  /// flipping its bytes alone cannot invalidate the checksum — the
+  /// bounds-check against the remaining payload is the load-bearing
+  /// guard here. Mirrors BUG-205's regression in `postings.rs` and
+  /// BUG-012's in `fastfields.rs`.
+  #[test]
+  fn read_terms_rejects_oversized_term_count_on_short_file() {
+>>>>>>> main
     let dir = tempdir().unwrap();
     let path = dir.path().join("terms");
     let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
 
+<<<<<<< HEAD
     // Write a minimal valid terms file
     write_terms(&storage, &path, &[("a".to_string(), 1)]).unwrap();
     let mut raw = std::fs::read(&path).unwrap();
@@ -208,6 +255,88 @@ mod tests {
     assert!(
       msg.contains("terms count") && msg.contains("remain"),
       "unexpected error: {err}"
+=======
+    write_terms(&storage, &path, &[("only".to_string(), 1)]).unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+    // Overwrite only the 8-byte term_count header. The inner CRC is
+    // computed over the payload only, so it remains valid.
+    raw[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized term_count must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    // `u64::MAX` trips the `checked_mul` guard; any moderately-oversized
+    // count trips the `needed > remaining` branch. Either message is a
+    // correct rejection — what matters is that the error surfaces
+    // `term_count` before a multi-gigabyte allocation is committed.
+    assert!(
+      msg.contains("term_count") && (msg.contains("remain") || msg.contains("overflow")),
+      "expected bounds-check error, got: {msg}"
+    );
+  }
+
+  /// Also verify that an oversized but not `u64::MAX` header — one
+  /// large enough to commit gigabytes of capacity but small enough to
+  /// not trigger the multiplication overflow branch — is still
+  /// rejected. Targets the `needed > remaining` branch specifically.
+  #[test]
+  fn read_terms_rejects_moderately_oversized_term_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    write_terms(&storage, &path, &[("only".to_string(), 1)]).unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+    // 4_000_000_000 * 9 B stride = 36 GB claimed; the written file is
+    // only a handful of bytes so this must be rejected without ever
+    // reaching `Vec::with_capacity`.
+    raw[..8].copy_from_slice(&4_000_000_000u64.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized term_count must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+      msg.contains("term_count") && msg.contains("remain"),
+      "expected bounds-check error, got: {msg}"
+    );
+  }
+
+  /// Defense-in-depth companion to BUG-207: a crafted per-term varint
+  /// length near `u64::MAX` must be rejected via a structured error
+  /// rather than wrapping `cursor + len as usize` and panicking on the
+  /// subsequent slice index. Addresses the panic vector flagged by
+  /// Copilot review on the BUG-207 PR.
+  #[test]
+  fn read_terms_rejects_oversized_per_term_length() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    // Assemble a valid terms file by hand whose single per-term varint
+    // encodes `u64::MAX` as the term byte length. The CRC is computed
+    // over the payload so the checksum guard passes and execution
+    // reaches the cursor arithmetic we want to exercise.
+    let mut payload = Vec::new();
+    write_u64(u64::MAX, &mut payload);
+    // No term bytes — the cursor-wrap guard fires before any term data
+    // could be read. Append a plausible 8-byte offset so the payload
+    // is not rejected for being structurally incomplete earlier on.
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    let crc = checksum(&payload);
+
+    let mut raw = Vec::new();
+    // term_count = 1 — passes checked_count (1 * 9 B <= payload bytes).
+    raw.extend_from_slice(&1u64.to_le_bytes());
+    raw.extend_from_slice(&payload);
+    raw.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized per-term length must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+      msg.contains("term length"),
+      "expected per-term length error, got: {msg}"
+>>>>>>> main
     );
   }
 }
