@@ -38,7 +38,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_K1: f32 = 0.9;
@@ -743,10 +743,19 @@ struct HttpError {
 
 type ApiResult<T> = Result<T, HttpError>;
 
+// Returned to every caller whose request body fails JSON deserialization. The
+// underlying `JsonRejection::to_string()` contains the target-type field path
+// of the failing value (e.g. `text_fields: invalid type: integer ...`), which
+// lets an unauthenticated probe enumerate the server's internal request
+// types. Log the detail for operators and return a constant message. See
+// BUG-016.
+const MALFORMED_REQUEST_BODY_MESSAGE: &str = "malformed request body";
+
 fn parse_json<T>(payload: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
-  payload
-    .map(|Json(inner)| inner)
-    .map_err(|err| HttpError::bad_request("invalid_request", err.to_string()))
+  payload.map(|Json(inner)| inner).map_err(|err| {
+    warn!(error = %err, "malformed request body");
+    HttpError::bad_request("invalid_request", MALFORMED_REQUEST_BODY_MESSAGE)
+  })
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1043,11 +1052,14 @@ async fn handle_middleware_error(err: BoxError) -> Response {
     )
     .into_response();
   }
+  // The `Debug` form of the underlying `BoxError` can include panic messages,
+  // tokio runtime state, and source-chain stringifications — information that
+  // belongs in operator logs, not in the response body. See BUG-016.
   error!(error = ?err, "middleware error");
   HttpError::from_anyhow(
     "middleware_error",
     StatusCode::INTERNAL_SERVER_ERROR,
-    anyhow::anyhow!(format!("{err:?}")),
+    anyhow::anyhow!("internal server error"),
   )
   .into_response()
 }
@@ -1102,6 +1114,33 @@ async fn init_index(
   Ok(Json(InitResponse { created: true }))
 }
 
+// Await the ingest writer task, surfacing its returned `HttpError` on success
+// and converting a `JoinError` (i.e. task panic) into a generic 500 while
+// recording the panic detail via `tracing`. `JoinError::to_string()` leaks the
+// panic message and source location, so it must never reach the response body.
+// See BUG-016.
+async fn await_writer_or_default(
+  writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>,
+  default: HttpError,
+) -> HttpError {
+  if let Some(handle) = writer_task.take() {
+    match handle.await {
+      Ok(Err(e)) => e,
+      Ok(Ok(_)) => default,
+      Err(join_err) => {
+        error!(error = %join_err, "ingest writer task failed to join");
+        HttpError::from_anyhow(
+          "add_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("internal server error"),
+        )
+      }
+    }
+  } else {
+    default
+  }
+}
+
 async fn add_ndjson(
   State(state): State<Arc<AppState>>,
   Path(index_name): Path<String>,
@@ -1124,25 +1163,6 @@ async fn add_ndjson(
     .map(|chunk| chunk.map_err(io::Error::other));
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
-
-  async fn await_writer_or_default(
-    writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>,
-    default: HttpError,
-  ) -> HttpError {
-    if let Some(handle) = writer_task.take() {
-      match handle.await {
-        Ok(Err(e)) => e,
-        Ok(Ok(_)) => default,
-        Err(join_err) => HttpError::from_anyhow(
-          "add_join",
-          StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ),
-      }
-    } else {
-      default
-    }
-  }
 
   let (tx, rx) = mpsc::channel::<IngestMsg>(INGEST_CHANNEL_BUFFER_BATCHES);
   let mut rx_slot = Some(rx);
@@ -4627,5 +4647,92 @@ mod tests {
       Ok(_) => panic!("expected duplicate index name error"),
       Err(err) => assert!(err.to_string().contains("duplicate index name provided")),
     }
+  }
+
+  // Regression tests for BUG-016: error responses must not leak internal
+  // deserialization, middleware, or task-panic detail to clients.
+
+  #[tokio::test]
+  async fn malformed_json_body_returns_generic_reason() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-malformed-json")).await;
+    // `text_fields` is an array of strings on `Schema`. Supplying an integer
+    // triggers a `JsonRejection` whose `Display` includes the field path and
+    // expected type — the exact detail the bug says must not be echoed.
+    let invalid = json!({ "text_fields": 1 });
+    let res = client
+      .post(format!("{index_base}/init"))
+      .json(&invalid)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let body: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(body.error.r#type, "invalid_request");
+    assert_eq!(body.error.reason, MALFORMED_REQUEST_BODY_MESSAGE);
+    // The leaked serde detail must not appear in the client-visible body.
+    assert!(
+      !body.error.reason.contains("text_fields"),
+      "reason leaked serde field path: {}",
+      body.error.reason
+    );
+    assert!(
+      !body.error.reason.contains("expected"),
+      "reason leaked serde expected-type detail: {}",
+      body.error.reason
+    );
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn handle_middleware_error_returns_generic_reason() {
+    init_tracing();
+    // A synthetic `BoxError` whose Debug form would leak a panic-like message.
+    #[derive(Debug)]
+    struct NoisyError;
+    impl std::fmt::Display for NoisyError {
+      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+          f,
+          "task panicked at src/secret.rs:42: internal state violated"
+        )
+      }
+    }
+    impl std::error::Error for NoisyError {}
+
+    let err: BoxError = Box::new(NoisyError);
+    let response = handle_middleware_error(err).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+      .await
+      .unwrap();
+    let body: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body.error.r#type, "middleware_error");
+    assert_eq!(body.error.reason, "internal server error");
+    // Neither the noisy Display nor its Debug form should be reflected.
+    assert!(!body.error.reason.contains("src/secret.rs"));
+    assert!(!body.error.reason.contains("panicked"));
+    assert!(!body.error.reason.contains("NoisyError"));
+  }
+
+  #[tokio::test]
+  async fn await_writer_or_default_masks_task_panic() {
+    init_tracing();
+    // Spawn a task that panics with a message that would otherwise leak into
+    // the response via `JoinError::to_string()`.
+    let handle: tokio::task::JoinHandle<Result<usize, HttpError>> = tokio::spawn(async {
+      panic!("index out of bounds: the len is 0 but the index is 4");
+    });
+    let mut slot = Some(handle);
+    let default = HttpError::bad_request("should_not_be_used", "default");
+    let err = await_writer_or_default(&mut slot, default).await;
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.kind, "add_join");
+    assert_eq!(err.reason, "internal server error");
+    assert!(!err.reason.contains("index out of bounds"));
+    assert!(!err.reason.contains("panicked"));
   }
 }
