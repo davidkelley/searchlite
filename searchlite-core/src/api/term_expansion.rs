@@ -436,22 +436,43 @@ fn expand_wildcard(
 /// `terms_with_prefix(field:<prefix>)` can be used to skip terms that
 /// could not possibly match without missing any that could.
 ///
-/// To preserve that invariant, the walker must account for two regex
-/// constructs that make the *last* accumulated character (or the whole
-/// accumulated branch) optional — and therefore not a guaranteed prefix of
-/// matching terms:
+/// To preserve that invariant, the pattern is split at top-level `|` into
+/// alternation branches, a per-branch safe prefix is extracted from each,
+/// and the greatest common prefix of those is returned. Cases handled:
 ///
 /// * Quantifiers that permit zero occurrences of the preceding atom
-///   (`*`, `?`, `{0,…}`, `{,…}`, `{0}`). The preceding literal must be
-///   dropped: e.g. `colou?r` requires prefix `colo`, not `colou`.
-/// * Top-level alternation (`|`). No single literal prefix is shared by
-///   every branch (e.g. `foo|bar` shares no common first character), so the
-///   prefix must be cleared entirely.
+///   (`*`, `?`, `{0,…}`, `{,…}`, `{0}`) drop the preceding literal inside
+///   a branch: e.g. `colou?r` yields branch prefix `colo`, not `colou`.
+/// * Top-level alternation returns the LCP across branches. Simple shared
+///   prefixes are preserved (e.g. `rust|ruby` → `ru`, `abc|ab` → `ab`),
+///   while branches with no shared first character collapse to `""`
+///   (e.g. `foo|bar` → `""`).
 ///
 /// Alternation, groups, and character classes *inside* `(`, `[`, or `{`
-/// never affect the running prefix because the walker already breaks at
+/// never affect a branch's running prefix because the walker breaks at
 /// those metacharacters. Only top-level constructs reach this logic.
 fn regex_literal_prefix(pattern: &str) -> String {
+  let mut branches = split_top_level_alternatives(pattern);
+  let first = match branches.next() {
+    Some(b) => b,
+    None => return String::new(),
+  };
+  let mut prefix = regex_branch_literal_prefix(first);
+  for branch in branches {
+    if prefix.is_empty() {
+      return prefix;
+    }
+    let next = regex_branch_literal_prefix(branch);
+    let lcp_len = longest_common_prefix_len(&prefix, &next);
+    prefix.truncate(lcp_len);
+  }
+  prefix
+}
+
+/// Extracts a safe literal prefix from a single alternation branch (i.e.
+/// a pattern with no top-level `|`). See [`regex_literal_prefix`] for the
+/// invariant the returned prefix upholds.
+fn regex_branch_literal_prefix(pattern: &str) -> String {
   let chars: Vec<(usize, char)> = pattern.char_indices().collect();
   let mut prefix = String::new();
   let mut escaped = false;
@@ -498,13 +519,9 @@ fn regex_literal_prefix(pattern: &str) -> String {
       '^' if prefix.is_empty() => {
         i += 1;
       }
-      '|' => {
-        // Top-level alternation: no literal prefix is guaranteed to appear
-        // across every branch, so invalidate anything accumulated so far.
-        prefix.clear();
-        break;
-      }
-      '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '$' => break,
+      // Any top-level `|` should have been consumed by the caller's
+      // splitter, but guard against it as a defensive break.
+      '|' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '$' => break,
       _ => {
         if quantifier_allows_zero(&chars, i + 1) {
           break;
@@ -518,9 +535,62 @@ fn regex_literal_prefix(pattern: &str) -> String {
   prefix
 }
 
+/// Splits `pattern` at every `|` that sits at the top level — i.e. not
+/// inside `(…)`, `[…]`, `{…}`, and not the target of a `\` escape. Returns
+/// an iterator that yields at least one branch (the empty pattern yields a
+/// single empty branch).
+fn split_top_level_alternatives(pattern: &str) -> impl Iterator<Item = &str> {
+  let mut out: SmallVec<[&str; 2]> = SmallVec::new();
+  let mut escaped = false;
+  let mut paren: i32 = 0;
+  let mut bracket: i32 = 0;
+  let mut brace: i32 = 0;
+  let mut start = 0usize;
+  for (i, ch) in pattern.char_indices() {
+    if escaped {
+      escaped = false;
+      continue;
+    }
+    match ch {
+      '\\' => escaped = true,
+      '(' => paren = paren.saturating_add(1),
+      ')' => paren = (paren - 1).max(0),
+      '[' => bracket = bracket.saturating_add(1),
+      ']' => bracket = (bracket - 1).max(0),
+      '{' => brace = brace.saturating_add(1),
+      '}' => brace = (brace - 1).max(0),
+      '|' if paren == 0 && bracket == 0 && brace == 0 => {
+        out.push(&pattern[start..i]);
+        start = i + ch.len_utf8();
+      }
+      _ => {}
+    }
+  }
+  out.push(&pattern[start..]);
+  out.into_iter()
+}
+
+/// Returns the byte length of the longest common prefix of `a` and `b`,
+/// measured at a UTF-8 character boundary. `a[..n]` and `b[..n]` are both
+/// valid UTF-8 substrings of their respective inputs.
+fn longest_common_prefix_len(a: &str, b: &str) -> usize {
+  let mut len = 0usize;
+  for (ac, bc) in a.char_indices().zip(b.chars()) {
+    if ac.1 == bc {
+      len = ac.0 + ac.1.len_utf8();
+    } else {
+      break;
+    }
+  }
+  len
+}
+
 /// Returns true when `chars[pos]` starts a quantifier that permits zero
 /// occurrences of the preceding atom (`*`, `?`, `{0,…}`, `{,…}`, `{0}`).
-/// Any other char, or a `{…}` whose lower bound is ≥ 1, returns false.
+///
+/// `{…}` forms must be properly terminated with `}`; unterminated cases
+/// like `{0,` or `{,5` return false. Non-zero lower bounds (`{1,3}`,
+/// `{5}`, …) also return false so the preceding literal is preserved.
 fn quantifier_allows_zero(chars: &[(usize, char)], pos: usize) -> bool {
   if pos >= chars.len() {
     return false;
@@ -528,8 +598,9 @@ fn quantifier_allows_zero(chars: &[(usize, char)], pos: usize) -> bool {
   match chars[pos].1 {
     '*' | '?' => true,
     '{' => {
-      // Parse the minimum-occurrences digits; anything that isn't a valid
-      // `{n…}` form is treated as "unknown" (conservative: return false).
+      // Parse the minimum-occurrences digits without allocating. An
+      // overflowing or non-digit body disqualifies the quantifier from
+      // being zero-permitting (conservative: return false).
       let digits_start = pos + 1;
       let mut j = digits_start;
       while j < chars.len() && chars[j].1.is_ascii_digit() {
@@ -538,19 +609,44 @@ fn quantifier_allows_zero(chars: &[(usize, char)], pos: usize) -> bool {
       if j >= chars.len() {
         return false;
       }
-      match chars[j].1 {
-        ',' | '}' => {
-          // Empty lower bound (e.g. `{,5}`) is treated as 0.
-          if digits_start == j {
-            return true;
+      let lower_is_zero = if digits_start == j {
+        // Empty lower bound (e.g. `{,5}`) is treated as 0.
+        true
+      } else {
+        let mut lower: u64 = 0;
+        let mut ok = true;
+        for (_, c) in &chars[digits_start..j] {
+          let digit = match c.to_digit(10) {
+            Some(d) => d as u64,
+            None => {
+              ok = false;
+              break;
+            }
+          };
+          match lower.checked_mul(10).and_then(|n| n.checked_add(digit)) {
+            Some(v) => lower = v,
+            None => {
+              ok = false;
+              break;
+            }
           }
-          let lower: u64 = chars[digits_start..j]
-            .iter()
-            .map(|(_, c)| *c)
-            .collect::<String>()
-            .parse()
-            .unwrap_or(u64::MAX);
-          lower == 0
+        }
+        ok && lower == 0
+      };
+      match chars[j].1 {
+        '}' => lower_is_zero,
+        ',' => {
+          // Skip optional upper-bound digits and require a closing `}`
+          // terminator; anything else is malformed and disqualifying.
+          let mut k = j + 1;
+          while k < chars.len() && chars[k].1.is_ascii_digit() {
+            k += 1;
+          }
+          if k < chars.len() && chars[k].1 == '}' {
+            lower_is_zero
+          } else {
+            false
+          }
         }
         _ => false,
       }
@@ -809,12 +905,38 @@ mod tests {
   }
 
   #[test]
-  fn top_level_alternation_clears_prefix() {
-    // BUG-202 repro: `foo|bar` shares no common first character.
+  fn top_level_alternation_returns_branch_lcp() {
+    // BUG-202 repro: branches with no shared first character collapse to
+    // an empty prefix.
     assert_eq!(regex_literal_prefix("foo|bar"), "");
     assert_prefix_is_safe("foo|bar", &["foo", "bar"]);
-    assert_eq!(regex_literal_prefix("rust|ruby"), "");
+    // Branches that *do* share a literal prefix keep that shared prefix,
+    // so the term-dictionary scan still benefits from a bound.
+    assert_eq!(regex_literal_prefix("rust|ruby"), "ru");
     assert_prefix_is_safe("rust|ruby", &["rust", "ruby"]);
+    assert_eq!(regex_literal_prefix("abc|ab"), "ab");
+    assert_prefix_is_safe("abc|ab", &["abc", "ab"]);
+    // More than two branches: LCP collapses to the shortest shared prefix.
+    assert_eq!(regex_literal_prefix("rust|ruby|rails"), "r");
+    assert_prefix_is_safe("rust|ruby|rails", &["rust", "ruby", "rails"]);
+    assert_eq!(regex_literal_prefix("alpha|beta|alp"), "");
+    assert_prefix_is_safe("alpha|beta|alp", &["alpha", "beta", "alp"]);
+  }
+
+  #[test]
+  fn alternation_respects_escaped_pipe() {
+    // An escaped `|` is a literal pipe character, not an alternation
+    // operator, so the whole pattern is a single branch.
+    assert_eq!(regex_literal_prefix("foo\\|bar"), "foo|bar");
+    assert_prefix_is_safe("foo\\|bar", &["foo|bar"]);
+  }
+
+  #[test]
+  fn alternation_ignores_pipe_inside_groups() {
+    // `|` inside `(`, `[`, or `{` is part of the group, not a top-level
+    // alternation, so the outer branch prefix is preserved.
+    assert_eq!(regex_literal_prefix("foo(ab|cd)"), "foo");
+    assert_eq!(regex_literal_prefix("foo[a|b]"), "foo");
   }
 
   #[test]
@@ -886,9 +1008,18 @@ mod tests {
     assert!(!quantifier_allows_zero(&chars("{1,3}"), 0));
     assert!(!quantifier_allows_zero(&chars("{2,}"), 0));
     assert!(!quantifier_allows_zero(&chars("foo"), 0));
-    // Unterminated / malformed `{…` — conservatively false.
+    // Overflowing lower bound disqualifies.
+    assert!(!quantifier_allows_zero(&chars("{99999999999999999999}"), 0));
+    // Unterminated / malformed `{…` — conservatively false. All of these
+    // are missing a closing `}`.
     assert!(!quantifier_allows_zero(&chars("{"), 0));
     assert!(!quantifier_allows_zero(&chars("{0"), 0));
+    assert!(!quantifier_allows_zero(&chars("{0,"), 0));
+    assert!(!quantifier_allows_zero(&chars("{0,3"), 0));
+    assert!(!quantifier_allows_zero(&chars("{,5"), 0));
+    assert!(!quantifier_allows_zero(&chars("{,"), 0));
+    // Non-digit body disqualifies.
+    assert!(!quantifier_allows_zero(&chars("{abc}"), 0));
     // Position past the end is false.
     assert!(!quantifier_allows_zero(&chars("?"), 1));
   }

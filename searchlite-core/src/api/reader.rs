@@ -4144,9 +4144,12 @@ mod tests {
 
   #[test]
   fn regex_flat_alternation_finds_all_branches() {
-    // BUG-202 regression: a flat top-level alternation has no literal
-    // prefix shared by every branch. Pre-fix, `regex_literal_prefix`
-    // returned "rust" and the term `ruby` was unreachable from the scan.
+    // BUG-202 regression: with a flat top-level alternation, the term
+    // scan must reach every branch. Pre-fix, `regex_literal_prefix`
+    // returned "rust" (only) and the term `ruby` was unreachable.
+    // Post-fix the extractor returns the longest literal prefix shared
+    // by every branch (`"ru"` for `rust|ruby`), which stays safe and
+    // still bounds the scan away from unrelated terms like `rope`.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx-regex-flat-alt");
     let idx = Index::create(
