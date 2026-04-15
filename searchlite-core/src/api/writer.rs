@@ -358,8 +358,9 @@ impl IndexWriter {
     let wal_len = self.wal.len()?;
     if let Err(e) = (|| -> Result<()> {
       new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
+      // `append_commit` fsyncs before returning, so no separate `sync` call
+      // is needed to guarantee the commit record is durable on disk.
       self.wal.append_commit()?;
-      self.wal.sync()?;
       Ok(())
     })() {
       // Roll back manifest to the previous snapshot and restore WAL to its
