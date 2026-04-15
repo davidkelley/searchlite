@@ -12,6 +12,11 @@ pub struct DocStoreWriter<'a, W: Write + Seek + ?Sized> {
   offsets: Vec<u64>,
   #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
   use_zstd: bool,
+  /// Set when a previous `add_document` failed and the post-failure rewind
+  /// could not restore the file cursor. In that state the stream has
+  /// unknown trailing bytes, so all subsequent `add_document` calls must
+  /// fail fast rather than paper over a torn record.
+  poisoned: bool,
 }
 
 impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
@@ -20,10 +25,17 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
       file,
       offsets: Vec::new(),
       use_zstd,
+      poisoned: false,
     }
   }
 
   pub fn add_document(&mut self, doc: &serde_json::Value) -> Result<()> {
+    if self.poisoned {
+      bail!(
+        "DocStoreWriter is poisoned after a prior IO failure whose cursor \
+         rewind could not be recovered; drop the writer and rebuild the segment"
+      );
+    }
     let offset = self.file.stream_position()?;
     #[allow(unused_mut)]
     let mut data = serde_json::to_vec(doc)?;
@@ -45,11 +57,39 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
         MAX_DOCSTORE_BYTES
       );
     }
-    self.offsets.push(offset);
     let len = data.len() as u32;
-    self.file.write_all(&len.to_le_bytes())?;
-    self.file.write_all(&data)?;
-    Ok(())
+    // Only publish the offset once both writes succeed. On IO failure rewind
+    // the file cursor so a retry or the next `add_document` call overwrites
+    // the partial record instead of leaving a torn header/payload that would
+    // desynchronise doc ids from offsets on the next write. If the rewind
+    // itself fails, mark the writer poisoned so the caller cannot silently
+    // append on top of an unknown cursor position.
+    match self
+      .file
+      .write_all(&len.to_le_bytes())
+      .and_then(|_| self.file.write_all(&data))
+    {
+      Ok(()) => {
+        self.offsets.push(offset);
+        Ok(())
+      }
+      Err(write_err) => match self.file.seek(SeekFrom::Start(offset)) {
+        Ok(_) => Err(anyhow::Error::new(write_err).context(format!(
+          "DocStoreWriter failed to append doc {}; file cursor rewound to {} for retry",
+          self.offsets.len(),
+          offset
+        ))),
+        Err(seek_err) => {
+          self.poisoned = true;
+          Err(anyhow::Error::new(write_err).context(format!(
+            "DocStoreWriter failed to append doc {} and could not rewind file cursor \
+             to {}: {seek_err}; writer is now poisoned",
+            self.offsets.len(),
+            offset
+          )))
+        }
+      },
+    }
   }
 
   pub fn offsets(&self) -> &[u64] {
@@ -147,6 +187,229 @@ mod tests {
     let huge = serde_json::json!(inner);
     let err = writer.add_document(&huge).unwrap_err();
     assert!(err.to_string().contains("too large"));
+  }
+
+  /// Write + Seek shim used to simulate mid-record IO failures in
+  /// `add_document`. The writer accepts bytes up to `fail_after` in total,
+  /// then every further `write` returns `ErrorKind::BrokenPipe`. A `write`
+  /// call that straddles the threshold returns a short count and the next
+  /// call produces the error — i.e. the failure surfaces *after* `fail_after`
+  /// bytes have been accepted, not *on* the `fail_after`-th byte.
+  struct FailingWriter {
+    inner: std::io::Cursor<Vec<u8>>,
+    fail_after: usize,
+    written: usize,
+  }
+
+  impl FailingWriter {
+    fn new(fail_after: usize) -> Self {
+      Self {
+        inner: std::io::Cursor::new(Vec::new()),
+        fail_after,
+        written: 0,
+      }
+    }
+  }
+
+  impl Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      if self.written >= self.fail_after {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "injected failure",
+        ));
+      }
+      let remaining = self.fail_after - self.written;
+      let to_write = buf.len().min(remaining);
+      let n = self.inner.write(&buf[..to_write])?;
+      self.written += n;
+      // If the caller's buffer was truncated we return the short count — the
+      // next `write` call will observe the injected failure and `write_all`
+      // will loop, surface the error, and the caller sees a real half-failed
+      // IO device.
+      Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.inner.flush()
+    }
+  }
+
+  impl Seek for FailingWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+      self.inner.seek(pos)
+    }
+  }
+
+  #[test]
+  fn add_document_preserves_offsets_on_io_failure() {
+    // Drive two writes through FailingWriter. The first runs with an
+    // effectively infinite byte budget and succeeds. The second lowers the
+    // byte budget so that the record's write_all only partially completes
+    // before FailingWriter injects BrokenPipe. After the failure the offsets
+    // vector must still describe only the first successful document so the
+    // caller can retry with the original doc_id.
+    let mut file = FailingWriter::new(usize::MAX);
+    let mut writer = DocStoreWriter::new(&mut file, false);
+    writer
+      .add_document(&serde_json::json!({"title": "Rust"}))
+      .unwrap();
+    assert_eq!(writer.offsets().len(), 1);
+
+    // Lock the failure threshold to the current position so the next write
+    // partially succeeds then errors.
+    let pos_after_first = writer.file.inner.position() as usize;
+    writer.file.fail_after = pos_after_first + 2;
+    writer.file.written = pos_after_first;
+
+    let err = writer
+      .add_document(&serde_json::json!({"title": "Search"}))
+      .unwrap_err();
+    // Use alternate-debug formatting so the full anyhow context chain is
+    // rendered (includes both the wrapping "cursor rewound" message and the
+    // original BrokenPipe root cause).
+    let chain = format!("{err:#}");
+    assert!(
+      chain.to_lowercase().contains("pipe") || chain.contains("injected"),
+      "expected BrokenPipe / injected in error chain, got: {chain}"
+    );
+    assert!(
+      chain.contains("rewound"),
+      "expected wrapping context mentioning rewind in error chain, got: {chain}"
+    );
+    // Critically: offsets was NOT advanced, so the next successful add_document
+    // re-uses doc_id == 1 (not 2).
+    assert_eq!(writer.offsets().len(), 1);
+    // And the cursor was rewound so the partial bytes get overwritten.
+    assert_eq!(
+      writer.file.inner.position() as usize,
+      pos_after_first,
+      "cursor should be rewound to the pre-failed-write position"
+    );
+
+    // Retry with an unbounded byte budget and confirm doc_id 1 is assigned.
+    writer.file.fail_after = usize::MAX;
+    writer.file.written = pos_after_first;
+    writer
+      .add_document(&serde_json::json!({"title": "Retry"}))
+      .unwrap();
+    assert_eq!(writer.offsets().len(), 2);
+
+    let offsets = writer.offsets().to_vec();
+    drop(writer);
+    // Read back both docs from the in-memory buffer via a cursor.
+    let buffer = file.inner.into_inner();
+    let cursor = std::io::Cursor::new(buffer);
+    let mut reader = DocStoreReader::new(cursor, offsets, false);
+    let first = reader.get(0).unwrap();
+    assert_eq!(first["title"], "Rust");
+    let second = reader.get(1).unwrap();
+    assert_eq!(
+      second["title"], "Retry",
+      "doc_id 1 must resolve to the retried document, not the abandoned one"
+    );
+  }
+
+  /// Write + Seek shim whose `seek` returns `ErrorKind::Other` after the
+  /// first call, letting us reach the unrecoverable-rewind branch in
+  /// `add_document` without otherwise affecting writes.
+  struct RewindFailingWriter {
+    inner: std::io::Cursor<Vec<u8>>,
+    fail_after: usize,
+    written: usize,
+    seek_calls: usize,
+    fail_seek_from: usize,
+  }
+
+  impl RewindFailingWriter {
+    fn new(fail_after: usize, fail_seek_from: usize) -> Self {
+      Self {
+        inner: std::io::Cursor::new(Vec::new()),
+        fail_after,
+        written: 0,
+        seek_calls: 0,
+        fail_seek_from,
+      }
+    }
+  }
+
+  impl Write for RewindFailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      if self.written >= self.fail_after {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "injected failure",
+        ));
+      }
+      let remaining = self.fail_after - self.written;
+      let to_write = buf.len().min(remaining);
+      let n = self.inner.write(&buf[..to_write])?;
+      self.written += n;
+      Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.inner.flush()
+    }
+  }
+
+  impl Seek for RewindFailingWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+      let call = self.seek_calls;
+      self.seek_calls += 1;
+      if call >= self.fail_seek_from {
+        return Err(std::io::Error::other("injected seek failure"));
+      }
+      self.inner.seek(pos)
+    }
+  }
+
+  #[test]
+  fn add_document_poisons_writer_when_rewind_fails() {
+    // stream_position() is the first seek call (call #0). Writes for the
+    // initial doc all succeed. On the second add_document we force write_all
+    // to fail, and also configure seek to start failing so the recovery
+    // rewind cannot restore the cursor. The writer must poison itself so
+    // later add_document calls fail fast rather than silently appending on
+    // top of a half-written record.
+    let mut file = RewindFailingWriter::new(usize::MAX, usize::MAX);
+    let mut writer = DocStoreWriter::new(&mut file, false);
+    writer
+      .add_document(&serde_json::json!({"title": "Rust"}))
+      .unwrap();
+
+    // From this point seek calls fail AND the write budget is exhausted.
+    let pos_after_first = writer.file.inner.position() as usize;
+    writer.file.fail_after = pos_after_first;
+    writer.file.written = pos_after_first;
+    writer.file.fail_seek_from = writer.file.seek_calls + 1; // allow the stream_position seek
+                                                             // Actually: stream_position() counts as one seek. Let the next seek fail.
+                                                             // `stream_position` inside add_document increments seek_calls by 1, so we
+                                                             // mark the _rewind_ seek (the one immediately after the failed write) as
+                                                             // the failing call.
+
+    let err = writer
+      .add_document(&serde_json::json!({"title": "Search"}))
+      .unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(
+      chain.contains("poisoned"),
+      "expected poisoned surface in error chain, got: {chain}"
+    );
+    assert_eq!(writer.offsets().len(), 1);
+
+    // The next add_document must fail fast with the poisoned error even
+    // though the underlying writer has been notionally "healed".
+    writer.file.fail_after = usize::MAX;
+    writer.file.fail_seek_from = usize::MAX;
+    let err = writer
+      .add_document(&serde_json::json!({"title": "Retry"}))
+      .unwrap_err();
+    assert!(
+      err.to_string().contains("poisoned"),
+      "poisoned writer must refuse further add_document calls, got: {err}"
+    );
+    assert_eq!(writer.offsets().len(), 1);
   }
 
   #[test]
