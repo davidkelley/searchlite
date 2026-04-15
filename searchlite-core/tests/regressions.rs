@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use searchlite_core::api::types::{
-  CollapseRequest, Document, ExecutionStrategy, IndexOptions, KeywordField, Schema, SearchRequest,
-  StorageType, TextField,
+  CollapseRequest, Document, ExecutionStrategy, IndexOptions, KeywordField, Query, QueryNode,
+  Schema, SearchRequest, StorageType, TextField,
 };
 use searchlite_core::api::{Filter, Index};
 use searchlite_core::storage::Storage;
@@ -332,4 +332,149 @@ fn concurrent_writers_refresh_manifest_before_commit() {
   let hits_updated = reader.search(&req_updated).unwrap().hits.len();
   assert_eq!(hits_first, 0, "stale writer should tombstone old doc");
   assert_eq!(hits_updated, 1, "new version must be visible");
+}
+
+/// Regression test for the keyword case-folding divergence reported in
+/// davidkelley/searchlite#212.
+///
+/// Before the fix, keyword indexing and `match`/`term` queries lowercased
+/// with `str::to_ascii_lowercase`, which only rewrites the 26 ASCII
+/// uppercase letters and leaves every other byte untouched. The fast-field
+/// filter path (`Filter::KeywordEq`) already used Unicode-aware folding, so
+/// documents whose keyword uppercase form contained non-ASCII code points
+/// (e.g. `RÉSUMÉ`) were matched by the filter but silently missed by the
+/// equivalent `term` query. After the fix both paths go through the shared
+/// `fold_keyword` helper and agree for ASCII and non-ASCII input alike.
+#[test]
+fn keyword_match_and_filter_agree_on_non_ascii_case() {
+  let dir = tempdir().unwrap();
+  let path = dir.path().to_path_buf();
+  let schema = Schema {
+    doc_id_field: "_id".into(),
+    analyzers: Vec::new(),
+    text_fields: vec![TextField {
+      name: "body".into(),
+      analyzer: "default".into(),
+      search_analyzer: None,
+      stored: true,
+      indexed: true,
+      nullable: false,
+      search_as_you_type: None,
+    }],
+    keyword_fields: vec![KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    }],
+    numeric_fields: Vec::new(),
+    nested_fields: Vec::new(),
+    #[cfg(feature = "vectors")]
+    vector_fields: Vec::new(),
+  };
+  let idx = Index::create(&path, schema, opts(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // doc_a's tag lowercases to "résumé" under either ASCII or Unicode folding.
+    writer
+      .add_document(&doc(
+        "doc_a",
+        vec![("body", json!("alpha")), ("tag", json!("Résumé"))],
+      ))
+      .unwrap();
+    // doc_b's tag only lowercases to "résumé" under Unicode folding; ASCII
+    // folding would leave it as "rÉsumÉ". This is the document that the
+    // pre-fix postings path silently missed.
+    writer
+      .add_document(&doc(
+        "doc_b",
+        vec![("body", json!("beta")), ("tag", json!("RÉSUMÉ"))],
+      ))
+      .unwrap();
+    // A Cyrillic control: uppercase ЖУК should match lowercase жук under
+    // Unicode folding and miss under ASCII folding.
+    writer
+      .add_document(&doc(
+        "doc_c",
+        vec![("body", json!("gamma")), ("tag", json!("ЖУК"))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+
+  // Filter path (fast field): both résumé docs match, the beetle does not.
+  let filter_req = SearchRequest {
+    query: Query::Node(QueryNode::MatchAll { boost: None }),
+    filter: Some(Filter::KeywordEq {
+      field: "tag".into(),
+      value: "résumé".into(),
+    }),
+    ..base_request("", None)
+  };
+  let mut filter_ids: Vec<String> = reader
+    .search(&filter_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  filter_ids.sort();
+  assert_eq!(filter_ids, vec!["doc_a".to_string(), "doc_b".to_string()]);
+
+  // Query/postings path (term query over the keyword field): same docs as
+  // the filter path. Before the fix, doc_b was missing from this result set.
+  let term_req = SearchRequest {
+    query: Query::Node(QueryNode::Term {
+      field: "tag".into(),
+      value: "résumé".into(),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let mut term_ids: Vec<String> = reader
+    .search(&term_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  term_ids.sort();
+  assert_eq!(term_ids, filter_ids);
+
+  // Cyrillic spot-check. Filter and query agree here too.
+  let cyrillic_filter = SearchRequest {
+    query: Query::Node(QueryNode::MatchAll { boost: None }),
+    filter: Some(Filter::KeywordEq {
+      field: "tag".into(),
+      value: "жук".into(),
+    }),
+    ..base_request("", None)
+  };
+  let cyrillic_filter_ids: Vec<String> = reader
+    .search(&cyrillic_filter)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(cyrillic_filter_ids, vec!["doc_c".to_string()]);
+
+  let cyrillic_query = SearchRequest {
+    query: Query::Node(QueryNode::Term {
+      field: "tag".into(),
+      value: "жук".into(),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let cyrillic_query_ids: Vec<String> = reader
+    .search(&cyrillic_query)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(cyrillic_query_ids, cyrillic_filter_ids);
 }

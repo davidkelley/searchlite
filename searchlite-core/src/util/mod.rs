@@ -1,4 +1,5 @@
 pub mod bitpack;
+pub mod case_fold;
 pub mod checksum;
 pub mod doc_id;
 pub mod fst;
