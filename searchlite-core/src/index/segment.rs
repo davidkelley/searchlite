@@ -721,13 +721,18 @@ impl<'a> SegmentWriter<'a> {
         let is_nested_field = field.contains('.');
         for value in values.iter() {
           if indexed {
+            // `fold_keyword` returns a borrowed `Cow` for already-lowercase
+            // ASCII input, so we probe `seen_terms` before allocating and
+            // only materialize an owned `String` on the insert path. This
+            // preserves the ASCII fast path for the common duplicate case.
             let lower = fold_keyword(value);
-            if seen_terms.insert(lower.clone().into_owned()) {
+            if !seen_terms.contains(lower.as_ref()) {
               let mut term_key = String::with_capacity(field.len() + lower.len() + 1);
               term_key.push_str(field);
               term_key.push(':');
               term_key.push_str(&lower);
               postings_builder.add_term(&term_key, doc_ord, 0, false);
+              seen_terms.insert(lower.into_owned());
             }
           }
         }
