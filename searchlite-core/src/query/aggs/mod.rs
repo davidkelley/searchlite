@@ -1118,7 +1118,7 @@ impl<'a> RangeCollector<'a> {
     for entry in self.ranges.iter_mut() {
       if values.iter().any(|val| {
         let ge_from = entry.from.map(|f| *val >= f).unwrap_or(true);
-        let lt_to = entry.to.map(|t| *val <= t).unwrap_or(true);
+        let lt_to = entry.to.map(|t| *val < t).unwrap_or(true);
         ge_from && lt_to
       }) {
         entry.bucket.doc_count += 1;
