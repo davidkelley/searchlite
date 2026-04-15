@@ -1819,6 +1819,13 @@ mod tests {
   }
 
   #[test]
+  fn read_fields_rejects_f64_nested_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
   fn read_fields_rejects_i64_nested_oversized_total_objects() {
     // doc_len = 0 so the doc_offsets allocation is fine (1 entry), but the
     // single offset claims `u32::MAX` objects, which is what the issue
