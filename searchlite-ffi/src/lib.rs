@@ -1078,10 +1078,9 @@ mod tests {
       "success return must be < buf_cap (got {big_ret} / {})",
       big_buf.len()
     );
-    let parsed: serde_json::Value = serde_json::from_slice(
-      unsafe { CStr::from_ptr(big_buf.as_ptr()) }.to_bytes(),
-    )
-    .expect("retry result must be valid JSON");
+    let parsed: serde_json::Value =
+      serde_json::from_slice(unsafe { CStr::from_ptr(big_buf.as_ptr()) }.to_bytes())
+        .expect("retry result must be valid JSON");
     assert_eq!(parsed["hits"].as_array().unwrap().len(), 1);
 
     unsafe { searchlite_index_close(handle) };
@@ -1115,7 +1114,10 @@ mod tests {
       )
     };
     // Positive and greater than buf_cap signals "required size".
-    assert!(ret > small_cap as isize, "expected required size > buf_cap, got {ret}");
+    assert!(
+      ret > small_cap as isize,
+      "expected required size > buf_cap, got {ret}"
+    );
     let bytes = unsafe { CStr::from_ptr(small_buf.as_ptr()) }.to_bytes();
     assert!(bytes.is_empty(), "buffer must not contain truncated data");
 
