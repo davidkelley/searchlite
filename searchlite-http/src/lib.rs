@@ -1336,11 +1336,14 @@ async fn add_ndjson(
       Ok(Ok(total)) => total,
       Ok(Err(e)) => return Err(e),
       Err(join_err) => {
+        // See BUG-016: `JoinError::to_string()` carries the panic message and
+        // source location. Keep that in operator logs, not the response body.
+        error!(error = %join_err, "ingest writer task failed to join");
         return Err(HttpError::from_anyhow(
           "add_join",
           StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ))
+          anyhow::anyhow!("internal server error"),
+        ));
       }
     },
     None => {
@@ -1568,11 +1571,17 @@ async fn bulk_update(
       match handle.await {
         Ok(Err(e)) => e,
         Ok(Ok(_)) => default,
-        Err(join_err) => HttpError::from_anyhow(
-          "bulk_update_join",
-          StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ),
+        Err(join_err) => {
+          // See BUG-016: `JoinError::to_string()` carries the panic message
+          // and source location. Keep that in operator logs rather than the
+          // client-visible response body.
+          error!(error = %join_err, "bulk update writer task failed to join");
+          HttpError::from_anyhow(
+            "bulk_update_join",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("internal server error"),
+          )
+        }
       }
     } else {
       default
