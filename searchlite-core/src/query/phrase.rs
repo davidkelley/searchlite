@@ -1,17 +1,34 @@
 use crate::index::postings::PostingEntry;
 use crate::DocId;
 
-pub fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId, slop: u32) -> bool {
+/// Test whether a phrase query matches `doc_id` given its per-term posting
+/// lists, with an optional slop budget.
+///
+/// # Precondition
+///
+/// Every inner `Vec<PostingEntry>` **must be sorted by `doc_id` in ascending
+/// order**. This function uses a binary search to locate `doc_id` inside each
+/// term's posting list, which is O(log N) vs. the previous O(N) linear scan
+/// and dominates phrase-query latency on large indexes. All callers in this
+/// crate satisfy this invariant: postings read via `SegmentReader::postings`
+/// are written in sorted order by `InvertedIndexBuilder::add_term` (see
+/// `searchlite-core/src/index/postings.rs`), and `merge_postings_lists`
+/// (`searchlite-core/src/api/phrase.rs`) explicitly sorts its output by
+/// `doc_id`.
+///
+/// In debug builds the precondition is asserted. In release builds, passing
+/// an unsorted posting list may cause a present `doc_id` to be reported as
+/// absent (a false negative), so the function is crate-internal.
+pub(crate) fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId, slop: u32) -> bool {
   if postings.is_empty() {
     return true;
   }
   let mut positions_per_term: Vec<Vec<u32>> = Vec::new();
   for term_posts in postings {
-    // Postings are stored sorted by `doc_id` (see
-    // `InvertedIndexBuilder::add_term` in postings.rs), so a binary search
-    // is O(log N) vs. the previous O(N) linear scan. `matches_phrase` is
-    // invoked once per candidate doc per phrase term, so the difference
-    // dominates phrase-query latency when any term has a long posting list.
+    debug_assert!(
+      term_posts.windows(2).all(|w| w[0].doc_id <= w[1].doc_id),
+      "matches_phrase requires each term's postings to be sorted by doc_id"
+    );
     match term_posts.binary_search_by_key(&doc_id, |p| p.doc_id) {
       Ok(idx) => positions_per_term.push(term_posts[idx].positions.iter().copied().collect()),
       Err(_) => return false,
