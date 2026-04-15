@@ -202,6 +202,14 @@ impl IndexWriter {
   pub fn add_document(&mut self, doc: &Document) -> Result<u32> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
+    // BUG-224: enforce required-field presence only at the user-facing
+    // ingest boundary. `add_document_locked` is also reached from
+    // `apply_patch`, which re-inserts documents reconstructed from the
+    // docstore; those reconstructed documents may legitimately be missing
+    // top-level fields that serialize away (empty arrays, nested
+    // containers whose stored children all serialize to null), so the
+    // presence check cannot live inside the locked path.
+    self.schema.check_required_fields_present(doc)?;
     self.add_document_locked(doc)
   }
 
@@ -463,7 +471,14 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     let checkpoint = self.checkpoint_locked()?;
     for doc in docs {
-      if let Err(e) = self.add_document_locked(doc) {
+      // BUG-224: enforce required-field presence at the ingest boundary;
+      // see the note in `add_document` for why this is kept out of
+      // `add_document_locked`.
+      if let Err(e) = self
+        .schema
+        .check_required_fields_present(doc)
+        .and_then(|()| self.add_document_locked(doc).map(|_| ()))
+      {
         self.rollback_to_locked(checkpoint)?;
         return Err(e);
       }
