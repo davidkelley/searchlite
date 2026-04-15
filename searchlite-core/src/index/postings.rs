@@ -678,4 +678,37 @@ mod tests {
       .collect();
     assert_eq!(collected, vec![(1, 2, 0), (7, 4, 0)]);
   }
+
+  /// Regression for the unchecked u32 addition overflow in position delta
+  /// accumulation. Two deltas each equal to u32::MAX / 2 + 1 would sum to
+  /// u32::MAX + 2, overflowing in release builds (producing 0) or panicking
+  /// in debug builds. The fix uses checked_add to return an error instead.
+  #[test]
+  fn read_at_rejects_position_delta_overflow() {
+    use crate::util::varint::write_u32_var;
+    use std::io::Cursor;
+    // Create a minimal valid postings segment header
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&1u32.to_le_bytes()); // doc_freq = 1 (little-endian u32)
+    buf.push(1); // stored_positions = true
+    buf.extend_from_slice(&0u32.to_le_bytes()); // raw_block (no block meta)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // max_doc_id
+    buf.extend_from_slice(&0f32.to_le_bytes()); // max_tf
+
+    // Add a single posting with two positions that overflow when accumulated
+    // Position 1: delta = u32::MAX / 2 + 1 = 2_147_483_648
+    // Position 2: delta = u32::MAX / 2 + 1 = 2_147_483_648
+    // Sum would be u32::MAX + 2 = 4_294_967_298, which overflows u32
+    let delta: u32 = u32::MAX / 2 + 1;
+    write_u32_var(1, &mut buf); // doc_id = 1 (1 byte varint)
+    write_u32_var(1, &mut buf); // term_freq = 1 (1 byte varint)
+    write_u32_var(2, &mut buf); // position count = 2
+    write_u32_var(delta, &mut buf); // first delta
+    write_u32_var(delta, &mut buf); // second delta - causes overflow
+
+    let mut cur = Cursor::new(buf);
+    let err = PostingsReader::read_at(&mut cur, 0, true).expect_err("overflow must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("overflow"), "unexpected error message: {msg}");
+  }
 }
