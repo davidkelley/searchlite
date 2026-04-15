@@ -56,13 +56,16 @@ Fix the input and retry.
 
 | `type` | When | Recovery |
 | --- | --- | --- |
-| `invalid_json` | A JS value could not be parsed as JSON / converted to the expected shape (e.g. `add_document(doc)` where `doc` is not an object). | Pass a valid JSON-serializable object. |
+| `invalid_json` | A JS value could not be converted to JSON by `serde_wasm_bindgen` (e.g. `add_document` / `add_documents` received a value containing functions, `undefined`, circular references, or other non-serializable types). | Pass only JSON-serializable values. |
+| `invalid_document` | A document passed to `add_document` is a valid JSON value but not an object (e.g. an array, string, or number). | Pass a JSON object shaped according to your schema. |
+| `invalid_document_batch` | `add_documents` received a value that is neither an object nor an array of objects after JSON conversion. | Pass an object or an array of objects. |
 | `invalid_schema_json` | `init` / `plan_migration` / `migrate_index` received a `schema_json` string that isn't parseable as a Searchlite schema. | Fix the schema. See [docs/wasm.md § Schema mini-reference](wasm.md#schema-mini-reference) for the shape. |
 | `invalid_search_request` | `search_request` / `search_request_value` received a payload that isn't a valid `SearchRequest`. | Fix the request shape. |
 | `invalid_update_request` | `update_document` received a payload that isn't `{ id, set?, unset? }`. | Fix the request shape. |
+| `invalid_mget_request` | `mget` received a payload that isn't a valid `MgetRequest` (`{ ids, return_stored? }`). | Fix the request shape. |
+| `invalid_multi_search_request` | `multi_search` received a payload that isn't a valid `MultiSearchRequest` (`{ searches, parallel?, max_concurrency? }`). | Fix the request shape. |
 | `invalid_doc_id_batch` | `delete_documents` received a non-array or an array with non-string members. | Pass an array of strings. |
 | `invalid_id` | A doc id failed validation (empty, whitespace only, control characters). | Use a non-empty printable string id. |
-| `invalid_document` | Document shape didn't match the schema (missing required field, wrong type). | Align the document with the schema. |
 | `invalid_cleanup_request` | `cleanup_indexes(stale_older_than_ms, ...)` received a negative / non-finite duration. | Pass a non-negative finite number of milliseconds. |
 | `invalid_timeout` | A controlled search or worker-client method received a negative / non-finite `timeoutMs`. | Pass a non-negative finite number. |
 | `invalid_argument` | Worker-client method received an invalid option (e.g. negative `delayMs`). | Inspect `err.reason` and fix the argument. |
