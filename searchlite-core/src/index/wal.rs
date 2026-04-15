@@ -40,8 +40,20 @@ impl Wal {
     self.append_entry(1, &payload)
   }
 
+  /// Append a commit record and fsync the file to disk.
+  ///
+  /// The commit record is the WAL's durability boundary: once `append_commit`
+  /// returns `Ok`, every preceding `AddDoc` / `DeleteDocId` entry is guaranteed
+  /// to have been forced out of the kernel page cache, so a subsequent crash
+  /// cannot resurrect "committed" state as pending ops on replay.
+  ///
+  /// `append_add_doc` and `append_delete_doc_id` deliberately defer fsync so
+  /// that a burst of writes under a single commit stays fast; callers do not
+  /// need to call [`Wal::sync`] separately after `append_commit`.
   pub fn append_commit(&mut self) -> Result<()> {
-    self.append_entry(2, &[])
+    self.append_entry(2, &[])?;
+    self.file.sync_all()?;
+    Ok(())
   }
 
   pub fn append_delete_doc_id(&mut self, doc_id: &str) -> Result<()> {
@@ -415,11 +427,140 @@ mod tests {
     wal.append_add_doc(&doc).unwrap();
     let len_after_add = wal.len().unwrap();
     wal.append_commit().unwrap();
-    wal.sync().unwrap();
     let len_after_commit = wal.len().unwrap();
     assert!(len_after_commit > len_after_add);
     wal.truncate_to(len_after_add).unwrap();
     let len_restored = wal.len().unwrap();
     assert_eq!(len_restored, len_after_add);
+  }
+
+  /// A [`StorageFile`] that proxies to an inner file and records each
+  /// `sync_all` call so tests can assert on durability behaviour without
+  /// inspecting the host kernel's page cache.
+  struct SyncCountingFile {
+    inner: crate::storage::DynFile,
+    sync_count: Arc<std::sync::atomic::AtomicUsize>,
+  }
+
+  impl std::io::Read for SyncCountingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      self.inner.read(buf)
+    }
+  }
+
+  impl std::io::Write for SyncCountingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.inner.flush()
+    }
+  }
+
+  impl std::io::Seek for SyncCountingFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+      self.inner.seek(pos)
+    }
+  }
+
+  impl crate::storage::StorageFile for SyncCountingFile {
+    fn set_len(&mut self, len: u64) -> Result<()> {
+      self.inner.set_len(len)
+    }
+
+    fn sync_all(&mut self) -> Result<()> {
+      self
+        .sync_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+      self.inner.sync_all()
+    }
+  }
+
+  struct SyncCountingStorage {
+    inner: crate::storage::FsStorage,
+    sync_count: Arc<std::sync::atomic::AtomicUsize>,
+  }
+
+  impl crate::storage::Storage for SyncCountingStorage {
+    fn root(&self) -> &Path {
+      self.inner.root()
+    }
+
+    fn ensure_dir(&self, path: &Path) -> Result<()> {
+      self.inner.ensure_dir(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+      self.inner.exists(path)
+    }
+
+    fn open_read(&self, path: &Path) -> Result<crate::storage::DynFile> {
+      self.inner.open_read(path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<crate::storage::DynFile> {
+      let file = self.inner.open_write(path)?;
+      Ok(Box::new(SyncCountingFile {
+        inner: file,
+        sync_count: Arc::clone(&self.sync_count),
+      }))
+    }
+
+    fn open_append(&self, path: &Path) -> Result<crate::storage::DynFile> {
+      let file = self.inner.open_append(path)?;
+      Ok(Box::new(SyncCountingFile {
+        inner: file,
+        sync_count: Arc::clone(&self.sync_count),
+      }))
+    }
+
+    fn read_to_end(&self, path: &Path) -> Result<Vec<u8>> {
+      self.inner.read_to_end(path)
+    }
+
+    fn write_all(&self, path: &Path, data: &[u8]) -> Result<()> {
+      self.inner.write_all(path, data)
+    }
+
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
+      self.inner.atomic_write(path, data)
+    }
+
+    fn remove(&self, path: &Path) -> Result<()> {
+      self.inner.remove(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+      self.inner.remove_dir_all(path)
+    }
+  }
+
+  #[test]
+  fn append_commit_fsyncs_before_returning() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let sync_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let storage = Arc::new(SyncCountingStorage {
+      inner: crate::storage::FsStorage::new(dir.path().to_path_buf()),
+      sync_count: Arc::clone(&sync_count),
+    });
+    let mut wal = Wal::open(storage, &path).unwrap();
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("durable"))]
+        .into_iter()
+        .collect(),
+    };
+
+    // Plain appends must not fsync so that batching stays cheap.
+    wal.append_add_doc(&doc).unwrap();
+    assert_eq!(sync_count.load(Ordering::SeqCst), 0);
+
+    // `append_commit` is the durability boundary: it must fsync before
+    // returning `Ok`, without requiring the caller to also invoke `sync`.
+    wal.append_commit().unwrap();
+    assert_eq!(sync_count.load(Ordering::SeqCst), 1);
   }
 }
