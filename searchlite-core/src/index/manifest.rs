@@ -371,9 +371,22 @@ impl Schema {
     // the caller actually sent, so a declared-required field that is simply
     // absent would otherwise slip through. Nested sub-properties are already
     // checked by `NestedField::validate` on a per-container basis.
+    //
+    // Fields with no persisted footprint (`!stored && !indexed && !fast`) are
+    // skipped: they carry no observable state, so they cannot be validated
+    // after documents are reconstructed from segments during `compact` /
+    // `merge_segments` / `apply_patch`. Enforcing presence on such degenerate
+    // schemas would therefore regress rewrite-based flows with no safety
+    // benefit (the field's value was already discarded at ingest time).
+    // Vector fields do not carry a nullability marker in the current schema
+    // model and are treated as implicitly optional by `collect_vector_value`,
+    // so they are excluded from this presence check by design.
     let doc_id_name = self.doc_id_field();
     for f in self.text_fields.iter() {
       if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !f.stored && !f.indexed {
         continue;
       }
       if !doc.fields.contains_key(&f.name) {
@@ -384,11 +397,17 @@ impl Schema {
       if f.nullable || f.name == doc_id_name {
         continue;
       }
+      if !f.stored && !f.indexed && !f.fast {
+        continue;
+      }
       if !doc.fields.contains_key(&f.name) {
         anyhow::bail!("missing required field `{}`", f.name);
       }
     }
     for f in self.numeric_fields.iter() {
+      // Numeric fields are always indexed (see `resolved_fields`), so they
+      // always have an observable footprint and must be present unless
+      // nullable.
       if f.nullable || f.name == doc_id_name {
         continue;
       }

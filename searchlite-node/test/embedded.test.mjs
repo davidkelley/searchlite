@@ -787,7 +787,7 @@ describe("typed search", () => {
 	});
 
 	it("works with optional fields in schema", async () => {
-		const idx = createIndex({ body: "text", tag: "keyword" });
+		const idx = createIndex({ body: "text", tag: { type: "keyword", nullable: true } });
 		await idx.add({ _id: "1", body: "optional test" });
 		await idx.commit();
 
