@@ -9,6 +9,7 @@ use crate::index::manifest::{FieldKind, Schema, SchemaAnalyzers};
 use crate::index::postings::PostingEntry;
 use crate::index::segment::SegmentReader;
 use crate::query::planner::PhraseSpec;
+use crate::util::case_fold::fold_keyword;
 use crate::DocId;
 
 #[derive(Clone, Debug)]
@@ -64,7 +65,7 @@ pub(crate) fn expand_phrase_fields(
             Some((field.clone(), positions))
           }),
           FieldKind::Keyword => {
-            let joined = phrase.terms.join(" ").to_ascii_lowercase();
+            let joined = fold_keyword(&phrase.terms.join(" ")).into_owned();
             if joined.is_empty() {
               None
             } else {
