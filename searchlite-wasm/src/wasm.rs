@@ -989,65 +989,56 @@ impl PendingWrites {
   }
 
   async fn flush(&self) -> Result<()> {
-    let receivers = {
-      let mut guard = self.pending.lock();
-      std::mem::take(&mut *guard)
-    };
     let mut first_error = None;
-    for rx in receivers {
-      match rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-          if first_error.is_none() {
-            first_error = Some(err);
+    loop {
+      // Drain all pending receivers from normal enqueue paths.
+      let receivers = {
+        let mut guard = self.pending.lock();
+        std::mem::take(&mut *guard)
+      };
+      for rx in receivers {
+        match rx.await {
+          Ok(Ok(())) => {}
+          Ok(Err(err)) => {
+            if first_error.is_none() {
+              first_error = Some(err);
+            }
           }
-        }
-        Err(_) => {
-          if first_error.is_none() {
-            first_error = Some(anyhow!("pending persist dropped"));
+          Err(_) => {
+            if first_error.is_none() {
+              first_error = Some(anyhow!("pending persist dropped"));
+            }
           }
         }
       }
-    }
-    // If previous batches failed and re-queued operations, ensure a worker
-    // is running so those entries are retried before we return.
-    {
-      let mut guard = self.state.lock();
-      if !guard.queue.is_empty() && !guard.worker_running {
-        let (tx, rx) = oneshot::channel();
-        // Attach a waiter to the first queued entry so we can await it.
-        if let Some(entry) = guard.queue.values_mut().next() {
-          entry.waiters.push(tx);
-          self.pending.lock().push(rx);
+      // If previous batches failed and re-queued operations, ensure a worker
+      // is running so those entries are retried. Attach a waiter to the LAST
+      // queued entry so we block until the entire queue has been processed.
+      let has_retry = {
+        let mut guard = self.state.lock();
+        if !guard.queue.is_empty() && !guard.worker_running {
+          let (tx, rx) = oneshot::channel();
+          if let Some(entry) = guard.queue.values_mut().next_back() {
+            entry.waiters.push(tx);
+            self.pending.lock().push(rx);
+          } else {
+            drop(tx);
+          }
+          guard.worker_running = true;
+          let db_name = self.db_name.clone();
+          let state = self.state.clone();
+          spawn_local(async move {
+            persist_queue_worker(db_name, state).await;
+          });
+          true
         } else {
-          drop(tx);
+          false
         }
-        guard.worker_running = true;
-        let db_name = self.db_name.clone();
-        let state = self.state.clone();
-        spawn_local(async move {
-          persist_queue_worker(db_name, state).await;
-        });
+      };
+      if !has_retry {
+        break;
       }
-    }
-    let retry_receivers = {
-      let mut guard = self.pending.lock();
-      std::mem::take(&mut *guard)
-    };
-    for rx in retry_receivers {
-      match rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-          if first_error.is_none() {
-            first_error = Some(err);
-          }
-        }
-        Err(_) => {
-          if first_error.is_none() {
-            first_error = Some(anyhow!("pending persist dropped"));
-          }
-        }
-      }
+      // Loop back to drain the retry receivers and check again.
     }
     if let Some(err) = first_error {
       Err(err)
@@ -1532,17 +1523,35 @@ fn f64_to_u64_bytes(value: f64) -> Option<u64> {
 }
 
 async fn browser_storage_usage() -> Result<StorageUsageResponse, JsValue> {
+  // Use Reflect to access navigator.storage so this works in both Window and
+  // Worker contexts (Window exposes Navigator, Workers expose WorkerNavigator,
+  // but both provide a StorageManager via navigator.storage).
   let global = js_sys::global();
-  let navigator = js_sys::Reflect::get(&global, &JsValue::from_str("navigator"))
-    .ok()
-    .and_then(|value| value.dyn_into::<web_sys::Navigator>().ok());
-  let Some(navigator) = navigator else {
-    return Ok(StorageUsageResponse::unsupported(
-      "navigator is unavailable",
-    ));
+  let navigator = match js_sys::Reflect::get(&global, &JsValue::from_str("navigator")) {
+    Ok(nav) if !nav.is_undefined() && !nav.is_null() => nav,
+    _ => {
+      return Ok(StorageUsageResponse::unsupported(
+        "navigator is unavailable",
+      ));
+    }
   };
-  let manager = navigator.storage();
-  let estimate_promise = match manager.estimate() {
+  let storage = match js_sys::Reflect::get(&navigator, &JsValue::from_str("storage")) {
+    Ok(s) if !s.is_undefined() && !s.is_null() => s,
+    _ => {
+      return Ok(StorageUsageResponse::unsupported(
+        "navigator.storage is unavailable",
+      ));
+    }
+  };
+  let estimate_fn = match js_sys::Reflect::get(&storage, &JsValue::from_str("estimate")) {
+    Ok(f) if f.is_function() => f.dyn_into::<js_sys::Function>().unwrap(),
+    _ => {
+      return Ok(StorageUsageResponse::unsupported(
+        "storage.estimate is unavailable",
+      ));
+    }
+  };
+  let estimate_promise = match estimate_fn.call0(&storage) {
     Ok(promise) => promise,
     Err(err) => {
       return Ok(StorageUsageResponse::unsupported(format!(
@@ -1550,7 +1559,7 @@ async fn browser_storage_usage() -> Result<StorageUsageResponse, JsValue> {
       )));
     }
   };
-  let estimate_value = match JsFuture::from(estimate_promise).await {
+  let estimate_value = match JsFuture::from(js_sys::Promise::from(estimate_promise)).await {
     Ok(value) => value,
     Err(err) => {
       return Ok(StorageUsageResponse::unsupported(format!(
@@ -1571,12 +1580,19 @@ async fn browser_storage_usage() -> Result<StorageUsageResponse, JsValue> {
     (Some(used), Some(limit)) => Some(limit.saturating_sub(used)),
     _ => None,
   };
-  let persisted = match manager.persisted() {
-    Ok(promise) => match JsFuture::from(promise).await {
-      Ok(value) => value.as_bool(),
-      Err(_) => None,
-    },
-    Err(_) => None,
+  // Check navigator.storage.persisted() via Reflect as well.
+  let persisted = match js_sys::Reflect::get(&storage, &JsValue::from_str("persisted")) {
+    Ok(f) if f.is_function() => {
+      let func = f.dyn_into::<js_sys::Function>().unwrap();
+      match func.call0(&storage) {
+        Ok(promise) => match JsFuture::from(js_sys::Promise::from(promise)).await {
+          Ok(value) => value.as_bool(),
+          Err(_) => None,
+        },
+        Err(_) => None,
+      }
+    }
+    _ => None,
   };
   Ok(StorageUsageResponse {
     supported: true,
@@ -2218,6 +2234,8 @@ impl Searchlite {
 
   /// Execute multiple search requests in order and return ordered results.
   /// `request` shape: `{ searches: SearchRequest[], parallel?: boolean, max_concurrency?: number }`.
+  /// Note: `parallel` and `max_concurrency` are accepted for API compatibility
+  /// but have no effect in single-threaded WASM — searches always run serially.
   pub fn multi_search(&self, request: JsValue) -> Result<JsValue, JsValue> {
     let req: MultiSearchRequest = parse_request_value(request, "invalid_multi_search_request")?;
     let reader: IndexReader = self

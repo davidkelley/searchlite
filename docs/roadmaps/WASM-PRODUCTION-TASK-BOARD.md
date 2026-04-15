@@ -49,7 +49,7 @@ Each task is only complete when all are true:
 | WASM-010 | M2 | Add `multi_search` API to WASM bindings | `searchlite-wasm/src/wasm.rs`, `docs/wasm.md` | Batched requests return ordered result list with per-request output | `Done` |
 | WASM-011 | M2 | Add maintenance APIs: `compact`, `inspect`, `stats` | `searchlite-wasm/src/wasm.rs`, `docs/wasm.md`, `docs/bindings.md` | Maintenance ops produce stable payloads and pass regression tests | `Done` |
 | WASM-012 | M2 | Add parity contract tests (core vs wasm normalized responses) | `searchlite-wasm/src/wasm.rs` (or dedicated test module), `integration/` if expanded | Shared fixture set compares behavior for search/mget/multi-search/update/delete | `Done` |
-| WASM-013 | M3 | Replace full-snapshot load with incremental/chunked load path | `searchlite-wasm/src/wasm.rs` | Large-index startup memory profile is bounded and documented | `Done` |
+| WASM-013 | M3 | Replace full-snapshot load with incremental/chunked load path | `searchlite-wasm/src/wasm.rs` | `load_snapshot` no longer relies on `get_all_keys()` + `get_all()`, and startup memory is bounded and documented | `In Progress` |
 | WASM-014 | M3 | Batch IndexedDB persistence writes and reduce per-file transaction overhead | `searchlite-wasm/src/wasm.rs` | Ingest benchmark shows fewer IDB transactions and lower commit latency | `Done` |
 | WASM-015 | M3 | Add storage usage/quota introspection API | `searchlite-wasm/src/wasm.rs`, `docs/wasm.md` | Browser reports usage/remaining capacity when supported | `Done` |
 | WASM-016 | M3 | Add typed quota exceeded handling and recovery guidance | `searchlite-wasm/src/wasm.rs`, `docs/bindings.md`, `docs/wasm.md` | Quota exhaustion test asserts explicit quota error type and recovery path | `Done` |
