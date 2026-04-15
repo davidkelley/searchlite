@@ -896,7 +896,7 @@ impl<'a> SegmentWriter<'a> {
         let graph = index.into_graph();
         let graph_bytes = serde_json::to_vec(&graph)?;
         // Match write_vector_file: the HNSW graph is an immutable segment
-        // artefact referenced from the manifest, so it must go through the
+        // artifact referenced from the manifest, so it must go through the
         // same tmp-write → fsync → rename → fsync-dir path to avoid a
         // truncated live file if the write is interrupted.
         self.storage.atomic_write(&hnsw_path, &graph_bytes)?;
@@ -1055,17 +1055,18 @@ fn build_vector_store(
   ))
 }
 
-/// Serialise a [`VectorStore`] to its on-disk representation and persist it
+/// Serialize a [`VectorStore`] to its on-disk representation and persist it
 /// through the storage's atomic-write path.
 ///
-/// The vector file is an immutable segment artefact referenced from the
+/// The vector file is an immutable segment artifact referenced from the
 /// manifest. The manifest itself is written with [`Storage::atomic_write`], so
 /// using the same tmp-write → fsync → rename → fsync-dir pattern here keeps
-/// the two artefacts on equivalent durability and atomicity footing: a reader
+/// the two artifacts on equivalent durability and atomicity footing: a reader
 /// recovering after a crash either sees the complete vector file or no file
 /// at that path, never a truncated body with a valid magic/version header.
-/// `storage.write_all` would fsync the body but leaves a partially-written
-/// live file visible to readers if the write is interrupted mid-way.
+/// By contrast, `storage.write_all` writes/truncates the live path in place,
+/// so an interrupted write can leave a partially-written file visible to
+/// readers even if the written bytes are later synced.
 #[cfg(feature = "vectors")]
 fn write_vector_file(storage: &dyn Storage, path: &Path, store: &VectorStore) -> Result<()> {
   let mut buf: Vec<u8> = Vec::new();
@@ -1724,7 +1725,7 @@ mod tests {
     }
   }
 
-  // Regression coverage for BUG-013: every segment artefact that is referenced
+  // Regression coverage for BUG-013: every segment artifact that is referenced
   // from a manifest (vector file, HNSW graph) must be persisted through the
   // atomic tmp-write → fsync → rename → fsync-dir path, matching what the
   // manifest itself does. Using `write_all` leaves a truncated live file at
@@ -1741,7 +1742,7 @@ mod tests {
 
     /// Storage wrapper around `FsStorage` that records which persistence
     /// method each write went through, so tests can assert that atomicity-
-    /// critical artefacts use `atomic_write` rather than `write_all`.
+    /// critical artifacts use `atomic_write` rather than `write_all`.
     struct RecordingStorage {
       inner: crate::storage::FsStorage,
       write_all_paths: Mutex<Vec<std::path::PathBuf>>,
@@ -1839,12 +1840,10 @@ mod tests {
     }
 
     #[test]
-    fn write_vector_file_leaves_no_partial_file_on_io_failure() {
-      // With atomic_write, an interrupted write must never produce a
-      // readable-but-truncated file at the target path: the tmp file is
-      // either renamed atomically or left behind, but the live path is not
-      // overwritten in place. We model this by inspecting what exists at
-      // the target path *during* the call: nothing until the rename fires.
+    fn write_vector_file_cleans_up_tmp_file_after_successful_atomic_write() {
+      // This test verifies the successful-write cleanup behavior of
+      // atomic_write: once the write completes, the final target file
+      // should exist and no `.tmp` staging file should remain alongside it.
       let dir = tempdir().unwrap();
       let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
       let path = dir.path().join("subdir").join("vec.bin");
@@ -1862,6 +1861,96 @@ mod tests {
       assert!(
         !leftover_tmp.exists(),
         "atomic_write must clean up the tmp staging file"
+      );
+    }
+
+    /// `Storage` impl whose `atomic_write` always fails. Used to assert that
+    /// when persistence errors out, the live target path is not clobbered —
+    /// an existing file stays intact and no partial file is left behind.
+    struct FailingAtomicWriteStorage {
+      inner: crate::storage::FsStorage,
+    }
+
+    impl Storage for FailingAtomicWriteStorage {
+      fn root(&self) -> &Path {
+        self.inner.root()
+      }
+      fn ensure_dir(&self, path: &Path) -> Result<()> {
+        self.inner.ensure_dir(path)
+      }
+      fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+      }
+      fn open_read(&self, path: &Path) -> Result<DynFile> {
+        self.inner.open_read(path)
+      }
+      fn open_write(&self, path: &Path) -> Result<DynFile> {
+        self.inner.open_write(path)
+      }
+      fn open_append(&self, path: &Path) -> Result<DynFile> {
+        self.inner.open_append(path)
+      }
+      fn read_to_end(&self, path: &Path) -> Result<Vec<u8>> {
+        self.inner.read_to_end(path)
+      }
+      fn write_all(&self, path: &Path, data: &[u8]) -> Result<()> {
+        self.inner.write_all(path, data)
+      }
+      fn atomic_write(&self, _path: &Path, _data: &[u8]) -> Result<()> {
+        Err(anyhow!("injected atomic_write failure"))
+      }
+      fn remove(&self, path: &Path) -> Result<()> {
+        self.inner.remove(path)
+      }
+      fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.inner.remove_dir_all(path)
+      }
+    }
+
+    #[test]
+    fn write_vector_file_does_not_clobber_existing_file_on_failure() {
+      // If atomic_write fails, an already-committed vector file at the
+      // target path must remain byte-identical — the whole point of going
+      // through the rename-based atomic path is that a failed write never
+      // becomes visible to readers.
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let path = dir.path().join("vec.bin");
+      let store = VectorStore::new(
+        2,
+        ApiVectorMetric::Cosine,
+        vec![0, u32::MAX, 1],
+        vec![0.1, 0.2, 0.3, 0.4],
+      );
+
+      // First commit a valid file with the real storage so the target path
+      // has known-good bytes we can compare against after the failing write.
+      write_vector_file(&storage, &path, &store).unwrap();
+      let baseline = std::fs::read(&path).unwrap();
+
+      // Now attempt a second write through a storage that fails atomic_write.
+      let failing = FailingAtomicWriteStorage {
+        inner: crate::storage::FsStorage::new(dir.path().to_path_buf()),
+      };
+      let overwrite_store = VectorStore::new(
+        2,
+        ApiVectorMetric::Cosine,
+        vec![0, 1, 2],
+        vec![9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+      );
+      let err = write_vector_file(&failing, &path, &overwrite_store)
+        .expect_err("failing atomic_write must surface an error");
+      assert!(
+        err.to_string().contains("injected atomic_write failure"),
+        "unexpected error: {err}"
+      );
+
+      // The original file must still be exactly what we wrote first — the
+      // failure path cannot leave a half-overwritten live file behind.
+      let after = std::fs::read(&path).unwrap();
+      assert_eq!(
+        after, baseline,
+        "failed atomic_write must not overwrite the live target path"
       );
     }
   }
