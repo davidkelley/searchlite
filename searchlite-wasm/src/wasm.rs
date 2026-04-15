@@ -29,6 +29,12 @@ const STORE_NAME: &str = "searchlite_files";
 // BM25 defaults tuned for browser-based search; keep aligned with core defaults.
 const BM25_K1: f32 = 0.9;
 const BM25_B: f32 = 0.4;
+/// Hard ceiling on `from + limit` and `candidate_size` for any WASM-exported
+/// search entrypoint. Browser linear memory is capped at 4 GiB, so an
+/// unbounded `limit` from JavaScript can drive the result heap to OOM and
+/// abort the WebAssembly.Instance with no recovery path. Callers needing more
+/// than this should paginate via `cursor` / `search_after`.
+const WASM_MAX_PAGE_SIZE: usize = 10_000;
 
 thread_local! {
   // Per-thread (per WASM worker) cache of IndexedDB connections.
@@ -97,6 +103,50 @@ fn path_key(path: &Path) -> String {
 
 fn to_js_error(err: impl std::fmt::Display) -> JsValue {
   JsValue::from_str(&err.to_string())
+}
+
+/// Reject WASM search requests whose `limit`, `from + limit`, or
+/// `candidate_size` exceed [`WASM_MAX_PAGE_SIZE`]. A JS caller that passes
+/// `limit = u32::MAX` would otherwise drive the result heap until the
+/// WebAssembly linear memory aborts the module with no recovery path.
+fn validate_search_limits(req: &SearchRequest) -> Result<(), JsValue> {
+  if req.limit > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "limit {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.limit
+    )));
+  }
+  if req.from > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "from {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.from
+    )));
+  }
+  if req.from.saturating_add(req.limit) > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "from + limit ({}) exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.from.saturating_add(req.limit),
+    )));
+  }
+  if let Some(candidate_size) = req.candidate_size {
+    if candidate_size > WASM_MAX_PAGE_SIZE {
+      return Err(JsValue::from_str(&format!(
+        "candidate_size {candidate_size} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      )));
+    }
+  }
+  Ok(())
+}
+
+/// Reject a `limit` argument supplied directly by JS to the convenience
+/// `search()` entrypoint, which always uses `from = 0`.
+fn validate_search_limit_arg(limit: usize) -> Result<(), JsValue> {
+  if limit > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "limit {limit} exceeds max page size {WASM_MAX_PAGE_SIZE}"
+    )));
+  }
+  Ok(())
 }
 
 fn value_to_document(value: serde_json::Value) -> Result<Document, JsValue> {
@@ -838,6 +888,7 @@ impl Searchlite {
     limit: usize,
     return_stored: Option<bool>,
   ) -> Result<JsValue, JsValue> {
+    validate_search_limit_arg(limit)?;
     let parsed_query = serde_json::from_str::<QueryNode>(&query)
       .map(Query::Node)
       .unwrap_or(Query::String(query));
@@ -857,6 +908,7 @@ impl Searchlite {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -878,12 +930,14 @@ impl Searchlite {
   pub fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
     let req: SearchRequest = serde_json::from_str(&request_json)
       .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    validate_search_limits(&req)?;
     self.run_search(req)
   }
 
   pub fn search_request_value(&self, request: JsValue) -> Result<JsValue, JsValue> {
     let req: SearchRequest = serde_wasm_bindgen::from_value(request)
       .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    validate_search_limits(&req)?;
     self.run_search(req)
   }
 
@@ -1037,6 +1091,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1083,6 +1138,7 @@ mod tests {
       execution: ExecutionStrategy::Wand,
       bmw_block_size: None,
       fuzzy: None,
+      track_total_hits: None,
       #[cfg(feature = "vectors")]
       vector_query: None,
 
@@ -1103,6 +1159,147 @@ mod tests {
     let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
     let hits = result_json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
+  }
+
+  // BUG-025: a JS caller passing `limit = 4_000_000_000` to `search()` would
+  // grow the result heap until the WebAssembly linear memory aborts with no
+  // recovery path. The validator must surface a `page_too_large`-style error
+  // before any allocation happens.
+  #[wasm_bindgen_test]
+  async fn search_rejects_limit_above_max_page_size() {
+    let db = unique_db("searchlite-bug-025-search");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let err = idx
+      .search("hello".to_string(), WASM_MAX_PAGE_SIZE + 1, Some(true))
+      .expect_err("limit above WASM_MAX_PAGE_SIZE must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
+
+    // The cap itself is allowed.
+    idx
+      .search("hello".to_string(), WASM_MAX_PAGE_SIZE, Some(true))
+      .expect("limit at the cap must still be accepted");
+  }
+
+  // BUG-025: the JSON-decoded `search_request` path must also reject huge
+  // `limit`, `from`, and `from + limit`, rather than allocating a million-slot
+  // top-k heap.
+  #[wasm_bindgen_test]
+  async fn search_request_rejects_oversized_limits() {
+    let db = unique_db("searchlite-bug-025-request");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "return_stored": true,
+    });
+    let err = idx
+      .search_request(request.to_string())
+      .expect_err("oversized limit must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
+
+    // `from + limit` over the cap is also rejected, even when `limit` alone
+    // fits.
+    let paginated = serde_json::json!({
+      "query": "hello",
+      "from": WASM_MAX_PAGE_SIZE,
+      "limit": 1,
+      "return_stored": true,
+    });
+    let err = idx
+      .search_request(paginated.to_string())
+      .expect_err("from + limit above cap must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
+  }
+
+  // BUG-025: `candidate_size` is plumbed through the top-k path the same way
+  // `limit` is, so it must also be capped to keep a hostile request from
+  // expanding the heap that way.
+  #[wasm_bindgen_test]
+  async fn search_request_rejects_candidate_size_above_max_page_size() {
+    let db = unique_db("searchlite-bug-025-candidate");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": 1,
+      "candidate_size": WASM_MAX_PAGE_SIZE + 1,
+      "return_stored": true,
+    });
+    let err = idx
+      .search_request(request.to_string())
+      .expect_err("oversized candidate_size must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
+  }
+
+  // BUG-025: the JsValue-decoded entrypoint shares the same allocation hazard
+  // as `search_request`, so it must enforce the same cap.
+  #[wasm_bindgen_test]
+  async fn search_request_value_rejects_oversized_limit() {
+    let db = unique_db("searchlite-bug-025-request-value");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
+    idx.commit().await.unwrap();
+
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "return_stored": true,
+    });
+    let request_js = serde_wasm_bindgen::to_value(&request).unwrap();
+    let err = idx
+      .search_request_value(request_js)
+      .expect_err("oversized limit must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
   }
 
   #[wasm_bindgen_test]
