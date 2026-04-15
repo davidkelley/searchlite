@@ -35,6 +35,18 @@ int32_t searchlite_add_json_batch(IndexHandle* handle, const char* json, size_t 
 int32_t searchlite_add_json_batch_with_write_key(IndexHandle* handle, const char* json, size_t json_len, const char* write_key);
 int32_t searchlite_commit(IndexHandle* handle);
 int32_t searchlite_commit_with_write_key(IndexHandle* handle, const char* write_key);
+// Search output buffer convention (applies to `searchlite_search` and
+// `searchlite_search_request`):
+// - Return `0` means an error (null argument, search failure, or JSON
+//   serialization failure). The buffer is untouched.
+// - A positive return `N` with `N <= buf_cap - 1` means success: `N` bytes of
+//   JSON were written to `out_json_buf` followed by a NUL terminator.
+// - A positive return `N` with `N > buf_cap` means the buffer was too small:
+//   no JSON was written (when `buf_cap >= 1` the buffer is NUL-terminated at
+//   index 0), and `N` is the required size including the NUL terminator.
+//   Callers should allocate `N` bytes and retry.
+// - `searchlite_search` additionally returns `SEARCHLITE_ERR_PANIC` (`-100`)
+//   if a Rust panic was caught.
 ssize_t searchlite_search(
   IndexHandle* handle,
   const char* query,

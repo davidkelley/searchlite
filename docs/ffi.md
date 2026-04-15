@@ -106,7 +106,8 @@ int main(void) {
   }
 
   // 4. Run a search. We allocate a buffer for the JSON response; if the
-  //    result is truncated, retry with a bigger buffer.
+  //    buffer is too small, the return value exceeds `buf_cap` and reports
+  //    the required size so we can retry.
   const char* request =
     "{\"query\":\"rust\",\"limit\":5,\"return_stored\":true}";
   char buf[64 * 1024] = {0};
@@ -114,9 +115,19 @@ int main(void) {
       idx, request, strlen(request), buf, sizeof(buf));
 
   if (written == 0) {
-    fprintf(stderr, "search produced no bytes\n");
-  } else if (written == sizeof(buf) - 1) {
-    fprintf(stderr, "result may be truncated -- retry with larger buffer\n");
+    fprintf(stderr, "search failed\n");
+  } else if (written > sizeof(buf)) {
+    // Buffer was too small. `written` is the required size including the
+    // NUL terminator -- allocate and retry.
+    char* big = malloc(written);
+    size_t retry = searchlite_search_request(
+        idx, request, strlen(request), big, written);
+    if (retry > 0 && retry <= written) {
+      printf("%s\n", big);
+    } else {
+      fprintf(stderr, "search retry failed\n");
+    }
+    free(big);
   } else {
     printf("%s\n", buf);
   }
