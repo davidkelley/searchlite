@@ -990,55 +990,50 @@ impl PendingWrites {
 
   async fn flush(&self) -> Result<()> {
     let mut first_error = None;
-    loop {
-      // Drain all pending receivers from normal enqueue paths.
-      let receivers = {
-        let mut guard = self.pending.lock();
-        std::mem::take(&mut *guard)
-      };
-      for rx in receivers {
-        match rx.await {
-          Ok(Ok(())) => {}
-          Ok(Err(err)) => {
-            if first_error.is_none() {
-              first_error = Some(err);
-            }
-          }
-          Err(_) => {
-            if first_error.is_none() {
-              first_error = Some(anyhow!("pending persist dropped"));
-            }
-          }
-        }
-      }
-      // If previous batches failed and re-queued operations, ensure a worker
-      // is running so those entries are retried. Attach a waiter to the LAST
-      // queued entry so we block until the entire queue has been processed.
-      let has_retry = {
-        let mut guard = self.state.lock();
-        if !guard.queue.is_empty() && !guard.worker_running {
-          let (tx, rx) = oneshot::channel();
-          if let Some(entry) = guard.queue.values_mut().next_back() {
-            entry.waiters.push(tx);
-            self.pending.lock().push(rx);
-          } else {
-            drop(tx);
-          }
-          guard.worker_running = true;
-          let db_name = self.db_name.clone();
-          let state = self.state.clone();
-          spawn_local(async move {
-            persist_queue_worker(db_name, state).await;
-          });
-          true
+    // If a previous batch failed and re-queued operations, spawn a new worker
+    // to retry before draining receivers. Attach a waiter to the LAST queued
+    // entry so we block until the worker either completes the entire queue
+    // or fails (in which case all remaining waiters are drained with the
+    // error by the worker's failure path). We only make ONE retry attempt
+    // per flush() call — a persistent failure returns an error immediately
+    // instead of looping.
+    {
+      let mut guard = self.state.lock();
+      if !guard.queue.is_empty() && !guard.worker_running {
+        let (tx, rx) = oneshot::channel();
+        if let Some(entry) = guard.queue.values_mut().next_back() {
+          entry.waiters.push(tx);
+          self.pending.lock().push(rx);
         } else {
-          false
+          drop(tx);
         }
-      };
-      if !has_retry {
-        break;
+        guard.worker_running = true;
+        let db_name = self.db_name.clone();
+        let state = self.state.clone();
+        spawn_local(async move {
+          persist_queue_worker(db_name, state).await;
+        });
       }
-      // Loop back to drain the retry receivers and check again.
+    }
+    // Drain all pending receivers (from enqueues plus any retry waiter).
+    let receivers = {
+      let mut guard = self.pending.lock();
+      std::mem::take(&mut *guard)
+    };
+    for rx in receivers {
+      match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+          if first_error.is_none() {
+            first_error = Some(err);
+          }
+        }
+        Err(_) => {
+          if first_error.is_none() {
+            first_error = Some(anyhow!("pending persist dropped"));
+          }
+        }
+      }
     }
     if let Some(err) = first_error {
       Err(err)
@@ -1085,6 +1080,10 @@ async fn persist_queue_worker(db_name: String, state: Arc<Mutex<PendingQueueStat
       // Do not overwrite entries added concurrently during this batch.
       // Stop the worker after re-queuing to avoid an infinite retry loop;
       // the next explicit flush() will spawn a new worker.
+      // Also drain any waiters attached to remaining queued entries (batches
+      // that were never attempted) so flush() can return the error without
+      // hanging or looping.
+      let mut pending_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
       {
         let mut guard = state.lock();
         for (path, op) in operations {
@@ -1093,12 +1092,18 @@ async fn persist_queue_worker(db_name: String, state: Arc<Mutex<PendingQueueStat
             waiters: Vec::new(),
           });
         }
+        for entry in guard.queue.values_mut() {
+          pending_waiters.append(&mut entry.waiters);
+        }
         guard.worker_running = false;
       }
       for waiters in waiter_sets {
         for tx in waiters {
           let _ = tx.send(Err(anyhow!(msg.clone())));
         }
+      }
+      for tx in pending_waiters {
+        let _ = tx.send(Err(anyhow!(msg.clone())));
       }
       return;
     }
