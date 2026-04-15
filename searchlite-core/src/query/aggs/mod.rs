@@ -2132,8 +2132,8 @@ impl<'a> TopHitsCollector<'a> {
     // segment-local rank is `< from` but whose global rank is within the
     // requested `[from, from + size)` page — see BUG-215 for details.
     let mut hits = Vec::with_capacity(ranked.len());
+    let need_doc = self.fields.is_some() || self.highlight_field.is_some();
     for doc in ranked.into_iter() {
-      let need_doc = self.fields.is_some() || self.highlight_field.is_some();
       let fetched = if need_doc {
         self.ctx.segment.get_doc(doc.doc_id).ok()
       } else {
