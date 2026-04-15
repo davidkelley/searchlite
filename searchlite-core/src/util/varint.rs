@@ -47,7 +47,16 @@ pub fn read_u32_var<R: Read>(r: &mut R) -> Result<u32> {
       return Err(anyhow!(e));
     }
     let b = byte[0];
-    value |= ((b & 0x7F) as u32) << shift;
+    let part = (b & 0x7F) as u32;
+    // On the final possible byte (shift == 28) only the low 4 bits of
+    // `part` fit in a u32; any higher bit would be silently truncated by
+    // the shift. Reject such inputs as overflowing u32 rather than
+    // decoding to a lossy value (mirrors the shift == 63 guard in
+    // read_u64; see BUG-002 / #140).
+    if shift == 28 && part > 0x0F {
+      return Err(anyhow!("varint overflows u32"));
+    }
+    value |= part << shift;
     if b & 0x80 == 0 {
       return Ok(value);
     }
@@ -119,6 +128,66 @@ mod tests {
     let (decoded, len) = read_u64(&buf).unwrap();
     assert_eq!(decoded, u64::MAX);
     assert_eq!(len, 10);
+  }
+
+  #[test]
+  fn read_u32_var_roundtrip_boundary_values() {
+    // u32::MAX encodes to exactly 5 LEB128 bytes — the boundary case that
+    // must round-trip through the stricter overflow guard without error.
+    use std::io::Cursor;
+    for val in [0u32, 1, 127, 128, 16383, 16384, u32::MAX - 1, u32::MAX] {
+      let mut buf = Vec::new();
+      write_u32_var(val, &mut buf);
+      let mut cur = Cursor::new(&buf);
+      let decoded = read_u32_var(&mut cur).unwrap();
+      assert_eq!(decoded, val, "round-trip failed for {val}");
+    }
+  }
+
+  #[test]
+  fn read_u32_var_rejects_final_byte_overflow() {
+    // 5-byte varint: four continuation bytes (value bits all zero) + final
+    // byte 0x10. The final byte's bit 4 sits at position 32 once shifted,
+    // i.e. one bit above u32::MAX. The decoded value is exactly 2^32 and
+    // does NOT fit in a u32. read_u32_var must error rather than silently
+    // dropping the high bit through the u32 left shift.
+    use std::io::Cursor;
+    let buf = vec![0x80u8, 0x80, 0x80, 0x80, 0x10];
+    let mut cur = Cursor::new(&buf);
+    let err = read_u32_var(&mut cur).expect_err("u32-overflowing varint must be rejected");
+    assert_eq!(err.to_string(), "varint overflows u32");
+
+    // Same shape, even more value bits set in the final byte (bits 4..6).
+    let buf = vec![0x80u8, 0x80, 0x80, 0x80, 0x70];
+    let mut cur = Cursor::new(&buf);
+    let err = read_u32_var(&mut cur).expect_err("u32-overflowing varint must be rejected");
+    assert_eq!(err.to_string(), "varint overflows u32");
+  }
+
+  #[test]
+  fn read_u32_var_rejects_overlong_varint() {
+    // A stream of continuation-only bytes (no value bits set) would shift
+    // past 28 bits of a u32 without ever terminating. Must return an
+    // error instead of panicking or silently corrupting the value.
+    use std::io::Cursor;
+    let buf = vec![0x80u8; 10];
+    let mut cur = Cursor::new(&buf);
+    let err = read_u32_var(&mut cur).expect_err("overlong varint must be rejected");
+    assert_eq!(err.to_string(), "varint too long");
+  }
+
+  #[test]
+  fn read_u32_var_accepts_max_length_valid_varint() {
+    // u32::MAX encodes to exactly 5 LEB128 bytes whose final byte is 0x0F —
+    // the boundary the new guard must accept.
+    use std::io::Cursor;
+    let mut buf = Vec::new();
+    write_u32_var(u32::MAX, &mut buf);
+    assert_eq!(buf.len(), 5);
+    assert_eq!(buf[4], 0x0F);
+    let mut cur = Cursor::new(&buf);
+    let decoded = read_u32_var(&mut cur).unwrap();
+    assert_eq!(decoded, u32::MAX);
   }
 
   #[test]
