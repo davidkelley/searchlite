@@ -2109,17 +2109,19 @@ impl<'a> TopHitsCollector<'a> {
     // Defense-in-depth: clamp `size` and `from` to `MAX_TOP_HITS` so an internal caller that
     // bypasses `validate_aggregations_in_scope` cannot drive an unbounded `BinaryHeap` here
     // (BUG-222). The request validator rejects values past the cap up-front; the `min` calls are
-    // a hard ceiling on the per-segment heap. `.max(1)` preserves the legacy invariant that the
-    // collector retains the best hit even when callers ask for `size = 0` so the merge step has
-    // a candidate to pick from.
+    // a hard ceiling on the per-segment heap. We persist the bounded values into the struct so
+    // every downstream use (heap sizing, `finish`'s `start + size` arithmetic, the
+    // `Vec::with_capacity` for hits) stays within the cap and consistent with `limit`. `.max(1)`
+    // on `limit` preserves the legacy invariant that the collector retains the best hit even
+    // when callers ask for `size = 0` so the merge step has a candidate to pick from.
     let bounded_size = agg.size.min(MAX_TOP_HITS);
     let bounded_from = agg.from.min(MAX_TOP_HITS);
     let limit = bounded_size
       .saturating_add(bounded_from)
       .clamp(1, MAX_TOP_HITS);
     Self {
-      size: agg.size,
-      from: agg.from,
+      size: bounded_size,
+      from: bounded_from,
       limit,
       heap: BinaryHeap::new(),
       total: 0,

@@ -338,8 +338,8 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "top_hits" },
-        "size": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Per-segment hits to retain. Capped server-side to bound the per-segment heap; `size + from` must also stay within the cap." },
-        "from": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Offset into the merged hit list. Capped server-side to bound the per-segment heap; `size + from` must also stay within the cap." },
+        "size": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Per-segment hits to retain. Must be <= 10000; requests exceeding this limit are rejected server-side. `size + from` must also stay within the cap." },
+        "from": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Offset into the merged hit list. Must be <= 10000; requests exceeding this limit are rejected server-side. `size + from` must also stay within the cap." },
         "fields": { "type": "array", "items": { "type": "string" } },
         "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
         "highlight_field": { "type": "string" }
