@@ -1,5 +1,8 @@
 #[cfg(not(feature = "write-key"))]
-use anyhow::{bail, Result};
+use anyhow::Result;
+
+#[cfg(not(feature = "write-key"))]
+use crate::api::errors::WriteKeyError;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct KdfParams {
@@ -38,7 +41,7 @@ pub fn default_kdf_params() -> KdfParams {
 
 #[cfg(feature = "write-key")]
 mod crypto {
-  use anyhow::{anyhow, bail, Result};
+  use anyhow::{anyhow, Result};
   use argon2::{password_hash::SaltString, Argon2, Params, PasswordHasher};
   use base64::{engine::general_purpose::STANDARD, Engine as _};
   use hmac::{Hmac, Mac};
@@ -47,10 +50,11 @@ mod crypto {
   use subtle::ConstantTimeEq;
 
   use super::{KdfParams, WriteKeyMeta};
+  use crate::api::errors::WriteKeyError;
 
   pub fn derive_write_key_meta(key: &str, params: Option<KdfParams>) -> Result<WriteKeyMeta> {
     if key.trim().is_empty() {
-      bail!("write key cannot be empty");
+      return Err(WriteKeyError::Empty.into());
     }
     let params = params.unwrap_or_else(super::default_kdf_params);
     let salt = SaltString::generate(&mut OsRng);
@@ -94,13 +98,13 @@ mod crypto {
       .hash_password(key.as_bytes(), &salt)
       .map_err(|e| anyhow!("failed to hash candidate: {e}"))?;
     let Some(phf) = candidate_hash.hash else {
-      bail!("derived hash missing");
+      return Err(anyhow!("derived hash missing"));
     };
     let ok = hash_bytes.as_slice().ct_eq(phf.as_bytes()).into();
     if ok {
       Ok(())
     } else {
-      bail!("invalid write key")
+      Err(WriteKeyError::Mismatch("provided key did not match stored hash").into())
     }
   }
 
@@ -123,5 +127,5 @@ pub use crypto::{binding_for_uuid, derive_write_key_meta, verify_binding, verify
 /// Returns an error when write-key operations are attempted without the feature enabled.
 #[cfg(not(feature = "write-key"))]
 pub fn require_write_key_feature() -> Result<()> {
-  bail!("write-key feature is not enabled; rebuild with `--features write-key`")
+  Err(WriteKeyError::FeatureDisabled.into())
 }
