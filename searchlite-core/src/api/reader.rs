@@ -4090,6 +4090,161 @@ mod tests {
   }
 
   #[test]
+  fn regex_with_optional_char_finds_shorter_term() {
+    // BUG-202 regression: a regex with an optional atom (here `u?`) must
+    // not have its literal-prefix scan overshoot past the optional char.
+    // Pre-fix, `regex_literal_prefix("colou?r")` returned "colou", and the
+    // term-dictionary iterator therefore skipped the term `color` even
+    // though the regex accepts it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-optional");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "color"), ("2", "colour")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "colou?r".into(),
+        max_expansions: Some(16),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys = groups[0].keys.to_vec();
+    assert!(
+      keys.contains(&"body:color".to_string()),
+      "missed `color`: got {keys:?}"
+    );
+    assert!(
+      keys.contains(&"body:colour".to_string()),
+      "missed `colour`: got {keys:?}"
+    );
+  }
+
+  #[test]
+  fn regex_flat_alternation_finds_all_branches() {
+    // BUG-202 regression: with a flat top-level alternation, the term
+    // scan must reach every branch. Pre-fix, `regex_literal_prefix`
+    // returned "rust" (only) and the term `ruby` was unreachable.
+    // Post-fix the extractor returns the longest literal prefix shared
+    // by every branch (`"ru"` for `rust|ruby`), which stays safe and
+    // still bounds the scan away from unrelated terms like `rope`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-flat-alt");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "ruby"), ("3", "rope")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "rust|ruby".into(),
+        max_expansions: Some(16),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys = groups[0].keys.to_vec();
+    assert!(
+      keys.contains(&"body:rust".to_string()),
+      "missed `rust`: got {keys:?}"
+    );
+    assert!(
+      keys.contains(&"body:ruby".to_string()),
+      "missed `ruby`: got {keys:?}"
+    );
+    assert!(
+      !keys.contains(&"body:rope".to_string()),
+      "`rope` must not be accepted by `rust|ruby`: got {keys:?}"
+    );
+  }
+
+  #[test]
   fn completion_suggest_prefers_higher_doc_freq() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx-suggest");
