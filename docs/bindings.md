@@ -26,7 +26,18 @@ All FFI functions that return `c_int` use the following codes:
 
 ### FFI search buffer behavior
 
-`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`). If the result exceeds `buf_cap`, the output is silently truncated to `buf_cap - 1` bytes plus a null terminator. Treat a returned byte count equal to `buf_cap - 1` as potentially truncated and retry with a larger buffer.
+`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`) and use the return value to report success, error, or buffer-too-small:
+
+| Return value `N` | Meaning |
+| --- | --- |
+| `0` | Error (null argument, search failure, or JSON serialization failure). Buffer is untouched. |
+| `0 < N <= buf_cap - 1` | Success. `N` bytes of JSON were written, followed by a NUL terminator. Read the result from `out_json_buf`. |
+| `N > buf_cap` | Buffer was too small. No JSON was written (when `buf_cap >= 1` the buffer is NUL-terminated at index 0). `N` is the required size including the NUL terminator -- allocate `N` bytes and retry. |
+| `-100` | `searchlite_search` only: a Rust panic was caught (`SEARCHLITE_ERR_PANIC`). |
+
+`N == buf_cap` is never returned: success always leaves at least one byte for the NUL terminator, so `N > buf_cap` is an unambiguous "buffer too small" signal even when `buf_cap == 0`.
+
+**C callers, signed/unsigned caveat for `searchlite_search`:** the return type is `ssize_t` but `buf_cap` is `size_t`. A direct `ret > buf_cap` comparison will promote a negative sentinel such as `SEARCHLITE_ERR_PANIC` (`-100`) to a huge unsigned value and misclassify it as "buffer too small". Check `ret <= 0` first (handling errors and panics), then compare `(size_t)ret > buf_cap` only when `ret > 0`. `searchlite_search_request` returns `size_t`, so a plain `ret > buf_cap` check is sufficient.
 
 ## WASM
 
