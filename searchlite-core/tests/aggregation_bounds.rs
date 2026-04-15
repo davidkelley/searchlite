@@ -1843,15 +1843,20 @@ mod bug_200 {
     );
   }
 
-  /// Defense-in-depth: the runtime cap inside `DateHistogramCollector::finish`
-  /// is load-bearing for callers that construct `DateHistogramAggregation`
-  /// programmatically or bypass validation. Exercise it directly by driving
-  /// the collector via the public API with a span that would otherwise loop
-  /// for ~10^11 iterations — the test must complete in milliseconds. (This
-  /// also verifies the validator's behavior end-to-end; if the validator is
-  /// ever weakened the collector cap still keeps the process alive.)
+  /// End-to-end wall-clock guard: a pathological date_histogram request that
+  /// would otherwise drive ~10^11 `HashMap` inserts in `finish` must return
+  /// quickly through the public API — either because validation rejects it
+  /// up front (the load-bearing path) or because the runtime cap inside
+  /// `DateHistogramCollector::finish` breaks the loop at `MAX_BUCKETS`
+  /// (defense-in-depth). This test passes regardless of which guard fires
+  /// first, and asserts both shape (`Err`) and wall-clock bound so an
+  /// accidental reintroduction of the unbounded loop is caught.
+  ///
+  /// Runtime-cap-only coverage that bypasses validation lives in
+  /// `searchlite-core/src/query/aggs/mod.rs` as a unit test of the span
+  /// helper (`date_histogram_span_exceeds_cap`).
   #[test]
-  fn extended_bounds_completes_within_reasonable_time() {
+  fn pathological_bounds_return_quickly_through_public_api() {
     use std::time::{Duration, Instant};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1879,8 +1884,12 @@ mod bug_200 {
     );
 
     let start = Instant::now();
-    let _ = search_with_agg(&idx, aggs);
+    let result = search_with_agg(&idx, aggs);
     let elapsed = start.elapsed();
+    assert!(
+      result.is_err(),
+      "pathological date_histogram request must be rejected, not silently accepted"
+    );
     assert!(
       elapsed < Duration::from_secs(5),
       "pathological date_histogram must not loop: took {elapsed:?}"

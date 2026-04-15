@@ -4025,6 +4025,115 @@ mod tests {
     );
   }
 
+  /// BUG-200: the helper feeding `validate_date_histogram_config` must use the
+  /// same inclusive `bucket_start(min)..=bucket_start(max)` span the collector
+  /// materializes — otherwise a pathologically small `fixed_interval` + wide
+  /// bounds can either slip past validation by one bucket (fence-post) or
+  /// silently allow a request that the runtime cap will later truncate.
+  #[test]
+  fn date_histogram_span_exceeds_cap_flags_wide_fixed_interval() {
+    // 4-year span at 1ms — the exact repro from the issue.
+    let four_years_ms: i64 = 4 * 365 * 86_400_000;
+    let extended = Some((0_i64, four_years_ms));
+    assert!(date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_fence_post_rejected() {
+    // 10_000 seconds at 1s → inclusive count = 10_001 (one above cap).
+    let extended = Some((0_i64, 10_000_000_i64));
+    assert!(date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1_000),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_exact_boundary_accepted() {
+    // 9_999 seconds at 1s → inclusive count = 10_000 (exactly at cap).
+    let extended = Some((0_i64, 9_999_000_i64));
+    assert!(!date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      0,
+      Some(1_000),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_honors_intersection_with_hard_bounds() {
+    // extended is huge, but hard_bounds clips it to a tiny sub-range —
+    // materialization is bounded by the intersection, not the union.
+    let huge: (i64, i64) = (0, 4 * 365 * 86_400_000);
+    let tiny_hard: (i64, i64) = (0, 1_000); // 1s at 1ms step = 1001 buckets.
+    assert!(!date_histogram_span_exceeds_cap(
+      Some(huge),
+      Some(tiny_hard),
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_no_bounds_is_safe() {
+    // With neither bound set, no empty buckets are materialized — safe.
+    assert!(!date_histogram_span_exceeds_cap(
+      None,
+      None,
+      0,
+      Some(1),
+      None
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_calendar_day_wide_range_rejected() {
+    // ~100 years of day buckets is well above MAX_BUCKETS.
+    let start = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap()
+      .and_utc()
+      .timestamp_millis();
+    let end = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap()
+      .and_utc()
+      .timestamp_millis();
+    assert!(date_histogram_span_exceeds_cap(
+      Some((start, end)),
+      None,
+      0,
+      None,
+      Some(CalendarUnit::Day)
+    ));
+  }
+
+  #[test]
+  fn date_histogram_span_exceeds_cap_degenerate_fixed_is_safe() {
+    // A `Fixed(0)` is rejected earlier in the validator chain; if it ever
+    // reaches the span helper, return `false` rather than dividing by zero.
+    assert!(!date_histogram_span_exceeds_cap(
+      Some((0_i64, 1_000)),
+      None,
+      0,
+      Some(0),
+      None
+    ));
+  }
+
   #[test]
   fn derivative_pipeline_emits_expected_values() {
     let mut buckets = vec![
