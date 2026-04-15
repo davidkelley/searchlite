@@ -5,8 +5,8 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, CompositeAggregation, CompositeSource, DateHistogramAggregation,
   DateHistogramBounds, Document, ExecutionStrategy, HistogramAggregation, HistogramBounds,
-  IndexOptions, KeywordField, MetricAggregation, NumericField, Schema, SearchRequest, SortOrder,
-  SortSpec, StorageType, TermsAggregation, TopHitsAggregation,
+  IndexOptions, KeywordField, MetricAggregation, MovingAvgAggregation, NumericField, Schema,
+  SearchRequest, SortOrder, SortSpec, StorageType, TermsAggregation, TopHitsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -1893,6 +1893,182 @@ mod bug_200 {
     assert!(
       elapsed < Duration::from_secs(5),
       "pathological date_histogram must not loop: took {elapsed:?}"
+    );
+  }
+}
+
+/// Regression tests for BUG-221 — `MovingAvgAggregation::predict` is fed
+/// straight into `vec![last_avg; predict]` inside `apply_moving_avg_pipeline`.
+/// Without a request-time bound, a tiny request body (well under the HTTP
+/// 50 MiB cap) could request multi-gigabyte allocations during response
+/// finalization and OOM the server.
+mod bug_221 {
+  use super::*;
+  use searchlite_core::api::types::GapPolicy;
+
+  fn views_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "n".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Two docs in distinct histogram buckets so the bucketing agg has at
+      // least one non-empty bucket — the precondition for the `predict`
+      // branch in `apply_moving_avg_pipeline` to allocate.
+      writer
+        .add_document(&doc(
+          "a",
+          vec![("body", json!("rust")), ("n", json!(1_i64))],
+        ))
+        .unwrap();
+      writer
+        .add_document(&doc(
+          "b",
+          vec![("body", json!("rust")), ("n", json!(2_i64))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn moving_avg_request(predict: Option<usize>, window: usize) -> BTreeMap<String, Aggregation> {
+    let mut hist_aggs = BTreeMap::new();
+    hist_aggs.insert(
+      "mov".into(),
+      Aggregation::MovingAvg(MovingAvgAggregation {
+        buckets_path: "_count".into(),
+        window,
+        predict,
+        gap_policy: Some(GapPolicy::Skip),
+      }),
+    );
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "n".into(),
+        interval: 1.0,
+        offset: None,
+        min_doc_count: Some(0),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: hist_aggs,
+      })),
+    );
+    aggs
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  #[test]
+  fn huge_predict_is_rejected_without_allocation() {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // ~8 GiB of `f64` if it ever reached `vec![..; predict]`.
+    let aggs = moving_avg_request(Some(1_073_741_824), 1);
+
+    let start = Instant::now();
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("moving_avg with predict above MAX_PREDICTIONS must be rejected");
+    let elapsed = start.elapsed();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("predict") && msg.contains("exceeds limit"),
+      "expected predict-bound error, got: {msg}"
+    );
+    // The validator runs before any allocation; rejection must be effectively
+    // instantaneous, never paying the cost of `vec![..; predict]`.
+    assert!(
+      elapsed < Duration::from_secs(2),
+      "moving_avg validation must reject quickly without allocating: took {elapsed:?}"
+    );
+  }
+
+  #[test]
+  fn predict_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // `MAX_PREDICTIONS` is 10_000; exercise the strict `>` boundary.
+    let aggs = moving_avg_request(Some(10_001), 1);
+    let err =
+      search_with_agg(&idx, aggs).expect_err("predict = MAX_PREDICTIONS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("predict") && msg.contains("10001"),
+      "expected predict bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn predict_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // 10_000 forecast points of an `f64` is ~80 KiB — well within budget and
+    // intentionally accepted so legitimate clients keep working.
+    let aggs = moving_avg_request(Some(10_000), 1);
+    search_with_agg(&idx, aggs).expect("predict at the cap must be accepted");
+  }
+
+  #[test]
+  fn small_predict_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    let aggs = moving_avg_request(Some(3), 2);
+    search_with_agg(&idx, aggs).expect("typical predict values must be accepted");
+  }
+
+  #[test]
+  fn huge_window_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // `window` is not itself an unbounded allocation today, but a runaway
+    // value is meaningless and must be rejected so future maintainers cannot
+    // accidentally turn it into one.
+    let aggs = moving_avg_request(None, 1_000_000);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("moving_avg window above MAX_BUCKETS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("window") && msg.contains("exceeds limit"),
+      "expected window-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn zero_window_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    let aggs = moving_avg_request(None, 0);
+    let err = search_with_agg(&idx, aggs).expect_err("window = 0 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("window") && msg.contains(">= 1"),
+      "expected zero-window error, got: {msg}"
     );
   }
 }
