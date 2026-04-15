@@ -318,7 +318,7 @@ curl -s http://localhost:8080/healthz
 curl -s http://localhost:8080/indexes
 # -> {
 #      "indexes": [
-#        { "name": "products", "path": "/data/products", "exists": true,
+#        { "name": "products", "exists": true,
 #          "doc_count": 1042, "committed_at": "2025-01-03T12:01:04Z",
 #          "auto_commit_secs": 0, "auto_refresh_secs": 0,
 #          "refresh_on_commit": false }

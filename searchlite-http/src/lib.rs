@@ -370,7 +370,6 @@ impl ManagedIndex {
 
     Ok(IndexDescriptor {
       name: self.name.clone(),
-      path: self.path.display().to_string(),
       exists,
       committed_at,
       doc_count,
@@ -838,10 +837,13 @@ struct HealthResponse {
   status: String,
 }
 
+// Note: `path` was removed from this descriptor as a Security fix (BUG-219),
+// mirroring the BUG-015 fix to `StatsResponse`. The on-disk filesystem path of
+// an index is an operator-side implementation detail and must not be exposed
+// to unauthenticated callers of `/indexes`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct IndexDescriptor {
   name: String,
-  path: String,
   exists: bool,
   committed_at: Option<String>,
   doc_count: Option<u64>,
@@ -2720,6 +2722,107 @@ mod tests {
     assert_eq!(stats["index_name"], INDEX_NAME);
     assert!(stats["index_uuid"].as_str().is_some());
     assert_eq!(stats["documents"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  // Regression test for BUG-219: the public `/indexes` endpoint must not leak
+  // the on-disk filesystem path of any mounted index. This mirrors BUG-015,
+  // which removed the same field from `/stats`. Read-side endpoints are
+  // unauthenticated by design, so the response surface is restricted to
+  // operator-chosen logical identifiers and aggregate counts.
+  #[tokio::test]
+  async fn list_indexes_response_does_not_expose_filesystem_path() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-list-no-path");
+    let (client, base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
+
+    // Walk the parsed JSON and check string values directly so we are not
+    // tricked by JSON escaping (e.g. Windows backslashes are doubled in the
+    // raw serialized form, which would let a regression slip past a naive
+    // substring check on the wire bytes).
+    fn json_contains_string_value(value: &serde_json::Value, target: &str) -> bool {
+      match value {
+        serde_json::Value::String(s) => s == target,
+        serde_json::Value::Array(values) => values
+          .iter()
+          .any(|value| json_contains_string_value(value, target)),
+        serde_json::Value::Object(map) => map
+          .values()
+          .any(|value| json_contains_string_value(value, target)),
+        _ => false,
+      }
+    }
+
+    let fs_path_str = index_path.display().to_string();
+
+    // Pre-init: descriptor still must not carry the path.
+    let before: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_before = before["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_before.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_before:?}"
+    );
+    assert!(
+      !json_contains_string_value(&before, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {before:?}"
+    );
+
+    // Post-init/commit: descriptor still must not carry the path even after
+    // the on-disk index has materialized.
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/add"))
+      .body("{\"_id\":\"1\",\"body\":\"doc\"}\n")
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let after: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_after = after["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_after.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_after:?}"
+    );
+    assert!(
+      !json_contains_string_value(&after, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {after:?}"
+    );
+
+    // Sanity: the public fields are still present.
+    assert_eq!(first_after["name"], INDEX_NAME);
+    assert_eq!(first_after["exists"], true);
+    assert_eq!(first_after["doc_count"], 1);
 
     handle.abort();
     let _ = handle.await;
