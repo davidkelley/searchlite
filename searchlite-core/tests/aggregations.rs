@@ -3110,6 +3110,220 @@ fn cardinality_and_percentiles_metrics() {
   }
 }
 
+/// Regression test for BUG-209: on the TDigest (approximate) path, a
+/// `percentile_rank(target)` call where `target == min_val` used to short-circuit
+/// to `0.0`, disagreeing with the exact path's inclusive `count of v <= target`
+/// semantics. This fixture populates > `PERCENTILE_EXACT_LIMIT` (256) documents
+/// with repeats at the observed minimum so the approximate path is selected,
+/// and verifies the reported rank reflects the share of values equal to the
+/// minimum instead of collapsing to zero.
+#[test]
+fn percentile_ranks_tdigest_path_includes_observed_minimum() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "latency".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // 100 values at the observed minimum (0.0) plus 400 values in 1.0..=400.0.
+    // Total 500 > PERCENTILE_EXACT_LIMIT (256), so `percentile_rank` takes the
+    // approximate (TDigest) path.
+    for i in 0..100u32 {
+      writer
+        .add_document(&doc(
+          &format!("min-{i}"),
+          vec![("body", json!("rust")), ("latency", json!(0.0_f64))],
+        ))
+        .unwrap();
+    }
+    for i in 1..=400u32 {
+      writer
+        .add_document(&doc(
+          &format!("rest-{i}"),
+          vec![("body", json!("rust")), ("latency", json!(i as f64))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "pct_ranks".into(),
+    Aggregation::PercentileRanks(PercentileRanksAggregation {
+      field: "latency".into(),
+      values: vec![0.0],
+      missing: None,
+    }),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
+    resp.aggregations.get("pct_ranks").unwrap()
+  {
+    let rank = *p.values.get("0").unwrap();
+    // Expected rank is 100/500 = 20.0. The TDigest is approximate, so allow a
+    // generous tolerance while still proving the short-circuit to 0.0 is gone.
+    assert!(
+      rank > 5.0,
+      "percentile_rank(0.0) on TDigest path should reflect ~20% at the minimum, got {rank}"
+    );
+    assert!(
+      rank <= 100.0,
+      "percentile_rank(0.0) must not exceed 100, got {rank}"
+    );
+  } else {
+    panic!("expected percentile ranks agg");
+  }
+}
+
+/// Regression test for BUG-209: when every observed value equals the target,
+/// the approximate path must report 100.0 (not 0.0, which the buggy
+/// `target <= min_val` short-circuit produced before reaching the `target >=
+/// max_val` branch).
+#[test]
+fn percentile_ranks_tdigest_path_all_values_equal_target() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "latency".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // 300 > PERCENTILE_EXACT_LIMIT (256) identical values forces the approximate
+    // path, where `min_val == max_val == target == 42.0`.
+    for i in 0..300u32 {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("latency", json!(42.0_f64))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "pct_ranks".into(),
+    Aggregation::PercentileRanks(PercentileRanksAggregation {
+      field: "latency".into(),
+      values: vec![42.0],
+      missing: None,
+    }),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
+    resp.aggregations.get("pct_ranks").unwrap()
+  {
+    let rank = *p.values.get("42").unwrap();
+    assert!(
+      (rank - 100.0).abs() < f64::EPSILON,
+      "percentile_rank(target) where every value equals target must be 100.0, got {rank}"
+    );
+  } else {
+    panic!("expected percentile ranks agg");
+  }
+}
+
 #[test]
 fn bucket_sort_and_avg_bucket_pipeline() {
   let tmp = tempfile::tempdir().unwrap();
