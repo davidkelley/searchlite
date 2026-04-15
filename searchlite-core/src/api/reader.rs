@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
-  HistogramAggregation, IndexOptions, MgetDoc, Query, RescoreMode, RescoreRequest, SearchRequest,
-  SortOrder, SuggestResult,
+  HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation, Query, RescoreMode,
+  RescoreRequest, SearchRequest, SortOrder, SuggestResult,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -2381,8 +2381,8 @@ fn validate_aggregations_in_scope(
       | Aggregation::AvgBucket(_)
       | Aggregation::SumBucket(_)
       | Aggregation::Derivative(_)
-      | Aggregation::MovingAvg(_)
       | Aggregation::BucketScript(_) => {}
+      Aggregation::MovingAvg(m) => validate_moving_avg_config(name, m)?,
       Aggregation::TopHits(t) => {
         SortPlan::from_request(schema, &t.sort)
           .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
@@ -2840,6 +2840,52 @@ fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Resu
         AggregationError::InvalidConfig {
           reason: format!(
             "aggregation `{name}` sampling seed requires size or probability to be set"
+          ),
+        }
+        .into(),
+      );
+    }
+  }
+  Ok(())
+}
+
+/// Reject `moving_avg` requests that would let untrusted input drive an unbounded
+/// `Vec<f64>` allocation in the response finalization step (BUG-221).
+///
+/// `predict` is fed straight into `vec![last_avg; predict]` inside
+/// `apply_moving_avg_pipeline`; without this gate a tiny request body (well under
+/// the HTTP body cap) can request multi-gigabyte allocations and OOM the process.
+/// We also bound `window` to the same ceiling so a runaway value cannot mask
+/// other validation failures or surprise future maintainers, even though `window`
+/// is not itself a direct allocation source today.
+fn validate_moving_avg_config(name: &str, agg: &MovingAvgAggregation) -> Result<()> {
+  if agg.window == 0 {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("moving_avg `{name}` requires window >= 1 (got 0)"),
+      }
+      .into(),
+    );
+  }
+  if agg.window > crate::query::aggs::MAX_BUCKETS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "moving_avg `{name}` window {} exceeds limit {}",
+          agg.window,
+          crate::query::aggs::MAX_BUCKETS
+        ),
+      }
+      .into(),
+    );
+  }
+  if let Some(predict) = agg.predict {
+    if predict > crate::query::aggs::MAX_PREDICTIONS {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "moving_avg `{name}` predict {predict} exceeds limit {}",
+            crate::query::aggs::MAX_PREDICTIONS
           ),
         }
         .into(),

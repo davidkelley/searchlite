@@ -42,6 +42,14 @@ pub struct AggregationContext<'a> {
 /// still allowing thousands of buckets. Deployments that need a different limit can adjust this
 /// constant at compile time.
 pub(crate) const MAX_BUCKETS: usize = 10_000;
+/// Upper bound on the number of forecast points a single `moving_avg` pipeline may emit.
+///
+/// `predict` controls a `Vec<f64>` allocation in [`apply_moving_avg_pipeline`] sized directly by
+/// untrusted user input (BUG-221). Without a cap, a tiny request body can drive an unbounded heap
+/// allocation during response finalization. We share the same `10_000` ceiling as `MAX_BUCKETS`
+/// so the forecast horizon never grows past the materialization budget for any other bucketing
+/// aggregation in the same request.
+pub(crate) const MAX_PREDICTIONS: usize = MAX_BUCKETS;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
 
@@ -3163,6 +3171,11 @@ fn apply_moving_avg_pipeline(
   let mut predictions = Vec::new();
   if let Some(predict) = cfg.predict {
     if let Some(last_avg) = avgs.last().and_then(|v| *v) {
+      // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
+      // that bypasses `validate_aggregations_in_scope` cannot drive an unbounded
+      // allocation here (BUG-221). The request validator rejects values past the cap
+      // up-front; this `min` is just a hard ceiling on the materialization step.
+      let predict = predict.min(MAX_PREDICTIONS);
       // Simple forecast that repeats the last observed average to avoid feedback loops.
       predictions = vec![last_avg; predict];
     }

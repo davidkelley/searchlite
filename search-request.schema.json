@@ -426,8 +426,8 @@
       "properties": {
         "type": { "const": "moving_avg" },
         "buckets_path": { "type": "string", "description": "Metric path to average." },
-        "window": { "type": "integer", "minimum": 1 },
-        "predict": { "type": "integer", "minimum": 0 },
+        "window": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "predict": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Forecast horizon in buckets. Capped server-side to bound response memory." },
         "gap_policy": { "type": "string", "enum": ["skip", "insert_zeros"] }
       }
     },
