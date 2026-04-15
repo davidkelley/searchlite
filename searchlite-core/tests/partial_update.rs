@@ -21,10 +21,13 @@ fn opts(path: &std::path::Path) -> IndexOptions {
 #[test]
 fn update_set_unset_top_level_fields() {
   let dir = tempdir().unwrap();
+  // `body` is declared nullable so the unset below leaves a schema-valid
+  // document. Per BUG-224, unsetting a non-nullable field produces a document
+  // that fails validation and is therefore now correctly rejected.
   let schema: Schema = serde_json::from_value(serde_json::json!({
     "type": "object",
     "properties": {
-      "body": { "type": "string" },
+      "body": { "type": ["string", "null"] },
       "count": { "type": "integer", "searchlite:stored": true, "searchlite:fast": false }
     }
   }))

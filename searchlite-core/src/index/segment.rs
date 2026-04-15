@@ -575,6 +575,43 @@ fn collect_document(
       bail!("unknown field {field}");
     }
   }
+  // Defence-in-depth: reject documents that omit any non-nullable top-level
+  // field. `Schema::validate_document` is the primary guard in the writer
+  // pipeline, but `collect_document` is reachable from callers (segment
+  // rebuilds, tests) that do not always run the schema validator first.
+  let doc_id_name = schema.doc_id_field();
+  for f in schema.text_fields.iter() {
+    if f.nullable || f.name == doc_id_name {
+      continue;
+    }
+    if !doc.fields.contains_key(&f.name) {
+      bail!("missing required field `{}`", f.name);
+    }
+  }
+  for f in schema.keyword_fields.iter() {
+    if f.nullable || f.name == doc_id_name {
+      continue;
+    }
+    if !doc.fields.contains_key(&f.name) {
+      bail!("missing required field `{}`", f.name);
+    }
+  }
+  for f in schema.numeric_fields.iter() {
+    if f.nullable || f.name == doc_id_name {
+      continue;
+    }
+    if !doc.fields.contains_key(&f.name) {
+      bail!("missing required field `{}`", f.name);
+    }
+  }
+  for f in schema.nested_fields.iter() {
+    if f.nullable || f.name == doc_id_name {
+      continue;
+    }
+    if !doc.fields.contains_key(&f.name) {
+      bail!("missing required field `{}`", f.name);
+    }
+  }
   Ok(collected)
 }
 

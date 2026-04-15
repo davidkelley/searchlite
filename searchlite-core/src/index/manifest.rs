@@ -365,6 +365,45 @@ impl Schema {
         validate_field_value(&meta, value)?;
       }
     }
+    // Reject documents that omit any non-nullable top-level field declared in
+    // the schema. Per `docs/schema.md`, every schema field is required unless
+    // it is explicitly marked nullable. The loop above only iterates fields
+    // the caller actually sent, so a declared-required field that is simply
+    // absent would otherwise slip through. Nested sub-properties are already
+    // checked by `NestedField::validate` on a per-container basis.
+    let doc_id_name = self.doc_id_field();
+    for f in self.text_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.keyword_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.numeric_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.nested_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
     Ok(())
   }
 
@@ -933,6 +972,160 @@ mod tests {
       .validate_document(&good_floats)
       .expect("number array ok");
     assert!(f64_schema.validate_document(&bad_strings).is_err());
+  }
+
+  #[test]
+  fn validate_document_rejects_missing_non_nullable_top_level_fields() {
+    // Regression for BUG-224: a document that omits a declared-required
+    // top-level field must be rejected, mirroring the nested-field behaviour.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "tag".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: false,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: false,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    for missing in ["body", "tag", "price"] {
+      let mut fields: std::collections::BTreeMap<String, serde_json::Value> = [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect();
+      fields.remove(missing);
+      let doc = crate::api::types::Document { fields };
+      let err = schema
+        .validate_document(&doc)
+        .expect_err("validation must reject missing required field");
+      let msg = err.to_string();
+      assert!(
+        msg.contains(&format!("missing required field `{missing}`")),
+        "unexpected error for missing field `{missing}`: {msg}"
+      );
+    }
+
+    // Complete document passes.
+    let complete = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-ok")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema
+      .validate_document(&complete)
+      .expect("complete document passes validation");
+  }
+
+  #[test]
+  fn validate_document_allows_missing_nullable_top_level_fields() {
+    // Complements the regression test above: nullable fields must still be
+    // allowed to be omitted entirely.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "subtitle".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: true,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "brand".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: true,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "sale_price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: true,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("only-id"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .validate_document(&doc)
+      .expect("nullable-only schema permits omission");
+  }
+
+  #[test]
+  fn validate_document_requires_nested_top_level_container() {
+    // A non-nullable nested container itself must be present, not just its
+    // sub-fields. This complements the existing nested sub-field check.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comment".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    let err = schema
+      .validate_document(&doc)
+      .expect_err("missing nested container must error");
+    assert!(
+      err.to_string().contains("missing required field `comment`"),
+      "unexpected error: {err}"
+    );
   }
 }
 
