@@ -120,18 +120,20 @@ impl Storage for FsStorage {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
+    // RAII guard: if any step between `File::create` and a successful `rename`
+    // returns early, the staging file is best-effort removed so repeated I/O
+    // failures (disk full, EIO, interrupted sync) don't accumulate stale
+    // `.tmp-<uuid>` entries next to the target.
+    let mut guard = TmpCleanup::new(&tmp);
     {
       let mut file = File::create(&tmp)?;
       file.write_all(data)?;
       file.sync_all()?;
     }
-    if let Err(err) = fs::rename(&tmp, path) {
-      // Best-effort cleanup so a failed rename doesn't leak a stale staging
-      // file alongside the target. We deliberately ignore the remove error —
-      // the rename failure is the one callers actually need to see.
-      let _ = fs::remove_file(&tmp);
-      return Err(err.into());
-    }
+    fs::rename(&tmp, path)?;
+    // Rename succeeded: the staging name no longer refers to our bytes, so
+    // there is nothing for the guard to clean up.
+    guard.disarm();
     sync_dir(path)?;
     Ok(())
   }
@@ -164,6 +166,36 @@ fn sync_dir(path: &Path) -> Result<()> {
     dir.sync_all()?;
   }
   Ok(())
+}
+
+/// Drop-guard that best-effort removes an `atomic_write` staging file if the
+/// caller returns early (create / write / sync / rename failure). After a
+/// successful rename the guard is disarmed because the staging name no longer
+/// refers to the bytes we wrote.
+struct TmpCleanup<'a> {
+  path: &'a Path,
+  armed: bool,
+}
+
+impl<'a> TmpCleanup<'a> {
+  fn new(path: &'a Path) -> Self {
+    Self { path, armed: true }
+  }
+
+  fn disarm(&mut self) {
+    self.armed = false;
+  }
+}
+
+impl Drop for TmpCleanup<'_> {
+  fn drop(&mut self) {
+    if self.armed {
+      // Best-effort: we're already unwinding or returning an error, so a
+      // cleanup failure is just a leaked staging file — strictly worse to
+      // mask the original error by propagating this one.
+      let _ = fs::remove_file(self.path);
+    }
+  }
 }
 
 pub struct InMemoryStorage {
@@ -396,6 +428,45 @@ mod tests {
         "unexpected staging files left behind: {leftovers:?}"
       );
     }
+  }
+
+  /// Regression for Copilot feedback on BUG-019: when any step between
+  /// `File::create` and a successful `rename` fails (write, sync, rename), the
+  /// staging file must be cleaned up — otherwise repeated I/O failures (disk
+  /// full, EIO, interrupted sync) accumulate stale `.tmp-<uuid>` files next to
+  /// the target. We drive the failure by pointing `atomic_write` at a target
+  /// path that is an existing non-empty directory: `File::create` on the
+  /// staging path still succeeds, but `fs::rename(tmp, target)` fails because
+  /// the target directory is not empty. After the failure the parent must
+  /// contain no leftover staging files.
+  #[test]
+  fn atomic_write_removes_staging_file_on_rename_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(dir.path().to_path_buf());
+    let target = dir.path().join("occupied");
+    fs::create_dir(&target).unwrap();
+    // Put a child inside the target directory so the eventual rename fails
+    // with ENOTEMPTY / EISDIR on every supported platform.
+    fs::write(target.join("bystander"), b"child").unwrap();
+
+    let err = storage
+      .atomic_write(&target, b"payload")
+      .expect_err("rename over a non-empty directory must fail");
+    // Surface the error to the assertion message if anything changes.
+    let _ = err;
+
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.file_name().to_string_lossy().starts_with("occupied.tmp-"))
+      .collect();
+    assert!(
+      leftovers.is_empty(),
+      "staging file was not cleaned up after rename failure: {leftovers:?}"
+    );
+    // The pre-existing target directory and its child must be untouched.
+    assert!(target.is_dir(), "target directory unexpectedly removed");
+    assert_eq!(fs::read(target.join("bystander")).unwrap(), b"child");
   }
 
   /// The staging file must not reuse the target's stem in a way that removes
