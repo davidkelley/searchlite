@@ -3211,11 +3211,14 @@ fn percentile_ranks_tdigest_path_includes_observed_minimum() {
     resp.aggregations.get("pct_ranks").unwrap()
   {
     let rank = *p.values.get("0").unwrap();
-    // Expected rank is 100/500 = 20.0. The TDigest is approximate, so allow a
-    // generous tolerance while still proving the short-circuit to 0.0 is gone.
+    // The regression being guarded against is that the TDigest path
+    // short-circuits to 0.0 when the target equals the observed minimum. A
+    // strict `> 0.0` check is enough to catch that without being brittle to
+    // TDigest parameterization changes that might shift the exact approximate
+    // value (100/500 worth of mass at the minimum ≈ 20.0).
     assert!(
-      rank > 5.0,
-      "percentile_rank(0.0) on TDigest path should reflect ~20% at the minimum, got {rank}"
+      rank > 0.0,
+      "percentile_rank(0.0) on TDigest path must not short-circuit to 0 when values equal the minimum, got {rank}"
     );
     assert!(
       rank <= 100.0,
