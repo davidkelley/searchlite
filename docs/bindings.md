@@ -37,6 +37,8 @@ All FFI functions that return `c_int` use the following codes:
 
 `N == buf_cap` is never returned: success always leaves at least one byte for the NUL terminator, so `N > buf_cap` is an unambiguous "buffer too small" signal even when `buf_cap == 0`.
 
+**C callers, signed/unsigned caveat for `searchlite_search`:** the return type is `ssize_t` but `buf_cap` is `size_t`. A direct `ret > buf_cap` comparison will promote a negative sentinel such as `SEARCHLITE_ERR_PANIC` (`-100`) to a huge unsigned value and misclassify it as "buffer too small". Check `ret <= 0` first (handling errors and panics), then compare `(size_t)ret > buf_cap` only when `ret > 0`. `searchlite_search_request` returns `size_t`, so a plain `ret > buf_cap` check is sufficient.
+
 ## WASM
 
 - `add_document` / `add_documents` queue writes; `commit()` persists them and makes them searchable. `flush_storage()` only drains pending storage writes if you need it.

@@ -120,14 +120,21 @@ int main(void) {
     // Buffer was too small. `written` is the required size including the
     // NUL terminator -- allocate and retry.
     char* big = malloc(written);
-    size_t retry = searchlite_search_request(
-        idx, request, strlen(request), big, written);
-    if (retry > 0 && retry <= written) {
-      printf("%s\n", big);
+    if (big == NULL) {
+      fprintf(stderr, "out of memory\n");
     } else {
-      fprintf(stderr, "search retry failed\n");
+      size_t retry = searchlite_search_request(
+          idx, request, strlen(request), big, written);
+      // Success leaves the return strictly less than buf_cap (so the NUL
+      // terminator fits); retry == written would mean the buffer is still
+      // reported as too small, which should not happen here.
+      if (retry > 0 && retry < written) {
+        printf("%s\n", big);
+      } else {
+        fprintf(stderr, "search retry failed\n");
+      }
+      free(big);
     }
-    free(big);
   } else {
     printf("%s\n", buf);
   }

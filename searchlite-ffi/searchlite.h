@@ -47,6 +47,17 @@ int32_t searchlite_commit_with_write_key(IndexHandle* handle, const char* write_
 //   Callers should allocate `N` bytes and retry.
 // - `searchlite_search` additionally returns `SEARCHLITE_ERR_PANIC` (`-100`)
 //   if a Rust panic was caught.
+//
+// Signed/unsigned caveat for `searchlite_search`:
+// Its return type is `ssize_t` while `buf_cap` is `size_t`. Because the usual
+// arithmetic conversions promote a signed left operand to unsigned when the
+// right operand is unsigned, a direct `ret > buf_cap` comparison can convert a
+// negative sentinel such as `SEARCHLITE_ERR_PANIC` (`-100`) into a huge
+// unsigned value and misclassify it as "buffer too small". The safe order is:
+// first check `ret <= 0` (handle errors and panic); then, only if `ret > 0`,
+// compare `(size_t)ret > buf_cap` to detect the retry-with-larger-buffer case.
+// `searchlite_search_request` returns `size_t`, so a plain `ret > buf_cap`
+// comparison is sufficient.
 ssize_t searchlite_search(
   IndexHandle* handle,
   const char* query,
