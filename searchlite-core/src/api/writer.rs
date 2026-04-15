@@ -669,7 +669,50 @@ fn validate_patch_fields(
       bail!("unknown field {path}");
     }
   }
+  // BUG-224 patch-path guard: reject `unset` on a non-nullable top-level
+  // field. `apply_patch` cannot rely on `check_required_fields_present`
+  // to catch this because the reconstructed-from-docstore document is
+  // lossy for legitimate ingest shapes (empty arrays, nested containers
+  // whose stored children all serialize to null), so post-patch presence
+  // enforcement would reject docs that were valid at ingest. Rejecting
+  // the user-initiated unset here is the narrower guard that captures
+  // the real schema-contract violation without false positives on
+  // round-tripped data. Unsetting a nested sub-path is still caught by
+  // `NestedField::validate` in `validate_document` when the container is
+  // present.
+  let non_nullable_tops = non_nullable_top_level_field_names(schema);
+  for path in unset.iter() {
+    if non_nullable_tops.contains(path) {
+      bail!("cannot unset non-nullable field `{path}`");
+    }
+  }
   Ok(())
+}
+
+fn non_nullable_top_level_field_names(schema: &Schema) -> HashSet<String> {
+  let doc_id_name = schema.doc_id_field().to_string();
+  let mut out = HashSet::new();
+  for f in schema.text_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.keyword_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.numeric_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.nested_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  out
 }
 
 fn patchable_schema_paths(schema: &Schema) -> HashSet<String> {
