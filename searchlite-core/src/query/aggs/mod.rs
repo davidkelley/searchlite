@@ -589,7 +589,12 @@ impl QuantileState {
       return 0.0;
     };
     let min_val = digest.estimate_quantile(0.0);
-    if target <= min_val {
+    // Use a strict `<` here so that `target == min_val` falls through to the
+    // binary search, which matches the exact path's inclusive semantics
+    // (`count of v <= target`). A `<=` comparison would incorrectly short-circuit
+    // to 0.0 whenever the caller targeted the observed minimum, even though one
+    // or more values in the population are equal to it.
+    if target < min_val {
       return 0.0;
     }
     let max_val = digest.estimate_quantile(1.0);
