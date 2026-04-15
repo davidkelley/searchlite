@@ -28,10 +28,14 @@ fn schema_json() -> String {
 /// `invalid_json` — JS-side value cannot be converted to JSON.
 /// (Also covered in `ingest_delete_update::add_document_rejects_non_serializable_value`.)
 #[wasm_bindgen_test]
-async fn invalid_json_on_add_document_with_undefined() {
+async fn invalid_json_on_add_document_with_function_value() {
   let db = unique_db("searchlite-err-invalid-json");
   let idx = Searchlite::init(db, schema_json(), None).await.unwrap();
-  let err = idx.add_document(JsValue::UNDEFINED).unwrap_err();
+  // A JS function cannot be converted to a serde_json::Value, so
+  // serde_wasm_bindgen::from_value fails and `add_document` emits
+  // `invalid_json`.
+  let fn_value = js_sys::eval("(function(){})").unwrap();
+  let err = idx.add_document(fn_value).unwrap_err();
   let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
   assert_eq!(payload.error_type, "invalid_json");
 }

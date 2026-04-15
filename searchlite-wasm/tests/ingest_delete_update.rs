@@ -5,7 +5,6 @@
 #![cfg(target_arch = "wasm32")]
 
 use searchlite_wasm::Searchlite;
-use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 mod common;
@@ -247,9 +246,12 @@ async fn add_document_rejects_non_serializable_value() {
   let db = unique_db("searchlite-add-nonserializable");
   let idx = Searchlite::init(db, schema_json(), None).await.unwrap();
 
-  // `undefined` is not a valid JSON value; `serde_wasm_bindgen::from_value`
-  // fails at the JS-to-Rust boundary, producing `invalid_json`.
-  let err = idx.add_document(JsValue::UNDEFINED).unwrap_err();
+  // A JS function cannot be serialised to a serde_json::Value, so
+  // `serde_wasm_bindgen::from_value` fails at the JS-to-Rust boundary,
+  // producing `invalid_json`. (Note: `undefined` is silently converted to
+  // `null` and would produce `invalid_document` instead.)
+  let fn_value = js_sys::eval("(function(){})").unwrap();
+  let err = idx.add_document(fn_value).unwrap_err();
   let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
   assert_eq!(payload.error_type, "invalid_json");
 }
