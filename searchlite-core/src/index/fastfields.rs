@@ -1222,7 +1222,16 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
     return Err(anyhow!("invalid fast field header"));
   }
   let mut cursor = 4;
-  let field_count = read_u32(&mut cursor, data)? as usize;
+  // Each field header is at least 9 bytes on disk (4-byte name length +
+  // at least 0 name bytes + 1-byte type tag + 4-byte doc_len). Validate the
+  // count against the remaining buffer so a crafted `field_count` near
+  // `u32::MAX` cannot drive a multi-gigabyte `HashMap::with_capacity` before
+  // the first field read even runs.
+  let field_count = checked_count(
+    read_u32(&mut cursor, data)? as usize,
+    9,
+    data.len() - cursor,
+  )?;
   let mut fields = HashMap::with_capacity(field_count);
   for _ in 0..field_count {
     let name_len = read_u32(&mut cursor, data)? as usize;
@@ -1237,7 +1246,8 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
     let column = match ty {
       FieldType::I64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
-        let mut vals = Vec::with_capacity(doc_len);
+        let vals_count = checked_count(doc_len, 8, data.len() - cursor)?;
+        let mut vals = Vec::with_capacity(vals_count);
         for present in presence.into_iter() {
           if cursor + 8 > data.len() {
             return Err(anyhow!("unexpected end of fast field i64"));
@@ -1254,11 +1264,16 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         Column::I64(vals)
       }
       FieldType::I64List => {
-        let mut offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *offsets.last().unwrap_or(&0) as usize,
+          8,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           if cursor + 8 > data.len() {
@@ -1275,16 +1290,25 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
       }
       FieldType::I64Nested => {
-        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let doc_offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut doc_offsets = Vec::with_capacity(doc_offsets_count);
+        for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
-        let mut object_offsets = Vec::with_capacity(total_objects + 1);
-        for _ in 0..total_objects + 1 {
+        let object_offsets_count = checked_count(
+          checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
+          4,
+          data.len() - cursor,
+        )?;
+        let mut object_offsets = Vec::with_capacity(object_offsets_count);
+        for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *object_offsets.last().unwrap_or(&0) as usize,
+          8,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           if cursor + 8 > data.len() {
@@ -1303,7 +1327,8 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
       }
       FieldType::F64 => {
         let presence = read_presence(doc_len, &mut cursor, data)?;
-        let mut vals = Vec::with_capacity(doc_len);
+        let vals_count = checked_count(doc_len, 8, data.len() - cursor)?;
+        let mut vals = Vec::with_capacity(vals_count);
         for present in presence.into_iter() {
           if cursor + 8 > data.len() {
             return Err(anyhow!("unexpected end of fast field f64"));
@@ -1320,11 +1345,16 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         Column::F64(vals)
       }
       FieldType::F64List => {
-        let mut offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *offsets.last().unwrap_or(&0) as usize,
+          8,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           if cursor + 8 > data.len() {
@@ -1341,16 +1371,25 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
       }
       FieldType::F64Nested => {
-        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let doc_offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut doc_offsets = Vec::with_capacity(doc_offsets_count);
+        for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
-        let mut object_offsets = Vec::with_capacity(total_objects + 1);
-        for _ in 0..total_objects + 1 {
+        let object_offsets_count = checked_count(
+          checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
+          4,
+          data.len() - cursor,
+        )?;
+        let mut object_offsets = Vec::with_capacity(object_offsets_count);
+        for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *object_offsets.last().unwrap_or(&0) as usize,
+          8,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           if cursor + 8 > data.len() {
@@ -1368,7 +1407,13 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
       }
       FieldType::Str => {
-        let dict_len = read_u32(&mut cursor, data)? as usize;
+        // Each dict entry has at least a 4-byte `u32` length prefix on disk,
+        // so `dict_len * 4` is a hard lower bound on the serialized size.
+        let dict_len = checked_count(
+          read_u32(&mut cursor, data)? as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut dict = Vec::with_capacity(dict_len);
         for _ in 0..dict_len {
           let slen = read_u32(&mut cursor, data)? as usize;
@@ -1379,8 +1424,9 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           cursor += slen;
           dict.push(s);
         }
-        let mut vals = Vec::with_capacity(doc_len);
-        for _ in 0..doc_len {
+        let vals_count = checked_count(doc_len, 4, data.len() - cursor)?;
+        let mut vals = Vec::with_capacity(vals_count);
+        for _ in 0..vals_count {
           let idx = read_u32(&mut cursor, data)?;
           if idx == u32::MAX {
             vals.push(None);
@@ -1394,7 +1440,11 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         Column::Str { dict, values: vals }
       }
       FieldType::StrList => {
-        let dict_len = read_u32(&mut cursor, data)? as usize;
+        let dict_len = checked_count(
+          read_u32(&mut cursor, data)? as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut dict = Vec::with_capacity(dict_len);
         for _ in 0..dict_len {
           let slen = read_u32(&mut cursor, data)? as usize;
@@ -1405,11 +1455,16 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           cursor += slen;
           dict.push(s);
         }
-        let mut offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *offsets.last().unwrap_or(&0) as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           let idx = read_u32(&mut cursor, data)?;
@@ -1425,7 +1480,11 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
       }
       FieldType::StrNested => {
-        let dict_len = read_u32(&mut cursor, data)? as usize;
+        let dict_len = checked_count(
+          read_u32(&mut cursor, data)? as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut dict = Vec::with_capacity(dict_len);
         for _ in 0..dict_len {
           let slen = read_u32(&mut cursor, data)? as usize;
@@ -1436,16 +1495,25 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           cursor += slen;
           dict.push(s);
         }
-        let mut doc_offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let doc_offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut doc_offsets = Vec::with_capacity(doc_offsets_count);
+        for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_objects = *doc_offsets.last().unwrap_or(&0) as usize;
-        let mut object_offsets = Vec::with_capacity(total_objects + 1);
-        for _ in 0..total_objects + 1 {
+        let object_offsets_count = checked_count(
+          checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
+          4,
+          data.len() - cursor,
+        )?;
+        let mut object_offsets = Vec::with_capacity(object_offsets_count);
+        for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total_vals = *object_offsets.last().unwrap_or(&0) as usize;
+        let total_vals = checked_count(
+          *object_offsets.last().unwrap_or(&0) as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut vals = Vec::with_capacity(total_vals);
         for _ in 0..total_vals {
           let idx = read_u32(&mut cursor, data)?;
@@ -1462,18 +1530,24 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         }
       }
       FieldType::NestedCount => {
-        let mut counts = Vec::with_capacity(doc_len);
-        for _ in 0..doc_len {
+        let counts_count = checked_count(doc_len, 4, data.len() - cursor)?;
+        let mut counts = Vec::with_capacity(counts_count);
+        for _ in 0..counts_count {
           counts.push(read_u32(&mut cursor, data)?);
         }
         Column::NestedCount(counts)
       }
       FieldType::NestedParent => {
-        let mut offsets = Vec::with_capacity(doc_len + 1);
-        for _ in 0..doc_len + 1 {
+        let offsets_count = checked_count(checked_add_one(doc_len)?, 4, data.len() - cursor)?;
+        let mut offsets = Vec::with_capacity(offsets_count);
+        for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
-        let total = *offsets.last().unwrap_or(&0) as usize;
+        let total = checked_count(
+          *offsets.last().unwrap_or(&0) as usize,
+          4,
+          data.len() - cursor,
+        )?;
         let mut parents = Vec::with_capacity(total);
         for _ in 0..total {
           parents.push(read_u32(&mut cursor, data)?);
@@ -1494,6 +1568,40 @@ fn read_u32(cursor: &mut usize, buf: &[u8]) -> Result<u32> {
   arr.copy_from_slice(&buf[*cursor..*cursor + 4]);
   *cursor += 4;
   Ok(u32::from_le_bytes(arr))
+}
+
+/// Validate that reading `count` entries, each serialized as at least
+/// `min_stride` bytes in the tail of the segment buffer, cannot run past the
+/// remaining `remaining` bytes. Returns the unchanged count on success so it
+/// can be used verbatim as a `Vec::with_capacity` size and loop bound.
+///
+/// Every element-count field in a fast-field column is a `u32` read directly
+/// from the segment file. A crafted or corrupted file can therefore supply a
+/// count approaching `u32::MAX`, whose naive `Vec::with_capacity` would ask
+/// for multi-gigabyte allocations (e.g. `4G * 8B = 32 GiB` for an `i64`
+/// list) before the per-element loop ever discovered that the file is too
+/// short. Bounding the count against the bytes still available keeps the
+/// pre-allocation cost proportional to the file itself.
+fn checked_count(count: usize, min_stride: usize, remaining: usize) -> Result<usize> {
+  let needed = count.checked_mul(min_stride).ok_or_else(|| {
+    anyhow!("fast field element count {count} * stride {min_stride} overflows usize")
+  })?;
+  if needed > remaining {
+    return Err(anyhow!(
+      "fast field claims {needed} bytes but only {remaining} remain"
+    ));
+  }
+  Ok(count)
+}
+
+/// `count + 1`, but returns an error instead of overflowing `usize`. `count`
+/// is a `u32` cast to `usize` in practice, so on 64-bit targets the add
+/// cannot overflow; on 32-bit targets it can, and a malicious segment with a
+/// count of `u32::MAX` would otherwise panic in debug or wrap in release.
+fn checked_add_one(count: usize) -> Result<usize> {
+  count
+    .checked_add(1)
+    .ok_or_else(|| anyhow!("fast field element count {count} + 1 overflows usize"))
 }
 
 fn read_u8(cursor: &mut usize, buf: &[u8]) -> Result<u8> {
@@ -1651,6 +1759,168 @@ mod tests {
     assert_eq!(
       reader.nested_str_values_at("comment.author", 1, 0),
       vec!["bob"]
+    );
+  }
+
+  // --- Corrupt-segment regression tests (BUG-012) ---
+  //
+  // Each test below hand-crafts a fast-field buffer whose on-disk counts
+  // would drive a multi-gigabyte `Vec::with_capacity` / `HashMap::with_capacity`
+  // in the pre-fix code. `read_fields` must reject them before allocating.
+  // The buffers are intentionally tiny so a regression would fail on most
+  // CI runners via OOM / allocator abort.
+
+  fn header_with(field_count: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8);
+    buf.extend_from_slice(b"FFV1");
+    buf.extend_from_slice(&field_count.to_le_bytes());
+    buf
+  }
+
+  fn field_prefix(buf: &mut Vec<u8>, ty: FieldType, doc_len: u32) {
+    buf.extend_from_slice(&0u32.to_le_bytes()); // empty name
+    buf.push(ty.as_u8());
+    buf.extend_from_slice(&doc_len.to_le_bytes());
+  }
+
+  fn assert_capacity_rejected(err: anyhow::Error) {
+    let msg = err.to_string();
+    assert!(
+      msg.contains("fast field claims") || msg.contains("overflows usize"),
+      "expected a bounded-allocation error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn read_fields_rejects_oversized_field_count() {
+    let buf = header_with(u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_i64_list_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64List, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_f64_list_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64List, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_i64_nested_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_f64_nested_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_i64_nested_oversized_total_objects() {
+    // doc_len = 0 so the doc_offsets allocation is fine (1 entry), but the
+    // single offset claims `u32::MAX` objects, which is what the issue
+    // called out as the second-layer OOM vector.
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // doc_offsets[0]
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_f64_nested_oversized_total_objects() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // doc_offsets[0]
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_str_oversized_dict_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::Str, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // dict_len
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_str_list_oversized_dict_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrList, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // dict_len
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_str_nested_oversized_dict_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrNested, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // dict_len
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_nested_count_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::NestedCount, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_nested_parent_oversized_doc_len() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::NestedParent, u32::MAX);
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_nested_parent_oversized_total() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::NestedParent, 0);
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // offsets[0]
+    assert_capacity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn checked_count_accepts_zero_count() {
+    // Guard against the helper over-rejecting legitimate empty columns.
+    assert_eq!(checked_count(0, 8, 0).unwrap(), 0);
+    assert_eq!(checked_count(0, 8, 1024).unwrap(), 0);
+  }
+
+  #[test]
+  fn checked_count_accepts_exact_fit() {
+    assert_eq!(checked_count(4, 8, 32).unwrap(), 4);
+  }
+
+  #[test]
+  fn checked_count_rejects_one_over() {
+    checked_count(5, 8, 32).unwrap_err();
+  }
+
+  #[test]
+  fn checked_count_rejects_overflow() {
+    // `count * stride` overflows `usize` even though `remaining` would
+    // otherwise allow the claim.
+    checked_count(usize::MAX, 8, usize::MAX).unwrap_err();
+  }
+
+  #[test]
+  fn checked_add_one_rejects_usize_max() {
+    checked_add_one(usize::MAX).unwrap_err();
+    assert_eq!(checked_add_one(0).unwrap(), 1);
+    assert_eq!(
+      checked_add_one(u32::MAX as usize).unwrap(),
+      u32::MAX as usize + 1
     );
   }
 }
