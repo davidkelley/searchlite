@@ -419,6 +419,17 @@ impl Schema {
       if f.nullable || f.name == doc_id_name {
         continue;
       }
+      // Apply the same "no observable footprint" carve-out as text/keyword:
+      // a nested container whose sub-tree contains no stored leaf cannot be
+      // reconstructed from the docstore during rewrite flows (see
+      // `stored_nested_value`, which strips such containers entirely), so
+      // enforcing presence on reconstructed documents would break
+      // `compact` / `merge_segments` / `apply_patch` for these schemas
+      // without any safety benefit. Ingest-time presence is unaffected for
+      // schemas where at least one nested sub-field is stored.
+      if !nested_has_stored_subfield(f) {
+        continue;
+      }
       if !doc.fields.contains_key(&f.name) {
         anyhow::bail!("missing required field `{}`", f.name);
       }
@@ -430,6 +441,38 @@ impl Schema {
   pub fn vector_field(&self, field: &str) -> Option<VectorField> {
     self.vector_fields.iter().find(|f| f.name == field).cloned()
   }
+}
+
+/// Returns true if at least one leaf sub-field inside `nested` is stored —
+/// i.e., the container has a reconstructable footprint in the docstore. Used
+/// to decide whether a non-nullable nested container can be required-presence
+/// checked in `validate_document`; see the carve-out there for context.
+fn nested_has_stored_subfield(nested: &NestedField) -> bool {
+  for prop in nested.fields.iter() {
+    match prop {
+      NestedProperty::Text(f) => {
+        if f.stored {
+          return true;
+        }
+      }
+      NestedProperty::Keyword(f) => {
+        if f.stored {
+          return true;
+        }
+      }
+      NestedProperty::Numeric(f) => {
+        if f.stored {
+          return true;
+        }
+      }
+      NestedProperty::Object(obj) => {
+        if nested_has_stored_subfield(obj) {
+          return true;
+        }
+      }
+    }
+  }
+  false
 }
 
 fn validate_field_value(meta: &ResolvedField, value: &serde_json::Value) -> anyhow::Result<()> {
@@ -1107,6 +1150,43 @@ mod tests {
     schema
       .validate_document(&doc)
       .expect("nullable-only schema permits omission");
+  }
+
+  #[test]
+  fn validate_document_skips_nested_container_with_no_stored_subfield() {
+    // Regression guard: a non-nullable nested container whose sub-tree
+    // has no stored leaf cannot be reconstructed from the docstore during
+    // rewrite flows (`stored_nested_value` strips it), so the required-
+    // presence check must skip it to avoid breaking `compact` /
+    // `merge_segments` / `apply_patch`.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "opaque".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "tag".into(),
+          stored: false,
+          indexed: false,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .validate_document(&doc)
+      .expect("opaque nested container must not trigger required-presence error");
   }
 
   #[test]
