@@ -1607,6 +1607,85 @@ mod bug_030 {
       );
     }
   }
+
+  /// BUG-233 regression: end-to-end coverage that a document timestamped
+  /// `YYYY-05-31` is counted by a `calendar_interval: "quarter"` aggregation.
+  /// Before the fix, `truncate_calendar` reordered `with_month` before
+  /// `with_day(1)`, so May 31 mapped to the invalid `YYYY-04-31` and chrono
+  /// returned `None`. The collector then hit the `None => continue` arm and
+  /// silently dropped the doc, so the Q2 bucket's `doc_count` was short by
+  /// exactly the number of May-31 docs — no error, no fallback bucket.
+  #[test]
+  fn quarter_calendar_interval_counts_may_31_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+
+    let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+
+    // Two Q2 documents — a noon-on-May-31 timestamp (the bug trigger) plus a
+    // safe mid-April timestamp so the bucket's expected count is strictly
+    // greater than 1 and the assertion distinguishes between "silently
+    // dropped May 31" (count = 1) and "correctly bucketed" (count = 2).
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, t) in [
+        ("q2-april", "2024-04-15T12:00:00Z"),
+        ("q2-may-31", "2024-05-31T12:00:00Z"),
+        ("q3-july", "2024-07-10T00:00:00Z"),
+      ] {
+        writer
+          .add_document(&doc(
+            id,
+            vec![("body", json!("rust")), ("ts", json!(ts(t)))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("quarter".into()),
+        fixed_interval: None,
+        offset: None,
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(
+        observed,
+        vec![
+          // Q2 2024 — April 15 + May 31 must both land here.
+          (json!(ts("2024-04-01T00:00:00Z")), 2),
+          // Q3 2024 — July 10.
+          (json!(ts("2024-07-01T00:00:00Z")), 1),
+        ],
+        "May 31 must be bucketed into Q2 (2024-04-01), not silently dropped"
+      );
+      let total: u64 = buckets.iter().map(|b| b.doc_count).sum();
+      assert_eq!(
+        total, 3,
+        "all three matching docs must be counted; {observed:?}",
+      );
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
 }
 
 /// Regression tests for BUG-200 — `DateHistogramCollector::finish` materialized

@@ -3861,9 +3861,16 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
     }
     CalendarUnit::Month => date.with_day(1)?,
     CalendarUnit::Quarter => {
+      // Normalize the day to 1 before changing the month. `with_month` fails
+      // when the resulting (year, target_month, original_day) triple is not a
+      // real date (e.g. 2024-05-31 → April, which has only 30 days), so the
+      // previous `with_month(..)?.with_day(1)?` ordering would short-circuit
+      // to `None` and cause `DateHistogramCollector::collect` to silently drop
+      // any `YYYY-05-31` document from the aggregation (BUG-233). Going
+      // day-first is always safe: day 1 is valid in every month.
       let month = date.month();
       let quarter_start = ((month - 1) / 3) * 3 + 1;
-      date.with_month(quarter_start)?.with_day(1)?
+      date.with_day(1)?.with_month(quarter_start)?
     }
     CalendarUnit::Year => date.with_month(1)?.with_day(1)?,
   };
@@ -4200,6 +4207,73 @@ mod tests {
       Some(0),
       None
     ));
+  }
+
+  /// BUG-233: `truncate_calendar` for `CalendarUnit::Quarter` used to change
+  /// the month before normalizing the day. When the source day was 31 and the
+  /// target quarter-start month was April (30 days), `with_month(4)` returned
+  /// `None`, cascading back into `DateHistogramCollector::collect`, which
+  /// silently dropped the document. The only real-world triggering date is
+  /// day 31 of May (any year). This regression pins the fixed
+  /// day-first ordering.
+  #[test]
+  fn truncate_calendar_quarter_handles_may_31_without_dropping_doc() {
+    fn ts(year: i32, month: u32, day: u32, hour: u32) -> i64 {
+      chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .and_hms_opt(hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+    }
+    // 2024-05-31T12:00:00Z → should truncate to 2024-04-01T00:00:00Z (Q2).
+    let input = ts(2024, 5, 31, 12);
+    let expected = ts(2024, 4, 1, 0);
+    assert_eq!(
+      truncate_calendar(input, CalendarUnit::Quarter),
+      Some(expected),
+      "May 31 must fall into the Q2 bucket keyed 2024-04-01T00:00:00Z, \
+       not disappear from the aggregation"
+    );
+    // The full collector path goes through `bucket_start`; assert that too.
+    assert_eq!(
+      bucket_start(input, 0, &DateInterval::Calendar(CalendarUnit::Quarter)),
+      Some(expected),
+      "bucket_start must propagate the truncated Q2 start, not None"
+    );
+  }
+
+  /// BUG-233 follow-up: exhaustive sweep over every day of a leap year
+  /// (which covers all 366 calendar slots, including Feb 29) × every calendar
+  /// unit. `truncate_calendar` must produce `Some(_)` for every valid
+  /// timestamp — `None` here is the exact failure mode that makes the
+  /// collector silently drop documents. Guards against any future
+  /// ordering regression in any branch of `truncate_calendar`.
+  #[test]
+  fn truncate_calendar_never_returns_none_for_valid_dates() {
+    let units = [
+      ("Day", CalendarUnit::Day),
+      ("Week", CalendarUnit::Week),
+      ("Month", CalendarUnit::Month),
+      ("Quarter", CalendarUnit::Quarter),
+      ("Year", CalendarUnit::Year),
+    ];
+    for ordinal in 1..=366u32 {
+      // 2024 is a leap year, so every ordinal in 1..=366 yields a valid date.
+      let date = chrono::NaiveDate::from_yo_opt(2024, ordinal).unwrap();
+      let millis = date
+        .and_hms_opt(23, 59, 59)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+      for (name, unit) in units {
+        assert!(
+          truncate_calendar(millis, unit).is_some(),
+          "truncate_calendar returned None for {date} with unit {name}; \
+           DateHistogramCollector would silently drop this document",
+        );
+      }
+    }
   }
 
   #[test]
