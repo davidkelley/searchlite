@@ -1,11 +1,36 @@
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::storage::Storage;
 use crate::util::checksum::checksum;
 use crate::util::fst::TinyFst;
 use crate::util::varint::{read_u64, write_u64};
+
+/// Reject `term_count` values that cannot possibly be backed by the bytes
+/// still available in the terms payload. `term_count` is an 8-byte header
+/// read directly from the file and is **not** covered by the inner CRC
+/// (the CRC is scoped to the payload only), so a single-byte flip in that
+/// header — or a legacy/merge-produced segment with an empty outer
+/// checksum map — would otherwise drive a multi-gigabyte
+/// `Vec::with_capacity` before the per-entry read loop ever discovered
+/// the file is too short. The minimum per-term stride is 9 bytes: a
+/// 1-byte varint length (smallest LEB128 encoding) + 0 bytes for an
+/// empty term + 8 bytes for the `u64` offset. Mirrors the helper
+/// introduced by BUG-012 for `fastfields::read_fields`.
+fn checked_count(count: u64, min_stride: u64, remaining: usize) -> Result<usize> {
+  let needed = count
+    .checked_mul(min_stride)
+    .ok_or_else(|| anyhow!("term_count {count} * stride {min_stride} overflows u64"))?;
+  if needed > remaining as u64 {
+    return Err(anyhow!(
+      "term_count {count} would need {needed} bytes but only {remaining} remain in terms payload"
+    ));
+  }
+  // At this point `count * min_stride <= remaining` and `remaining: usize`,
+  // so `count` fits in a `usize` without truncation.
+  Ok(count as usize)
+}
 
 pub fn write_terms(storage: &dyn Storage, path: &Path, terms: &[(String, u64)]) -> Result<()> {
   let mut file = storage.open_write(path)?;
@@ -38,8 +63,14 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   if expected != actual {
     bail!("terms file at {path:?} failed checksum validation");
   }
+  // Validate the untrusted `term_count` header against the bytes still
+  // available in the payload before it reaches `Vec::with_capacity`. The
+  // payload excludes the 8-byte header and the trailing 4-byte CRC, so
+  // `data.len()` is the exact byte budget the per-entry loop has left to
+  // work with. See BUG-207; the header is not covered by the inner CRC.
+  let term_count = checked_count(term_count, 9, data.len())?;
   let mut cursor = 0usize;
-  let mut pairs = Vec::with_capacity(term_count as usize);
+  let mut pairs = Vec::with_capacity(term_count);
   for _ in 0..term_count {
     let (len, consumed) = read_u64(&data[cursor..])?;
     cursor += consumed;
@@ -165,6 +196,65 @@ mod tests {
     assert!(
       err.chain().any(|cause| cause.is::<std::str::Utf8Error>()),
       "expected Utf8Error in error chain, got: {msg}"
+    );
+  }
+
+  /// Regression for BUG-207: a tampered terms file whose 8-byte
+  /// `term_count` header claims `u64::MAX` entries must be rejected
+  /// before `Vec::with_capacity` commits a multi-gigabyte allocation.
+  /// The inner CRC intentionally does not cover the header, so
+  /// flipping its bytes alone cannot invalidate the checksum — the
+  /// bounds-check against the remaining payload is the load-bearing
+  /// guard here. Mirrors BUG-205's regression in `postings.rs` and
+  /// BUG-012's in `fastfields.rs`.
+  #[test]
+  fn read_terms_rejects_oversized_term_count_on_short_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    write_terms(&storage, &path, &[("only".to_string(), 1)]).unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+    // Overwrite only the 8-byte term_count header. The inner CRC is
+    // computed over the payload only, so it remains valid.
+    raw[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized term_count must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    // `u64::MAX` trips the `checked_mul` guard; any moderately-oversized
+    // count trips the `needed > remaining` branch. Either message is a
+    // correct rejection — what matters is that the error surfaces
+    // `term_count` before a multi-gigabyte allocation is committed.
+    assert!(
+      msg.contains("term_count") && (msg.contains("remain") || msg.contains("overflow")),
+      "expected bounds-check error, got: {msg}"
+    );
+  }
+
+  /// Also verify that an oversized but not `u64::MAX` header — one
+  /// large enough to commit gigabytes of capacity but small enough to
+  /// not trigger the multiplication overflow branch — is still
+  /// rejected. Targets the `needed > remaining` branch specifically.
+  #[test]
+  fn read_terms_rejects_moderately_oversized_term_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    write_terms(&storage, &path, &[("only".to_string(), 1)]).unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+    // 4_000_000_000 * 9 B stride = 36 GB claimed; the written file is
+    // only a handful of bytes so this must be rejected without ever
+    // reaching `Vec::with_capacity`.
+    raw[..8].copy_from_slice(&4_000_000_000u64.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized term_count must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+      msg.contains("term_count") && msg.contains("remain"),
+      "expected bounds-check error, got: {msg}"
     );
   }
 }
