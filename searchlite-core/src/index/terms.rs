@@ -74,7 +74,18 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   for _ in 0..term_count {
     let (len, consumed) = read_u64(&data[cursor..])?;
     cursor += consumed;
-    let end = cursor + len as usize;
+    // `len` is read from an untrusted varint on disk. On 32-bit targets
+    // `len as usize` would truncate; on any target `cursor + len as usize`
+    // could wrap past `usize::MAX` for a crafted `u64::MAX`-ish length,
+    // letting the subsequent bounds check pass on the wrapped value and
+    // panicking the slice index below. Use `try_from` + `checked_add` so
+    // the overflow surfaces as a structured error instead.
+    let len_usize = usize::try_from(len).map_err(|_| {
+      anyhow!("terms file at {path:?} declares term length {len} that exceeds usize")
+    })?;
+    let end = cursor.checked_add(len_usize).ok_or_else(|| {
+      anyhow!("terms file at {path:?} declares term length {len} that overflows cursor")
+    })?;
     if end > data.len() {
       bail!("terms file at {path:?} ended unexpectedly while reading term");
     }
@@ -89,7 +100,13 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
       })?
       .to_string();
     cursor = end;
-    if cursor + 8 > data.len() {
+    // Same wrap concern as above, but with a fixed 8-byte stride — still
+    // worth guarding defensively so the bounds check cannot be bypassed
+    // by a `cursor` near `usize::MAX`.
+    let offset_end = cursor
+      .checked_add(8)
+      .ok_or_else(|| anyhow!("terms file at {path:?} cursor overflow reading offset"))?;
+    if offset_end > data.len() {
       bail!("terms file at {path:?} ended unexpectedly while reading offset");
     }
     let offset = u64::from_le_bytes([
@@ -255,6 +272,44 @@ mod tests {
     assert!(
       msg.contains("term_count") && msg.contains("remain"),
       "expected bounds-check error, got: {msg}"
+    );
+  }
+
+  /// Defense-in-depth companion to BUG-207: a crafted per-term varint
+  /// length near `u64::MAX` must be rejected via a structured error
+  /// rather than wrapping `cursor + len as usize` and panicking on the
+  /// subsequent slice index. Addresses the panic vector flagged by
+  /// Copilot review on the BUG-207 PR.
+  #[test]
+  fn read_terms_rejects_oversized_per_term_length() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    // Assemble a valid terms file by hand whose single per-term varint
+    // encodes `u64::MAX` as the term byte length. The CRC is computed
+    // over the payload so the checksum guard passes and execution
+    // reaches the cursor arithmetic we want to exercise.
+    let mut payload = Vec::new();
+    write_u64(u64::MAX, &mut payload);
+    // No term bytes — the cursor-wrap guard fires before any term data
+    // could be read. Append a plausible 8-byte offset so the payload
+    // is not rejected for being structurally incomplete earlier on.
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    let crc = checksum(&payload);
+
+    let mut raw = Vec::new();
+    // term_count = 1 — passes checked_count (1 * 9 B <= payload bytes).
+    raw.extend_from_slice(&1u64.to_le_bytes());
+    raw.extend_from_slice(&payload);
+    raw.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized per-term length must be rejected");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+      msg.contains("term length"),
+      "expected per-term length error, got: {msg}"
     );
   }
 }
