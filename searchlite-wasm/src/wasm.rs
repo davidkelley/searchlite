@@ -29,12 +29,17 @@ const STORE_NAME: &str = "searchlite_files";
 // BM25 defaults tuned for browser-based search; keep aligned with core defaults.
 const BM25_K1: f32 = 0.9;
 const BM25_B: f32 = 0.4;
-/// Hard ceiling on `from + limit` and `candidate_size` for any WASM-exported
-/// search entrypoint. Browser linear memory is capped at 4 GiB, so an
-/// unbounded `limit` from JavaScript can drive the result heap to OOM and
-/// abort the WebAssembly.Instance with no recovery path. Callers needing more
-/// than this should paginate via `cursor` / `search_after`.
-const WASM_MAX_PAGE_SIZE: usize = 10_000;
+/// Hard ceiling on `limit`, `from + limit`, and `candidate_size` for any
+/// WASM-exported search entrypoint. Browser linear memory is capped at
+/// 4 GiB, so an unbounded `limit` from JavaScript can drive the result heap
+/// to OOM and abort the WebAssembly.Instance with no recovery path.
+///
+/// This must stay aligned with `MAX_PAGE_SIZE` in
+/// `searchlite-core/src/api/reader.rs`: that layer rejects `from + limit`
+/// above its own cap when `return_hits` is true, so any value the WASM
+/// validator lets through still has to fit core's contract. Callers needing
+/// more than this should paginate via `cursor` / `search_after`.
+const WASM_MAX_PAGE_SIZE: usize = 1_000;
 
 thread_local! {
   // Per-thread (per WASM worker) cache of IndexedDB connections.
