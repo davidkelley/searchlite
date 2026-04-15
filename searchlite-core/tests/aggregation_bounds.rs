@@ -2282,3 +2282,184 @@ mod bug_215 {
     }
   }
 }
+
+/// Regression tests for BUG-222 — `TopHitsAggregation::size` and `from` are
+/// forwarded straight into `TopHitsCollector::new`, which uses them to size a
+/// per-segment `BinaryHeap<RankedDoc>`. Without a request-time bound, a tiny
+/// request body (well under the HTTP 50 MiB cap) could ask for `size = 10^10`
+/// and grow the heap until the segment is exhausted or the process OOMs.
+mod bug_222 {
+  use super::*;
+
+  fn corpus_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "n".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Two docs is enough to exercise the heap-growth branch in `collect`;
+      // the bug is about how the heap is *sized*, not about the number of
+      // matching docs.
+      writer
+        .add_document(&doc(
+          "a",
+          vec![("body", json!("rust")), ("n", json!(1_i64))],
+        ))
+        .unwrap();
+      writer
+        .add_document(&doc(
+          "b",
+          vec![("body", json!("rust")), ("n", json!(2_i64))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn top_hits_request(size: usize, from: usize) -> BTreeMap<String, Aggregation> {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size,
+        from,
+        fields: None,
+        sort: Vec::new(),
+        highlight_field: None,
+      }),
+    );
+    aggs
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.limit = 1;
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  #[test]
+  fn huge_size_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // `usize::MAX` is the largest possible value the deserializer can hand us;
+    // it is also portable across 32- and 64-bit targets, where a literal like
+    // `10_000_000_000` would overflow on 32-bit. The validator must reject it
+    // outright — without the bound, the per-segment heap would grow until the
+    // segment is exhausted or the process OOMs.
+    let aggs = top_hits_request(usize::MAX, 0);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("top_hits with size above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size") && msg.contains("exceeds limit"),
+      "expected size-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn huge_from_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // See `huge_size_is_rejected` — `usize::MAX` keeps the test 32-bit safe.
+    let aggs = top_hits_request(1, usize::MAX);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("top_hits with from above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("from") && msg.contains("exceeds limit"),
+      "expected from-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // `MAX_TOP_HITS` is 10_000; exercise the strict `>` boundary on `size`.
+    let aggs = top_hits_request(10_001, 0);
+    let err = search_with_agg(&idx, aggs).expect_err("size = MAX_TOP_HITS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size") && msg.contains("10001"),
+      "expected size bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn from_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    let aggs = top_hits_request(0, 10_001);
+    let err = search_with_agg(&idx, aggs).expect_err("from = MAX_TOP_HITS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("from") && msg.contains("10001"),
+      "expected from bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_plus_from_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // Each value is below the cap, but the sum exceeds it. Without the
+    // additive check, an attacker could pick `size = cap` and `from = cap`
+    // to size the heap at `2 * cap` and bypass the per-dimension bound.
+    let aggs = top_hits_request(10_000, 1);
+    let err =
+      search_with_agg(&idx, aggs).expect_err("size + from above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size + from") && msg.contains("exceeds limit"),
+      "expected combined bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // 10_000 hits is intentionally accepted so legitimate clients keep working.
+    let aggs = top_hits_request(10_000, 0);
+    search_with_agg(&idx, aggs).expect("size at the cap must be accepted");
+  }
+
+  #[test]
+  fn size_plus_from_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // The combined bound is `<= MAX_TOP_HITS`, not `<`. Exercise the boundary
+    // so a future tightening of the check does not silently break clients
+    // that already rely on `size + from = cap`.
+    let aggs = top_hits_request(9_000, 1_000);
+    search_with_agg(&idx, aggs).expect("size + from at the cap must be accepted");
+  }
+
+  #[test]
+  fn small_top_hits_request_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    let aggs = top_hits_request(2, 1);
+    search_with_agg(&idx, aggs).expect("typical top_hits values must be accepted");
+  }
+}
