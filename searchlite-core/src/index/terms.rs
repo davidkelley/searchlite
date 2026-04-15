@@ -38,6 +38,21 @@ pub fn read_terms(storage: &dyn Storage, path: &Path) -> Result<TinyFst> {
   if expected != actual {
     bail!("terms file at {path:?} failed checksum validation");
   }
+
+  // Reject term counts that cannot possibly be backed by the bytes available in the
+  // payload. Each term entry consists of at minimum a 1-byte varint length and an
+  // 8-byte offset. This prevents a tampered file from driving a multi-gigabyte
+  // allocation via `Vec::with_capacity` before the read loop surfaces the truncation.
+  let min_stride = 9u64;
+  let needed = term_count
+    .checked_mul(min_stride)
+    .ok_or_else(|| anyhow::anyhow!("terms count {term_count} overflows u64"))?;
+  if needed > data.len() as u64 {
+    bail!(
+      "terms count {term_count} would need {needed} bytes but only {data.len()} remain"
+    );
+  }
+
   let mut cursor = 0usize;
   let mut pairs = Vec::with_capacity(term_count as usize);
   for _ in 0..term_count {
@@ -165,6 +180,34 @@ mod tests {
     assert!(
       err.chain().any(|cause| cause.is::<std::str::Utf8Error>()),
       "expected Utf8Error in error chain, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn read_terms_rejects_oversized_count_on_short_file() {
+    // Regression for #207: a tampered terms file that claims an enormous number
+    // of entries must be rejected before `Vec::with_capacity` commits a large
+    // allocation. The check happens *after* CRC validation but *before* the
+    // loop, so we must ensure the CRC is valid for the payload.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("terms");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    // Write a minimal valid terms file
+    write_terms(&storage, &path, &[("a".to_string(), 1)]).unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+
+    // Overwrite the term_count (first 8 bytes) with a huge value.
+    // This preserves the payload and CRC, so the CRC check passes.
+    let huge_count = 1u64 << 60;
+    raw[0..8].copy_from_slice(&huge_count.to_le_bytes());
+    std::fs::write(&path, raw).unwrap();
+
+    let err = read_terms(&storage, &path).expect_err("oversized term_count must be rejected");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+      msg.contains("terms count") && msg.contains("remain"),
+      "unexpected error: {err}"
     );
   }
 }
