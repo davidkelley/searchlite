@@ -2011,8 +2011,8 @@ mod bug_221 {
 
     // `MAX_PREDICTIONS` is 10_000; exercise the strict `>` boundary.
     let aggs = moving_avg_request(Some(10_001), 1);
-    let err = search_with_agg(&idx, aggs)
-      .expect_err("predict = MAX_PREDICTIONS + 1 must be rejected");
+    let err =
+      search_with_agg(&idx, aggs).expect_err("predict = MAX_PREDICTIONS + 1 must be rejected");
     let msg = err.to_string();
     assert!(
       msg.contains("predict") && msg.contains("10001"),

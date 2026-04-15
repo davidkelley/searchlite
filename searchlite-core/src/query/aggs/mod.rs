@@ -3140,6 +3140,15 @@ fn apply_moving_avg_pipeline(
   let series = bucket_metric_series(buckets, &cfg.buckets_path);
   let policy = cfg.gap_policy.unwrap_or(GapPolicy::Skip);
   let mut window_values: VecDeque<f64> = VecDeque::new();
+  // The request validator rejects `window = 0` (BUG-221) so this is the documented
+  // precondition; assert it loudly in dev/test builds. The `.max(1)` survives as a
+  // production safety net so an internal caller that bypasses validation still gets
+  // a windowed average rather than the deque growing unboundedly to `buckets.len()`.
+  debug_assert!(
+    cfg.window >= 1,
+    "moving_avg window must be >= 1; got {}",
+    cfg.window
+  );
   let window = cfg.window.max(1);
   let mut avgs = Vec::with_capacity(buckets.len());
   for (idx, bucket) in buckets.iter_mut().enumerate() {
