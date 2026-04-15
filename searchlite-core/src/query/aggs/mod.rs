@@ -50,6 +50,14 @@ pub(crate) const MAX_BUCKETS: usize = 10_000;
 /// so the forecast horizon never grows past the materialization budget for any other bucketing
 /// aggregation in the same request.
 pub(crate) const MAX_PREDICTIONS: usize = MAX_BUCKETS;
+/// Upper bound on the number of hits a single `top_hits` sub-aggregation may track per segment.
+///
+/// `size` and `from` control the per-segment `BinaryHeap<RankedDoc>` allocation in
+/// [`TopHitsCollector`]; without a cap, a tiny request body can size the heap from untrusted user
+/// input and drive an unbounded heap growth during collection (BUG-222). We share the same
+/// `10_000` ceiling as `MAX_BUCKETS` so the materialized hit set never grows past the
+/// materialization budget for any other bucketing aggregation in the same request.
+pub(crate) const MAX_TOP_HITS: usize = MAX_BUCKETS;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
 
@@ -2098,10 +2106,21 @@ impl<'a> TopHitsCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &TopHitsAggregation) -> Self {
     let plan = SortPlan::from_request(ctx.schema, &agg.sort)
       .expect("top_hits sort validated during request planning");
+    // Defense-in-depth: clamp `size` and `from` to `MAX_TOP_HITS` so an internal caller that
+    // bypasses `validate_aggregations_in_scope` cannot drive an unbounded `BinaryHeap` here
+    // (BUG-222). The request validator rejects values past the cap up-front; the `min` calls are
+    // a hard ceiling on the per-segment heap. `.max(1)` preserves the legacy invariant that the
+    // collector retains the best hit even when callers ask for `size = 0` so the merge step has
+    // a candidate to pick from.
+    let bounded_size = agg.size.min(MAX_TOP_HITS);
+    let bounded_from = agg.from.min(MAX_TOP_HITS);
+    let limit = bounded_size
+      .saturating_add(bounded_from)
+      .clamp(1, MAX_TOP_HITS);
     Self {
       size: agg.size,
       from: agg.from,
-      limit: agg.size.saturating_add(agg.from).max(agg.size).max(1),
+      limit,
       heap: BinaryHeap::new(),
       total: 0,
       fields: agg.fields.clone(),

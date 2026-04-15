@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
   HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation, Query, RescoreMode,
-  RescoreRequest, SearchRequest, SortOrder, SuggestResult,
+  RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -2383,10 +2383,7 @@ fn validate_aggregations_in_scope(
       | Aggregation::Derivative(_)
       | Aggregation::BucketScript(_) => {}
       Aggregation::MovingAvg(m) => validate_moving_avg_config(name, m)?,
-      Aggregation::TopHits(t) => {
-        SortPlan::from_request(schema, &t.sort)
-          .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
-      }
+      Aggregation::TopHits(t) => validate_top_hits_config(schema, name, t)?,
     }
   }
   Ok(())
@@ -2891,6 +2888,59 @@ fn validate_moving_avg_config(name: &str, agg: &MovingAvgAggregation) -> Result<
         .into(),
       );
     }
+  }
+  Ok(())
+}
+
+/// Reject `top_hits` requests that would let untrusted input drive an unbounded
+/// `BinaryHeap<RankedDoc>` allocation in the per-segment collector (BUG-222).
+///
+/// `size` and `from` are forwarded directly into `TopHitsCollector::new` and used
+/// to size the per-segment heap (`size + from`). Without a request-time gate, a
+/// tiny request body can ask for `size = 10_000_000_000` and OOM the process as
+/// the heap grows during collection. We reject `size`, `from`, and the saturating
+/// sum independently so the error message names the offending dimension and so
+/// the additive case (`size = cap`, `from = cap`) cannot bypass either single
+/// bound. The existing sort-plan validation is preserved so a malformed sort
+/// surfaces at request-parse time rather than a collector panic.
+fn validate_top_hits_config(schema: &Schema, name: &str, agg: &TopHitsAggregation) -> Result<()> {
+  SortPlan::from_request(schema, &agg.sort)
+    .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
+  if agg.size > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size {} exceeds limit {}",
+          agg.size,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  if agg.from > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` from {} exceeds limit {}",
+          agg.from,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  let combined = agg.size.saturating_add(agg.from);
+  if combined > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size + from = {combined} exceeds limit {}",
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
   }
   Ok(())
 }
