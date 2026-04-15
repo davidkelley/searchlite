@@ -7,10 +7,14 @@ pub fn matches_phrase(postings: &[Vec<PostingEntry>], doc_id: DocId, slop: u32) 
   }
   let mut positions_per_term: Vec<Vec<u32>> = Vec::new();
   for term_posts in postings {
-    if let Some(entry) = term_posts.iter().find(|p| p.doc_id == doc_id) {
-      positions_per_term.push(entry.positions.iter().copied().collect());
-    } else {
-      return false;
+    // Postings are stored sorted by `doc_id` (see
+    // `InvertedIndexBuilder::add_term` in postings.rs), so a binary search
+    // is O(log N) vs. the previous O(N) linear scan. `matches_phrase` is
+    // invoked once per candidate doc per phrase term, so the difference
+    // dominates phrase-query latency when any term has a long posting list.
+    match term_posts.binary_search_by_key(&doc_id, |p| p.doc_id) {
+      Ok(idx) => positions_per_term.push(term_posts[idx].positions.iter().copied().collect()),
+      Err(_) => return false,
     }
   }
   if positions_per_term.iter().any(|p| p.is_empty()) {
@@ -142,5 +146,72 @@ mod tests {
     assert!(matches_phrase(&postings, 1, 0));
     assert!(matches_phrase(&postings, 1, u32::MAX));
     assert!(matches_phrase(&postings, 1, (i32::MAX as u32) + 1));
+  }
+
+  #[test]
+  fn finds_doc_in_long_sorted_postings() {
+    // Regression test for BUG-021. `matches_phrase` used to walk each term's
+    // postings linearly to locate the current `doc_id`; for high-frequency
+    // terms that produced per-doc O(N) behaviour when postings are known to
+    // be sorted. This test asserts correctness across a long posting list
+    // and exercises targets near the middle and at both ends so that the
+    // binary-search path is covered end-to-end.
+    const N: u32 = 10_000;
+    let term_a: Vec<PostingEntry> = (0..N)
+      .map(|doc| PostingEntry {
+        doc_id: doc,
+        term_freq: 1,
+        positions: smallvec![1],
+      })
+      .collect();
+    let term_b: Vec<PostingEntry> = (0..N)
+      .map(|doc| PostingEntry {
+        doc_id: doc,
+        term_freq: 1,
+        positions: smallvec![2],
+      })
+      .collect();
+    let postings = vec![term_a, term_b];
+    assert!(matches_phrase(&postings, 0, 0));
+    assert!(matches_phrase(&postings, N / 2, 0));
+    assert!(matches_phrase(&postings, N - 1, 0));
+    assert!(!matches_phrase(&postings, N, 0));
+  }
+
+  #[test]
+  fn missing_doc_returns_false_without_matching_neighbour() {
+    // The new binary-search path returns `Err(insertion_idx)` when the
+    // target doc is absent; guard against a future refactor that forgets
+    // to treat `Err` as "no match" and accidentally indexes into the
+    // neighbouring entry's positions instead.
+    let term_a = vec![
+      PostingEntry {
+        doc_id: 10,
+        term_freq: 1,
+        positions: smallvec![1],
+      },
+      PostingEntry {
+        doc_id: 30,
+        term_freq: 1,
+        positions: smallvec![1],
+      },
+    ];
+    let term_b = vec![
+      PostingEntry {
+        doc_id: 10,
+        term_freq: 1,
+        positions: smallvec![2],
+      },
+      PostingEntry {
+        doc_id: 30,
+        term_freq: 1,
+        positions: smallvec![2],
+      },
+    ];
+    let postings = vec![term_a, term_b];
+    assert!(matches_phrase(&postings, 10, 0));
+    assert!(matches_phrase(&postings, 30, 0));
+    // doc_id 20 is absent — must not silently succeed on a neighbour.
+    assert!(!matches_phrase(&postings, 20, 0));
   }
 }
