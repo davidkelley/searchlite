@@ -722,7 +722,7 @@ enum DateInterval {
   Calendar(CalendarUnit),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CalendarUnit {
   Day,
   Week,
