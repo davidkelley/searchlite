@@ -225,6 +225,161 @@ fn histogram_nested_bounds_produce_expected_buckets() {
   }
 }
 
+/// Regression test for BUG-269 — `hard_bounds` was applied against the raw
+/// document value instead of the computed bucket key, and used an inclusive
+/// upper bound (`val > max`) instead of exclusive on the bucket key
+/// (`bucket_val >= max`).
+///
+/// **Lower bound:** `interval = 10`, `hard_bounds = { min: 25, max: 80 }`.
+/// A document with value 27 has `bucket_key = 20`. Since `20 < 25`, the
+/// bucket must be dropped. Before the fix the raw-value check `27 >= 25`
+/// passed, producing a spurious bucket at key 20.
+///
+/// **Upper bound:** `interval = 10`, `hard_bounds = { min: 0, max: 30 }`.
+/// A document with value 30 has `bucket_key = 30`. Since `30 >= 30`
+/// (exclusive upper), the bucket must be dropped. Before the fix the
+/// raw-value check `30 > 30` evaluated to false, letting the bucket
+/// through.
+#[test]
+fn histogram_hard_bounds_filters_on_bucket_key_not_raw_value() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // 27 → bucket_key 20 (below hard_bounds.min 25 → excluded)
+    // 60 → bucket_key 60 (inside [25, 80) → included)
+    for val in [27_i64, 60] {
+      writer
+        .add_document(&doc(
+          &format!("hb-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "score".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: Some(HistogramBounds {
+        min: 25.0,
+        max: 80.0,
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let hist = resp.aggregations.get("hist").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // hard_bounds [25, 80) produces filled buckets at keys 30..=70 (key 20
+    // is below min, key 80 is at the exclusive upper bound). The doc with
+    // value 27 maps to bucket_key 20 which is outside hard_bounds, so only
+    // the doc with value 60 contributes a hit.
+    assert_eq!(
+      keys,
+      vec![json!(30.0), json!(40.0), json!(50.0), json!(60.0), json!(70.0)]
+    );
+    assert_eq!(buckets[0].doc_count, 0); // key 30 — empty fill
+    assert_eq!(buckets[1].doc_count, 0); // key 40 — empty fill
+    assert_eq!(buckets[2].doc_count, 0); // key 50 — empty fill
+    assert_eq!(buckets[3].doc_count, 1); // key 60 — collected from val 60
+    assert_eq!(buckets[4].doc_count, 0); // key 70 — empty fill
+  } else {
+    panic!("unexpected histogram response");
+  }
+}
+
+/// Companion to the lower-bound test above: verifies that the upper bound
+/// is exclusive on the bucket key (`bucket_key >= max` → drop).
+#[test]
+fn histogram_hard_bounds_upper_bound_is_exclusive_on_bucket_key() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "score".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // 25 → bucket_key 20 (inside [0, 30) → included)
+    // 30 → bucket_key 30 (30 >= 30, exclusive upper → excluded)
+    for val in [25_i64, 30] {
+      writer
+        .add_document(&doc(
+          &format!("hbu-{val}"),
+          vec![("body", json!("rust")), ("score", json!(val))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "score".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: Some(HistogramBounds {
+        min: 0.0,
+        max: 30.0,
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let hist = resp.aggregations.get("hist").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } = hist {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // hard_bounds [0, 30) fills keys 0, 10, 20. The doc with value 30 maps
+    // to bucket_key 30 which is at the exclusive upper bound, so it is
+    // dropped. Only the doc with value 25 (bucket_key 20) contributes.
+    assert_eq!(keys, vec![json!(0.0), json!(10.0), json!(20.0)]);
+    assert_eq!(buckets[0].doc_count, 0); // key 0 — empty fill
+    assert_eq!(buckets[1].doc_count, 0); // key 10 — empty fill
+    assert_eq!(buckets[2].doc_count, 1); // key 20 — collected from val 25
+  } else {
+    panic!("unexpected histogram response");
+  }
+}
+
 #[test]
 fn histogram_requires_positive_interval() {
   let tmp = tempfile::tempdir().unwrap();
@@ -948,6 +1103,96 @@ fn date_histogram_nested_bounds_produce_expected_buckets() {
     assert_eq!(buckets[1].doc_count, 1);
     assert_eq!(buckets[2].doc_count, 1);
     assert_eq!(buckets[3].doc_count, 0);
+  } else {
+    panic!("expected date histogram response");
+  }
+}
+
+/// Regression test for BUG-269 — `DateHistogramCollector` applied
+/// `hard_bounds` against the raw timestamp instead of the computed bucket
+/// start, producing buckets whose keys fall outside `hard_bounds`.
+///
+/// `calendar_interval = "month"`, `hard_bounds = { min: "2024-01-15", max:
+/// "2024-03-15" }`. A document dated 2024-01-20 has `bucket_start =
+/// 2024-01-01T00:00:00Z`. Since Jan 1 < Jan 15, the bucket must be
+/// dropped. Before the fix the raw-value check passed because Jan 20 >=
+/// Jan 15, producing a spurious bucket at Jan 1.
+#[test]
+fn date_histogram_hard_bounds_filters_on_bucket_start_not_raw_value() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+  {
+    let mut writer = idx.writer().unwrap();
+    // Jan 20 → bucket_start Jan 1 (Jan 1 < Jan 15 → excluded)
+    // Feb 10 → bucket_start Feb 1 (Feb 1 >= Jan 15 and Feb 1 < Mar 15 → included)
+    // Mar 20 → bucket_start Mar 1 (Mar 1 >= Mar 15 is false, so Mar 1 < Mar 15 → included)
+    // Apr 5  → bucket_start Apr 1 (Apr 1 >= Mar 15 exclusive upper → excluded)
+    for t in [
+      "2024-01-20T00:00:00Z",
+      "2024-02-10T00:00:00Z",
+      "2024-03-20T00:00:00Z",
+      "2024-04-05T00:00:00Z",
+    ] {
+      writer
+        .add_document(&doc(
+          &format!("ts-{t}"),
+          vec![("body", json!("rust")), ("ts", json!(ts(t)))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "dates".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("month".into()),
+      fixed_interval: None,
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: Some(DateHistogramBounds {
+        min: "2024-01-15T00:00:00Z".into(),
+        max: "2024-03-15T00:00:00Z".into(),
+      }),
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let mut req = SearchRequest::new("rust");
+  req.aggs = aggs;
+  let resp = idx.reader().unwrap().search(&req).unwrap();
+
+  let agg = resp.aggregations.get("dates").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+    let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
+    // Only Feb 1 and Mar 1 buckets should survive.
+    // Jan 1 is below hard_bounds.min (Jan 15), Apr 1 is at/above hard_bounds.max (Mar 15).
+    assert_eq!(
+      keys,
+      vec![
+        json!(ts("2024-02-01T00:00:00Z")),
+        json!(ts("2024-03-01T00:00:00Z")),
+      ]
+    );
+    assert_eq!(buckets[0].doc_count, 1); // Feb 10 doc
+    assert_eq!(buckets[1].doc_count, 1); // Mar 20 doc
   } else {
     panic!("expected date histogram response");
   }
