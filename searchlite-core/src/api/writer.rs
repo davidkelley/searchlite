@@ -202,6 +202,14 @@ impl IndexWriter {
   pub fn add_document(&mut self, doc: &Document) -> Result<u32> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
+    // BUG-224: enforce required-field presence only at the user-facing
+    // ingest boundary. `add_document_locked` is also reached from
+    // `apply_patch`, which re-inserts documents reconstructed from the
+    // docstore; those reconstructed documents may legitimately be missing
+    // top-level fields that serialize away (empty arrays, nested
+    // containers whose stored children all serialize to null), so the
+    // presence check cannot live inside the locked path.
+    self.schema.check_required_fields_present(doc)?;
     self.add_document_locked(doc)
   }
 
@@ -571,7 +579,14 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     let checkpoint = self.checkpoint_locked()?;
     for doc in docs {
-      if let Err(e) = self.add_document_locked(doc) {
+      // BUG-224: enforce required-field presence at the ingest boundary;
+      // see the note in `add_document` for why this is kept out of
+      // `add_document_locked`.
+      if let Err(e) = self
+        .schema
+        .check_required_fields_present(doc)
+        .and_then(|()| self.add_document_locked(doc).map(|_| ()))
+      {
         self.rollback_to_locked(checkpoint)?;
         return Err(e);
       }
@@ -762,7 +777,54 @@ fn validate_patch_fields(
       bail!("unknown field {path}");
     }
   }
+  // BUG-224 patch-path guard: reject `unset` on a non-nullable top-level
+  // field. `apply_patch` cannot rely on `check_required_fields_present`
+  // to catch this because the reconstructed-from-docstore document is
+  // lossy for legitimate ingest shapes (empty arrays, nested containers
+  // whose stored children all serialize to null), so post-patch presence
+  // enforcement would reject docs that were valid at ingest. Rejecting
+  // the user-initiated unset here is the narrower guard that captures
+  // the real schema-contract violation without false positives on
+  // round-tripped data. Unsetting a nested sub-path is still caught by
+  // `NestedField::validate` in `validate_document` when the container is
+  // present.
+  //
+  // `apply_patch` applies `unset` first and then `set`, so a payload
+  // that unsets a required field and re-sets it in the same patch ends
+  // up with the field present again; allow that overlap case.
+  let non_nullable_tops = non_nullable_top_level_field_names(schema);
+  for path in unset.iter() {
+    if non_nullable_tops.contains(path) && !set.contains_key(path) {
+      bail!("cannot unset non-nullable field `{path}`");
+    }
+  }
   Ok(())
+}
+
+fn non_nullable_top_level_field_names(schema: &Schema) -> HashSet<String> {
+  let doc_id_name = schema.doc_id_field().to_string();
+  let mut out = HashSet::new();
+  for f in schema.text_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.keyword_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.numeric_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.nested_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  out
 }
 
 fn patchable_schema_paths(schema: &Schema) -> HashSet<String> {
@@ -1702,9 +1764,12 @@ mod tests {
     let mut writer = idx.writer_with_key(Some(key)).unwrap();
     writer
       .add_document(&Document {
-        fields: [("_id".into(), serde_json::json!("1"))]
-          .into_iter()
-          .collect(),
+        fields: [
+          ("_id".into(), serde_json::json!("1")),
+          ("body".into(), serde_json::json!("hello")),
+        ]
+        .into_iter()
+        .collect(),
       })
       .unwrap();
     writer.commit().unwrap();
