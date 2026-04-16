@@ -35,6 +35,29 @@ int32_t searchlite_add_json_batch(IndexHandle* handle, const char* json, size_t 
 int32_t searchlite_add_json_batch_with_write_key(IndexHandle* handle, const char* json, size_t json_len, const char* write_key);
 int32_t searchlite_commit(IndexHandle* handle);
 int32_t searchlite_commit_with_write_key(IndexHandle* handle, const char* write_key);
+// Search output buffer convention (applies to `searchlite_search` and
+// `searchlite_search_request`):
+// - Return `0` means an error (null argument, search failure, or JSON
+//   serialization failure). The buffer is untouched.
+// - A positive return `N` with `N <= buf_cap - 1` means success: `N` bytes of
+//   JSON were written to `out_json_buf` followed by a NUL terminator.
+// - A positive return `N` with `N > buf_cap` means the buffer was too small:
+//   no JSON was written (when `buf_cap >= 1` the buffer is NUL-terminated at
+//   index 0), and `N` is the required size including the NUL terminator.
+//   Callers should allocate `N` bytes and retry.
+// - `searchlite_search` additionally returns `SEARCHLITE_ERR_PANIC` (`-100`)
+//   if a Rust panic was caught.
+//
+// Signed/unsigned caveat for `searchlite_search`:
+// Its return type is `ssize_t` while `buf_cap` is `size_t`. Because the usual
+// arithmetic conversions promote a signed left operand to unsigned when the
+// right operand is unsigned, a direct `ret > buf_cap` comparison can convert a
+// negative sentinel such as `SEARCHLITE_ERR_PANIC` (`-100`) into a huge
+// unsigned value and misclassify it as "buffer too small". The safe order is:
+// first check `ret <= 0` (handle errors and panic); then, only if `ret > 0`,
+// compare `(size_t)ret > buf_cap` to detect the retry-with-larger-buffer case.
+// `searchlite_search_request` returns `size_t`, so a plain `ret > buf_cap`
+// comparison is sufficient.
 ssize_t searchlite_search(
   IndexHandle* handle,
   const char* query,
