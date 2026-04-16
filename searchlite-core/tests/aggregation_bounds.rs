@@ -2463,3 +2463,134 @@ mod bug_222 {
     search_with_agg(&idx, aggs).expect("typical top_hits values must be accepted");
   }
 }
+
+/// Regression for BUG-233: calendar_interval "quarter" silently dropped
+/// documents dated May 31 because truncate_calendar changed the month
+/// before normalizing the day.
+mod bug_233 {
+  use super::*;
+
+  fn timestamp_index(path: &std::path::Path) -> Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "ts".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(path, schema, build_base_options(path)).unwrap();
+    let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+    let mut writer = idx.writer().unwrap();
+    for (id, t) in [
+      ("d1", "2024-04-15T10:00:00Z"),
+      ("d2", "2024-05-31T12:00:00Z"),
+      ("d3", "2024-07-10T08:00:00Z"),
+    ] {
+      writer
+        .add_document(&doc(
+          id,
+          vec![("body", json!("text")), ("ts", json!(ts(t)))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    idx
+  }
+
+  fn run_quarter_histogram(idx: &Index) -> Vec<(serde_json::Value, u64)> {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "q".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("quarter".into()),
+        fixed_interval: None,
+        offset: None,
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let req = SearchRequest {
+      query: "text".into(),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let reader = idx.reader().unwrap();
+    let resp = reader.search(&req).unwrap();
+    if let Some(searchlite_core::api::types::AggregationResponse::DateHistogram {
+      buckets, ..
+    }) = resp.aggregations.get("q")
+    {
+      buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect()
+    } else {
+      panic!("expected DateHistogram response");
+    }
+  }
+
+  #[test]
+  fn quarter_calendar_interval_counts_may_31_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    let buckets = run_quarter_histogram(&idx);
+
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected exactly 2 quarter buckets (Q2 + Q3); got: {buckets:?}"
+    );
+
+    // Q2 (2024-04-01) must have 2 docs (April 15 + May 31).
+    assert_eq!(
+      buckets[0].1, 2,
+      "Q2 bucket must contain 2 docs; got: {buckets:?}"
+    );
+
+    // Q3 (2024-07-01) must have 1 doc.
+    assert_eq!(
+      buckets[1].1, 1,
+      "Q3 bucket must contain 1 doc; got: {buckets:?}"
+    );
+
+    // Total doc_count across all buckets must equal 3 (no silent drops).
+    let total: u64 = buckets.iter().map(|(_, c)| c).sum();
+    assert_eq!(
+      total, 3,
+      "total doc_count must equal indexed docs; got: {buckets:?}"
+    );
+  }
+}
