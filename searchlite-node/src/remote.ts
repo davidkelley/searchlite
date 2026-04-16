@@ -14,21 +14,33 @@ import {
 	validate,
 	validateTypedResult,
 } from "./transform";
+import { type ZodIndexSchema, isZodIndexSchema } from "./zod/compile";
 
-export interface RemoteIndexOptions {
+export interface RemoteIndexOptions<T = Record<string, unknown>> {
 	/** Write key sent via X-Write-Key header for protected indexes. */
 	writeKey?: string;
 	/** Custom fetch implementation for testing or custom transports. Defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
+	/**
+	 * Optional Zod-authored index schema (from `sl.index(...)`). When provided,
+	 * `add` / `addMany` validate documents against it, and `search()` auto-
+	 * validates & types hit fields without requiring the schema per-call.
+	 *
+	 * Unlike `EmbeddedIndex`, the schema is NOT sent to the server — the server
+	 * already has its own schema. This option exists purely for client-side
+	 * validation and type flow.
+	 */
+	schema?: ZodIndexSchema;
 }
 
-export class RemoteIndex implements SearchIndex {
+export class RemoteIndex<T = Record<string, unknown>> implements SearchIndex<T> {
 	readonly #baseUrl: string;
 	readonly #indexName: string;
 	readonly #writeKey?: string;
 	readonly #fetch: typeof globalThis.fetch;
+	readonly #zodSchema: ZodIndexSchema | undefined;
 
-	constructor(baseUrl: string, indexName: string, options?: RemoteIndexOptions) {
+	constructor(baseUrl: string, indexName: string, options?: RemoteIndexOptions<T>) {
 		if (typeof baseUrl !== "string" || baseUrl.length === 0) {
 			throw new Error("baseUrl must be a non-empty string");
 		}
@@ -39,15 +51,43 @@ export class RemoteIndex implements SearchIndex {
 		this.#indexName = indexName;
 		this.#writeKey = options?.writeKey;
 		this.#fetch = options?.fetch ?? globalThis.fetch;
+
+		if (options?.schema !== undefined) {
+			if (!isZodIndexSchema(options.schema)) {
+				throw new Error(
+					"RemoteIndex `schema` option must be a Zod index schema wrapped with `sl.index(...)`.",
+				);
+			}
+			this.#zodSchema = options.schema;
+		}
 	}
 
-	async add(doc: Record<string, unknown>): Promise<void> {
-		validate(DocumentSchema, doc, "document");
+	async add(doc: T): Promise<void> {
+		if (this.#zodSchema) {
+			validate(this.#zodSchema as unknown as ZodType<T>, doc, "document");
+		} else {
+			validate(DocumentSchema, doc as Record<string, unknown>, "document");
+		}
 		await this.#post("bulk", { docs: [doc] });
 	}
 
-	async addMany(docs: Record<string, unknown>[] | Record<string, unknown>): Promise<number> {
-		validate(DocumentsSchema, docs, "documents");
+	async addMany(docs: T[] | T): Promise<number> {
+		if (this.#zodSchema) {
+			if (Array.isArray(docs)) {
+				const zod = this.#zodSchema as unknown as ZodType<T>;
+				for (let i = 0; i < docs.length; i++) {
+					validate(zod, docs[i], `documents[${i}]`);
+				}
+			} else {
+				validate(this.#zodSchema as unknown as ZodType<T>, docs, "document");
+			}
+		} else {
+			validate(
+				DocumentsSchema,
+				docs as Record<string, unknown>[] | Record<string, unknown>,
+				"documents",
+			);
+		}
 		const docsArray = Array.isArray(docs) ? docs : [docs];
 		const body = await this.#post<{ queued: number }>("bulk", { docs: docsArray });
 		return body.queued;
@@ -61,25 +101,28 @@ export class RemoteIndex implements SearchIndex {
 		await this.#post("compact");
 	}
 
-	async search<T>(schema: ZodType<T>, query: string): Promise<TypedSearchResult<T>>;
-	async search<T>(schema: ZodType<T>, query: SearchRequest): Promise<TypedSearchResult<T>>;
-	async search(query: string): Promise<SearchResult>;
-	async search(query: SearchRequest): Promise<SearchResult>;
-	async search<T = unknown>(
-		queryOrSchema: string | SearchRequest | ZodType<T>,
+	async search<U>(schema: ZodType<U>, query: string): Promise<TypedSearchResult<U>>;
+	async search<U>(schema: ZodType<U>, query: SearchRequest): Promise<TypedSearchResult<U>>;
+	async search(query: string): Promise<SearchResult<T>>;
+	async search(query: SearchRequest): Promise<SearchResult<T>>;
+	async search<U = T>(
+		queryOrSchema: string | SearchRequest | ZodType<U>,
 		maybeQuery?: string | SearchRequest,
-	): Promise<SearchResult | TypedSearchResult<T>> {
-		let fieldsSchema: ZodType<T> | undefined;
+	): Promise<SearchResult<T> | TypedSearchResult<U>> {
+		let fieldsSchema: ZodType<U> | undefined;
 		let query: string | SearchRequest;
 
 		if (maybeQuery !== undefined) {
-			fieldsSchema = queryOrSchema as ZodType<T>;
+			fieldsSchema = queryOrSchema as ZodType<U>;
 			query = maybeQuery;
 		} else {
 			query = queryOrSchema as string | SearchRequest;
 		}
 
-		if (fieldsSchema) {
+		const effectiveSchema: ZodType<unknown> | undefined =
+			fieldsSchema ?? (this.#zodSchema as ZodType<unknown> | undefined);
+
+		if (effectiveSchema) {
 			if (typeof query === "string") {
 				query = { query, returnStored: true };
 			} else {
@@ -102,11 +145,11 @@ export class RemoteIndex implements SearchIndex {
 			"search result",
 		) as SearchResult;
 
-		if (fieldsSchema) {
-			return validateTypedResult(result, fieldsSchema);
+		if (effectiveSchema) {
+			return validateTypedResult(result, effectiveSchema) as TypedSearchResult<U>;
 		}
 
-		return result;
+		return result as SearchResult<T>;
 	}
 
 	async close(): Promise<void> {
