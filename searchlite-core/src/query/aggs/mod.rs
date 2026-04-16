@@ -3403,6 +3403,7 @@ enum ScriptToken {
   Number(f64),
   Var(String),
   Op(char),
+  Neg,
   LParen,
   RParen,
 }
@@ -3411,6 +3412,7 @@ fn op_precedence(op: char) -> u8 {
   match op {
     '+' | '-' => 1,
     '*' | '/' => 2,
+    '~' => 3,
     _ => 0,
   }
 }
@@ -3477,6 +3479,11 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
     }
     match ch {
       '+' | '-' | '*' | '/' => {
+        if ch == '-' && expect_unary {
+          tokens.push(ScriptToken::Neg);
+          chars.next();
+          continue;
+        }
         tokens.push(ScriptToken::Op(ch));
         chars.next();
         expect_unary = true;
@@ -3497,20 +3504,30 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
   Some(tokens)
 }
 
+fn pop_op(op: char) -> ScriptToken {
+  if op == '~' {
+    ScriptToken::Neg
+  } else {
+    ScriptToken::Op(op)
+  }
+}
+
 fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
   let mut output = Vec::new();
   let mut ops: Vec<char> = Vec::new();
   for token in tokens.into_iter() {
     match token {
       ScriptToken::Number(_) | ScriptToken::Var(_) => output.push(token),
+      ScriptToken::Neg => {
+        ops.push('~');
+      }
       ScriptToken::Op(op) => {
         while let Some(&top) = ops.last() {
           if top == '(' {
             break;
           }
           if op_precedence(top) >= op_precedence(op) {
-            output.push(ScriptToken::Op(top));
-            ops.pop();
+            output.push(pop_op(ops.pop().unwrap()));
           } else {
             break;
           }
@@ -3525,7 +3542,7 @@ fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
             found_lparen = true;
             break;
           }
-          output.push(ScriptToken::Op(op));
+          output.push(pop_op(op));
         }
         if !found_lparen {
           return None;
@@ -3537,7 +3554,7 @@ fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
     if op == '(' {
       return None;
     }
-    output.push(ScriptToken::Op(op));
+    output.push(pop_op(op));
   }
   Some(output)
 }
@@ -3548,6 +3565,10 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
     match token {
       ScriptToken::Number(v) => stack.push(v),
       ScriptToken::Var(name) => stack.push(*vars.get(&name)?),
+      ScriptToken::Neg => {
+        let a = stack.pop()?;
+        stack.push(-a);
+      }
       ScriptToken::Op(op) => {
         let b = stack.pop()?;
         let a = stack.pop()?;
@@ -4206,6 +4227,49 @@ mod tests {
     vars.insert("c".to_string(), 4.0);
     let value = eval_bucket_script("(a + b) * c", &vars).unwrap();
     assert!((value - 20.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_negation_of_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    let value = eval_bucket_script("a * -b", &vars).unwrap();
+    assert!((value - (-6.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_leading_unary_negation_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 5.0);
+    let value = eval_bucket_script("-a", &vars).unwrap();
+    assert!((value - (-5.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_double_negation_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 3.0);
+    vars.insert("b".to_string(), 2.0);
+    let value = eval_bucket_script("a - -b", &vars).unwrap();
+    assert!((value - 5.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_negation_in_parens() {
+    let mut vars = BTreeMap::new();
+    vars.insert("b".to_string(), 4.0);
+    let value = eval_bucket_script("(-b)", &vars).unwrap();
+    assert!((value - (-4.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_division_by_negated_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 10.0);
+    vars.insert("b".to_string(), 2.0);
+    let value = eval_bucket_script("a / -b", &vars).unwrap();
+    assert!((value - (-5.0)).abs() < 1e-6);
   }
 
   #[test]
