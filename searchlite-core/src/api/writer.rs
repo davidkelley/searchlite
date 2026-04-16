@@ -385,6 +385,31 @@ impl IndexWriter {
     let serialized_manifest =
       serde_json::to_vec_pretty(&new_manifest).context("serializing manifest for commit")?;
 
+    // Promote any leftover `.pending` from a prior commit whose manifest
+    // publish failed post-fence. This prevents overwriting a durable staged
+    // manifest with uncommitted content — without this, the old `.pending`
+    // (which represents an already-committed batch) would be silently
+    // replaced by the new staging write below.
+    if self.inner.storage.exists(&pending_manifest_path) {
+      match self.inner.storage.read_to_end(&pending_manifest_path) {
+        Ok(prior_data) => {
+          if let Err(e) = self.inner.storage.atomic_write(&manifest_path, &prior_data) {
+            log::error!(
+              "failed to promote leftover staged manifest before new commit: {e}; \
+               proceeding with overwrite — recovery on next open will reconcile"
+            );
+          }
+          let _ = self.inner.storage.remove(&pending_manifest_path);
+        }
+        Err(e) => {
+          log::error!(
+            "failed to read leftover staged manifest before new commit: {e}; \
+             proceeding with overwrite — recovery on next open will reconcile"
+          );
+        }
+      }
+    }
+
     // Step 1 — stage manifest (pre-fence; rollback on failure).
     if let Err(e) = self
       .inner
@@ -415,14 +440,6 @@ impl IndexWriter {
         log::error!(
           "Pending manifest cleanup failed while handling commit error: {remove_err}. \
            Recovery on the next open will discard the staged file."
-        );
-      }
-      if let Err(manifest_err) =
-        manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path)
-      {
-        log::error!(
-          "Manifest rollback failed while handling commit error: {manifest_err}. \
-           The on-disk manifest and WAL may be inconsistent."
         );
       }
       if !new_segments.is_empty() {
@@ -1171,7 +1188,7 @@ mod tests {
       "WAL must retain pending ops when the pre-fence manifest stage fails",
     );
     assert!(
-      !Wal::has_trailing_commit(storage.as_ref(), &wal_path).unwrap(),
+      !Wal::contains_commit(storage.as_ref(), &wal_path).unwrap(),
       "no WAL commit should have been appended on a pre-fence failure",
     );
     let pending_path = Manifest::manifest_pending_path(dir.path());
@@ -1228,8 +1245,8 @@ mod tests {
     );
     let wal_path = directory::wal_path(dir.path());
     assert!(
-      Wal::has_trailing_commit(storage.as_ref(), &wal_path).unwrap(),
-      "WAL must have a trailing commit marker after the durability fence",
+      Wal::contains_commit(storage.as_ref(), &wal_path).unwrap(),
+      "WAL must contain a commit marker after the durability fence",
     );
     let pending_path = Manifest::manifest_pending_path(dir.path());
     assert!(
@@ -1239,7 +1256,7 @@ mod tests {
   }
 
   #[test]
-  fn open_promotes_pending_manifest_when_wal_has_trailing_commit() {
+  fn open_promotes_pending_manifest_when_wal_has_commit() {
     // BUG-018 reconciliation: on startup, if the previous commit was
     // interrupted between the WAL commit fence and the live manifest
     // publish, `Index::open` must promote the staged manifest so the next
@@ -1298,7 +1315,7 @@ mod tests {
   }
 
   #[test]
-  fn open_discards_pending_manifest_when_wal_has_no_trailing_commit() {
+  fn open_discards_pending_manifest_when_wal_has_no_commit() {
     // BUG-018: a `.pending` file with no trailing WAL commit corresponds
     // to a commit that never crossed the durability fence. The staged
     // manifest must be discarded so the live manifest stays authoritative.
@@ -1403,6 +1420,73 @@ mod tests {
     assert_eq!(
       after_second_commit, segments_after_normal_commit,
       "an empty commit on the recovered index must not produce another segment",
+    );
+  }
+
+  #[test]
+  fn open_promotes_pending_manifest_despite_uncommitted_entries_after_fence() {
+    // Codex/Copilot review scenario: post-fence manifest publish fails,
+    // then a later uncommitted write is appended before a crash. The WAL
+    // looks like [..., Commit, AddDoc]. Recovery must still promote
+    // `.pending` because the Commit is durable — the trailing AddDoc
+    // must not hide it. `last_pending_ops` correctly replays only the
+    // entries after the last Commit (the uncommitted AddDoc).
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+    let storage = idx.inner.storage.clone();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    // Synthesize the interrupted state: staged manifest + durable commit
+    // + a subsequent uncommitted AddDoc.
+    let mut staged = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    staged.committed_at = "2099-12-31T23:59:59+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+    {
+      let wal_path = directory::wal_path(dir.path());
+      let mut wal = Wal::open(storage.clone(), &wal_path).unwrap();
+      // Durable commit for the staged manifest's batch.
+      wal.append_commit().unwrap();
+      // Uncommitted write appended after the fence, before the crash.
+      wal
+        .append_add_doc(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("uncommitted")),
+            ("body".into(), serde_json::json!("pending after fence")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      wal.sync().unwrap();
+    }
+    drop(idx);
+
+    // Reopen: recovery must promote `.pending` and replay the uncommitted
+    // AddDoc as a pending op.
+    let opts2 = opts(dir.path());
+    let idx2 = Index::open_with_storage(opts2, storage.clone()).unwrap();
+    let live = idx2.manifest();
+    assert_eq!(
+      live.committed_at, "2099-12-31T23:59:59+00:00",
+      "the staged manifest must be promoted even when uncommitted entries follow the fence",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the staging file must be cleaned up after reconciliation",
+    );
+    // The uncommitted AddDoc must appear as a pending op in the new writer.
+    let writer = idx2.writer().unwrap();
+    assert_eq!(
+      writer
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Add { .. }))
+        .count(),
+      1,
+      "the uncommitted AddDoc after the fence must be replayed as a pending op",
     );
   }
 

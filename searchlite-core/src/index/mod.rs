@@ -457,15 +457,18 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
 /// promotes the staging file to `MANIFEST.json` once the fence has been crossed.
 /// A crash between those steps therefore leaves one of two recoverable states:
 ///
-/// * **Trailing WAL `Commit` present** — the batch was durably committed but
-///   the live manifest publish (or the cleanup that follows it) did not
-///   complete. The staged file is the authoritative manifest for that batch
-///   and we promote it now so the next reader/writer sees a consistent index.
+/// * **WAL contains at least one `Commit` record** — the batch was durably
+///   committed but the live manifest publish (or the cleanup that follows
+///   it) did not complete. The staged file is the authoritative manifest for
+///   that batch and we promote it now so the next reader/writer sees a
+///   consistent index. Uncommitted entries appended *after* the durable
+///   `Commit` (e.g. an `AddDoc` written before the crash) do not invalidate
+///   this — `last_pending_ops` correctly replays only post-commit entries.
 ///
-/// * **No trailing WAL `Commit`** — the WAL never crossed the durability fence,
-///   so the staged manifest belongs to a batch that was effectively rolled
-///   back. The pending entries still in the WAL will replay through the next
-///   commit; we discard the staging file.
+/// * **No `Commit` record in WAL** — the WAL never crossed the durability
+///   fence, so the staged manifest belongs to a batch that was effectively
+///   rolled back. The pending entries still in the WAL will replay through
+///   the next commit; we discard the staging file.
 ///
 /// In either case the staging file is removed before we return, so subsequent
 /// opens see a clean slate. This is the BUG-018 reconciler.
@@ -479,7 +482,7 @@ fn reconcile_pending_manifest(
     return Ok(());
   }
   let wal_path = directory::wal_path(root);
-  if Wal::has_trailing_commit(storage, &wal_path)? {
+  if Wal::contains_commit(storage, &wal_path)? {
     let pending_data = storage
       .read_to_end(&pending_path)
       .with_context(|| format!("reading staged manifest at {pending_path:?}"))?;
@@ -547,7 +550,7 @@ mod tests {
   }
 
   #[test]
-  fn reconcile_pending_manifest_promotes_when_wal_has_trailing_commit() {
+  fn reconcile_pending_manifest_promotes_when_wal_has_commit() {
     // BUG-018: a `.pending` manifest paired with a trailing WAL `Commit`
     // marker means the prior commit crossed the durability fence but the
     // live `MANIFEST.json` was never published. Recovery must copy the

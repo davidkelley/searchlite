@@ -228,28 +228,22 @@ impl Wal {
     Ok((binding, pending))
   }
 
-  /// Returns `true` when the most recent data entry in the WAL (i.e. the last
-  /// `AddDoc` / `DeleteDocId` / `Commit`, ignoring `WriteBinding` framing) is a
-  /// `Commit` record.
+  /// Returns `true` when the WAL contains at least one durable `Commit`
+  /// record, ignoring `WriteBinding` framing.
   ///
-  /// This is the durability oracle used by recovery to distinguish "the
-  /// previous commit's WAL fence completed" (trailing `Commit`, ops are
-  /// durable) from "the previous commit was rolled back or never reached the
-  /// fence" (trailing data entries with no `Commit` after them).
-  pub fn has_trailing_commit(storage: &dyn Storage, path: &Path) -> Result<bool> {
+  /// Recovery uses this as a durability oracle for staged manifest promotion:
+  /// once a commit fence has been reached, later `AddDoc` / `DeleteDocId`
+  /// entries do not invalidate that earlier commit. A staged
+  /// `MANIFEST.json.pending` only survives past the WAL commit fence, so the
+  /// presence of *any* `Commit` record in the WAL confirms the batch
+  /// represented by the staged manifest is durable — even if uncommitted
+  /// entries were appended after the fence before a crash.
+  pub fn contains_commit(storage: &dyn Storage, path: &Path) -> Result<bool> {
     if !storage.exists(path) {
       return Ok(false);
     }
     let (_, entries) = Self::replay_with_binding(storage, path)?;
-    let mut last_data_was_commit = false;
-    for entry in entries {
-      match entry {
-        WalEntry::Commit => last_data_was_commit = true,
-        WalEntry::AddDoc(_) | WalEntry::DeleteDocId(_) => last_data_was_commit = false,
-        WalEntry::WriteBinding(_) => {} // already stripped above, but be defensive
-      }
-    }
-    Ok(last_data_was_commit)
+    Ok(entries.iter().any(|e| matches!(e, WalEntry::Commit)))
   }
 }
 
@@ -438,21 +432,23 @@ mod tests {
   }
 
   #[test]
-  fn has_trailing_commit_distinguishes_pending_from_committed_tail() {
-    // BUG-018 oracle: `has_trailing_commit` is the recovery primitive that
-    // tells `Index::open` whether a `MANIFEST.json.pending` file should be
-    // promoted (WAL crossed the durability fence) or discarded (it didn't).
-    // Pin every state transition on a single WAL so a future change to the
-    // entry filtering can't silently flip the answer.
+  fn contains_commit_detects_durable_fence_regardless_of_tail() {
+    // BUG-018 oracle: `contains_commit` is the recovery primitive that tells
+    // `Index::open` whether a `MANIFEST.json.pending` file should be promoted
+    // (a WAL commit fence was crossed) or discarded (it never was). Unlike
+    // a strict "trailing commit" check, this returns true even when
+    // uncommitted entries follow the durable commit — a crash after the
+    // fence but before the manifest publish must not discard the staged
+    // manifest just because a later AddDoc appears in the WAL.
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
     // No WAL on disk → false (treat as fresh index).
-    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
 
     let mut wal = Wal::open(storage.clone(), &path).unwrap();
     // Empty WAL file → false.
-    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
 
     let doc = Document {
       fields: [("body".into(), serde_json::json!("first"))]
@@ -461,12 +457,12 @@ mod tests {
     };
     wal.append_add_doc(&doc).unwrap();
     wal.sync().unwrap();
-    // AddDoc with no following Commit → false.
-    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    // AddDoc with no Commit anywhere → false.
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
 
     wal.append_commit().unwrap();
     // AddDoc, Commit → true.
-    assert!(Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    assert!(Wal::contains_commit(storage.as_ref(), &path).unwrap());
 
     let doc2 = Document {
       fields: [("body".into(), serde_json::json!("second"))]
@@ -475,12 +471,15 @@ mod tests {
     };
     wal.append_add_doc(&doc2).unwrap();
     wal.sync().unwrap();
-    // ..., Commit, AddDoc → false (the tail is no longer Commit).
-    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    // ..., Commit, AddDoc → still true (the Commit is still in the WAL).
+    assert!(
+      Wal::contains_commit(storage.as_ref(), &path).unwrap(),
+      "uncommitted entries after the fence must not hide the durable commit",
+    );
 
     wal.append_commit().unwrap();
-    // ..., AddDoc, Commit → true again.
-    assert!(Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+    // ..., AddDoc, Commit → still true.
+    assert!(Wal::contains_commit(storage.as_ref(), &path).unwrap());
   }
 
   #[test]

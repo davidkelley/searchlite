@@ -197,7 +197,6 @@ fn collapse_rejects_multivalued_fast_field() {
 
 struct FailingManifestStorage {
   inner: searchlite_core::storage::InMemoryStorage,
-  fail_manifest: std::sync::atomic::AtomicBool,
   fail_pending_manifest: std::sync::atomic::AtomicBool,
 }
 
@@ -205,16 +204,8 @@ impl FailingManifestStorage {
   fn new(root: PathBuf) -> Self {
     Self {
       inner: searchlite_core::storage::InMemoryStorage::new(root),
-      fail_manifest: std::sync::atomic::AtomicBool::new(false),
       fail_pending_manifest: std::sync::atomic::AtomicBool::new(false),
     }
-  }
-
-  #[allow(dead_code)]
-  fn fail_next_manifest_store(&self) {
-    self
-      .fail_manifest
-      .store(true, std::sync::atomic::Ordering::SeqCst);
   }
 
   fn fail_next_pending_manifest_store(&self) {
@@ -228,21 +219,10 @@ impl FailingManifestStorage {
       .file_name()
       .and_then(|n| n.to_str())
       .unwrap_or_default();
-    if name == "MANIFEST.json.pending"
+    name == "MANIFEST.json.pending"
       && self
         .fail_pending_manifest
         .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-      return true;
-    }
-    if name == "MANIFEST.json"
-      && self
-        .fail_manifest
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-      return true;
-    }
-    false
   }
 }
 
