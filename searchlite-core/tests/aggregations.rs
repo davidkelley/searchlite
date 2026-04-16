@@ -3993,11 +3993,12 @@ fn range_aggregation_to_is_exclusive_at_boundary() {
       buckets[2].doc_count, 2,
       "premium should contain price=100 and price=150"
     );
-    // Total across buckets must equal the number of matching docs (no double-counting).
+    // In this fixture each matching document has a single price value, so the bucket totals
+    // should add up to the number of matching docs if boundary values are not double-counted.
     let total: u64 = buckets.iter().map(|b| b.doc_count).sum();
     assert_eq!(
       total, 5,
-      "each doc must be counted exactly once across disjoint ranges"
+      "single-valued price docs should not be double-counted across exclusive range boundaries"
     );
   } else {
     panic!("expected range agg response");
