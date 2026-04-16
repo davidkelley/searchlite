@@ -2594,3 +2594,160 @@ mod bug_233 {
     );
   }
 }
+
+/// Regression tests for #251: add_calendar must preserve the sub-day time
+/// component so that the fill loop produces bucket keys aligned with the
+/// offset applied by bucket_start.
+mod bug_251 {
+  use super::*;
+
+  /// Calendar month interval with offset=1h and extended_bounds spanning
+  /// April–June. The fill loop must produce keys at T01:00:00Z (not midnight)
+  /// for every bucket, and there must be no phantom duplicate buckets.
+  #[test]
+  fn date_histogram_calendar_month_with_offset_produces_aligned_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "ts".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // April 15 doc
+      let apr = DateTime::parse_from_rfc3339("2024-04-15T10:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+      writer
+        .add_document(&doc(
+          "d1",
+          vec![("body", json!("test")), ("ts", json!(apr))],
+        ))
+        .unwrap();
+      // May 20 doc
+      let may = DateTime::parse_from_rfc3339("2024-05-20T10:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+      writer
+        .add_document(&doc(
+          "d2",
+          vec![("body", json!("test")), ("ts", json!(may))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("month".into()),
+        fixed_interval: None,
+        offset: Some("1h".into()),
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "2024-04-01T02:00:00Z".into(),
+          max: "2024-06-01T02:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let resp = idx
+      .reader()
+      .unwrap()
+      .search(&SearchRequest {
+        query: "test".into(),
+        fields: None,
+        filter: None,
+        limit: 0,
+        from: 0,
+        return_hits: false,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        track_total_hits: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs,
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let hist = resp.aggregations.get("hist").unwrap();
+    let buckets = match hist {
+      searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } => buckets,
+      other => panic!("expected DateHistogram, got: {other:?}"),
+    };
+
+    // Collect (key_ms, doc_count) pairs
+    let entries: Vec<(i64, u64)> = buckets
+      .iter()
+      .map(|b| {
+        let key = b.key.as_i64().unwrap();
+        (key, b.doc_count)
+      })
+      .collect();
+
+    // Expected bucket keys: all at T01:00:00Z due to 1h offset
+    let apr_key = DateTime::parse_from_rfc3339("2024-04-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+    let may_key = DateTime::parse_from_rfc3339("2024-05-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+    let jun_key = DateTime::parse_from_rfc3339("2024-06-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+
+    // Must have exactly 3 buckets (Apr, May, Jun) — no phantom midnight buckets
+    assert_eq!(
+      entries.len(),
+      3,
+      "expected 3 buckets (Apr/May/Jun), got {}: {entries:?}",
+      entries.len()
+    );
+
+    // Verify all keys are at T01:00:00Z
+    let keys: Vec<i64> = entries.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+      keys,
+      vec![apr_key, may_key, jun_key],
+      "bucket keys must be at T01:00:00Z, not midnight; got: {entries:?}"
+    );
+
+    // April: 1 doc, May: 1 doc, June: 0 docs
+    assert_eq!(entries[0].1, 1, "April bucket should have 1 doc");
+    assert_eq!(entries[1].1, 1, "May bucket should have 1 doc");
+    assert_eq!(entries[2].1, 0, "June bucket should have 0 docs");
+
+    // Total doc_count must equal indexed docs (no double-counting)
+    let total: u64 = entries.iter().map(|(_, c)| c).sum();
+    assert_eq!(total, 2, "total doc_count must equal indexed docs");
+  }
+}
