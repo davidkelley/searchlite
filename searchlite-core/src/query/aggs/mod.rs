@@ -257,19 +257,26 @@ impl<'a> SignificantTermsCollector<'a> {
       .into_values()
       .filter(|b| b.doc_count >= self.min_doc_count)
       .collect();
-    // Sort by significance score (doc_count/bg_count ratio) descending before
-    // truncation. Since the foreground/background totals are constant across all
-    // buckets, the ratio `doc_count / bg_count` is monotonically related to the
-    // full significance score `(doc_count/fg_total) / (bg_count/bg_total)` and
-    // is sufficient for ranking. This avoids discarding high-significance
-    // low-frequency terms that would be lost by a doc_count-only sort.
+    // Sort by significance score proxy (doc_count / bg_count) descending
+    // before truncation. Since the foreground/background totals are constant
+    // across all buckets, this proxy is monotonically related to the full
+    // significance score `(doc_count/fg_total) / (bg_count/bg_total)`.
+    //
+    // Buckets with bg_count == 0 are treated as score 0 to match the final
+    // scoring guard in finalize_response. Compare ratios via integer
+    // cross-multiplication to avoid float rounding.
     buckets.sort_by(|a, b| {
-      let a_score = a.doc_count as f64 / (a.bg_count.max(1)) as f64;
-      let b_score = b.doc_count as f64 / (b.bg_count.max(1)) as f64;
-      b_score
-        .partial_cmp(&a_score)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+      let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater, // a has score 0, b > 0 → b first
+        (false, true) => Ordering::Less,    // b has score 0, a > 0 → a first
+        (false, false) => {
+          let left = (a.doc_count as u128) * (b.bg_count as u128);
+          let right = (b.doc_count as u128) * (a.bg_count as u128);
+          right.cmp(&left)
+        }
+      };
+      score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
     });
     let limit = self.size.unwrap_or(buckets.len()).min(MAX_BUCKETS);
     buckets.truncate(limit);
@@ -2390,15 +2397,22 @@ fn merge_intermediate_in_place(
       let limit = target_size
         .unwrap_or_else(|| target_buckets.len())
         .min(MAX_BUCKETS);
-      // Sort by significance score proxy (doc_count/bg_count ratio) to
-      // preserve high-significance low-frequency terms during truncation.
+      // Sort by significance score proxy (doc_count/bg_count) to preserve
+      // high-significance low-frequency terms during truncation. Buckets with
+      // bg_count == 0 are treated as score 0 to match finalize_response.
+      // Compare ratios via integer cross-multiplication to avoid float rounding.
       target_buckets.sort_by(|a, b| {
-        let a_score = a.doc_count as f64 / (a.bg_count.max(1)) as f64;
-        let b_score = b.doc_count as f64 / (b.bg_count.max(1)) as f64;
-        b_score
-          .partial_cmp(&a_score)
-          .unwrap_or(Ordering::Equal)
-          .then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+        let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+          (true, true) => Ordering::Equal,
+          (true, false) => Ordering::Greater,
+          (false, true) => Ordering::Less,
+          (false, false) => {
+            let left = (a.doc_count as u128) * (b.bg_count as u128);
+            let right = (b.doc_count as u128) * (a.bg_count as u128);
+            right.cmp(&left)
+          }
+        };
+        score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
       });
       if target_buckets.len() > limit {
         target_buckets.truncate(limit);
@@ -4378,6 +4392,55 @@ mod tests {
       assert!(
         keys.contains(&"rare_sig"),
         "rare_sig must survive truncation"
+      );
+    } else {
+      panic!("expected SignificantTerms response");
+    }
+  }
+
+  /// Zero bg_count buckets must not displace genuinely significant terms.
+  /// finalize_response assigns score 0.0 when bg_count == 0, so the
+  /// intermediate proxy sort must also treat them as score 0.0.
+  #[test]
+  fn significant_terms_zero_bg_count_does_not_displace_real_terms() {
+    use serde_json::json;
+
+    let intermediate = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        // "real_sig": genuinely significant (bg_count > 0)
+        SignificantBucketIntermediate {
+          key: json!("real_sig"),
+          doc_count: 5,
+          bg_count: 10,
+          aggs: BTreeMap::new(),
+        },
+        // "zero_bg": high doc_count but bg_count == 0 → final score 0.0
+        SignificantBucketIntermediate {
+          key: json!("zero_bg"),
+          doc_count: 90,
+          bg_count: 0,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 100,
+      bg_count: 10_000,
+      sampled: false,
+    };
+
+    let response = finalize_response(intermediate);
+    if let AggregationResponse::SignificantTerms { buckets, .. } = response {
+      assert_eq!(buckets.len(), 1, "size=1 should yield 1 bucket");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "real_sig",
+        "zero bg_count bucket must not displace genuinely significant term"
+      );
+      assert!(
+        buckets[0].score > 0.0,
+        "real_sig should have a positive score"
       );
     } else {
       panic!("expected SignificantTerms response");

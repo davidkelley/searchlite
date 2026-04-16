@@ -4167,17 +4167,20 @@ fn significant_terms_preserves_high_significance_low_frequency_terms() {
   };
   let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
 
-  // Build a corpus:
-  // - "common" tag appears in 80 foreground docs and 5000 background docs
-  //   → score ≈ (80/100) / (5000/10000) = 1.6
-  // - "frequent" tag appears in 50 foreground docs and 4000 background docs
-  //   → score ≈ (50/100) / (4000/10000) = 1.25
-  // - "rare_sig" tag appears in 3 foreground docs and 5 background docs
-  //   → score ≈ (3/100) / (5/10000) = 60.0
+  // Build a corpus of 9005 total docs. The foreground set (matching "target")
+  // contains 133 docs (80 + 50 + 3). Background counts are total occurrences
+  // across the full corpus (foreground + background-only docs).
+  //
+  // - "common" tag: 80 foreground, 5000 total bg
+  //   → score ≈ (80/133) / (5000/9005) ≈ 1.08
+  // - "frequent" tag: 50 foreground, 4000 total bg
+  //   → score ≈ (50/133) / (4000/9005) ≈ 0.85
+  // - "rare_sig" tag: 3 foreground, 5 total bg
+  //   → score ≈ (3/133) / (5/9005) ≈ 40.6
   //
   // With size=2, a doc_count sort would keep "common"(80) and "frequent"(50),
-  // discarding "rare_sig"(3). The correct result keeps "rare_sig" (score=60)
-  // and "common" (score=1.6).
+  // discarding "rare_sig"(3). The correct result keeps "rare_sig" (score≈40.6)
+  // and "common" (score≈1.08).
   {
     let mut writer = idx.writer().expect("writer");
     let mut id = 0u64;
