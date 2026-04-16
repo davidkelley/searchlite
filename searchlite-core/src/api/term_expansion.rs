@@ -215,9 +215,14 @@ pub(crate) fn expand_term_groups(
   Ok((qualified_terms, term_groups))
 }
 
-/// Returns `true` if `value` contains any wildcard or regex metacharacter that
-/// the default tokenizer would discard (non-alphanumeric separators).
-fn contains_pattern_meta(value: &str) -> bool {
+/// Returns `true` if `value` contains wildcard metacharacters (`*`, `?`).
+fn contains_wildcard_meta(value: &str) -> bool {
+  value.bytes().any(|b| matches!(b, b'*' | b'?'))
+}
+
+/// Returns `true` if `value` contains regex metacharacters that the default
+/// tokenizer would discard (non-alphanumeric separators).
+fn contains_regex_meta(value: &str) -> bool {
   value.bytes().any(|b| {
     matches!(
       b,
@@ -254,16 +259,18 @@ fn analyze_pattern_tokens(
   }
   if tokens.len() == 1 {
     // For wildcard/regex expansions: if the original value contains
-    // metacharacters, the analyzer will have stripped them (they are
-    // non-alphanumeric token separators). Fall back to normalize_pattern
-    // to preserve the pattern structure. For prefix expansions and plain
-    // terms we keep the analyzed form so that stemming, Unicode folding,
-    // and other filters are honoured.
-    let is_pattern = matches!(
-      expansion,
-      TermExpansion::Wildcard { .. } | TermExpansion::Regex { .. }
-    );
-    if is_pattern && contains_pattern_meta(value) {
+    // metacharacters relevant to that expansion type, the analyzer will
+    // have stripped them (they are non-alphanumeric token separators).
+    // Fall back to normalize_pattern to preserve the pattern structure.
+    // Wildcard only uses `*` and `?`; regex uses the full set. For prefix
+    // expansions and plain terms we keep the analyzed form so that stemming,
+    // Unicode folding, and other filters are honoured.
+    let has_meta = match expansion {
+      TermExpansion::Wildcard { .. } => contains_wildcard_meta(value),
+      TermExpansion::Regex { .. } => contains_regex_meta(value),
+      _ => false,
+    };
+    if has_meta {
       return vec![analyzer.normalize_pattern(value)];
     }
     return tokens;
@@ -924,7 +931,8 @@ fn expand_term_fuzzy(
 #[cfg(test)]
 mod tests {
   use super::{
-    analyze_pattern_tokens, contains_pattern_meta, quantifier_allows_zero, regex_literal_prefix,
+    analyze_pattern_tokens, contains_regex_meta, contains_wildcard_meta, quantifier_allows_zero,
+    regex_literal_prefix,
   };
   use crate::analysis::analyzer::AnalyzerRegistry;
   use crate::query::planner::TermExpansion;
@@ -1275,22 +1283,50 @@ mod tests {
   }
 
   #[test]
-  fn contains_pattern_meta_detects_wildcards_and_regex() {
-    assert!(contains_pattern_meta("hello*"));
-    assert!(contains_pattern_meta("*world"));
-    assert!(contains_pattern_meta("hel?o"));
-    assert!(contains_pattern_meta("r.+"));
-    assert!(contains_pattern_meta("a[bc]d"));
-    assert!(contains_pattern_meta("^start"));
-    assert!(contains_pattern_meta("end$"));
-    assert!(contains_pattern_meta("a\\b"));
-    assert!(contains_pattern_meta("a|b"));
-    assert!(contains_pattern_meta("(group)"));
-    assert!(contains_pattern_meta("a{2,3}"));
-    assert!(!contains_pattern_meta("hello"));
-    assert!(!contains_pattern_meta("running"));
-    assert!(!contains_pattern_meta("café"));
-    assert!(!contains_pattern_meta(""));
+  fn contains_wildcard_meta_only_detects_star_and_question() {
+    assert!(contains_wildcard_meta("hello*"));
+    assert!(contains_wildcard_meta("*world"));
+    assert!(contains_wildcard_meta("hel?o"));
+    // Regex-only metacharacters are NOT wildcard metacharacters.
+    assert!(!contains_wildcard_meta("r.+"));
+    assert!(!contains_wildcard_meta("c++"));
+    assert!(!contains_wildcard_meta("node.js"));
+    assert!(!contains_wildcard_meta("a[bc]d"));
+    assert!(!contains_wildcard_meta("hello"));
+    assert!(!contains_wildcard_meta(""));
+  }
+
+  #[test]
+  fn contains_regex_meta_detects_full_metachar_set() {
+    assert!(contains_regex_meta("hello*"));
+    assert!(contains_regex_meta("hel?o"));
+    assert!(contains_regex_meta("r.+"));
+    assert!(contains_regex_meta("a[bc]d"));
+    assert!(contains_regex_meta("^start"));
+    assert!(contains_regex_meta("end$"));
+    assert!(contains_regex_meta("a\\b"));
+    assert!(contains_regex_meta("a|b"));
+    assert!(contains_regex_meta("(group)"));
+    assert!(contains_regex_meta("a{2,3}"));
+    assert!(!contains_regex_meta("hello"));
+    assert!(!contains_regex_meta("running"));
+    assert!(!contains_regex_meta("café"));
+    assert!(!contains_regex_meta(""));
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_wildcard_keeps_analyzed_form_for_non_wildcard_meta() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let wildcard = TermExpansion::Wildcard {
+      max_expansions: 100,
+    };
+    // "node.js" contains `.` which is a regex meta but NOT a wildcard meta.
+    // Wildcard expansion should return the analyzed form, not normalize_pattern.
+    let tokens = analyze_pattern_tokens(analyzer, "node.js", &wildcard);
+    // The default analyzer tokenizes "node.js" as ["node", "js"] (two tokens)
+    // → multi-token path → normalize_pattern("node.js") = "node.js".
+    assert_eq!(tokens, vec!["node.js"]);
   }
 
   #[test]
