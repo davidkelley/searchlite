@@ -4378,19 +4378,47 @@ fn bucket_sort_runs_after_derivative_pipeline() {
     let mut writer = idx.writer().unwrap();
     // bucket 0: metric avg = 10
     writer
-      .add_document(&doc("d0", vec![("body", json!("rust")), ("val", json!(5.0)), ("metric", json!(10.0))]))
+      .add_document(&doc(
+        "d0",
+        vec![
+          ("body", json!("rust")),
+          ("val", json!(5.0)),
+          ("metric", json!(10.0)),
+        ],
+      ))
       .unwrap();
     // bucket 10: metric avg = 50, derivative = 40
     writer
-      .add_document(&doc("d1", vec![("body", json!("rust")), ("val", json!(15.0)), ("metric", json!(50.0))]))
+      .add_document(&doc(
+        "d1",
+        vec![
+          ("body", json!("rust")),
+          ("val", json!(15.0)),
+          ("metric", json!(50.0)),
+        ],
+      ))
       .unwrap();
     // bucket 20: metric avg = 20, derivative = -30
     writer
-      .add_document(&doc("d2", vec![("body", json!("rust")), ("val", json!(25.0)), ("metric", json!(20.0))]))
+      .add_document(&doc(
+        "d2",
+        vec![
+          ("body", json!("rust")),
+          ("val", json!(25.0)),
+          ("metric", json!(20.0)),
+        ],
+      ))
       .unwrap();
     // bucket 30: metric avg = 100, derivative = 80
     writer
-      .add_document(&doc("d3", vec![("body", json!("rust")), ("val", json!(35.0)), ("metric", json!(100.0))]))
+      .add_document(&doc(
+        "d3",
+        vec![
+          ("body", json!("rust")),
+          ("val", json!(35.0)),
+          ("metric", json!(100.0)),
+        ],
+      ))
       .unwrap();
     writer.commit().unwrap();
   }
