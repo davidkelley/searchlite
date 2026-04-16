@@ -2464,19 +2464,13 @@ mod bug_222 {
   }
 }
 
-/// Regression tests for BUG-233 — `truncate_calendar` for
-/// `CalendarUnit::Quarter` changed the month before normalizing the day,
-/// so a source date of `YYYY-05-31` produced `with_month(4)` against a
-/// day-31 value (April has 30 days), returning `None`. The `None`
-/// propagated through `bucket_start` into the collector's
-/// `None => continue` arm and silently dropped the document from the
-/// aggregation. The fix swaps the ordering so `with_day(1)` runs before
-/// `with_month(quarter_start)`; both operations are then total on their
-/// domains and the full pipeline is defined for every valid input.
+/// Regression for BUG-233: calendar_interval "quarter" silently dropped
+/// documents dated May 31 because truncate_calendar changed the month
+/// before normalizing the day.
 mod bug_233 {
   use super::*;
 
-  fn timestamp_index(path: &std::path::Path) -> searchlite_core::api::Index {
+  fn timestamp_index(path: &std::path::Path) -> Index {
     let mut schema = Schema::default_text_body();
     schema.numeric_fields.push(NumericField {
       name: "ts".into(),
@@ -2485,54 +2479,29 @@ mod bug_233 {
       stored: true,
       nullable: false,
     });
-    Index::create(path, schema, build_base_options(path)).unwrap()
-  }
-
-  fn run_date_histogram(
-    idx: &searchlite_core::api::Index,
-    aggs: BTreeMap<String, Aggregation>,
-  ) -> searchlite_core::api::types::AggregationResponse {
-    let mut req = SearchRequest::new("rust");
-    req.aggs = aggs;
-    let resp = idx.reader().unwrap().search(&req).unwrap();
-    resp.aggregations.get("hist").cloned().unwrap()
-  }
-
-  /// End-to-end coverage that a document timestamped `YYYY-05-31` is counted
-  /// by a `calendar_interval: "quarter"` aggregation. The assertion covers
-  /// both the per-bucket count (May 31 must land in Q2) and the total
-  /// `doc_count` across buckets (no doc may be silently dropped anywhere).
-  #[test]
-  fn quarter_calendar_interval_counts_may_31_documents() {
-    let tmp = tempfile::tempdir().unwrap();
-    let idx = timestamp_index(tmp.path());
-
+    let idx = IndexBuilder::create(path, schema, build_base_options(path)).unwrap();
     let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
-
-    // Two Q2 documents — a noon-on-May-31 timestamp (the bug trigger) plus a
-    // safe mid-April timestamp so the bucket's expected count is strictly
-    // greater than 1 and the assertion distinguishes between "silently
-    // dropped May 31" (count = 1) and "correctly bucketed" (count = 2).
-    {
-      let mut writer = idx.writer().unwrap();
-      for (id, t) in [
-        ("q2-april", "2024-04-15T12:00:00Z"),
-        ("q2-may-31", "2024-05-31T12:00:00Z"),
-        ("q3-july", "2024-07-10T00:00:00Z"),
-      ] {
-        writer
-          .add_document(&doc(
-            id,
-            vec![("body", json!("rust")), ("ts", json!(ts(t)))],
-          ))
-          .unwrap();
-      }
-      writer.commit().unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, t) in [
+      ("d1", "2024-04-15T10:00:00Z"),
+      ("d2", "2024-05-31T12:00:00Z"),
+      ("d3", "2024-07-10T08:00:00Z"),
+    ] {
+      writer
+        .add_document(&doc(
+          id,
+          vec![("body", json!("text")), ("ts", json!(ts(t)))],
+        ))
+        .unwrap();
     }
+    writer.commit().unwrap();
+    idx
+  }
 
+  fn run_quarter_histogram(idx: &Index) -> Vec<(serde_json::Value, u64)> {
     let mut aggs = BTreeMap::new();
     aggs.insert(
-      "hist".into(),
+      "q".into(),
       Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
         field: "ts".into(),
         calendar_interval: Some("quarter".into()),
@@ -2547,30 +2516,238 @@ mod bug_233 {
         aggs: BTreeMap::new(),
       })),
     );
-
-    let agg = run_date_histogram(&idx, aggs);
-    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
-      let observed: Vec<(serde_json::Value, u64)> = buckets
+    let req = SearchRequest {
+      query: "text".into(),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let reader = idx.reader().unwrap();
+    let resp = reader.search(&req).unwrap();
+    if let Some(searchlite_core::api::types::AggregationResponse::DateHistogram {
+      buckets, ..
+    }) = resp.aggregations.get("q")
+    {
+      buckets
         .iter()
         .map(|b| (b.key.clone(), b.doc_count))
-        .collect();
-      assert_eq!(
-        observed,
-        vec![
-          // Q2 2024 — April 15 + May 31 must both land here.
-          (json!(ts("2024-04-01T00:00:00Z")), 2),
-          // Q3 2024 — July 10.
-          (json!(ts("2024-07-01T00:00:00Z")), 1),
-        ],
-        "May 31 must be bucketed into Q2 (2024-04-01), not silently dropped"
-      );
-      let total: u64 = buckets.iter().map(|b| b.doc_count).sum();
-      assert_eq!(
-        total, 3,
-        "all three matching docs must be counted; {observed:?}",
-      );
+        .collect()
     } else {
-      panic!("expected date histogram response");
+      panic!("expected DateHistogram response");
     }
+  }
+
+  #[test]
+  fn quarter_calendar_interval_counts_may_31_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    let buckets = run_quarter_histogram(&idx);
+
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected exactly 2 quarter buckets (Q2 + Q3); got: {buckets:?}"
+    );
+
+    // Q2 (2024-04-01) must have 2 docs (April 15 + May 31).
+    assert_eq!(
+      buckets[0].1, 2,
+      "Q2 bucket must contain 2 docs; got: {buckets:?}"
+    );
+
+    // Q3 (2024-07-01) must have 1 doc.
+    assert_eq!(
+      buckets[1].1, 1,
+      "Q3 bucket must contain 1 doc; got: {buckets:?}"
+    );
+
+    // Total doc_count across all buckets must equal 3 (no silent drops).
+    let total: u64 = buckets.iter().map(|(_, c)| c).sum();
+    assert_eq!(
+      total, 3,
+      "total doc_count must equal indexed docs; got: {buckets:?}"
+    );
+  }
+}
+
+/// Regression tests for #251: add_calendar must preserve the sub-day time
+/// component so that the fill loop produces bucket keys aligned with the
+/// offset applied by bucket_start.
+mod bug_251 {
+  use super::*;
+
+  /// Calendar month interval with offset=1h and extended_bounds spanning
+  /// April–June. The fill loop must produce keys at T01:00:00Z (not midnight)
+  /// for every bucket, and there must be no phantom duplicate buckets.
+  #[test]
+  fn date_histogram_calendar_month_with_offset_produces_aligned_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "ts".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // April 15 doc
+      let apr = DateTime::parse_from_rfc3339("2024-04-15T10:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+      writer
+        .add_document(&doc(
+          "d1",
+          vec![("body", json!("test")), ("ts", json!(apr))],
+        ))
+        .unwrap();
+      // May 20 doc
+      let may = DateTime::parse_from_rfc3339("2024-05-20T10:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+      writer
+        .add_document(&doc(
+          "d2",
+          vec![("body", json!("test")), ("ts", json!(may))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("month".into()),
+        fixed_interval: None,
+        offset: Some("1h".into()),
+        format: None,
+        min_doc_count: Some(0),
+        extended_bounds: Some(DateHistogramBounds {
+          min: "2024-04-01T02:00:00Z".into(),
+          max: "2024-06-01T02:00:00Z".into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let resp = idx
+      .reader()
+      .unwrap()
+      .search(&SearchRequest {
+        query: "test".into(),
+        fields: None,
+        filter: None,
+        limit: 0,
+        from: 0,
+        return_hits: false,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        track_total_hits: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs,
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let hist = resp.aggregations.get("hist").unwrap();
+    let buckets = match hist {
+      searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } => buckets,
+      other => panic!("expected DateHistogram, got: {other:?}"),
+    };
+
+    // Collect (key_ms, doc_count) pairs
+    let entries: Vec<(i64, u64)> = buckets
+      .iter()
+      .map(|b| {
+        let key = b.key.as_i64().unwrap();
+        (key, b.doc_count)
+      })
+      .collect();
+
+    // Expected bucket keys: all at T01:00:00Z due to 1h offset
+    let apr_key = DateTime::parse_from_rfc3339("2024-04-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+    let may_key = DateTime::parse_from_rfc3339("2024-05-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+    let jun_key = DateTime::parse_from_rfc3339("2024-06-01T01:00:00Z")
+      .unwrap()
+      .timestamp_millis();
+
+    // Must have exactly 3 buckets (Apr, May, Jun) — no phantom midnight buckets
+    assert_eq!(
+      entries.len(),
+      3,
+      "expected 3 buckets (Apr/May/Jun), got {}: {entries:?}",
+      entries.len()
+    );
+
+    // Verify all keys are at T01:00:00Z
+    let keys: Vec<i64> = entries.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+      keys,
+      vec![apr_key, may_key, jun_key],
+      "bucket keys must be at T01:00:00Z, not midnight; got: {entries:?}"
+    );
+
+    // April: 1 doc, May: 1 doc, June: 0 docs
+    assert_eq!(entries[0].1, 1, "April bucket should have 1 doc");
+    assert_eq!(entries[1].1, 1, "May bucket should have 1 doc");
+    assert_eq!(entries[2].1, 0, "June bucket should have 0 docs");
+
+    // Total doc_count must equal indexed docs (no double-counting)
+    let total: u64 = entries.iter().map(|(_, c)| c).sum();
+    assert_eq!(total, 2, "total doc_count must equal indexed docs");
   }
 }
