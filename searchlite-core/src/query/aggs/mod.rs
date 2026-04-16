@@ -1379,11 +1379,8 @@ impl<'a> HistogramCollector<'a> {
     // `hard_bounds.max`. Drop any bucket whose key-value falls outside the
     // half-open range `[hard_bounds.min, hard_bounds.max)`.
     if let Some((hmin, hmax)) = hard_bounds {
-      buckets.retain(|_, b| {
-        let bv = match &b.key {
-          serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-          _ => return true,
-        };
+      buckets.retain(|bucket_id, _| {
+        let bv = bucket_value(*bucket_id);
         bv >= hmin && bv < hmax
       });
     }

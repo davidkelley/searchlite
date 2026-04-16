@@ -300,7 +300,13 @@ fn histogram_hard_bounds_filters_on_bucket_key_not_raw_value() {
     // the doc with value 60 contributes a hit.
     assert_eq!(
       keys,
-      vec![json!(30.0), json!(40.0), json!(50.0), json!(60.0), json!(70.0)]
+      vec![
+        json!(30.0),
+        json!(40.0),
+        json!(50.0),
+        json!(60.0),
+        json!(70.0)
+      ]
     );
     assert_eq!(buckets[0].doc_count, 0); // key 30 — empty fill
     assert_eq!(buckets[1].doc_count, 0); // key 40 — empty fill
