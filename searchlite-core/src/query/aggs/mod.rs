@@ -3161,6 +3161,16 @@ fn topological_sort_pipeline(pipeline: &BTreeMap<String, Aggregation>) -> Vec<&s
       }
     }
   }
+  // Append cycle members in BTreeMap key order so they still execute
+  // (with unresolved deps) rather than being silently dropped.
+  if order.len() < pipeline.len() {
+    let in_order: HashSet<&str> = order.iter().copied().collect();
+    for key in pipeline.keys() {
+      if !in_order.contains(key.as_str()) {
+        order.push(key.as_str());
+      }
+    }
+  }
   order
 }
 
