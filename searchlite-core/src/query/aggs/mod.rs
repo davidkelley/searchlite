@@ -3320,17 +3320,20 @@ fn apply_moving_avg_pipeline(
       (None, GapPolicy::InsertZeros) => Some(0.0),
       (None, GapPolicy::Skip) => None,
     };
+    // Compute the average from preceding values only (look-back). The current
+    // bucket's value must NOT be included — Elasticsearch's moving_avg emits
+    // the mean of the *previous* window at each position.
+    let avg = if window_values.is_empty() {
+      None
+    } else {
+      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+    };
     if let Some(val) = current {
       if window_values.len() == window {
         window_values.pop_front();
       }
       window_values.push_back(val);
     }
-    let avg = if window_values.is_empty() {
-      None
-    } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
-    };
     avgs.push(avg);
     bucket.aggregations.insert(
       name.to_string(),
@@ -5173,24 +5176,24 @@ mod tests {
       &mut responses,
     );
 
-    // First bucket: moving_avg of window [10.0] = 10.0
+    // First bucket: no preceding values → null (look-back window is empty)
     if let Some(AggregationResponse::MovingAvg(val)) = buckets[0].aggregations.get("smoothed_p999")
     {
-      assert_eq!(val.value.unwrap(), 10.0);
+      assert_eq!(val.value, None);
     } else {
       panic!("expected moving_avg on bucket 0");
     }
-    // Second bucket: moving_avg of window [10.0, 20.0] = 15.0
+    // Second bucket: preceding window [10.0] → avg = 10.0
     if let Some(AggregationResponse::MovingAvg(val)) = buckets[1].aggregations.get("smoothed_p999")
     {
-      assert_eq!(val.value.unwrap(), 15.0);
+      assert_eq!(val.value.unwrap(), 10.0);
     } else {
       panic!("expected moving_avg on bucket 1");
     }
-    // Third bucket: moving_avg of window [20.0, 30.0] = 25.0
+    // Third bucket: preceding window [10.0, 20.0] → avg = 15.0
     if let Some(AggregationResponse::MovingAvg(val)) = buckets[2].aggregations.get("smoothed_p999")
     {
-      assert_eq!(val.value.unwrap(), 25.0);
+      assert_eq!(val.value.unwrap(), 15.0);
     } else {
       panic!("expected moving_avg on bucket 2");
     }
