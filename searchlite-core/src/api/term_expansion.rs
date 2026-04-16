@@ -225,7 +225,15 @@ fn analyze_pattern_tokens(analyzer: &Analyzer, value: &str) -> Vec<String> {
     return vec![analyzer.normalize_pattern(value)];
   }
   if tokens.len() == 1 {
-    return tokens;
+    // If the analyzed token matches the normalized pattern, the pattern
+    // has no metacharacters and we can use the analyzed form. Otherwise
+    // the analyzer stripped metacharacters (e.g. `*`, `?`, `.+`) — fall
+    // through to preserve them via normalize_pattern.
+    let normalized = analyzer.normalize_pattern(value);
+    if tokens[0] == normalized {
+      return tokens;
+    }
+    return vec![normalized];
   }
   // Wildcard/regex patterns often get split by analyzers; fall back to the raw pattern so we
   // preserve the literal structure, but still apply lightweight normalization (e.g. lowercase).
@@ -882,7 +890,8 @@ fn expand_term_fuzzy(
 
 #[cfg(test)]
 mod tests {
-  use super::{quantifier_allows_zero, regex_literal_prefix};
+  use super::{analyze_pattern_tokens, quantifier_allows_zero, regex_literal_prefix};
+  use crate::analysis::analyzer::AnalyzerRegistry;
   use crate::util::regex::anchored_regex;
 
   /// Pins the invariant the whole helper exists to uphold: every term the
@@ -1139,5 +1148,60 @@ mod tests {
     assert!(!quantifier_allows_zero(&chars("{abc}"), 0));
     // Position past the end is false.
     assert!(!quantifier_allows_zero(&chars("?"), 1));
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_preserves_trailing_wildcard() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    // Trailing wildcard: the analyzer absorbs "hello" as a single token and
+    // discards the `*`. The fix must preserve it via normalize_pattern.
+    let tokens = analyze_pattern_tokens(analyzer, "hello*");
+    assert_eq!(tokens, vec!["hello*"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_preserves_leading_wildcard() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let tokens = analyze_pattern_tokens(analyzer, "*world");
+    assert_eq!(tokens, vec!["*world"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_preserves_trailing_question_mark() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let tokens = analyze_pattern_tokens(analyzer, "hel?");
+    assert_eq!(tokens, vec!["hel?"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_preserves_regex_metacharacters() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    // Regex pattern: `r.+` → tokenizer produces ["r"] (one token) and strips
+    // the `.+`. The fix must fall back to normalize_pattern to preserve them.
+    let tokens = analyze_pattern_tokens(analyzer, "r.+");
+    assert_eq!(tokens, vec!["r.+"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_returns_analyzed_form_for_plain_term() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    // A plain term with no metacharacters should still return the analyzed form.
+    let tokens = analyze_pattern_tokens(analyzer, "hello");
+    assert_eq!(tokens, vec!["hello"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_middle_wildcard_uses_normalize_pattern() {
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    // Middle wildcard: produces multiple tokens → falls through to
+    // normalize_pattern. This should still work as before.
+    let tokens = analyze_pattern_tokens(analyzer, "r*st");
+    assert_eq!(tokens, vec!["r*st"]);
   }
 }
