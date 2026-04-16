@@ -2038,6 +2038,11 @@ impl IndexReader {
           continue;
         }
         if !query_eval.matches(doc_id) {
+          let hit = hits.get_mut(hit_idx).unwrap();
+          let orig_score = hit.score;
+          let combined = combine_rescore_scores(rescore.score_mode, orig_score, 0.0);
+          hit.score = combined;
+          hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
           continue;
         }
         stats.candidates_examined += 1;
