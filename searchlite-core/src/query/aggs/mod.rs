@@ -3537,19 +3537,18 @@ fn bucket_metric_value(bucket: &BucketResponse, path: &str) -> Option<f64> {
   if path == "_count" {
     return Some(bucket.doc_count as f64);
   }
-  let mut parts: Vec<&str> = path.split('.').collect();
-  if parts.is_empty() {
-    return None;
-  }
-  let agg_name = parts.remove(0);
+  let (agg_name, sub_path) = match path.split_once('.') {
+    Some((name, rest)) => (name, Some(rest)),
+    None => (path, None),
+  };
   let agg = bucket.aggregations.get(agg_name)?;
-  extract_metric_from_response(agg, &parts)
+  extract_metric_from_response(agg, sub_path)
 }
 
-fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Option<f64> {
+fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) -> Option<f64> {
   match resp {
     AggregationResponse::Stats(stats) => {
-      let field = path.first().copied().unwrap_or("avg");
+      let field = path.unwrap_or("avg");
       match field {
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
@@ -3560,7 +3559,7 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Op
       }
     }
     AggregationResponse::ExtendedStats(stats) => {
-      let field = path.first().copied().unwrap_or("avg");
+      let field = path.unwrap_or("avg");
       match field {
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
@@ -3575,11 +3574,11 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Op
     AggregationResponse::ValueCount(val) => Some(val.value as f64),
     AggregationResponse::Cardinality(val) => Some(val.value as f64),
     AggregationResponse::Percentiles(vals) => {
-      let key = path.first().copied()?;
+      let key = path?;
       vals.values.get(key).copied()
     }
     AggregationResponse::PercentileRanks(vals) => {
-      let key = path.first().copied()?;
+      let key = path?;
       vals.values.get(key).copied()
     }
     AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => Some(val.value),
@@ -4852,6 +4851,178 @@ mod tests {
       );
     } else {
       panic!("expected SignificantTerms intermediate");
+    }
+  }
+
+  #[test]
+  fn bucket_metric_value_resolves_decimal_percentile_key() {
+    let mut aggs = BTreeMap::new();
+    let mut pct_values = BTreeMap::new();
+    pct_values.insert("50".to_string(), 10.0);
+    pct_values.insert("99.9".to_string(), 42.5);
+    pct_values.insert("99.99".to_string(), 100.0);
+    aggs.insert(
+      "latency_pct".to_string(),
+      AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 1,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.99.9"), Some(42.5));
+    assert_eq!(
+      bucket_metric_value(&bucket, "latency_pct.99.99"),
+      Some(100.0)
+    );
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.50"), Some(10.0));
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.unknown"), None);
+  }
+
+  #[test]
+  fn bucket_metric_value_resolves_decimal_percentile_rank_key() {
+    let mut aggs = BTreeMap::new();
+    let mut rank_values = BTreeMap::new();
+    rank_values.insert("50.5".to_string(), 72.0);
+    rank_values.insert("100".to_string(), 99.0);
+    aggs.insert(
+      "rank_agg".to_string(),
+      AggregationResponse::PercentileRanks(PercentileRanksResponse {
+        values: rank_values,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 1,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "rank_agg.50.5"), Some(72.0));
+    assert_eq!(bucket_metric_value(&bucket, "rank_agg.100"), Some(99.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_stats_subfield_still_works() {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_stats".to_string(),
+      AggregationResponse::Stats(StatsResponse {
+        count: 10,
+        min: 1.0,
+        max: 100.0,
+        avg: 50.0,
+        sum: 500.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 10,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.max"), Some(100.0));
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.min"), Some(1.0));
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.avg"), Some(50.0));
+    assert_eq!(bucket_metric_value(&bucket, "_count"), Some(10.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_no_subpath_returns_default_for_stats() {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_stats".to_string(),
+      AggregationResponse::Stats(StatsResponse {
+        count: 5,
+        min: 0.0,
+        max: 10.0,
+        avg: 5.0,
+        sum: 25.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 5,
+      aggregations: aggs,
+    };
+
+    // Without a subpath, Stats defaults to "avg"
+    assert_eq!(bucket_metric_value(&bucket, "my_stats"), Some(5.0));
+  }
+
+  #[test]
+  fn moving_avg_pipeline_with_decimal_percentile_path() {
+    let mut pct_values = BTreeMap::new();
+    pct_values.insert("99.9".to_string(), 10.0);
+    let mut pct_values2 = BTreeMap::new();
+    pct_values2.insert("99.9".to_string(), 20.0);
+    let mut pct_values3 = BTreeMap::new();
+    pct_values3.insert("99.9".to_string(), 30.0);
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!(0),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(1),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse {
+            values: pct_values2,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(2),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse {
+            values: pct_values3,
+          }),
+        )]),
+      },
+    ];
+
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smoothed_p999",
+      &MovingAvgAggregation {
+        buckets_path: "latency_pct.99.9".to_string(),
+        window: 2,
+        predict: None,
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // First bucket: moving_avg of window [10.0] = 10.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[0].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value.unwrap(), 10.0);
+    } else {
+      panic!("expected moving_avg on bucket 0");
+    }
+    // Second bucket: moving_avg of window [10.0, 20.0] = 15.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[1].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value.unwrap(), 15.0);
+    } else {
+      panic!("expected moving_avg on bucket 1");
+    }
+    // Third bucket: moving_avg of window [20.0, 30.0] = 25.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[2].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value.unwrap(), 25.0);
+    } else {
+      panic!("expected moving_avg on bucket 2");
     }
   }
 }
