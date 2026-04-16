@@ -3942,7 +3942,11 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
       .with_month(1)?
       .with_day(1)?,
   };
-  let next_dt = next_date.and_hms_opt(0, 0, 0)?;
+  // Preserve the original time-of-day so that bucket keys remain aligned
+  // with any sub-day offset applied by `bucket_start`. Previously this
+  // hardcoded midnight via `and_hms_opt(0, 0, 0)`, which discarded the
+  // offset and produced misaligned fill-loop keys (issue #251).
+  let next_dt = next_date.and_time(dt.naive_utc().time());
   Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(next_dt, Utc).timestamp_millis())
 }
 
@@ -4332,6 +4336,105 @@ mod tests {
         );
       }
       date = date.succ_opt().unwrap();
+    }
+  }
+
+  /// Regression for #251: add_calendar must preserve the sub-day time
+  /// component so that bucket keys stay aligned with the offset applied by
+  /// bucket_start. Previously `and_hms_opt(0, 0, 0)` discarded the time,
+  /// snapping every bucket after the first to midnight.
+  #[test]
+  fn add_calendar_preserves_sub_day_time_component() {
+    use chrono::{NaiveDate, Utc};
+    // Input: 2024-04-01T01:00:00Z (midnight + 1h offset)
+    let dt = NaiveDate::from_ymd_opt(2024, 4, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+
+    // Month: expect 2024-05-01T01:00:00Z, NOT 2024-05-01T00:00:00Z
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 5, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "add_calendar(Month) must preserve 01:00:00 offset"
+    );
+
+    // Quarter: expect 2024-07-01T01:00:00Z
+    let next_q = add_calendar(ts, CalendarUnit::Quarter).unwrap();
+    let expected_q = NaiveDate::from_ymd_opt(2024, 7, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_q_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_q, Utc).timestamp_millis();
+    assert_eq!(
+      next_q, expected_q_ts,
+      "add_calendar(Quarter) must preserve 01:00:00 offset"
+    );
+
+    // Year: expect 2025-01-01T01:00:00Z
+    let next_y = add_calendar(ts, CalendarUnit::Year).unwrap();
+    let expected_y = NaiveDate::from_ymd_opt(2025, 1, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_y_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_y, Utc).timestamp_millis();
+    assert_eq!(
+      next_y, expected_y_ts,
+      "add_calendar(Year) must preserve 01:00:00 offset"
+    );
+  }
+
+  /// Regression for #251: chained add_calendar calls (as the fill loop does)
+  /// must produce a monotonically increasing sequence where every bucket key
+  /// keeps the original sub-day offset.
+  #[test]
+  fn add_calendar_fill_loop_stays_aligned_with_offset() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = 3_600_000; // 1 hour
+    let start_dt = NaiveDate::from_ymd_opt(2024, 4, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let start =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis();
+
+    let expected_keys: Vec<i64> = [(2024, 4, 1), (2024, 5, 1), (2024, 6, 1), (2024, 7, 1)]
+      .iter()
+      .map(|(y, m, d)| {
+        let dt = NaiveDate::from_ymd_opt(*y, *m, *d)
+          .unwrap()
+          .and_hms_opt(1, 0, 0)
+          .unwrap();
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+      })
+      .collect();
+
+    let mut current = start;
+    let mut keys = vec![current];
+    for _ in 0..3 {
+      current = add_calendar(current, CalendarUnit::Month).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys, expected_keys,
+      "fill loop must produce keys at T01:00:00Z, not T00:00:00Z"
+    );
+
+    // Also verify bucket_start + add_interval round-trip consistency
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+    let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
+    for expected in &expected_keys {
+      assert_eq!(cur, *expected);
+      cur = add_interval(cur, &interval).unwrap();
     }
   }
 
