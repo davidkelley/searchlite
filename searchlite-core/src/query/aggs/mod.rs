@@ -3413,19 +3413,25 @@ fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
       }
       ScriptToken::LParen => ops.push('('),
       ScriptToken::RParen => {
+        let mut found_lparen = false;
         while let Some(op) = ops.pop() {
           if op == '(' {
+            found_lparen = true;
             break;
           }
           output.push(ScriptToken::Op(op));
+        }
+        if !found_lparen {
+          return None;
         }
       }
     }
   }
   while let Some(op) = ops.pop() {
-    if op != '(' {
-      output.push(ScriptToken::Op(op));
+    if op == '(' {
+      return None;
     }
+    output.push(ScriptToken::Op(op));
   }
   Some(output)
 }
@@ -4067,6 +4073,34 @@ mod tests {
     vars.insert("a".to_string(), 1.0);
     vars.insert("b".to_string(), 1e-14);
     assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_unmatched_rparen() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    assert!(eval_bucket_script("a + b) * c", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_unmatched_lparen() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    assert!(eval_bucket_script("(a + b * c", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_accepts_matched_parentheses() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    let value = eval_bucket_script("(a + b) * c", &vars).unwrap();
+    assert!((value - 20.0).abs() < 1e-6);
   }
 
   #[test]
