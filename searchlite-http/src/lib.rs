@@ -24,7 +24,7 @@ use searchlite_core::api::types::{
   Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
 };
 use searchlite_core::api::PatchError;
-use searchlite_core::api::{MultiSearchResponse, SearchResult};
+use searchlite_core::api::{IndexReader, MultiSearchResponse, SearchResult};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
@@ -2222,8 +2222,33 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
+  // Share a bounded pool of IndexReaders across sub-searches rather than
+  // re-opening one per task. Pool size matches the effective concurrency so
+  // each permit is always backed by an available reader, and reuse eliminates
+  // the repeated segment-open cost for large multi_search payloads.
+  let pool_size = max_concurrency.min(searches.len()).max(1);
   let idx = index.clone();
-  let semaphore = Arc::new(Semaphore::new(max_concurrency));
+  let readers = {
+    let idx_for_pool = idx.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<IndexReader>> {
+      let mut readers = Vec::with_capacity(pool_size);
+      for _ in 0..pool_size {
+        readers.push(idx_for_pool.reader()?);
+      }
+      Ok(readers)
+    })
+    .await
+    .map_err(|err| {
+      HttpError::from_anyhow(
+        "multi_search_join",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!(err.to_string()),
+      )
+    })?
+    .map_err(|err| HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err))?
+  };
+  let pool = Arc::new(tokio::sync::Mutex::new(readers));
+  let semaphore = Arc::new(Semaphore::new(pool_size));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
   for (search_idx, mut req) in searches.into_iter().enumerate() {
     if req.cursor.is_some() {
@@ -2231,6 +2256,7 @@ async fn multi_search(
       req.from = 0;
     }
     let semaphore_clone = semaphore.clone();
+    let pool_clone = pool.clone();
     let index_clone = idx.clone();
     tasks.push(async move {
       let permit = semaphore_clone.acquire_owned().await.map_err(|err| {
@@ -2240,19 +2266,29 @@ async fn multi_search(
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
+      // Holding a permit guarantees a reader is available in steady state.
+      // The pool can briefly be empty if a prior blocking task panicked and
+      // dropped its reader; open a fresh one so the request still completes.
+      let reader = match pool_clone.lock().await.pop() {
+        Some(reader) => reader,
+        None => index_clone.reader().map_err(|err| {
+          HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
+        })?,
+      };
+      let handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let reader = index_clone.reader()?;
-        reader.search(&req)
+        let result = reader.search(&req);
+        (reader, result)
       });
-      let joined = handle.await.map_err(|err: tokio::task::JoinError| {
+      let (reader, result) = handle.await.map_err(|err: tokio::task::JoinError| {
         HttpError::from_anyhow(
           "multi_search_join",
           StatusCode::INTERNAL_SERVER_ERROR,
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let search_res = joined.map_err(|err| {
+      pool_clone.lock().await.push(reader);
+      let search_res = result.map_err(|err| {
         HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
       })?;
       Ok::<(usize, SearchResult), HttpError>((search_idx, search_res))
@@ -3931,6 +3967,83 @@ mod tests {
     assert_eq!(body.results.len(), 2);
     assert!(body.results[0].hits.is_empty());
     assert_eq!(body.results[1].hits.first().unwrap().doc_id, "2");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn multi_search_parallel_reuses_reader_pool() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-multi-pool");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson =
+      "{\"_id\":\"1\",\"body\":\"rust\"}\n{\"_id\":\"2\",\"body\":\"go\"}\n{\"_id\":\"3\",\"body\":\"rust go\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    // Eight sub-searches with a pool capped at two exercises reader reuse:
+    // the pool is strictly smaller than the search count, so correctness here
+    // depends on readers being handed back and picked up again by later tasks.
+    let searches: Vec<serde_json::Value> = (0..8)
+      .map(|i| {
+        let term = if i % 2 == 0 { "rust" } else { "go" };
+        json!({ "query": term, "limit": 5, "return_stored": false })
+      })
+      .collect();
+    let req = json!({
+      "searches": searches,
+      "parallel": true,
+      "max_concurrency": 2
+    });
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MultiSearchResponse = res.json().await.unwrap();
+    assert_eq!(body.results.len(), 8);
+    for (i, result) in body.results.iter().enumerate() {
+      let ids: Vec<&str> = result.hits.iter().map(|h| h.doc_id.as_str()).collect();
+      if i % 2 == 0 {
+        assert!(
+          ids.contains(&"1"),
+          "expected doc 1 for rust query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for rust query #{i}: {ids:?}"
+        );
+      } else {
+        assert!(
+          ids.contains(&"2"),
+          "expected doc 2 for go query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for go query #{i}: {ids:?}"
+        );
+      }
+    }
 
     handle.abort();
     let _ = handle.await;
