@@ -2646,9 +2646,10 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
   let hist = resp.aggregations.get("hist").unwrap();
   if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = hist {
     let keys: Vec<_> = buckets.iter().map(|b| b.key.clone()).collect();
-    assert_eq!(keys, vec![json!(1_000), json!(2_000)]);
+    // hard_bounds.max is exclusive on the bucket key, so the bucket at
+    // key 2000 (== hard_bounds.max) is dropped (BUG-269).
+    assert_eq!(keys, vec![json!(1_000)]);
     assert_eq!(buckets[0].doc_count, 1);
-    assert_eq!(buckets[1].doc_count, 0);
   } else {
     panic!("expected date histogram response");
   }
