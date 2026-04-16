@@ -1154,72 +1154,84 @@ mod tests {
   }
 
   #[test]
-  fn bmw_block_tf_skipping_reduces_postings_advanced() {
-    // Construct a scenario where BMW tf-based block skipping should
-    // kick in: one common term with many low-tf blocks and a few
-    // high-tf blocks, paired with a rare high-tf term that fills the
-    // top-k heap quickly. Once the heap is full, the common term's
-    // low-tf blocks should be skippable.
+  fn bmw_block_tf_skipping_exercises_advancement_path() {
+    // Regression test for BUG-005: exercises the `pivot_doc > smallest_doc`
+    // advancement branch where `skip_blocks_below_bound` is called.
     //
-    // Block size = 4 so we get clear block boundaries.
+    // Layout (block_size = 4):
+    //
+    //   anchor: 8 entries at doc_ids [0..4, 40..44], all tf=20
+    //     block 0 (entries 0-3): docs [0,1,2,3],     max_tf=20
+    //     block 1 (entries 4-7): docs [40,41,42,43],  max_tf=20
+    //
+    //   spread: 44 entries at doc_ids [0..4] tf=20, [4..40] tf=1, [40..44] tf=20
+    //     block 0  (entries 0-3):   docs [0,1,2,3],     max_tf=20
+    //     block 1  (entries 4-7):   docs [4,5,6,7],     max_tf=1   ← skippable
+    //     block 2  (entries 8-11):  docs [8,9,10,11],   max_tf=1   ← skippable
+    //     ...
+    //     block 9  (entries 36-39): docs [36,37,38,39], max_tf=1   ← skippable
+    //     block 10 (entries 40-43): docs [40,41,42,43], max_tf=20
+    //
+    // Phase 1 (docs 0-3): both terms score together (tf=20 each).
+    //   The top-k heap fills with high combined scores (k=3).
+    //
+    // Phase 2: anchor jumps to doc 40. spread is at doc 4.
+    //   Queue: [spread(4), anchor(40)]
+    //   Pivot scan accumulates spread.block_ub(tf=1) + anchor.block_ub(tf=20).
+    //   pivot_doc = 40 > smallest_doc = 4 → advancement branch entered.
+    //   spread must advance from doc 4 to doc 40 through 9 blocks of tf=1.
+    //   skip_blocks_below_bound skips those low-tf blocks.
     let block_size = 4;
 
-    // Common term: 16 postings across 4 blocks.
-    // Block 0 (doc_ids 0-3):  tf=1 each (low contribution)
-    // Block 1 (doc_ids 4-7):  tf=1 each (low contribution)
-    // Block 2 (doc_ids 8-11): tf=1 each (low contribution)
-    // Block 3 (doc_ids 12-15): tf=10 each (high contribution)
-    let mut common_entries = Vec::new();
-    for doc_id in 0..12 {
-      common_entries.push(PostingEntry {
+    // anchor: high-tf entries at low and high doc_ids with a gap.
+    let mut anchor_entries = Vec::new();
+    for doc_id in 0..4 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 40..44 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    let anchor = term_from_entries_with_block_size(&anchor_entries, block_size);
+
+    // spread: overlaps anchor at both ends, with many low-tf entries in between.
+    let mut spread_entries = Vec::new();
+    for doc_id in 0..4 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 4..40 {
+      spread_entries.push(PostingEntry {
         doc_id,
         term_freq: 1,
         positions: smallvec![],
       });
     }
-    for doc_id in 12..16 {
-      common_entries.push(PostingEntry {
+    for doc_id in 40..44 {
+      spread_entries.push(PostingEntry {
         doc_id,
-        term_freq: 10,
+        term_freq: 20,
         positions: smallvec![],
       });
     }
-    let common = term_from_entries_with_block_size(&common_entries, block_size);
-
-    // Rare term: 4 postings, all high tf, in the high doc_id range.
-    // These fill the top-k heap with high scores early.
-    let rare = term_from_entries_with_block_size(
-      &[
-        PostingEntry {
-          doc_id: 12,
-          term_freq: 8,
-          positions: smallvec![],
-        },
-        PostingEntry {
-          doc_id: 13,
-          term_freq: 9,
-          positions: smallvec![],
-        },
-        PostingEntry {
-          doc_id: 14,
-          term_freq: 7,
-          positions: smallvec![],
-        },
-        PostingEntry {
-          doc_id: 15,
-          term_freq: 10,
-          positions: smallvec![],
-        },
-      ],
-      block_size,
-    );
+    let spread = term_from_entries_with_block_size(&spread_entries, block_size);
 
     let mut accept = |_doc: DocId, _score: f32| true;
 
     // Run with plain WAND (no block-tf skipping)
     let mut wand_stats = QueryStats::default();
     let wand_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
-      vec![common.clone(), rare.clone()],
+      vec![anchor.clone(), spread.clone()],
       3,
       ExecutionStrategy::Wand,
       Some(block_size),
@@ -1231,7 +1243,7 @@ mod tests {
     // Run with BMW (block-tf skipping active)
     let mut bmw_stats = QueryStats::default();
     let bmw_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
-      vec![common, rare],
+      vec![anchor, spread],
       3,
       ExecutionStrategy::Bmw,
       Some(block_size),
@@ -1257,11 +1269,12 @@ mod tests {
       );
     }
 
-    // BMW should advance fewer postings than plain WAND because it
-    // skips low-tf blocks during advancement.
+    // BMW should advance strictly fewer postings than plain WAND because
+    // spread's low-tf blocks (doc_ids 4-39) are skipped in the advancement
+    // phase rather than walked entry-by-entry.
     assert!(
-      bmw_stats.postings_advanced <= wand_stats.postings_advanced,
-      "BMW should advance no more postings than WAND: bmw={} wand={}",
+      bmw_stats.postings_advanced < wand_stats.postings_advanced,
+      "BMW should advance strictly fewer postings than WAND: bmw={} wand={}",
       bmw_stats.postings_advanced,
       wand_stats.postings_advanced
     );
