@@ -3126,7 +3126,16 @@ fn pipeline_agg_dependencies<'a>(
 }
 
 fn topological_sort_pipeline(pipeline: &BTreeMap<String, Aggregation>) -> Vec<&str> {
-  let pipeline_keys: HashSet<&str> = pipeline.keys().map(|k| k.as_str()).collect();
+  let pipeline_keys: HashSet<&str> = pipeline
+    .iter()
+    .filter(|(_, agg)| {
+      matches!(
+        agg,
+        Aggregation::Derivative(_) | Aggregation::MovingAvg(_) | Aggregation::BucketScript(_)
+      )
+    })
+    .map(|(k, _)| k.as_str())
+    .collect();
   let mut in_degree: BTreeMap<&str, usize> = BTreeMap::new();
   let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
   for key in pipeline.keys() {
