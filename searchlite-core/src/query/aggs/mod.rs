@@ -1292,12 +1292,13 @@ impl<'a> HistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
+      let bucket_id = self.bucket_key(val);
       if let Some((min, max)) = self.hard_bounds {
-        if val < min || val > max {
+        let bucket_val = bucket_id as f64 * self.interval + self.offset;
+        if bucket_val < min || bucket_val >= max {
           continue;
         }
       }
-      let bucket_id = self.bucket_key(val);
       if !seen.insert(bucket_id) {
         continue;
       }
@@ -1372,6 +1373,16 @@ impl<'a> HistogramCollector<'a> {
           }
         }
       }
+    }
+    // BUG-269: the fill loop maps `hard_bounds` values to bucket keys via
+    // `floor()`, which can produce keys below `hard_bounds.min` or at
+    // `hard_bounds.max`. Drop any bucket whose key-value falls outside the
+    // half-open range `[hard_bounds.min, hard_bounds.max)`.
+    if let Some((hmin, hmax)) = hard_bounds {
+      buckets.retain(|bucket_id, _| {
+        let bv = bucket_value(*bucket_id);
+        bv >= hmin && bv < hmax
+      });
     }
     let mut buckets: Vec<BucketIntermediate> = buckets
       .into_values()
@@ -1477,15 +1488,15 @@ impl<'a> DateHistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
-      if let Some((min, max)) = self.hard_bounds {
-        if val < min || val > max {
-          continue;
-        }
-      }
       let bucket_start = match bucket_start(val, self.offset_millis, &self.interval) {
         Some(v) => v,
         None => continue,
       };
+      if let Some((min, max)) = self.hard_bounds {
+        if bucket_start < min || bucket_start >= max {
+          continue;
+        }
+      }
       if !seen.insert(bucket_start) {
         continue;
       }
@@ -1546,6 +1557,13 @@ impl<'a> DateHistogramCollector<'a> {
           };
         }
       }
+    }
+    // BUG-269: the fill loop maps `hard_bounds` timestamps to bucket starts
+    // via `bucket_start()`, which can produce a bucket start below
+    // `hard_bounds.min` or at `hard_bounds.max`. Drop any bucket whose start
+    // falls outside the half-open range `[hard_bounds.min, hard_bounds.max)`.
+    if let Some((hmin, hmax)) = self.hard_bounds {
+      buckets.retain(|&bucket_start, _| bucket_start >= hmin && bucket_start < hmax);
     }
     let mut buckets: Vec<BucketIntermediate> = buckets
       .into_values()
