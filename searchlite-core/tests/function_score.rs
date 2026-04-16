@@ -416,3 +416,211 @@ fn script_score_evaluates_expression_with_score_and_field() {
   let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
   assert!(scores[0] > scores[1] && scores[1] > scores[2]);
 }
+
+#[test]
+fn rescore_multiply_zeros_non_matching_docs() {
+  let reader = setup_reader();
+  // Give every doc a constant score of 5.0 via function_score + Replace.
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore with a term that only matches doc-1 ("rust fast") and doc-2 ("rust slow").
+  // doc-3 ("boring") does not match and should receive 5.0 * 0.0 = 0.0.
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::Term {
+      field: "body".into(),
+      value: "rust".into(),
+      boost: None,
+    },
+    score_mode: RescoreMode::Multiply,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  // Find doc-3's score — it must be zero because it did not match the rescore query.
+  let doc3 = resp.hits.iter().find(|h| h.doc_id == "doc-3").unwrap();
+  assert!(
+    doc3.score.abs() < 1e-6,
+    "expected doc-3 score ≈ 0.0 under Multiply, got {}",
+    doc3.score
+  );
+  // doc-1 and doc-2 matched the rescore query, so they should have positive scores.
+  for hit in resp.hits.iter().filter(|h| h.doc_id != "doc-3") {
+    assert!(
+      hit.score > 0.0,
+      "expected positive rescore score for {}, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn rescore_min_zeros_non_matching_docs() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore with Min mode — non-matching docs get min(5.0, 0.0) = 0.0.
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::Term {
+      field: "body".into(),
+      value: "rust".into(),
+      boost: None,
+    },
+    score_mode: RescoreMode::Min,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  let doc3 = resp.hits.iter().find(|h| h.doc_id == "doc-3").unwrap();
+  assert!(
+    doc3.score.abs() < 1e-6,
+    "expected doc-3 score ≈ 0.0 under Min, got {}",
+    doc3.score
+  );
+}
+
+#[test]
+fn rescore_total_preserves_score_for_non_matching_docs() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore with Total mode — non-matching docs get 5.0 + 0.0 = 5.0 (unchanged).
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::Term {
+      field: "body".into(),
+      value: "rust".into(),
+      boost: None,
+    },
+    score_mode: RescoreMode::Total,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  let doc3 = resp.hits.iter().find(|h| h.doc_id == "doc-3").unwrap();
+  assert!(
+    (doc3.score - 5.0).abs() < 1e-6,
+    "expected doc-3 score ≈ 5.0 under Total, got {}",
+    doc3.score
+  );
+}
+
+#[test]
+fn rescore_max_preserves_score_for_non_matching_docs() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore with Max mode — non-matching docs get max(5.0, 0.0) = 5.0 (unchanged).
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::Term {
+      field: "body".into(),
+      value: "rust".into(),
+      boost: None,
+    },
+    score_mode: RescoreMode::Max,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  let doc3 = resp.hits.iter().find(|h| h.doc_id == "doc-3").unwrap();
+  assert!(
+    (doc3.score - 5.0).abs() < 1e-6,
+    "expected doc-3 score ≈ 5.0 under Max, got {}",
+    doc3.score
+  );
+}
+
+#[test]
+fn rescore_explain_consistent_for_non_matching_docs() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::Term {
+      field: "body".into(),
+      value: "rust".into(),
+      boost: None,
+    },
+    score_mode: RescoreMode::Multiply,
+  });
+  req.explain = true;
+  let resp = reader.search(&req).unwrap();
+  // doc-3 does not match the rescore query — its explanation must reflect
+  // the zero-contribution rescore and the combined score must match hit.score.
+  let doc3 = resp.hits.iter().find(|h| h.doc_id == "doc-3").unwrap();
+  let expl = doc3
+    .explanation
+    .as_ref()
+    .expect("missing explanation for doc-3");
+  let rescore_expl = expl
+    .rescore
+    .as_ref()
+    .expect("missing rescore explanation for doc-3");
+  assert!(
+    rescore_expl.rescore_score.abs() < 1e-6,
+    "non-matching rescore_score should be 0.0, got {}",
+    rescore_expl.rescore_score
+  );
+  assert!(
+    (rescore_expl.combined_score - doc3.score).abs() < 1e-6,
+    "combined_score ({}) should match hit.score ({})",
+    rescore_expl.combined_score,
+    doc3.score
+  );
+  assert!(
+    (expl.final_score - doc3.score).abs() < 1e-6,
+    "final_score ({}) should match hit.score ({})",
+    expl.final_score,
+    doc3.score
+  );
+}
