@@ -3914,6 +3914,18 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
   Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis())
 }
 
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+  use chrono::Datelike;
+  if month == 12 {
+    31
+  } else {
+    chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+      .and_then(|d| d.pred_opt())
+      .map(|d| d.day())
+      .unwrap_or(28)
+  }
+}
+
 fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
   use chrono::{Datelike, Duration, Utc};
   let dt = chrono::DateTime::<Utc>::from_timestamp_millis(value)?;
@@ -3929,7 +3941,13 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
         month = 1;
         year += 1;
       }
-      date.with_year(year)?.with_month(month)?.with_day(1)?
+      let original_day = date.day();
+      // Normalize to day 1 before changing year/month to prevent
+      // `with_month` from failing when the source day exceeds the
+      // target month's length (BUG-233 pattern).
+      let base = date.with_day(1)?.with_year(year)?.with_month(month)?;
+      let max_day = last_day_of_month(year, month);
+      base.with_day(original_day.min(max_day))?
     }
     CalendarUnit::Quarter => {
       let mut month = date.month();
@@ -3939,12 +3957,19 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
         month -= 12;
         year += 1;
       }
-      date.with_year(year)?.with_month(month)?.with_day(1)?
+      let original_day = date.day();
+      let base = date.with_day(1)?.with_year(year)?.with_month(month)?;
+      let max_day = last_day_of_month(year, month);
+      base.with_day(original_day.min(max_day))?
     }
-    CalendarUnit::Year => date
-      .with_year(date.year() + 1)?
-      .with_month(1)?
-      .with_day(1)?,
+    CalendarUnit::Year => {
+      let new_year = date.year() + 1;
+      let original_day = date.day();
+      let original_month = date.month();
+      let base = date.with_day(1)?.with_year(new_year)?;
+      let max_day = last_day_of_month(new_year, original_month);
+      base.with_month(original_month)?.with_day(original_day.min(max_day))?
+    }
   };
   // Preserve the original time-of-day so that bucket keys remain aligned
   // with any sub-day offset applied by `bucket_start`. Previously this
@@ -4397,9 +4422,9 @@ mod tests {
       "add_calendar(Quarter) must preserve 01:00:00 offset"
     );
 
-    // Year: expect 2025-01-01T01:00:00Z
+    // Year: expect 2025-04-01T01:00:00Z (preserves month and day)
     let next_y = add_calendar(ts, CalendarUnit::Year).unwrap();
-    let expected_y = NaiveDate::from_ymd_opt(2025, 1, 1)
+    let expected_y = NaiveDate::from_ymd_opt(2025, 4, 1)
       .unwrap()
       .and_hms_opt(1, 0, 0)
       .unwrap();
@@ -4454,6 +4479,170 @@ mod tests {
       assert_eq!(cur, *expected);
       cur = add_interval(cur, &interval).unwrap();
     }
+  }
+
+  /// Regression for #257: add_calendar(Month) must preserve the day-of-month
+  /// when the input has day > 1 (as happens with offsets >= 24h). Previously
+  /// `.with_day(1)?` forced every bucket key to day 1, misaligning the fill
+  /// loop with `bucket_start` output.
+  #[test]
+  fn add_calendar_preserves_day_with_large_offset() {
+    use chrono::{NaiveDate, Utc};
+    // Input: 2024-06-03T00:00:00Z (day 3 from a 2-day offset)
+    let dt = NaiveDate::from_ymd_opt(2024, 6, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+
+    // Month: expect 2024-07-03, NOT 2024-07-01
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 7, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "add_calendar(Month) must preserve the day-of-month"
+    );
+
+    // Quarter: expect 2024-09-03
+    let next_q = add_calendar(ts, CalendarUnit::Quarter).unwrap();
+    let expected_q = NaiveDate::from_ymd_opt(2024, 9, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_q_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_q, Utc).timestamp_millis();
+    assert_eq!(
+      next_q, expected_q_ts,
+      "add_calendar(Quarter) must preserve the day-of-month"
+    );
+
+    // Year: expect 2025-06-03
+    let next_y = add_calendar(ts, CalendarUnit::Year).unwrap();
+    let expected_y = NaiveDate::from_ymd_opt(2025, 6, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_y_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_y, Utc).timestamp_millis();
+    assert_eq!(
+      next_y, expected_y_ts,
+      "add_calendar(Year) must preserve the day-of-month"
+    );
+  }
+
+  /// Regression for #257: chained add_calendar calls with a 2-day offset must
+  /// produce keys at day 3 each month, matching bucket_start output.
+  #[test]
+  fn add_calendar_fill_loop_aligned_with_multi_day_offset() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = 172_800_000; // 2 days
+    let start_dt = NaiveDate::from_ymd_opt(2024, 4, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let start =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis();
+
+    let expected_keys: Vec<i64> = [(2024, 4, 3), (2024, 5, 3), (2024, 6, 3), (2024, 7, 3)]
+      .iter()
+      .map(|(y, m, d)| {
+        let dt = NaiveDate::from_ymd_opt(*y, *m, *d)
+          .unwrap()
+          .and_hms_opt(0, 0, 0)
+          .unwrap();
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+      })
+      .collect();
+
+    let mut current = start;
+    let mut keys = vec![current];
+    for _ in 0..3 {
+      current = add_calendar(current, CalendarUnit::Month).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys, expected_keys,
+      "fill loop must produce keys at day 3, not day 1"
+    );
+
+    // Verify bucket_start + add_interval round-trip consistency
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+    let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
+    for expected in &expected_keys {
+      assert_eq!(cur, *expected);
+      cur = add_interval(cur, &interval).unwrap();
+    }
+  }
+
+  /// Regression for #257: day clamping when the original day exceeds the
+  /// target month's length (e.g. Jan 31 + 1 month → Feb 28/29).
+  #[test]
+  fn add_calendar_clamps_day_to_target_month_length() {
+    use chrono::{NaiveDate, Utc};
+
+    // Jan 31 + 1 month → Feb 29 (2024 is a leap year)
+    let jan31 = NaiveDate::from_ymd_opt(2024, 1, 31)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(jan31, Utc).timestamp_millis();
+
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 2, 29)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "Jan 31 + Month must clamp to Feb 29 in a leap year"
+    );
+
+    // Jan 31 + 1 month in a non-leap year → Feb 28
+    let jan31_nl = NaiveDate::from_ymd_opt(2023, 1, 31)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts_nl =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(jan31_nl, Utc).timestamp_millis();
+
+    let next_nl = add_calendar(ts_nl, CalendarUnit::Month).unwrap();
+    let expected_nl = NaiveDate::from_ymd_opt(2023, 2, 28)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_nl_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_nl, Utc).timestamp_millis();
+    assert_eq!(
+      next_nl, expected_nl_ts,
+      "Jan 31 + Month must clamp to Feb 28 in a non-leap year"
+    );
+
+    // Feb 29 (leap) + 1 year → Feb 28 (non-leap)
+    let feb29 = NaiveDate::from_ymd_opt(2024, 2, 29)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts_leap =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(feb29, Utc).timestamp_millis();
+
+    let next_year = add_calendar(ts_leap, CalendarUnit::Year).unwrap();
+    let expected_year = NaiveDate::from_ymd_opt(2025, 2, 28)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_year_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_year, Utc).timestamp_millis();
+    assert_eq!(
+      next_year, expected_year_ts,
+      "Feb 29 + Year must clamp to Feb 28 in a non-leap year"
+    );
   }
 
   /// Regression test for #249: finalize_response must rank significant_terms
