@@ -1,4 +1,5 @@
 use hashbrown::{HashMap, HashSet};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
@@ -314,10 +315,13 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
   }
 }
 
+pub(crate) type DocLookupEntries = SmallVec<[(u32, DocId); 1]>;
+pub(crate) type DocLookupMap = HashMap<Arc<str>, DocLookupEntries>;
+
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
-  doc_lookup: OnceLock<HashMap<String, Vec<(usize, DocId)>>>,
+  doc_lookup: OnceLock<DocLookupMap>,
   pub(crate) analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -1556,14 +1560,15 @@ impl IndexReader {
       };
       let mut chosen: Option<(usize, DocId)> = None;
       for (seg_idx, doc_idx) in entries.iter().rev() {
+        let seg_usize = *seg_idx as usize;
         let seg = self
           .segments
-          .get(*seg_idx)
+          .get(seg_usize)
           .ok_or_else(|| anyhow::anyhow!("segment {seg_idx} missing for mget"))?;
         if seg.is_deleted(*doc_idx) {
           continue;
         }
-        chosen = Some((*seg_idx, *doc_idx));
+        chosen = Some((seg_usize, *doc_idx));
         break;
       }
       let Some((seg_idx, doc_idx)) = chosen else {
@@ -1586,18 +1591,20 @@ impl IndexReader {
     Ok(results)
   }
 
-  fn doc_lookup(&self) -> &HashMap<String, Vec<(usize, DocId)>> {
+  fn doc_lookup(&self) -> &DocLookupMap {
     self.doc_lookup.get_or_init(|| {
-      let mut map = HashMap::new();
+      let mut map: DocLookupMap = HashMap::new();
       for (seg_idx, seg) in self.segments.iter().enumerate() {
+        let seg_ord = seg_idx as u32;
         for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
-          if seg.is_deleted(doc_idx as DocId) {
+          let doc_ord = doc_idx as DocId;
+          if seg.is_deleted(doc_ord) {
             continue;
           }
           map
-            .entry(doc_id.clone())
-            .or_insert_with(Vec::new)
-            .push((seg_idx, doc_idx as DocId));
+            .entry(Arc::clone(doc_id))
+            .or_insert_with(SmallVec::new)
+            .push((seg_ord, doc_ord));
         }
       }
       map
@@ -4754,6 +4761,117 @@ mod tests {
       "plan candidate_size {} exceeds cap {}",
       plan.candidate_size,
       DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+    );
+  }
+
+  #[test]
+  fn doc_lookup_shares_doc_id_allocations_with_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for i in 0..8 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("doc-{i}"))),
+            ("body".into(), json!("rust search")),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let lookup = reader.doc_lookup();
+    assert!(!lookup.is_empty(), "doc_lookup should be populated");
+
+    let seg = reader.segments.first().expect("segment present");
+    for arc in seg.doc_ids().iter() {
+      let key: &str = arc.as_ref();
+      assert!(
+        lookup.contains_key(key),
+        "lookup missing key {key}; expected Arc<str> sharing"
+      );
+      assert!(
+        Arc::strong_count(arc) >= 2,
+        "doc_id Arc<str> should be shared with doc_lookup; got strong_count={}",
+        Arc::strong_count(arc)
+      );
+    }
+  }
+
+  #[test]
+  fn doc_lookup_resolves_updates_to_latest_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!("shared-1")),
+            ("body".into(), json!("first version")),
+          ]),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!("shared-1")),
+            ("body".into(), json!("second version")),
+          ]),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let reader = idx.reader().unwrap();
+    let docs = reader
+      .mget(&["shared-1".to_string()], true)
+      .expect("mget ok");
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found, "updated doc should be reachable via mget");
+    let source = docs[0]._source.as_ref().expect("source payload");
+    assert_eq!(
+      source.get("body").and_then(|v| v.as_str()),
+      Some("second version"),
+      "mget should return the most recent version"
     );
   }
 }

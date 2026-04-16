@@ -1,8 +1,7 @@
-use hashbrown::HashMap;
-
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::api::reader::DocLookupMap;
 use crate::api::scoring::score_sort_key;
 use crate::api::types::SortOrder;
 use crate::index::segment::SegmentReader;
@@ -218,7 +217,7 @@ pub(crate) fn decode_search_after_token(
   token: &[serde_json::Value],
   sort_plan: &SortPlan,
   segments: &[SegmentReader],
-  doc_lookup: &HashMap<String, Vec<(usize, DocId)>>,
+  doc_lookup: &DocLookupMap,
 ) -> Result<SortKey> {
   if token.len() < sort_plan.len().saturating_add(2) {
     bail!(
@@ -252,7 +251,7 @@ pub(crate) fn decode_search_after_token(
     .and_then(|entries| {
       entries
         .iter()
-        .find(|(seg_idx, _)| *seg_idx == segment_ord as usize)
+        .find(|(seg_idx, _)| *seg_idx == segment_ord)
         .map(|(_, doc_idx)| *doc_idx)
     })
     .or_else(|| seg.find_doc_id(&doc_id_str))

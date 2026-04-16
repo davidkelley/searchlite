@@ -1278,7 +1278,7 @@ pub struct SegmentReader {
   terms: TinyTerms,
   postings: RefCell<Box<dyn StorageFile>>,
   docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
-  doc_ids: Vec<String>,
+  doc_ids: Vec<Arc<str>>,
   deleted: FastHashSet<DocId>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
@@ -1362,12 +1362,17 @@ impl SegmentReader {
         );
       }
     }
+    let doc_ids: Vec<Arc<str>> = seg_meta
+      .doc_ids
+      .iter()
+      .map(|s| Arc::<str>::from(s.as_str()))
+      .collect();
     Ok(Self {
       meta,
       terms: TinyTerms(terms),
       postings: RefCell::new(postings),
       docstore: RefCell::new(docstore),
-      doc_ids: seg_meta.doc_ids.clone(),
+      doc_ids,
       deleted,
       fast_fields,
       keep_positions,
@@ -1407,18 +1412,18 @@ impl SegmentReader {
   }
 
   pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {
-    self.doc_ids.get(doc_id as usize).map(|s| s.as_str())
+    self.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
   }
 
   pub fn find_doc_id(&self, id: &str) -> Option<DocId> {
     self
       .doc_ids
       .iter()
-      .position(|d| d == id)
+      .position(|d| d.as_ref() == id)
       .map(|i| i as DocId)
   }
 
-  pub fn doc_ids(&self) -> &[String] {
+  pub fn doc_ids(&self) -> &[Arc<str>] {
     &self.doc_ids
   }
 
