@@ -386,17 +386,17 @@ fn log2p_modifier_uses_natural_log_of_value_plus_two() {
   assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
   let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
   assert!(
-    (scores[0] - 12_f64.ln() as f32).abs() < 1e-4,
+    (scores[0] - 12_f32.ln()).abs() < 1e-6,
     "doc-1: {}",
     scores[0]
   );
   assert!(
-    (scores[1] - 7_f64.ln() as f32).abs() < 1e-4,
+    (scores[1] - 7_f32.ln()).abs() < 1e-6,
     "doc-3: {}",
     scores[1]
   );
   assert!(
-    (scores[2] - 3_f64.ln() as f32).abs() < 1e-4,
+    (scores[2] - 3_f32.ln()).abs() < 1e-6,
     "doc-2: {}",
     scores[2]
   );
