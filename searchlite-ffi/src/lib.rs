@@ -150,17 +150,47 @@ fn value_to_documents(value: serde_json::Value) -> Result<Vec<Document>, ()> {
   }
 }
 
+/// Copy a JSON payload into a caller-provided C buffer and return the number of
+/// bytes written (not counting the NUL terminator).
+///
+/// Return value convention:
+/// - `0` — the output pointer was null. Nothing was written and the caller has
+///   no way to receive a required-size signal.
+/// - `N` where `0 < N <= buf_cap - 1` — success; `N` bytes of JSON followed by a
+///   NUL byte were written into `out_json_buf`.
+/// - `N` where `N > buf_cap` — the buffer was too small. No JSON was written
+///   (when `buf_cap >= 1` a single NUL byte is written so the buffer is a valid
+///   empty C string). `N` is the required buffer size including the NUL
+///   terminator; the caller should allocate a buffer of that size and retry.
+///
+/// Note: `N == buf_cap` can never be returned — success always leaves at least
+/// one byte for the NUL terminator, so the success case satisfies
+/// `N <= buf_cap - 1`. This makes `N > buf_cap` an unambiguous "buffer too
+/// small" signal even when `buf_cap == 0`.
 fn write_json_to_buffer(json: String, out_json_buf: *mut c_char, buf_cap: usize) -> usize {
-  if out_json_buf.is_null() || buf_cap == 0 {
+  if out_json_buf.is_null() {
     return 0;
   }
   let bytes = json.as_bytes();
-  let len = bytes.len().min(buf_cap.saturating_sub(1));
-  unsafe {
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, len);
-    *out_json_buf.add(len) = 0;
+  // Required capacity includes the trailing NUL. `saturating_add` defends
+  // against a pathological `bytes.len() == usize::MAX`, which cannot occur in
+  // practice but lets the helper be total.
+  let required = bytes.len().saturating_add(1);
+  if required > buf_cap {
+    // NUL-terminate what we can so callers that ignore the return value see
+    // an empty C string rather than stale or partial data.
+    if buf_cap >= 1 {
+      unsafe {
+        *out_json_buf = 0;
+      }
+    }
+    return required;
   }
-  len
+  unsafe {
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json_buf as *mut u8, bytes.len());
+    *out_json_buf.add(bytes.len()) = 0;
+  }
+  bytes.len()
 }
 
 fn run_search(
@@ -905,6 +935,191 @@ mod tests {
       unsafe { searchlite_commit_with_write_key(handle, key.as_ptr()) },
       0
     );
+
+    unsafe { searchlite_index_close(handle) };
+  }
+
+  // Regression tests for BUG-029: callers must be able to distinguish a
+  // successful write from an undersized buffer rather than receiving a
+  // silently-truncated JSON payload.
+  mod write_json_to_buffer {
+    use super::super::write_json_to_buffer;
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+
+    #[test]
+    fn success_returns_bytes_written_and_nul_terminates() {
+      let json = "{\"a\":1}".to_string();
+      let expected_len = json.len();
+      let mut buf = vec![0xAAu8 as c_char; 64];
+      let written = write_json_to_buffer(json.clone(), buf.as_mut_ptr(), buf.len());
+      assert_eq!(written, expected_len);
+      assert!(written < buf.len(), "success return must be < buf_cap");
+      let c_str = unsafe { CStr::from_ptr(buf.as_ptr()) };
+      assert_eq!(c_str.to_str().unwrap(), json);
+    }
+
+    #[test]
+    fn undersized_buffer_returns_required_size_not_truncated_payload() {
+      // Payload is 7 bytes, so required = 8 (including NUL). Give the caller
+      // only 4 bytes.
+      let json = "{\"a\":1}".to_string();
+      let required = json.len() + 1;
+      let mut buf = vec![0xAAu8 as c_char; 4];
+      let written = write_json_to_buffer(json, buf.as_mut_ptr(), buf.len());
+      // The return value must exceed buf_cap so callers can detect the
+      // too-small-buffer condition, and it must equal the required size.
+      assert_eq!(written, required);
+      assert!(written > buf.len(), "required size must exceed buf_cap");
+      // The buffer must be a valid empty C string rather than a truncated
+      // JSON fragment (no silent data loss).
+      assert_eq!(buf[0], 0);
+      let c_str = unsafe { CStr::from_ptr(buf.as_ptr()) };
+      assert_eq!(c_str.to_bytes(), b"");
+    }
+
+    #[test]
+    fn zero_cap_buffer_still_reports_required_size() {
+      // buf_cap == 0 used to be indistinguishable from other errors because
+      // the helper returned 0. Callers must now learn the required size.
+      let json = "{}".to_string();
+      let required = json.len() + 1;
+      let mut sentinel = 0u8 as c_char;
+      let written = write_json_to_buffer(json, &mut sentinel as *mut c_char, 0);
+      assert_eq!(written, required);
+      assert!(written > 0);
+    }
+
+    #[test]
+    fn exact_fit_buffer_is_success_not_truncation() {
+      // buf_cap == required_size (payload + NUL) must be treated as success,
+      // not as "buffer too small". The return must be bytes_written, which is
+      // strictly less than buf_cap so callers see a value < buf_cap.
+      let json = "hi".to_string();
+      let payload_len = json.len();
+      let mut buf = vec![0xAAu8 as c_char; payload_len + 1];
+      let buf_cap = buf.len();
+      let written = write_json_to_buffer(json, buf.as_mut_ptr(), buf_cap);
+      assert_eq!(written, payload_len);
+      assert!(written < buf_cap, "success return must be < buf_cap");
+      let c_str = unsafe { CStr::from_ptr(buf.as_ptr()) };
+      assert_eq!(c_str.to_str().unwrap(), "hi");
+    }
+
+    #[test]
+    fn null_pointer_returns_zero_for_error() {
+      // With a null pointer we have no way to signal a required size, so
+      // fall back to the generic "0 means error" convention.
+      let json = "{}".to_string();
+      let written = write_json_to_buffer(json, std::ptr::null_mut(), 0);
+      assert_eq!(written, 0);
+    }
+  }
+
+  #[test]
+  fn ffi_search_request_signals_buffer_too_small_without_truncation() {
+    let _guard = test_guard();
+    let dir = tempdir().unwrap();
+    let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+    let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
+    assert!(!handle.is_null());
+
+    let doc = CString::new(r#"{"_id":"small-buf","body":"buffer too small regression"}"#).unwrap();
+    assert!(unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) } >= 0);
+    assert_eq!(unsafe { searchlite_commit(handle) }, 0);
+
+    let request = json!({
+      "query": "buffer",
+      "limit": 5,
+      "return_stored": true
+    });
+    let request_c = CString::new(request.to_string()).unwrap();
+
+    // First: deliberately undersized buffer. The old behaviour silently
+    // truncated the JSON; the new contract returns the required size.
+    let small_cap = 8usize;
+    let mut small_buf = vec![0xAAu8 as c_char; small_cap];
+    let small_ret = unsafe {
+      searchlite_search_request(
+        handle,
+        request_c.as_ptr(),
+        request_c.as_bytes().len(),
+        small_buf.as_mut_ptr(),
+        small_cap,
+      )
+    };
+    assert!(
+      small_ret > small_cap,
+      "buffer-too-small must be signalled as return > buf_cap, got {small_ret} for cap {small_cap}"
+    );
+    // Buffer must not contain a truncated JSON fragment.
+    let small_bytes = unsafe { CStr::from_ptr(small_buf.as_ptr()) }.to_bytes();
+    assert!(
+      small_bytes.is_empty(),
+      "undersized buffer must not contain truncated payload, got {:?}",
+      String::from_utf8_lossy(small_bytes)
+    );
+
+    // Second: allocate the required size returned by the first call and
+    // retry. The new contract guarantees this retry succeeds.
+    let mut big_buf = vec![0u8 as c_char; small_ret];
+    let big_ret = unsafe {
+      searchlite_search_request(
+        handle,
+        request_c.as_ptr(),
+        request_c.as_bytes().len(),
+        big_buf.as_mut_ptr(),
+        big_buf.len(),
+      )
+    };
+    assert!(big_ret > 0);
+    assert!(
+      big_ret < big_buf.len(),
+      "success return must be < buf_cap (got {big_ret} / {})",
+      big_buf.len()
+    );
+    let parsed: serde_json::Value =
+      serde_json::from_slice(unsafe { CStr::from_ptr(big_buf.as_ptr()) }.to_bytes())
+        .expect("retry result must be valid JSON");
+    assert_eq!(parsed["hits"].as_array().unwrap().len(), 1);
+
+    unsafe { searchlite_index_close(handle) };
+  }
+
+  #[test]
+  fn ffi_search_signals_buffer_too_small_via_positive_required_size() {
+    let _guard = test_guard();
+    let dir = tempdir().unwrap();
+    let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+    let handle = unsafe { searchlite_index_open(path.as_ptr(), true) };
+    assert!(!handle.is_null());
+
+    let doc = CString::new(r#"{"_id":"s1","body":"search signal regression"}"#).unwrap();
+    assert!(unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) } >= 0);
+    assert_eq!(unsafe { searchlite_commit(handle) }, 0);
+
+    let query = CString::new("search").unwrap();
+    let small_cap = 8usize;
+    let mut small_buf = vec![0xAAu8 as c_char; small_cap];
+    let ret = unsafe {
+      searchlite_search(
+        handle,
+        query.as_ptr(),
+        5,
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        small_buf.as_mut_ptr(),
+        small_cap,
+      )
+    };
+    // Positive and greater than buf_cap signals "required size".
+    assert!(
+      ret > small_cap as isize,
+      "expected required size > buf_cap, got {ret}"
+    );
+    let bytes = unsafe { CStr::from_ptr(small_buf.as_ptr()) }.to_bytes();
+    assert!(bytes.is_empty(), "buffer must not contain truncated data");
 
     unsafe { searchlite_index_close(handle) };
   }
