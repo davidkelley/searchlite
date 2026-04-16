@@ -19,7 +19,24 @@ use searchlite_core::api::types::{
   Aggregation, Document, ExecutionStrategy, IndexOptions, Query, QueryNode, Schema, SearchRequest,
   StorageType,
 };
-use searchlite_core::api::Index;
+use searchlite_core::api::{Index, WriteKeyError};
+
+/// Classify an error returned by `Index::writer*` into the FFI auth-error
+/// code (`-8`) or a generic open-failure code. Callers that distinguish the
+/// two must use a typed downcast on the `anyhow::Error` — the previous
+/// substring match on `err.to_string()` silently flipped the classification
+/// whenever any crate changed the Display form of the underlying error.
+///
+/// `generic` is the fallback code for non-auth failures (e.g. `-3` for
+/// commit paths, `-4` for add paths) so this helper can be shared across
+/// every mutating FFI entrypoint without baking the exact integer in.
+fn classify_writer_err(err: &anyhow::Error, generic: c_int) -> c_int {
+  if err.downcast_ref::<WriteKeyError>().is_some() {
+    -8
+  } else {
+    generic
+  }
+}
 
 #[repr(C)]
 pub struct IndexHandle {
@@ -298,14 +315,7 @@ pub unsafe extern "C" fn searchlite_add_json(
     };
     let mut writer = match h.index.writer() {
       Ok(w) => w,
-      Err(err) => {
-        let msg = err.to_string();
-        return if msg.to_lowercase().contains("write key") {
-          -8
-        } else {
-          -4
-        };
-      }
+      Err(err) => return classify_writer_err(&err, -4),
     };
     match writer.add_document(&doc) {
       Ok(res) => res as c_int,
@@ -348,12 +358,15 @@ pub unsafe extern "C" fn searchlite_add_json_with_write_key(
     };
     let mut writer = match h.index.writer_with_key(write_key.as_deref()) {
       Ok(w) => w,
+      // A caller that passed a key explicitly is asserting "I want auth"; any
+      // failure at writer-open time on that path is an auth failure for
+      // classification purposes (previous behaviour). For callers that did
+      // not pass a key, only typed WriteKeyError variants are auth failures.
       Err(err) => {
-        let msg = err.to_string();
-        return if write_key.is_some() || msg.contains("write key") {
+        return if write_key.is_some() {
           -8
         } else {
-          -4
+          classify_writer_err(&err, -4)
         };
       }
     };
@@ -395,14 +408,7 @@ pub unsafe extern "C" fn searchlite_add_json_batch(
     };
     let mut writer = match h.index.writer() {
       Ok(w) => w,
-      Err(err) => {
-        let msg = err.to_string();
-        return if msg.to_lowercase().contains("write key") {
-          -8
-        } else {
-          -4
-        };
-      }
+      Err(err) => return classify_writer_err(&err, -4),
     };
     match writer.add_documents_batch(&docs) {
       Ok(count) => count as c_int,
@@ -449,11 +455,10 @@ pub unsafe extern "C" fn searchlite_add_json_batch_with_write_key(
       let mut writer = match h.index.writer_with_key(write_key.as_deref()) {
         Ok(w) => w,
         Err(err) => {
-          let msg = err.to_string();
-          return if write_key.is_some() || msg.contains("write key") {
+          return if write_key.is_some() {
             -8
           } else {
-            -4
+            classify_writer_err(&err, -4)
           };
         }
       };
@@ -482,14 +487,7 @@ pub unsafe extern "C" fn searchlite_commit(handle: *mut IndexHandle) -> c_int {
         Ok(_) => 0,
         Err(_) => -2,
       },
-      Err(err) => {
-        let msg = err.to_string();
-        if msg.to_lowercase().contains("write key") {
-          -8
-        } else {
-          -3
-        }
-      }
+      Err(err) => classify_writer_err(&err, -3),
     }
   })
 }
@@ -519,11 +517,10 @@ pub unsafe extern "C" fn searchlite_commit_with_write_key(
         Err(_) => -2,
       },
       Err(err) => {
-        let msg = err.to_string();
-        if write_key.is_some() || msg.contains("write key") {
+        if write_key.is_some() {
           -8
         } else {
-          -3
+          classify_writer_err(&err, -3)
         }
       }
     }
@@ -1122,5 +1119,105 @@ mod tests {
     assert!(bytes.is_empty(), "buffer must not contain truncated data");
 
     unsafe { searchlite_index_close(handle) };
+  }
+
+  // Regression tests for BUG-020: the FFI classifies write-key (auth)
+  // failures via a typed `anyhow::Error::downcast_ref::<WriteKeyError>()`
+  // rather than sniffing the error's Display form. These tests pin the new
+  // contract so a future rename of the error message cannot silently flip
+  // the returned error code from -8 to -4/-3.
+  mod classify_writer_err {
+    use super::super::{
+      classify_writer_err, searchlite_add_json, searchlite_add_json_batch, searchlite_commit,
+      searchlite_index_close, searchlite_index_open_with_write_key, test_guard,
+    };
+    use searchlite_core::api::WriteKeyError;
+    use std::ffi::CString;
+    use tempfile::tempdir;
+
+    #[test]
+    fn classifies_typed_write_key_error_as_auth_failure() {
+      let err = anyhow::Error::from(WriteKeyError::Required);
+      assert_eq!(classify_writer_err(&err, -4), -8);
+
+      let err = anyhow::Error::from(WriteKeyError::Mismatch(
+        "WAL binding; index may be tampered",
+      ));
+      assert_eq!(classify_writer_err(&err, -4), -8);
+
+      let err = anyhow::Error::from(WriteKeyError::MetadataTampered);
+      assert_eq!(classify_writer_err(&err, -4), -8);
+
+      let err = anyhow::Error::from(WriteKeyError::FeatureDisabled);
+      assert_eq!(classify_writer_err(&err, -4), -8);
+    }
+
+    #[test]
+    fn classifies_typed_write_key_error_even_when_context_is_added() {
+      // anyhow::Context wraps the inner error; downcast_ref must still find
+      // the WriteKeyError through the wrapper. This is the core property
+      // that BUG-020's substring-match approach broke whenever a caller
+      // added `.context("...")` that shadowed the "write key" substring.
+      let err = anyhow::Error::from(WriteKeyError::Required)
+        .context("while opening writer for background compaction")
+        .context("completely unrelated wrapper that hides the original message");
+      assert_eq!(classify_writer_err(&err, -4), -8);
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_errors_as_auth_failure() {
+      let err = anyhow::anyhow!("some generic failure unrelated to auth");
+      assert_eq!(classify_writer_err(&err, -4), -4);
+      assert_eq!(classify_writer_err(&err, -3), -3);
+      assert_eq!(classify_writer_err(&err, -2), -2);
+    }
+
+    #[test]
+    fn does_not_auth_classify_message_that_merely_contains_write_key_substring() {
+      // Previous substring-matching logic returned -8 for any error whose
+      // Display happened to include "write key" — e.g. a future feature
+      // error such as "a write key index cannot be opened in this mode".
+      // With typed classification, only the typed variant triggers -8.
+      let err = anyhow::anyhow!("index contains 'write key' marker but this is a storage error");
+      assert_eq!(classify_writer_err(&err, -4), -4);
+    }
+
+    // End-to-end: a protected index without a provided key must still
+    // classify as -8 through the full FFI pipeline. This was already the
+    // behaviour before the fix, but it is re-verified to guard against
+    // regression in the downcast-driven path.
+    #[test]
+    fn protected_index_without_key_returns_minus_eight_via_ffi() {
+      let _guard = test_guard();
+      let dir = tempdir().unwrap();
+      let path = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+      let key = CString::new("key-for-bug-020").unwrap();
+      let handle =
+        unsafe { searchlite_index_open_with_write_key(path.as_ptr(), true, key.as_ptr()) };
+      assert!(!handle.is_null());
+
+      // Missing key for add_json: FFI must see the typed error and return -8.
+      let doc = CString::new(r#"{"_id":"x","body":"auth"}"#).unwrap();
+      let added = unsafe { searchlite_add_json(handle, doc.as_ptr(), doc.as_bytes().len()) };
+      assert_eq!(added, -8, "missing write key must return -8, got {added}");
+
+      // Same for add_json_batch.
+      let docs = CString::new(r#"[{"_id":"y","body":"batch-auth"}]"#).unwrap();
+      let batched =
+        unsafe { searchlite_add_json_batch(handle, docs.as_ptr(), docs.as_bytes().len()) };
+      assert_eq!(
+        batched, -8,
+        "missing write key must return -8, got {batched}"
+      );
+
+      // And for commit.
+      let committed = unsafe { searchlite_commit(handle) };
+      assert_eq!(
+        committed, -8,
+        "missing write key must return -8, got {committed}"
+      );
+
+      unsafe { searchlite_index_close(handle) };
+    }
   }
 }
