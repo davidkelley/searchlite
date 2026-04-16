@@ -215,6 +215,30 @@ pub(crate) fn expand_term_groups(
   Ok((qualified_terms, term_groups))
 }
 
+/// Returns `true` if `value` contains any wildcard or regex metacharacter that
+/// the default tokenizer would discard (non-alphanumeric separators).
+fn contains_pattern_meta(value: &str) -> bool {
+  value.bytes().any(|b| {
+    matches!(
+      b,
+      b'*'
+        | b'?'
+        | b'.'
+        | b'+'
+        | b'['
+        | b']'
+        | b'('
+        | b')'
+        | b'{'
+        | b'}'
+        | b'|'
+        | b'^'
+        | b'$'
+        | b'\\'
+    )
+  })
+}
+
 fn analyze_pattern_tokens(analyzer: &Analyzer, value: &str) -> Vec<String> {
   let tokens: Vec<String> = analyzer
     .analyze(value)
@@ -225,15 +249,15 @@ fn analyze_pattern_tokens(analyzer: &Analyzer, value: &str) -> Vec<String> {
     return vec![analyzer.normalize_pattern(value)];
   }
   if tokens.len() == 1 {
-    // If the analyzed token matches the normalized pattern, the pattern
-    // has no metacharacters and we can use the analyzed form. Otherwise
-    // the analyzer stripped metacharacters (e.g. `*`, `?`, `.+`) — fall
-    // through to preserve them via normalize_pattern.
-    let normalized = analyzer.normalize_pattern(value);
-    if tokens[0] == normalized {
-      return tokens;
+    // If the original value contains wildcard/regex metacharacters, the
+    // analyzer will have stripped them (they are non-alphanumeric token
+    // separators). Fall back to normalize_pattern to preserve the pattern
+    // structure. For plain terms (no metacharacters) we keep the analyzed
+    // form so that stemming, Unicode folding, and other filters are honoured.
+    if contains_pattern_meta(value) {
+      return vec![analyzer.normalize_pattern(value)];
     }
-    return vec![normalized];
+    return tokens;
   }
   // Wildcard/regex patterns often get split by analyzers; fall back to the raw pattern so we
   // preserve the literal structure, but still apply lightweight normalization (e.g. lowercase).
@@ -890,7 +914,9 @@ fn expand_term_fuzzy(
 
 #[cfg(test)]
 mod tests {
-  use super::{analyze_pattern_tokens, quantifier_allows_zero, regex_literal_prefix};
+  use super::{
+    analyze_pattern_tokens, contains_pattern_meta, quantifier_allows_zero, regex_literal_prefix,
+  };
   use crate::analysis::analyzer::AnalyzerRegistry;
   use crate::util::regex::anchored_regex;
 
@@ -1203,5 +1229,39 @@ mod tests {
     // normalize_pattern. This should still work as before.
     let tokens = analyze_pattern_tokens(analyzer, "r*st");
     assert_eq!(tokens, vec!["r*st"]);
+  }
+
+  #[test]
+  fn contains_pattern_meta_detects_wildcards_and_regex() {
+    assert!(contains_pattern_meta("hello*"));
+    assert!(contains_pattern_meta("*world"));
+    assert!(contains_pattern_meta("hel?o"));
+    assert!(contains_pattern_meta("r.+"));
+    assert!(contains_pattern_meta("a[bc]d"));
+    assert!(contains_pattern_meta("^start"));
+    assert!(contains_pattern_meta("end$"));
+    assert!(contains_pattern_meta("a\\b"));
+    assert!(contains_pattern_meta("a|b"));
+    assert!(contains_pattern_meta("(group)"));
+    assert!(contains_pattern_meta("a{2,3}"));
+    assert!(!contains_pattern_meta("hello"));
+    assert!(!contains_pattern_meta("running"));
+    assert!(!contains_pattern_meta("café"));
+    assert!(!contains_pattern_meta(""));
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_keeps_analyzed_form_when_no_metacharacters() {
+    // Simulates the concern raised in review: when an analyzer transforms a
+    // plain term (e.g. via stemming or Unicode folding), the analyzed token
+    // differs from normalize_pattern(value). We must return the analyzed form,
+    // not the normalized one, so that expansion matches indexed terms.
+    // The default analyzer lowercases but does not stem, so "HELLO" → "hello"
+    // matches normalize_pattern("HELLO") = "hello". This confirms the plain-
+    // term path returns the analyzed form.
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let tokens = analyze_pattern_tokens(analyzer, "HELLO");
+    assert_eq!(tokens, vec!["hello"]);
   }
 }
