@@ -3345,14 +3345,22 @@ fn apply_moving_avg_pipeline(
   }
   let mut predictions = Vec::new();
   if let Some(predict) = cfg.predict {
-    if let Some(last_avg) = avgs.last().and_then(|v| *v) {
+    // Seed predictions from the final window state (which includes the last
+    // bucket) rather than from `avgs.last()` (which is a look-back value that
+    // excludes the last bucket).
+    let seed = if window_values.is_empty() {
+      None
+    } else {
+      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+    };
+    if let Some(seed_val) = seed {
       // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
       // that bypasses `validate_aggregations_in_scope` cannot drive an unbounded
       // allocation here (BUG-221). The request validator rejects values past the cap
       // up-front; this `min` is just a hard ceiling on the materialization step.
       let predict = predict.min(MAX_PREDICTIONS);
       // Simple forecast that repeats the last observed average to avoid feedback loops.
-      predictions = vec![last_avg; predict];
+      predictions = vec![seed_val; predict];
     }
   }
   responses.insert(
@@ -5196,6 +5204,70 @@ mod tests {
       assert_eq!(val.value.unwrap(), 15.0);
     } else {
       panic!("expected moving_avg on bucket 2");
+    }
+  }
+
+  #[test]
+  fn moving_avg_predictions_seed_from_final_window() {
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!(0),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 1.0,
+            max: 1.0,
+            sum: 1.0,
+            avg: 1.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(1),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 100.0,
+            max: 100.0,
+            sum: 100.0,
+            avg: 100.0,
+          }),
+        )]),
+      },
+    ];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m".to_string(),
+        window: 2,
+        predict: Some(2),
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+    // Bucket 0: no preceding values → None
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[0].aggregations.get("smooth") {
+      assert_eq!(val.value, None);
+    } else {
+      panic!("expected moving_avg on bucket 0");
+    }
+    // Bucket 1: preceding window [1.0] → avg = 1.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[1].aggregations.get("smooth") {
+      assert_eq!(val.value.unwrap(), 1.0);
+    } else {
+      panic!("expected moving_avg on bucket 1");
+    }
+    // Predictions seed from final window [1.0, 100.0] → 50.5
+    if let Some(AggregationResponse::MovingAvg(resp)) = responses.get("smooth") {
+      assert_eq!(resp.predictions, vec![50.5, 50.5]);
+    } else {
+      panic!("missing moving_avg pipeline response");
     }
   }
 
