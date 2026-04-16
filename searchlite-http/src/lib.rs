@@ -2275,8 +2275,12 @@ async fn multi_search(
           HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
         })?,
       };
+      // Keep `permit` in the outer async scope so it is not released until
+      // after the reader is returned to the pool. Dropping it inside the
+      // blocking closure (i.e. as soon as `reader.search` returns) would let
+      // a waiting task acquire the freed permit, find the pool momentarily
+      // empty, and open a new reader — growing the pool past its bound.
       let handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
         let result = reader.search(&req);
         (reader, result)
       });
@@ -2288,6 +2292,7 @@ async fn multi_search(
         )
       })?;
       pool_clone.lock().await.push(reader);
+      drop(permit);
       let search_res = result.map_err(|err| {
         HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
       })?;
