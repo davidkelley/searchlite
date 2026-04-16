@@ -585,7 +585,10 @@ mod tests {
       })],
       "ab",
     );
-    assert!(tokens.is_empty(), "tokens shorter than min should produce no ngrams");
+    assert!(
+      tokens.is_empty(),
+      "tokens shorter than min should produce no ngrams"
+    );
   }
 
   #[test]
