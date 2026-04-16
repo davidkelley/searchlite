@@ -2172,7 +2172,9 @@ fn range_aggregation_counts() {
     .unwrap();
   let range = resp.aggregations.get("score_ranges").unwrap();
   if let searchlite_core::api::types::AggregationResponse::Range { buckets, .. } = range {
-    assert_eq!(buckets[0].doc_count, 2);
+    // With `to` exclusive: score=1 is in low (1 < 5), score=5 is NOT in low (5 < 5 is false).
+    assert_eq!(buckets[0].doc_count, 1);
+    // score=5 and score=10 are in mid (5 >= 5 && 5 < 15, 10 >= 5 && 10 < 15).
     assert_eq!(buckets[1].doc_count, 2);
   }
 }
@@ -3866,5 +3868,260 @@ fn pipeline_missing_metric_path_with_gap_policy_inserts_zeros() {
     assert_eq!(deriv_second, Some(0.0));
   } else {
     panic!("expected histogram agg");
+  }
+}
+
+#[test]
+fn range_aggregation_to_is_exclusive_at_boundary() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "price".into(),
+    i64: false,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for (i, price) in [25.0, 50.0, 75.0, 100.0, 150.0].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("p-{i}"),
+          vec![("body", json!("item")), ("price", json!(price))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  // Disjoint ranges matching the searchlite-node README example: cheap/mid/premium.
+  // With `to` exclusive, each boundary value belongs to exactly one bucket.
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "price_ranges".into(),
+    Aggregation::Range(Box::new(RangeAggregation {
+      field: "price".into(),
+      keyed: false,
+      ranges: vec![
+        searchlite_core::api::types::RangeBound {
+          key: Some("cheap".into()),
+          from: None,
+          to: Some(50.0),
+        },
+        searchlite_core::api::types::RangeBound {
+          key: Some("mid".into()),
+          from: Some(50.0),
+          to: Some(100.0),
+        },
+        searchlite_core::api::types::RangeBound {
+          key: Some("premium".into()),
+          from: Some(100.0),
+          to: None,
+        },
+      ],
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "item".into(),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  let range = resp.aggregations.get("price_ranges").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Range { buckets, .. } = range {
+    assert_eq!(buckets.len(), 3);
+    // cheap: only 25 (50 is NOT included because to is exclusive)
+    assert_eq!(
+      buckets[0].doc_count, 1,
+      "cheap should contain only price=25"
+    );
+    // mid: 50 and 75 (100 is NOT included because to is exclusive)
+    assert_eq!(
+      buckets[1].doc_count, 2,
+      "mid should contain price=50 and price=75"
+    );
+    // premium: 100 and 150
+    assert_eq!(
+      buckets[2].doc_count, 2,
+      "premium should contain price=100 and price=150"
+    );
+    // Total across buckets must equal the number of matching docs (no double-counting).
+    let total: u64 = buckets.iter().map(|b| b.doc_count).sum();
+    assert_eq!(
+      total, 5,
+      "each doc must be counted exactly once across disjoint ranges"
+    );
+  } else {
+    panic!("expected range agg response");
+  }
+}
+
+#[test]
+fn date_range_to_is_exclusive_at_boundary() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // ts=2000 corresponds to the exact boundary between the two ranges.
+    writer
+      .add_document(&doc(
+        "on-boundary",
+        vec![("body", json!("event")), ("ts", json!(2000))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "before-boundary",
+        vec![("body", json!("event")), ("ts", json!(1000))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "ts_ranges".into(),
+    Aggregation::DateRange(Box::new(
+      searchlite_core::api::types::DateRangeAggregation {
+        field: "ts".into(),
+        keyed: false,
+        format: None,
+        ranges: vec![
+          searchlite_core::api::types::DateRangeBound {
+            key: Some("before".into()),
+            from: Some("1970-01-01T00:00:00Z".into()),
+            to: Some("1970-01-01T00:00:02Z".into()), // 2000 ms
+          },
+          searchlite_core::api::types::DateRangeBound {
+            key: Some("after".into()),
+            from: Some("1970-01-01T00:00:02Z".into()), // 2000 ms
+            to: Some("1970-01-01T00:00:04Z".into()),
+          },
+        ],
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      },
+    )),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "event".into(),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  let range = resp.aggregations.get("ts_ranges").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateRange { buckets, .. } = range {
+    assert_eq!(buckets.len(), 2);
+    // ts=1000 is in "before" (1000 >= 0 && 1000 < 2000)
+    assert_eq!(buckets[0].doc_count, 1, "before: only ts=1000");
+    // ts=2000 is in "after" (2000 >= 2000 && 2000 < 4000), NOT in "before"
+    assert_eq!(
+      buckets[1].doc_count, 1,
+      "after: only ts=2000 (boundary is exclusive in 'before')"
+    );
+    let total: u64 = buckets.iter().map(|b| b.doc_count).sum();
+    assert_eq!(total, 2, "no double-counting at boundary");
+  } else {
+    panic!("expected date range agg response");
   }
 }
