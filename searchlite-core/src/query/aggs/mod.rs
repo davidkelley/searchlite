@@ -3863,7 +3863,10 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
     CalendarUnit::Quarter => {
       let month = date.month();
       let quarter_start = ((month - 1) / 3) * 3 + 1;
-      date.with_month(quarter_start)?.with_day(1)?
+      // Normalize day to 1 before changing month — with_month fails when
+      // the current day exceeds the target month's length (e.g. May 31 →
+      // April has only 30 days).
+      date.with_day(1)?.with_month(quarter_start)?
     }
     CalendarUnit::Year => date.with_month(1)?.with_day(1)?,
   };
@@ -4241,5 +4244,58 @@ mod tests {
       panic!("missing derivative on bucket");
     }
     assert!(responses.contains_key("diff"));
+  }
+
+  /// Regression for BUG-233: truncate_calendar Quarter arm must not return
+  /// None for May 31 (day 31 → April has only 30 days). The fix normalizes
+  /// day to 1 before changing the month.
+  #[test]
+  fn truncate_calendar_quarter_handles_may_31() {
+    use chrono::{NaiveDate, Utc};
+    let dt = NaiveDate::from_ymd_opt(2024, 5, 31)
+      .unwrap()
+      .and_hms_opt(12, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+    let result = truncate_calendar(ts, CalendarUnit::Quarter);
+    assert!(
+      result.is_some(),
+      "truncate_calendar must not return None for May 31"
+    );
+    let expected = NaiveDate::from_ymd_opt(2024, 4, 1)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(result.unwrap(), expected_ts);
+  }
+
+  /// Exhaustive sweep: truncate_calendar must never return None for any
+  /// valid date across all five calendar units (Day, Week, Month, Quarter,
+  /// Year). Uses every day of leap-year 2024 (366 days).
+  #[test]
+  fn truncate_calendar_never_returns_none_for_valid_dates() {
+    use chrono::{NaiveDate, Utc};
+    let units = [
+      CalendarUnit::Day,
+      CalendarUnit::Week,
+      CalendarUnit::Month,
+      CalendarUnit::Quarter,
+      CalendarUnit::Year,
+    ];
+    let mut date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+    while date <= end {
+      let dt = date.and_hms_opt(12, 0, 0).unwrap();
+      let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+      for unit in &units {
+        assert!(
+          truncate_calendar(ts, *unit).is_some(),
+          "truncate_calendar returned None for {date}"
+        );
+      }
+      date = date.succ_opt().unwrap();
+    }
   }
 }

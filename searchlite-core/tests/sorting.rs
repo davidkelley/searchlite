@@ -35,12 +35,15 @@ fn sorts_numeric_and_missing_last() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `rating` is nullable so the "c" document below can omit it while
+  // exercising "missing last" sort semantics. Per BUG-224, omitting a
+  // non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "rating".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(&path, schema, base_options(&path)).unwrap();
   {

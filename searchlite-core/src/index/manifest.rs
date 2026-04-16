@@ -379,6 +379,62 @@ impl Schema {
     Ok(())
   }
 
+  /// Reject documents that omit any non-nullable top-level field declared in
+  /// the schema. Per `docs/schema.md`, every schema field is required unless
+  /// it is explicitly marked nullable.
+  ///
+  /// Separated from `validate_document` because round-tripping a document
+  /// through the docstore is lossy for several legitimate schema shapes
+  /// (empty arrays and fields whose values all serialize away via
+  /// `stored_nested_value`). The writer therefore invokes this check only
+  /// on user-supplied documents at the ingest boundary (`add_document` /
+  /// `add_documents_batch`). Reconstruction-based flows (`compact`,
+  /// `merge_segments`, `apply_patch`) continue to use `validate_document`
+  /// alone so they don't reject documents that were valid when ingested.
+  ///
+  /// Vector fields do not carry a nullability marker in the current schema
+  /// model and are treated as implicitly optional by `collect_vector_value`,
+  /// so they are excluded from this presence check by design.
+  pub fn check_required_fields_present(
+    &self,
+    doc: &crate::api::types::Document,
+  ) -> anyhow::Result<()> {
+    let doc_id_name = self.doc_id_field();
+    for f in self.text_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.keyword_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.numeric_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.nested_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    Ok(())
+  }
+
   #[cfg(feature = "vectors")]
   pub fn vector_field(&self, field: &str) -> Option<VectorField> {
     self.vector_fields.iter().find(|f| f.name == field).cloned()
@@ -944,6 +1000,207 @@ mod tests {
       .validate_document(&good_floats)
       .expect("number array ok");
     assert!(f64_schema.validate_document(&bad_strings).is_err());
+  }
+
+  #[test]
+  fn check_required_fields_present_rejects_missing_non_nullable_top_level_fields() {
+    // Regression for BUG-224: a user-submitted document that omits a
+    // declared-required top-level field must be rejected at the ingest
+    // boundary, mirroring the nested-field behaviour. This check lives in
+    // `check_required_fields_present` (invoked by `add_document` /
+    // `add_documents_batch`), not `validate_document`, so that rewrite
+    // flows that re-validate reconstructed documents do not false-fail.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "tag".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: false,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: false,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    for missing in ["body", "tag", "price"] {
+      let mut fields: std::collections::BTreeMap<String, serde_json::Value> = [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect();
+      fields.remove(missing);
+      let doc = crate::api::types::Document { fields };
+      let err = schema
+        .check_required_fields_present(&doc)
+        .expect_err("validation must reject missing required field");
+      let msg = err.to_string();
+      assert!(
+        msg.contains(&format!("missing required field `{missing}`")),
+        "unexpected error for missing field `{missing}`: {msg}"
+      );
+    }
+
+    // Complete document passes both checks.
+    let complete = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-ok")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema
+      .validate_document(&complete)
+      .expect("complete document passes validation");
+    schema
+      .check_required_fields_present(&complete)
+      .expect("complete document passes required-fields check");
+  }
+
+  #[test]
+  fn check_required_fields_present_allows_missing_nullable_top_level_fields() {
+    // Complements the regression test above: nullable fields must still be
+    // allowed to be omitted entirely at ingest.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "subtitle".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: true,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "brand".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: true,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "sale_price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: true,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("only-id"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .check_required_fields_present(&doc)
+      .expect("nullable-only schema permits omission");
+  }
+
+  #[test]
+  fn validate_document_does_not_enforce_required_presence() {
+    // BUG-224 split: `validate_document` must stay permissive about
+    // missing top-level fields because rewrite flows (`compact`,
+    // `merge_segments`, `apply_patch`) re-validate documents
+    // reconstructed from the docstore, and round-tripping is lossy for
+    // several legitimate schema shapes (empty arrays, nested containers
+    // whose stored children serialize away). The presence check lives
+    // in `check_required_fields_present` and is invoked only on
+    // user-supplied documents at the ingest boundary.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let reconstructed = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .validate_document(&reconstructed)
+      .expect("validate_document must not enforce required-field presence");
+  }
+
+  #[test]
+  fn check_required_fields_present_requires_nested_top_level_container() {
+    // A non-nullable nested container itself must be present at ingest,
+    // not just its sub-fields. Complements the existing nested sub-field
+    // check performed by `NestedField::validate` when the container is
+    // present.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comment".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    let err = schema
+      .check_required_fields_present(&doc)
+      .expect_err("missing nested container must error at ingest");
+    assert!(
+      err.to_string().contains("missing required field `comment`"),
+      "unexpected error: {err}"
+    );
   }
 }
 
