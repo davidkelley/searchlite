@@ -6,18 +6,18 @@
     "text": { "type": "string" },
     "title": { "type": "string" },
     "summary": { "type": "string" },
-    "tips": { "type": "string" },
-    "notes": { "type": "string" },
-    "changes": { "type": "string" },
-    "pros": { "type": "string" },
-    "cons": { "type": "string" },
-    "settings": { "type": "string" },
-    "known_issues": { "type": "string" },
-    "installation_steps": { "type": "string" },
-    "steps": { "type": "string" },
-    "techniques": { "type": "string" },
-    "compatibility": { "type": "string" },
-    "legal_note": { "type": "string" },
+    "tips": { "type": ["string", "null"] },
+    "notes": { "type": ["string", "null"] },
+    "changes": { "type": ["string", "null"] },
+    "pros": { "type": ["string", "null"] },
+    "cons": { "type": ["string", "null"] },
+    "settings": { "type": ["string", "null"] },
+    "known_issues": { "type": ["string", "null"] },
+    "installation_steps": { "type": ["string", "null"] },
+    "steps": { "type": ["string", "null"] },
+    "techniques": { "type": ["string", "null"] },
+    "compatibility": { "type": ["string", "null"] },
+    "legal_note": { "type": ["string", "null"] },
     "doc_type": { "type": "string", "searchlite:kind": "keyword" },
     "developer": { "type": "string", "searchlite:kind": "keyword" },
     "publisher": { "type": "string", "searchlite:kind": "keyword" },
@@ -31,17 +31,17 @@
     "tags": { "type": "string", "searchlite:kind": "keyword" },
     "keywords": { "type": "string", "searchlite:kind": "keyword" },
     "entities": { "type": "string", "searchlite:kind": "keyword" },
-    "difficulty_estimate": { "type": "string", "searchlite:kind": "keyword" },
-    "category": { "type": "string", "searchlite:kind": "keyword" },
-    "version": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
-    "accuracy_grade": { "type": "string", "searchlite:kind": "keyword" },
-    "recommended_core": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
-    "mod_name": { "type": "string", "searchlite:kind": "keyword", "searchlite:fast": false },
+    "difficulty_estimate": { "type": ["string", "null"], "searchlite:kind": "keyword" },
+    "category": { "type": ["string", "null"], "searchlite:kind": "keyword" },
+    "version": { "type": ["string", "null"], "searchlite:kind": "keyword", "searchlite:fast": false },
+    "accuracy_grade": { "type": ["string", "null"], "searchlite:kind": "keyword" },
+    "recommended_core": { "type": ["string", "null"], "searchlite:kind": "keyword", "searchlite:fast": false },
+    "mod_name": { "type": ["string", "null"], "searchlite:kind": "keyword", "searchlite:fast": false },
     "created_at": { "type": "string", "searchlite:kind": "keyword" },
     "updated_at": { "type": "string", "searchlite:kind": "keyword" },
     "release_year": { "type": "integer", "searchlite:stored": true },
-    "review_score_out_of_10": { "type": "number", "searchlite:stored": true },
-    "target_time_minutes": { "type": "integer", "searchlite:stored": true },
+    "review_score_out_of_10": { "type": ["number", "null"], "searchlite:stored": true },
+    "target_time_minutes": { "type": ["integer", "null"], "searchlite:stored": true },
     "game": {
       "type": "array",
       "items": {
@@ -54,7 +54,7 @@
       }
     },
     "sections": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {
@@ -64,7 +64,7 @@
       }
     },
     "achievements": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {
@@ -75,7 +75,7 @@
       }
     },
     "estimated_hours": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {
@@ -85,7 +85,7 @@
       }
     },
     "tier_list": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {
@@ -96,7 +96,7 @@
       }
     },
     "codes": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {
@@ -106,7 +106,7 @@
       }
     },
     "splits": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "type": "object",
         "properties": {

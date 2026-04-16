@@ -6,3 +6,4 @@ docs/plans/
 searchlite-node/node_modules/
 searchlite-node/dist/
 searchlite-node/*.node
+searchlite-node/index.d.ts

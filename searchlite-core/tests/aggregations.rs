@@ -2184,12 +2184,15 @@ fn date_range_missing_and_keyed() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `ts` is intentionally nullable here so that one of the documents below can
+  // omit it to exercise the aggregation-side `missing` default. See BUG-224:
+  // omitting a non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "ts".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
@@ -2299,12 +2302,15 @@ fn extended_stats_and_value_count_include_missing() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `score` is intentionally nullable so one of the documents below can omit
+  // it to exercise the metric-aggregation `missing` default. See BUG-224:
+  // omitting a non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "score".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
@@ -2408,12 +2414,15 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `ts` is intentionally nullable so the "missing ts" document below can
+  // exercise the date-histogram `missing` default. See BUG-224: omitting a
+  // non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "ts".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
@@ -4124,5 +4133,209 @@ fn date_range_to_is_exclusive_at_boundary() {
     assert_eq!(total, 2, "no double-counting at boundary");
   } else {
     panic!("expected date range agg response");
+  }
+}
+
+/// Regression test for #249: significant_terms intermediate truncation must
+/// sort by significance score (doc_count/bg_count ratio), not by raw doc_count.
+/// A low-frequency term with a very low background count can have a much higher
+/// significance score than a high-frequency term with a high background count.
+/// With size=2, the two most *significant* terms must survive truncation.
+#[test]
+fn significant_terms_preserves_high_significance_low_frequency_terms() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema
+    .keyword_fields
+    .push(searchlite_core::api::types::KeywordField {
+      name: "tag".into(),
+      stored: true,
+      indexed: true,
+      fast: true,
+      nullable: false,
+    });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = IndexBuilder::create(&path, schema, opts).expect("create index");
+
+  // Build a corpus of 9005 total docs. The foreground set (matching "target")
+  // contains 133 docs (80 + 50 + 3). Background counts are total occurrences
+  // across the full corpus (foreground + background-only docs).
+  //
+  // - "common" tag: 80 foreground, 5000 total bg
+  //   → score ≈ (80/133) / (5000/9005) ≈ 1.08
+  // - "frequent" tag: 50 foreground, 4000 total bg
+  //   → score ≈ (50/133) / (4000/9005) ≈ 0.85
+  // - "rare_sig" tag: 3 foreground, 5 total bg
+  //   → score ≈ (3/133) / (5/9005) ≈ 40.6
+  //
+  // With size=2, a doc_count sort would keep "common"(80) and "frequent"(50),
+  // discarding "rare_sig"(3). The correct result keeps "rare_sig" (score≈40.6)
+  // and "common" (score≈1.08).
+  {
+    let mut writer = idx.writer().expect("writer");
+    let mut id = 0u64;
+
+    // Background-only docs: "common" tag in 4920 docs (total bg will be 5000)
+    for _ in 0..4920 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![
+            ("body", json!("background noise")),
+            ("tag", json!("common")),
+          ],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    // Background-only docs: "frequent" tag in 3950 docs (total bg will be 4000)
+    for _ in 0..3950 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![
+            ("body", json!("background noise")),
+            ("tag", json!("frequent")),
+          ],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    // Background-only docs: "rare_sig" tag in 2 docs (total bg will be 5)
+    for _ in 0..2 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![
+            ("body", json!("background noise")),
+            ("tag", json!("rare_sig")),
+          ],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    // Foreground docs matching "target": 80 with "common"
+    for _ in 0..80 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![("body", json!("target query")), ("tag", json!("common"))],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    // Foreground docs matching "target": 50 with "frequent"
+    for _ in 0..50 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![("body", json!("target query")), ("tag", json!("frequent"))],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    // Foreground docs matching "target": 3 with "rare_sig"
+    for _ in 0..3 {
+      writer
+        .add_document(&doc(
+          &id.to_string(),
+          vec![("body", json!("target query")), ("tag", json!("rare_sig"))],
+        ))
+        .unwrap();
+      id += 1;
+    }
+
+    writer.commit().unwrap();
+  }
+
+  let reader = idx.reader().unwrap();
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "sig".to_string(),
+    Aggregation::SignificantTerms(Box::new(SignificantTermsAggregation {
+      field: "tag".into(),
+      size: Some(2),
+      min_doc_count: None,
+      background_filter: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+
+  let resp = reader
+    .search(&SearchRequest {
+      query: "target".into(),
+      fields: None,
+      filter: None,
+      limit: 0,
+      from: 0,
+      return_hits: false,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+
+  let sig = resp.aggregations.get("sig").unwrap();
+  if let searchlite_core::api::types::AggregationResponse::SignificantTerms { buckets, .. } = sig {
+    assert_eq!(buckets.len(), 2, "expected 2 significant_terms buckets");
+    // "rare_sig" must be in the results despite having doc_count=3,
+    // because its significance score is far higher than "frequent"
+    let keys: Vec<String> = buckets
+      .iter()
+      .map(|b| b.key.as_str().unwrap().to_string())
+      .collect();
+    assert!(
+      keys.contains(&"rare_sig".to_string()),
+      "rare_sig (high significance, low doc_count) must survive truncation, got: {:?}",
+      keys
+    );
+    // "rare_sig" should be ranked first (highest score)
+    assert_eq!(
+      buckets[0].key.as_str().unwrap(),
+      "rare_sig",
+      "rare_sig should be ranked #1 by significance score"
+    );
+    assert!(
+      buckets[0].score > buckets[1].score,
+      "first bucket should have higher score than second"
+    );
+  } else {
+    panic!("expected significant_terms response");
   }
 }

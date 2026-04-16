@@ -4146,6 +4146,232 @@ mod tests {
   }
 
   #[test]
+  fn wildcard_expansion_handles_trailing_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-trailing-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [
+      ("1", "hello"),
+      ("2", "helloworld"),
+      ("3", "help"),
+      ("4", "world"),
+    ] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Trailing wildcard: "hello*" must match "hello" and "helloworld".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "hello*".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:hello"),
+      "trailing star must match exact term"
+    );
+    assert!(
+      keys.contains("body:helloworld"),
+      "trailing star must match extended term"
+    );
+    assert!(
+      !keys.contains("body:help"),
+      "trailing star must not match non-prefix term"
+    );
+    assert!(
+      !keys.contains("body:world"),
+      "trailing star must not match unrelated term"
+    );
+  }
+
+  #[test]
+  fn wildcard_expansion_handles_leading_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-leading-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "helloworld"), ("2", "bigworld"), ("3", "hello")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Leading wildcard: "*world" must match terms ending in "world".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "*world".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:helloworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      keys.contains("body:bigworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      !keys.contains("body:hello"),
+      "leading star must not match term without suffix"
+    );
+  }
+
+  #[test]
+  fn regex_expansion_handles_trailing_metacharacters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-trailing");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "ruby"), ("3", "rope"), ("4", "run")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Regex "r.+" must match any term starting with 'r' followed by one or more chars.
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "r.+".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(keys.contains("body:rust"), "r.+ must match 'rust'");
+    assert!(keys.contains("body:ruby"), "r.+ must match 'ruby'");
+    assert!(keys.contains("body:rope"), "r.+ must match 'rope'");
+    assert!(keys.contains("body:run"), "r.+ must match 'run'");
+  }
+
+  #[test]
   fn regex_expansion_applies_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx-regex");
