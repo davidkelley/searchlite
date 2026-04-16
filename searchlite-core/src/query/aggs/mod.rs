@@ -3968,7 +3968,9 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
       let original_month = date.month();
       let base = date.with_day(1)?.with_year(new_year)?;
       let max_day = last_day_of_month(new_year, original_month);
-      base.with_month(original_month)?.with_day(original_day.min(max_day))?
+      base
+        .with_month(original_month)?
+        .with_day(original_day.min(max_day))?
     }
   };
   // Preserve the original time-of-day so that bucket keys remain aligned
@@ -4629,8 +4631,7 @@ mod tests {
       .unwrap()
       .and_hms_opt(0, 0, 0)
       .unwrap();
-    let ts_leap =
-      chrono::DateTime::<Utc>::from_naive_utc_and_offset(feb29, Utc).timestamp_millis();
+    let ts_leap = chrono::DateTime::<Utc>::from_naive_utc_and_offset(feb29, Utc).timestamp_millis();
 
     let next_year = add_calendar(ts_leap, CalendarUnit::Year).unwrap();
     let expected_year = NaiveDate::from_ymd_opt(2025, 2, 28)
