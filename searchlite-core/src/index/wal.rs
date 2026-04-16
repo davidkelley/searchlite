@@ -227,6 +227,24 @@ impl Wal {
     }
     Ok((binding, pending))
   }
+
+  /// Returns `true` when the WAL contains at least one durable `Commit`
+  /// record, ignoring `WriteBinding` framing.
+  ///
+  /// Recovery uses this as a durability oracle for staged manifest promotion:
+  /// once a commit fence has been reached, later `AddDoc` / `DeleteDocId`
+  /// entries do not invalidate that earlier commit. A staged
+  /// `MANIFEST.json.pending` only survives past the WAL commit fence, so the
+  /// presence of *any* `Commit` record in the WAL confirms the batch
+  /// represented by the staged manifest is durable — even if uncommitted
+  /// entries were appended after the fence before a crash.
+  pub fn contains_commit(storage: &dyn Storage, path: &Path) -> Result<bool> {
+    if !storage.exists(path) {
+      return Ok(false);
+    }
+    let (_, entries) = Self::replay_with_binding(storage, path)?;
+    Ok(entries.iter().any(|e| matches!(e, WalEntry::Commit)))
+  }
 }
 
 #[cfg(test)]
@@ -411,6 +429,57 @@ mod tests {
       1,
       "bad-checksum tail must stop replay silently, not abort",
     );
+  }
+
+  #[test]
+  fn contains_commit_detects_durable_fence_regardless_of_tail() {
+    // BUG-018 oracle: `contains_commit` is the recovery primitive that tells
+    // `Index::open` whether a `MANIFEST.json.pending` file should be promoted
+    // (a WAL commit fence was crossed) or discarded (it never was). Unlike
+    // a strict "trailing commit" check, this returns true even when
+    // uncommitted entries follow the durable commit — a crash after the
+    // fence but before the manifest publish must not discard the staged
+    // manifest just because a later AddDoc appears in the WAL.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    // No WAL on disk → false (treat as fresh index).
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
+
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    // Empty WAL file → false.
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
+
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("first"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    wal.sync().unwrap();
+    // AddDoc with no Commit anywhere → false.
+    assert!(!Wal::contains_commit(storage.as_ref(), &path).unwrap());
+
+    wal.append_commit().unwrap();
+    // AddDoc, Commit → true.
+    assert!(Wal::contains_commit(storage.as_ref(), &path).unwrap());
+
+    let doc2 = Document {
+      fields: [("body".into(), serde_json::json!("second"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc2).unwrap();
+    wal.sync().unwrap();
+    // ..., Commit, AddDoc → still true (the Commit is still in the WAL).
+    assert!(
+      Wal::contains_commit(storage.as_ref(), &path).unwrap(),
+      "uncommitted entries after the fence must not hide the durable commit",
+    );
+
+    wal.append_commit().unwrap();
+    // ..., AddDoc, Commit → still true.
+    assert!(Wal::contains_commit(storage.as_ref(), &path).unwrap());
   }
 
   #[test]
