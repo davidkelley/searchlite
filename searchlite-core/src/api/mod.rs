@@ -14,7 +14,7 @@ pub mod writer;
 
 pub use crate::index::Index;
 pub use builder::IndexBuilder;
-pub use errors::{AggregationError, PatchError};
+pub use errors::{AggregationError, PatchError, WriteKeyError};
 pub use reader::{
   ExecutionProfile, FunctionExplanation, Hit, HitExplanation, IndexReader, MultiSearchResponse,
   ProfileResult, RescoreExplanation, SearchResult,
