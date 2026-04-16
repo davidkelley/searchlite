@@ -694,9 +694,12 @@ mod tests {
       let mut writer = idx.writer_with_key(Some(key)).unwrap();
       writer
         .add_document(&Document {
-          fields: [("_id".into(), serde_json::json!("1"))]
-            .into_iter()
-            .collect(),
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("hello")),
+          ]
+          .into_iter()
+          .collect(),
         })
         .unwrap();
       writer.commit().unwrap();

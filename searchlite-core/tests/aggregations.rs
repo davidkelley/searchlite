@@ -2184,12 +2184,15 @@ fn date_range_missing_and_keyed() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `ts` is intentionally nullable here so that one of the documents below can
+  // omit it to exercise the aggregation-side `missing` default. See BUG-224:
+  // omitting a non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "ts".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
@@ -2299,12 +2302,15 @@ fn extended_stats_and_value_count_include_missing() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `score` is intentionally nullable so one of the documents below can omit
+  // it to exercise the metric-aggregation `missing` default. See BUG-224:
+  // omitting a non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "score".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
@@ -2408,12 +2414,15 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
   let tmp = tempfile::tempdir().unwrap();
   let path = tmp.path().to_path_buf();
   let mut schema = Schema::default_text_body();
+  // `ts` is intentionally nullable so the "missing ts" document below can
+  // exercise the date-histogram `missing` default. See BUG-224: omitting a
+  // non-nullable field is now rejected at validation time.
   schema.numeric_fields.push(NumericField {
     name: "ts".into(),
     i64: true,
     fast: true,
     stored: true,
-    nullable: false,
+    nullable: true,
   });
   let idx = Index::create(
     &path,
