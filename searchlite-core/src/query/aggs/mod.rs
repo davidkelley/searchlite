@@ -702,7 +702,7 @@ enum DateInterval {
   Calendar(CalendarUnit),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CalendarUnit {
   Day,
   Week,
@@ -3863,7 +3863,11 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
     CalendarUnit::Quarter => {
       let month = date.month();
       let quarter_start = ((month - 1) / 3) * 3 + 1;
-      date.with_month(quarter_start)?.with_day(1)?
+      // Normalize the day to 1 before changing the month so that
+      // `with_month` never receives an out-of-range day (e.g. May 31
+      // → April 31 is invalid and returns None).  `with_day(1)` is
+      // always valid, and `with_month(x)` on day 1 is always valid.
+      date.with_day(1)?.with_month(quarter_start)?
     }
     CalendarUnit::Year => date.with_month(1)?.with_day(1)?,
   };
@@ -4241,5 +4245,65 @@ mod tests {
       panic!("missing derivative on bucket");
     }
     assert!(responses.contains_key("diff"));
+  }
+
+  #[test]
+  fn truncate_calendar_quarter_handles_may_31() {
+    // BUG-233: `truncate_calendar` Quarter branch called `with_month`
+    // before `with_day(1)`, causing `NaiveDate::with_month(4)` to
+    // return None for May 31 (April has only 30 days).
+    use chrono::{TimeZone, Utc};
+
+    let dt = Utc.with_ymd_and_hms(2024, 5, 31, 12, 0, 0).unwrap();
+    let ts = dt.timestamp_millis();
+
+    let result = truncate_calendar(ts, CalendarUnit::Quarter);
+    let expected = Utc
+      .with_ymd_and_hms(2024, 4, 1, 0, 0, 0)
+      .unwrap()
+      .timestamp_millis();
+    assert_eq!(
+      result,
+      Some(expected),
+      "May 31 should truncate to Q2 start (2024-04-01)"
+    );
+
+    // Also verify via bucket_start which is what the collector calls.
+    let interval = DateInterval::Calendar(CalendarUnit::Quarter);
+    let bucket = bucket_start(ts, 0, &interval);
+    assert_eq!(
+      bucket,
+      Some(expected),
+      "bucket_start must not return None for May 31"
+    );
+  }
+
+  #[test]
+  fn truncate_calendar_never_returns_none_for_valid_dates() {
+    // Exhaustive sweep over every day of leap year 2024 for all calendar
+    // units to guard against ordering regressions in any branch.
+    use chrono::{NaiveDate, TimeZone, Utc};
+
+    let units = [
+      CalendarUnit::Day,
+      CalendarUnit::Week,
+      CalendarUnit::Month,
+      CalendarUnit::Quarter,
+      CalendarUnit::Year,
+    ];
+
+    let mut date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+    while date <= end {
+      let ts = date.and_hms_opt(12, 0, 0).unwrap();
+      let ts_millis = Utc.from_utc_datetime(&ts).timestamp_millis();
+      for unit in &units {
+        assert!(
+          truncate_calendar(ts_millis, *unit).is_some(),
+          "truncate_calendar returned None for {date} with unit {unit:?}"
+        );
+      }
+      date = date.succ_opt().unwrap();
+    }
   }
 }
