@@ -1185,11 +1185,8 @@ fn write_presence(iter: impl Iterator<Item = bool>, buf: &mut Vec<u8>) {
 }
 
 fn doc_range(offsets: &[u32], doc: usize) -> Option<(usize, usize)> {
-  if offsets.len() < doc + 2 {
-    return None;
-  }
-  let start = offsets[doc] as usize;
-  let end = offsets[doc + 1] as usize;
+  let start = *offsets.get(doc)? as usize;
+  let end = *offsets.get(doc.checked_add(1)?)? as usize;
   if start > end {
     return None;
   }
@@ -1197,11 +1194,8 @@ fn doc_range(offsets: &[u32], doc: usize) -> Option<(usize, usize)> {
 }
 
 fn object_range(offsets: &[u32], object_idx: usize) -> Option<(usize, usize)> {
-  if offsets.len() < object_idx + 2 {
-    return None;
-  }
-  let start = offsets[object_idx] as usize;
-  let end = offsets[object_idx + 1] as usize;
+  let start = *offsets.get(object_idx)? as usize;
+  let end = *offsets.get(object_idx.checked_add(1)?)? as usize;
   if start > end {
     return None;
   }
