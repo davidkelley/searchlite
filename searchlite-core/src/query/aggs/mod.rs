@@ -257,7 +257,27 @@ impl<'a> SignificantTermsCollector<'a> {
       .into_values()
       .filter(|b| b.doc_count >= self.min_doc_count)
       .collect();
-    buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+    // Sort by significance score proxy (doc_count / bg_count) descending
+    // before truncation. Since the foreground/background totals are constant
+    // across all buckets, this proxy is monotonically related to the full
+    // significance score `(doc_count/fg_total) / (bg_count/bg_total)`.
+    //
+    // Buckets with bg_count == 0 are treated as score 0 to match the final
+    // scoring guard in finalize_response. Compare ratios via integer
+    // cross-multiplication to avoid float rounding.
+    buckets.sort_by(|a, b| {
+      let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater, // a has score 0, b > 0 → b first
+        (false, true) => Ordering::Less,    // b has score 0, a > 0 → a first
+        (false, false) => {
+          let left = (a.doc_count as u128) * (b.bg_count as u128);
+          let right = (b.doc_count as u128) * (a.bg_count as u128);
+          right.cmp(&left)
+        }
+      };
+      score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+    });
     let limit = self.size.unwrap_or(buckets.len()).min(MAX_BUCKETS);
     buckets.truncate(limit);
     AggregationIntermediate::SignificantTerms {
@@ -2377,7 +2397,23 @@ fn merge_intermediate_in_place(
       let limit = target_size
         .unwrap_or_else(|| target_buckets.len())
         .min(MAX_BUCKETS);
-      target_buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+      // Sort by significance score proxy (doc_count/bg_count) to preserve
+      // high-significance low-frequency terms during truncation. Buckets with
+      // bg_count == 0 are treated as score 0 to match finalize_response.
+      // Compare ratios via integer cross-multiplication to avoid float rounding.
+      target_buckets.sort_by(|a, b| {
+        let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+          (true, true) => Ordering::Equal,
+          (true, false) => Ordering::Greater,
+          (false, true) => Ordering::Less,
+          (false, false) => {
+            let left = (a.doc_count as u128) * (b.bg_count as u128);
+            let right = (b.doc_count as u128) * (a.bg_count as u128);
+            right.cmp(&left)
+          }
+        };
+        score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+      });
       if target_buckets.len() > limit {
         target_buckets.truncate(limit);
       }
@@ -4296,6 +4332,181 @@ mod tests {
         );
       }
       date = date.succ_opt().unwrap();
+    }
+  }
+
+  /// Regression test for #249: finalize_response must rank significant_terms
+  /// buckets by significance score, not by doc_count. A low-frequency term
+  /// with a very low bg_count must outrank a high-frequency term with a high
+  /// bg_count when its significance score is higher.
+  #[test]
+  fn significant_terms_finalize_ranks_by_significance_score() {
+    use serde_json::json;
+
+    let intermediate = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        // "common": high doc_count, high bg_count → low significance
+        SignificantBucketIntermediate {
+          key: json!("common"),
+          doc_count: 80,
+          bg_count: 5000,
+          aggs: BTreeMap::new(),
+        },
+        // "frequent": medium doc_count, high bg_count → low significance
+        SignificantBucketIntermediate {
+          key: json!("frequent"),
+          doc_count: 50,
+          bg_count: 4000,
+          aggs: BTreeMap::new(),
+        },
+        // "rare_sig": low doc_count, very low bg_count → very high significance
+        SignificantBucketIntermediate {
+          key: json!("rare_sig"),
+          doc_count: 3,
+          bg_count: 5,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(2),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 100,
+      bg_count: 10_000,
+      sampled: false,
+    };
+
+    let response = finalize_response(intermediate);
+    if let AggregationResponse::SignificantTerms { buckets, .. } = response {
+      assert_eq!(buckets.len(), 2, "size=2 should yield 2 buckets");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "rare_sig",
+        "rare_sig (score=60.0) must be ranked #1"
+      );
+      assert!(
+        buckets[0].score > buckets[1].score,
+        "first bucket should have higher score"
+      );
+      // Verify that "rare_sig" was not discarded by intermediate truncation
+      let keys: Vec<&str> = buckets.iter().map(|b| b.key.as_str().unwrap()).collect();
+      assert!(
+        keys.contains(&"rare_sig"),
+        "rare_sig must survive truncation"
+      );
+    } else {
+      panic!("expected SignificantTerms response");
+    }
+  }
+
+  /// Zero bg_count buckets must not displace genuinely significant terms.
+  /// finalize_response assigns score 0.0 when bg_count == 0, so the
+  /// intermediate proxy sort must also treat them as score 0.0.
+  #[test]
+  fn significant_terms_zero_bg_count_does_not_displace_real_terms() {
+    use serde_json::json;
+
+    let intermediate = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        // "real_sig": genuinely significant (bg_count > 0)
+        SignificantBucketIntermediate {
+          key: json!("real_sig"),
+          doc_count: 5,
+          bg_count: 10,
+          aggs: BTreeMap::new(),
+        },
+        // "zero_bg": high doc_count but bg_count == 0 → final score 0.0
+        SignificantBucketIntermediate {
+          key: json!("zero_bg"),
+          doc_count: 90,
+          bg_count: 0,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 100,
+      bg_count: 10_000,
+      sampled: false,
+    };
+
+    let response = finalize_response(intermediate);
+    if let AggregationResponse::SignificantTerms { buckets, .. } = response {
+      assert_eq!(buckets.len(), 1, "size=1 should yield 1 bucket");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "real_sig",
+        "zero bg_count bucket must not displace genuinely significant term"
+      );
+      assert!(
+        buckets[0].score > 0.0,
+        "real_sig should have a positive score"
+      );
+    } else {
+      panic!("expected SignificantTerms response");
+    }
+  }
+
+  /// Regression test for #249: cross-segment merge must also sort by
+  /// significance score proxy before truncation.
+  #[test]
+  fn significant_terms_merge_preserves_high_significance_terms() {
+    use serde_json::json;
+
+    // Segment 1: contains "common" (high doc_count)
+    let mut seg1 = AggregationIntermediate::SignificantTerms {
+      buckets: vec![SignificantBucketIntermediate {
+        key: json!("common"),
+        doc_count: 40,
+        bg_count: 2500,
+        aggs: BTreeMap::new(),
+      }],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 50,
+      bg_count: 5000,
+      sampled: false,
+    };
+
+    // Segment 2: contains "common" (more) and "rare_sig" (low doc_count, very low bg_count)
+    let seg2 = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        SignificantBucketIntermediate {
+          key: json!("common"),
+          doc_count: 40,
+          bg_count: 2500,
+          aggs: BTreeMap::new(),
+        },
+        SignificantBucketIntermediate {
+          key: json!("rare_sig"),
+          doc_count: 3,
+          bg_count: 5,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 50,
+      bg_count: 5000,
+      sampled: false,
+    };
+
+    merge_intermediate_in_place(&mut seg1, seg2);
+
+    // After merge with size=1, "rare_sig" should survive because its
+    // doc_count/bg_count ratio (3/5 = 0.6) is much higher than
+    // "common"'s (80/5000 = 0.016).
+    if let AggregationIntermediate::SignificantTerms { buckets, .. } = &seg1 {
+      assert_eq!(buckets.len(), 1, "size=1 should yield 1 bucket after merge");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "rare_sig",
+        "rare_sig must survive merge truncation due to higher significance"
+      );
+    } else {
+      panic!("expected SignificantTerms intermediate");
     }
   }
 }
