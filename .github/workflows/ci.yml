@@ -20,10 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [1.88.0, stable]
         include:
+          - toolchain: 1.88.0
+            check_fmt: false
           - toolchain: stable
-            check-fmt: true
+            check_fmt: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
@@ -34,7 +35,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Format check
-        if: ${{ matrix.check-fmt }}
+        if: ${{ matrix.check_fmt }}
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all --all-features --all-targets -- -D warnings
