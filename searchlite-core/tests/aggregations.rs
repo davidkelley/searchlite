@@ -4339,3 +4339,172 @@ fn significant_terms_preserves_high_significance_low_frequency_terms() {
     panic!("expected significant_terms response");
   }
 }
+
+#[test]
+fn bucket_sort_runs_after_derivative_pipeline() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "val".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  schema.numeric_fields.push(NumericField {
+    name: "metric".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // bucket 0: metric avg = 10
+    writer
+      .add_document(&doc("d0", vec![("body", json!("rust")), ("val", json!(5.0)), ("metric", json!(10.0))]))
+      .unwrap();
+    // bucket 10: metric avg = 50, derivative = 40
+    writer
+      .add_document(&doc("d1", vec![("body", json!("rust")), ("val", json!(15.0)), ("metric", json!(50.0))]))
+      .unwrap();
+    // bucket 20: metric avg = 20, derivative = -30
+    writer
+      .add_document(&doc("d2", vec![("body", json!("rust")), ("val", json!(25.0)), ("metric", json!(20.0))]))
+      .unwrap();
+    // bucket 30: metric avg = 100, derivative = 80
+    writer
+      .add_document(&doc("d3", vec![("body", json!("rust")), ("val", json!(35.0)), ("metric", json!(100.0))]))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let mut sub_aggs = BTreeMap::new();
+  sub_aggs.insert(
+    "metric_avg".into(),
+    Aggregation::Stats(MetricAggregation {
+      field: "metric".into(),
+      missing: None,
+    }),
+  );
+  sub_aggs.insert(
+    "rate_of_change".into(),
+    Aggregation::Derivative(DerivativeAggregation {
+      buckets_path: "metric_avg.avg".into(),
+      gap_policy: None,
+      unit: None,
+    }),
+  );
+  sub_aggs.insert(
+    "top_movers".into(),
+    Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+      sort: vec![searchlite_core::api::types::BucketSortSpec {
+        field: "rate_of_change".into(),
+        order: searchlite_core::api::types::SortOrder::Desc,
+      }],
+      from: None,
+      size: Some(2),
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "by_val".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "val".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(1),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: sub_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } =
+    resp.aggregations.get("by_val").unwrap()
+  {
+    assert_eq!(buckets.len(), 2, "bucket_sort size=2 should keep 2 buckets");
+    // Bucket 30 has derivative=80 (highest), bucket 10 has derivative=40
+    assert_eq!(
+      buckets[0].key,
+      json!(30.0),
+      "first bucket should be key 30 (derivative=80)"
+    );
+    assert_eq!(
+      buckets[1].key,
+      json!(10.0),
+      "second bucket should be key 10 (derivative=40)"
+    );
+    let d0 = buckets[0].aggregations.get("rate_of_change").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::Derivative(ref v) = d0 {
+      assert!(
+        (v.value.unwrap() - 80.0).abs() < f64::EPSILON,
+        "derivative for bucket 30 should be 80"
+      );
+    } else {
+      panic!("expected derivative response");
+    }
+    let d1 = buckets[1].aggregations.get("rate_of_change").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::Derivative(ref v) = d1 {
+      assert!(
+        (v.value.unwrap() - 40.0).abs() < f64::EPSILON,
+        "derivative for bucket 10 should be 40"
+      );
+    } else {
+      panic!("expected derivative response");
+    }
+  } else {
+    panic!("expected histogram agg");
+  }
+}
