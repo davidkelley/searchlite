@@ -3897,11 +3897,15 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
     }
     CalendarUnit::Month => date.with_day(1)?,
     CalendarUnit::Quarter => {
+      // Normalize the day to 1 before changing the month. `with_month` fails
+      // when the resulting (year, target_month, original_day) triple is not a
+      // real date (e.g. 2024-05-31 → April, which has only 30 days), so the
+      // previous `with_month(..)?.with_day(1)?` ordering would short-circuit
+      // to `None` and cause `DateHistogramCollector::collect` to silently drop
+      // any `YYYY-05-31` document from the aggregation (BUG-233). Going
+      // day-first is always safe: day 1 is valid in every month.
       let month = date.month();
       let quarter_start = ((month - 1) / 3) * 3 + 1;
-      // Normalize day to 1 before changing month — with_month fails when
-      // the current day exceeds the target month's length (e.g. May 31 →
-      // April has only 30 days).
       date.with_day(1)?.with_month(quarter_start)?
     }
     CalendarUnit::Year => date.with_month(1)?.with_day(1)?,
@@ -4245,6 +4249,73 @@ mod tests {
     ));
   }
 
+  /// BUG-233: `truncate_calendar` for `CalendarUnit::Quarter` used to change
+  /// the month before normalizing the day. When the source day was 31 and the
+  /// target quarter-start month was April (30 days), `with_month(4)` returned
+  /// `None`, cascading back into `DateHistogramCollector::collect`, which
+  /// silently dropped the document. The only real-world triggering date is
+  /// day 31 of May (any year). This regression pins the fixed
+  /// day-first ordering.
+  #[test]
+  fn truncate_calendar_quarter_handles_may_31_without_dropping_doc() {
+    fn ts(year: i32, month: u32, day: u32, hour: u32) -> i64 {
+      chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .and_hms_opt(hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+    }
+    // 2024-05-31T12:00:00Z → should truncate to 2024-04-01T00:00:00Z (Q2).
+    let input = ts(2024, 5, 31, 12);
+    let expected = ts(2024, 4, 1, 0);
+    assert_eq!(
+      truncate_calendar(input, CalendarUnit::Quarter),
+      Some(expected),
+      "May 31 must fall into the Q2 bucket keyed 2024-04-01T00:00:00Z, \
+       not disappear from the aggregation"
+    );
+    // The full collector path goes through `bucket_start`; assert that too.
+    assert_eq!(
+      bucket_start(input, 0, &DateInterval::Calendar(CalendarUnit::Quarter)),
+      Some(expected),
+      "bucket_start must propagate the truncated Q2 start, not None"
+    );
+  }
+
+  /// BUG-233 follow-up: exhaustive sweep over every day of a leap year
+  /// (which covers all 366 calendar slots, including Feb 29) × every calendar
+  /// unit. `truncate_calendar` must produce `Some(_)` for every valid
+  /// timestamp — `None` here is the exact failure mode that makes the
+  /// collector silently drop documents. Guards against any future
+  /// ordering regression in any branch of `truncate_calendar`.
+  #[test]
+  fn truncate_calendar_never_returns_none_for_valid_dates() {
+    let units = [
+      ("Day", CalendarUnit::Day),
+      ("Week", CalendarUnit::Week),
+      ("Month", CalendarUnit::Month),
+      ("Quarter", CalendarUnit::Quarter),
+      ("Year", CalendarUnit::Year),
+    ];
+    for ordinal in 1..=366u32 {
+      // 2024 is a leap year, so every ordinal in 1..=366 yields a valid date.
+      let date = chrono::NaiveDate::from_yo_opt(2024, ordinal).unwrap();
+      let millis = date
+        .and_hms_opt(23, 59, 59)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+      for (name, unit) in units {
+        assert!(
+          truncate_calendar(millis, unit).is_some(),
+          "truncate_calendar returned None for {date} with unit {name}; \
+           DateHistogramCollector would silently drop this document",
+        );
+      }
+    }
+  }
+
   #[test]
   fn derivative_pipeline_emits_expected_values() {
     let mut buckets = vec![
@@ -4284,59 +4355,6 @@ mod tests {
       panic!("missing derivative on bucket");
     }
     assert!(responses.contains_key("diff"));
-  }
-
-  /// Regression for BUG-233: truncate_calendar Quarter arm must not return
-  /// None for May 31 (day 31 → April has only 30 days). The fix normalizes
-  /// day to 1 before changing the month.
-  #[test]
-  fn truncate_calendar_quarter_handles_may_31() {
-    use chrono::{NaiveDate, Utc};
-    let dt = NaiveDate::from_ymd_opt(2024, 5, 31)
-      .unwrap()
-      .and_hms_opt(12, 0, 0)
-      .unwrap();
-    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
-    let result = truncate_calendar(ts, CalendarUnit::Quarter);
-    assert!(
-      result.is_some(),
-      "truncate_calendar must not return None for May 31"
-    );
-    let expected = NaiveDate::from_ymd_opt(2024, 4, 1)
-      .unwrap()
-      .and_hms_opt(0, 0, 0)
-      .unwrap();
-    let expected_ts =
-      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
-    assert_eq!(result.unwrap(), expected_ts);
-  }
-
-  /// Exhaustive sweep: truncate_calendar must never return None for any
-  /// valid date across all five calendar units (Day, Week, Month, Quarter,
-  /// Year). Uses every day of leap-year 2024 (366 days).
-  #[test]
-  fn truncate_calendar_never_returns_none_for_valid_dates() {
-    use chrono::{NaiveDate, Utc};
-    let units = [
-      CalendarUnit::Day,
-      CalendarUnit::Week,
-      CalendarUnit::Month,
-      CalendarUnit::Quarter,
-      CalendarUnit::Year,
-    ];
-    let mut date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
-    let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
-    while date <= end {
-      let dt = date.and_hms_opt(12, 0, 0).unwrap();
-      let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
-      for unit in &units {
-        assert!(
-          truncate_calendar(ts, *unit).is_some(),
-          "truncate_calendar returned None for {date}"
-        );
-      }
-      date = date.succ_opt().unwrap();
-    }
   }
 
   /// Regression for #251: add_calendar must preserve the sub-day time
