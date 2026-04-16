@@ -656,7 +656,13 @@ fn max_boost_caps_function_score_before_boost_mode_sum() {
 fn max_boost_caps_function_score_before_boost_mode_multiply() {
   let reader = setup_reader();
   let req = base_request(QueryNode::FunctionScore {
-    query: Box::new(QueryNode::MatchAll { boost: None }),
+    query: Box::new(QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(2.0),
+    }),
     functions: vec![FunctionSpec::Weight {
       weight: 10.0,
       filter: None,
@@ -668,13 +674,14 @@ fn max_boost_caps_function_score_before_boost_mode_multiply() {
     boost: None,
   });
   let resp = reader.search(&req).unwrap();
-  assert_eq!(resp.hits.len(), 3);
-  // base=1.0, func=10.0, max_boost=5.0 → capped_func=5.0 → 1.0 * 5.0 = 5.0
-  // Old buggy code: min(1.0 * 10.0, 5.0) = 5.0 (same result for this case)
+  assert_eq!(resp.hits.len(), 2);
+  // base=2.0 (ConstantScore), func=10.0, max_boost=5.0
+  // Correct: 2.0 * min(10.0, 5.0) = 2.0 * 5.0 = 10.0
+  // Old buggy code: min(2.0 * 10.0, 5.0) = 5.0
   for hit in &resp.hits {
     assert!(
-      (hit.score - 5.0).abs() < 1e-6,
-      "expected 1.0 * capped(5.0) = 5.0, got {}",
+      (hit.score - 10.0).abs() < 1e-6,
+      "expected 2.0 * capped(5.0) = 10.0, got {}",
       hit.score
     );
   }
