@@ -3100,12 +3100,81 @@ fn finalize_bucket(bucket: BucketIntermediate) -> BucketResponse {
   }
 }
 
+fn pipeline_agg_dependencies<'a>(
+  agg: &'a Aggregation,
+  pipeline_keys: &HashSet<&str>,
+) -> Vec<&'a str> {
+  let paths: Vec<&str> = match agg {
+    Aggregation::AvgBucket(cfg) => vec![&cfg.buckets_path],
+    Aggregation::SumBucket(cfg) => vec![&cfg.buckets_path],
+    Aggregation::Derivative(cfg) => vec![&cfg.buckets_path],
+    Aggregation::MovingAvg(cfg) => vec![&cfg.buckets_path],
+    Aggregation::BucketScript(cfg) => cfg.buckets_path.values().map(|s| s.as_str()).collect(),
+    _ => vec![],
+  };
+  paths
+    .into_iter()
+    .filter_map(|path| {
+      let agg_name = path.split('.').next().unwrap_or(path);
+      if pipeline_keys.contains(agg_name) {
+        Some(agg_name)
+      } else {
+        None
+      }
+    })
+    .collect()
+}
+
+fn topological_sort_pipeline(pipeline: &BTreeMap<String, Aggregation>) -> Vec<&str> {
+  let pipeline_keys: HashSet<&str> = pipeline.keys().map(|k| k.as_str()).collect();
+  let mut in_degree: BTreeMap<&str, usize> = BTreeMap::new();
+  let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+  for key in pipeline.keys() {
+    in_degree.entry(key.as_str()).or_insert(0);
+  }
+  for (name, agg) in pipeline.iter() {
+    if matches!(agg, Aggregation::BucketSort(_)) {
+      continue;
+    }
+    let deps = pipeline_agg_dependencies(agg, &pipeline_keys);
+    *in_degree.entry(name.as_str()).or_insert(0) += deps.len();
+    for dep in deps {
+      dependents.entry(dep).or_default().push(name.as_str());
+    }
+  }
+  let mut queue: VecDeque<&str> = in_degree
+    .iter()
+    .filter(|(_, &deg)| deg == 0)
+    .map(|(&k, _)| k)
+    .collect();
+  let mut order = Vec::with_capacity(pipeline.len());
+  while let Some(node) = queue.pop_front() {
+    order.push(node);
+    if let Some(deps) = dependents.get(node) {
+      for &dep in deps {
+        if let Some(deg) = in_degree.get_mut(dep) {
+          *deg -= 1;
+          if *deg == 0 {
+            queue.push_back(dep);
+          }
+        }
+      }
+    }
+  }
+  order
+}
+
 fn apply_pipeline_aggs(
   pipeline: &BTreeMap<String, Aggregation>,
   buckets: &mut Vec<BucketResponse>,
 ) -> BTreeMap<String, AggregationResponse> {
   let mut responses = BTreeMap::new();
-  for (name, agg) in pipeline.iter() {
+  let order = topological_sort_pipeline(pipeline);
+  for name in &order {
+    let agg = match pipeline.get(*name) {
+      Some(a) => a,
+      None => continue,
+    };
     match agg {
       Aggregation::AvgBucket(cfg) => {
         let mut sum = 0.0_f64;
@@ -3118,7 +3187,7 @@ fn apply_pipeline_aggs(
         }
         let value = if count > 0 { sum / count as f64 } else { 0.0 };
         responses.insert(
-          name.clone(),
+          name.to_string(),
           AggregationResponse::AvgBucket(BucketMetricResponse { value }),
         );
       }
@@ -3130,7 +3199,7 @@ fn apply_pipeline_aggs(
           }
         }
         responses.insert(
-          name.clone(),
+          name.to_string(),
           AggregationResponse::SumBucket(BucketMetricResponse { value: sum }),
         );
       }
@@ -5042,5 +5111,133 @@ mod tests {
     } else {
       panic!("expected moving_avg on bucket 2");
     }
+  }
+
+  #[test]
+  fn pipeline_aggs_respect_dependency_order_not_alphabetical() {
+    use crate::api::types::{BucketScriptAggregation, DerivativeAggregation};
+
+    fn stats_bucket(key: i64, revenue: f64) -> BucketResponse {
+      let mut m = BTreeMap::new();
+      m.insert(
+        "revenue".to_string(),
+        AggregationResponse::Stats(StatsResponse {
+          count: 1,
+          min: revenue,
+          max: revenue,
+          sum: revenue,
+          avg: revenue,
+        }),
+      );
+      BucketResponse {
+        key: serde_json::Value::Number(serde_json::Number::from(key)),
+        doc_count: 1,
+        aggregations: m,
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(1, 100.0),
+      stats_bucket(2, 150.0),
+      stats_bucket(3, 200.0),
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    // "adjusted" sorts before "daily_change" alphabetically, but depends on it
+    pipeline.insert(
+      "adjusted".to_string(),
+      Aggregation::BucketScript(BucketScriptAggregation {
+        buckets_path: {
+          let mut bp = BTreeMap::new();
+          bp.insert("d".to_string(), "daily_change".to_string());
+          bp
+        },
+        script: "d * 100".to_string(),
+      }),
+    );
+    pipeline.insert(
+      "daily_change".to_string(),
+      Aggregation::Derivative(DerivativeAggregation {
+        buckets_path: "revenue".to_string(),
+        gap_policy: None,
+        unit: None,
+      }),
+    );
+
+    let _responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+
+    // Bucket 0: derivative is None (no previous), so adjusted should be None
+    let adj0 = buckets[0].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj0 {
+      assert!(v.value.is_none(), "bucket 0 adjusted should be None");
+    } else {
+      panic!("expected BucketScript response");
+    }
+
+    // Bucket 1: derivative = 150 - 100 = 50, adjusted = 50 * 100 = 5000
+    let adj1 = buckets[1].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj1 {
+      assert!(
+        v.value.is_some(),
+        "bucket 1 adjusted must not be None (dependency ordering bug)"
+      );
+      assert!(
+        (v.value.unwrap() - 5000.0).abs() < 1e-6,
+        "expected 5000.0, got {:?}",
+        v.value
+      );
+    } else {
+      panic!("expected BucketScript response");
+    }
+
+    // Bucket 2: derivative = 200 - 150 = 50, adjusted = 50 * 100 = 5000
+    let adj2 = buckets[2].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj2 {
+      assert!(
+        v.value.is_some(),
+        "bucket 2 adjusted must not be None (dependency ordering bug)"
+      );
+      assert!(
+        (v.value.unwrap() - 5000.0).abs() < 1e-6,
+        "expected 5000.0, got {:?}",
+        v.value
+      );
+    } else {
+      panic!("expected BucketScript response");
+    }
+  }
+
+  #[test]
+  fn topological_sort_orders_dependencies_first() {
+    use crate::api::types::{BucketScriptAggregation, DerivativeAggregation};
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "adjusted".to_string(),
+      Aggregation::BucketScript(BucketScriptAggregation {
+        buckets_path: {
+          let mut bp = BTreeMap::new();
+          bp.insert("d".to_string(), "daily_change".to_string());
+          bp
+        },
+        script: "d * 100".to_string(),
+      }),
+    );
+    pipeline.insert(
+      "daily_change".to_string(),
+      Aggregation::Derivative(DerivativeAggregation {
+        buckets_path: "revenue".to_string(),
+        gap_policy: None,
+        unit: None,
+      }),
+    );
+
+    let order = topological_sort_pipeline(&pipeline);
+    let dc_pos = order.iter().position(|&n| n == "daily_change").unwrap();
+    let adj_pos = order.iter().position(|&n| n == "adjusted").unwrap();
+    assert!(
+      dc_pos < adj_pos,
+      "daily_change must come before adjusted, got dc={dc_pos} adj={adj_pos}"
+    );
   }
 }
