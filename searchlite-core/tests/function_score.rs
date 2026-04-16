@@ -624,3 +624,58 @@ fn rescore_explain_consistent_for_non_matching_docs() {
     doc3.score
   );
 }
+
+#[test]
+fn max_boost_caps_function_score_before_boost_mode_sum() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 10.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Sum),
+    max_boost: Some(5.0),
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  // base=1.0, func=10.0, max_boost=5.0 → capped_func=5.0 → 1.0+5.0=6.0
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 6.0).abs() < 1e-6,
+      "expected 6.0 (base + capped func), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn max_boost_caps_function_score_before_boost_mode_multiply() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 10.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Multiply),
+    max_boost: Some(5.0),
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  // base=1.0, func=10.0, max_boost=5.0 → capped_func=5.0 → 1.0 * 5.0 = 5.0
+  // Old buggy code: min(1.0 * 10.0, 5.0) = 5.0 (same result for this case)
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 1.0 * capped(5.0) = 5.0, got {}",
+      hit.score
+    );
+  }
+}
