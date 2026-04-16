@@ -1215,6 +1215,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       storage: storage.clone(),
+      reader_opens: std::sync::atomic::AtomicUsize::new(0),
     });
 
     storage.fail_next_pending_manifest_store();
@@ -1284,6 +1285,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       storage: storage.clone(),
+      reader_opens: std::sync::atomic::AtomicUsize::new(0),
     });
 
     storage.fail_next_manifest_store();

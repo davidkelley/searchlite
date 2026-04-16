@@ -2268,21 +2268,24 @@ async fn multi_search(
       })?;
       // Holding a permit guarantees a reader is available in steady state.
       // The pool can briefly be empty if a prior blocking task panicked and
-      // dropped its reader; open a fresh one so the request still completes.
-      let reader = match pool_clone.lock().await.pop() {
-        Some(reader) => reader,
-        None => index_clone.reader().map_err(|err| {
-          HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
-        })?,
-      };
+      // dropped its reader; defer the fallback open into the blocking task
+      // below so file I/O never runs on a Tokio worker thread.
+      let pooled = pool_clone.lock().await.pop();
       // Keep `permit` in the outer async scope so it is not released until
       // after the reader is returned to the pool. Dropping it inside the
       // blocking closure (i.e. as soon as `reader.search` returns) would let
       // a waiting task acquire the freed permit, find the pool momentarily
       // empty, and open a new reader — growing the pool past its bound.
       let handle = tokio::task::spawn_blocking(move || {
+        let reader = match pooled {
+          Some(reader) => reader,
+          None => match index_clone.reader() {
+            Ok(reader) => reader,
+            Err(err) => return (None, Err(err)),
+          },
+        };
         let result = reader.search(&req);
-        (reader, result)
+        (Some(reader), result)
       });
       let (reader, result) = handle.await.map_err(|err: tokio::task::JoinError| {
         HttpError::from_anyhow(
@@ -2291,7 +2294,9 @@ async fn multi_search(
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      pool_clone.lock().await.push(reader);
+      if let Some(reader) = reader {
+        pool_clone.lock().await.push(reader);
+      }
       drop(permit);
       let search_res = result.map_err(|err| {
         HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
@@ -3982,7 +3987,7 @@ mod tests {
     init_tracing();
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("idx-multi-pool");
-    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path).await;
+    let (client, _base, index_base, handle, state, _args) = setup_server(index_path).await;
 
     client
       .post(format!("{index_base}/init"))
@@ -4004,9 +4009,16 @@ mod tests {
       .await
       .unwrap();
 
+    // Capture the baseline reader-open count *after* init/add/commit so the
+    // assertion below only measures opens caused by this multi_search call.
+    let managed = state.registry().resolve(INDEX_NAME).unwrap();
+    let index = managed.require_index().await.unwrap();
+    let opens_before = index.reader_open_count();
+
     // Eight sub-searches with a pool capped at two exercises reader reuse:
     // the pool is strictly smaller than the search count, so correctness here
     // depends on readers being handed back and picked up again by later tasks.
+    const POOL_SIZE: usize = 2;
     let searches: Vec<serde_json::Value> = (0..8)
       .map(|i| {
         let term = if i % 2 == 0 { "rust" } else { "go" };
@@ -4016,7 +4028,7 @@ mod tests {
     let req = json!({
       "searches": searches,
       "parallel": true,
-      "max_concurrency": 2
+      "max_concurrency": POOL_SIZE
     });
     let res = client
       .post(format!("{index_base}/multi_search"))
@@ -4049,6 +4061,16 @@ mod tests {
         );
       }
     }
+
+    // The pool caps concurrent readers at `POOL_SIZE`, so a multi_search with
+    // 8 sub-requests must open no more than that many fresh readers. Opening
+    // one per sub-search (the pre-fix behavior) would produce 8 here.
+    let opens_after = index.reader_open_count();
+    let opens_for_multi_search = opens_after - opens_before;
+    assert!(
+      opens_for_multi_search <= POOL_SIZE,
+      "expected at most {POOL_SIZE} reader opens from multi_search, observed {opens_for_multi_search}"
+    );
 
     handle.abort();
     let _ = handle.await;
