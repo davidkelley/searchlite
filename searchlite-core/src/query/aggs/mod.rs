@@ -3105,21 +3105,6 @@ fn apply_pipeline_aggs(
   buckets: &mut Vec<BucketResponse>,
 ) -> BTreeMap<String, AggregationResponse> {
   let mut responses = BTreeMap::new();
-  for (name, agg) in pipeline
-    .iter()
-    .filter(|(_, a)| matches!(a, Aggregation::BucketSort(_)))
-  {
-    if let Aggregation::BucketSort(cfg) = agg {
-      bucket_sort_buckets(buckets, cfg);
-      responses.insert(
-        name.clone(),
-        AggregationResponse::BucketSort {
-          from: cfg.from.unwrap_or(0),
-          size: cfg.size,
-        },
-      );
-    }
-  }
   for (name, agg) in pipeline.iter() {
     match agg {
       Aggregation::AvgBucket(cfg) => {
@@ -3160,6 +3145,21 @@ fn apply_pipeline_aggs(
       }
       Aggregation::BucketSort(_) => {}
       _ => {}
+    }
+  }
+  for (name, agg) in pipeline
+    .iter()
+    .filter(|(_, a)| matches!(a, Aggregation::BucketSort(_)))
+  {
+    if let Aggregation::BucketSort(cfg) = agg {
+      bucket_sort_buckets(buckets, cfg);
+      responses.insert(
+        name.clone(),
+        AggregationResponse::BucketSort {
+          from: cfg.from.unwrap_or(0),
+          size: cfg.size,
+        },
+      );
     }
   }
   responses
