@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,6 +41,10 @@ pub(crate) struct InnerIndex {
   pub manifest: RwLock<Manifest>,
   pub writer_lock: Mutex<()>,
   pub storage: Arc<dyn Storage>,
+  /// Monotonic count of successful `Index::reader()` calls. Exposed via
+  /// `Index::reader_open_count` so pooling/caching layers can be regression-
+  /// tested without relying on wall-clock heuristics.
+  pub(crate) reader_opens: AtomicUsize,
 }
 
 impl Index {
@@ -97,6 +102,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
   }
@@ -129,6 +135,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
   }
@@ -145,7 +152,19 @@ impl Index {
   }
 
   pub fn reader(&self) -> Result<crate::api::reader::IndexReader> {
-    crate::api::reader::IndexReader::open(self.inner.clone())
+    let reader = crate::api::reader::IndexReader::open(self.inner.clone())?;
+    self.inner.reader_opens.fetch_add(1, Ordering::Relaxed);
+    Ok(reader)
+  }
+
+  /// Number of successful `reader()` calls issued against this `Index`.
+  ///
+  /// Exposed as an observability hook so reader-reuse behavior (e.g. the
+  /// bounded pool in HTTP `multi_search`) can be exercised in regression
+  /// tests without relying on timing or log parsing.
+  #[doc(hidden)]
+  pub fn reader_open_count(&self) -> usize {
+    self.inner.reader_opens.load(Ordering::Relaxed)
   }
 
   pub fn compact(&self) -> Result<()> {
