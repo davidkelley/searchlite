@@ -1185,20 +1185,20 @@ fn write_presence(iter: impl Iterator<Item = bool>, buf: &mut Vec<u8>) {
 }
 
 fn doc_range(offsets: &[u32], doc: usize) -> Option<(usize, usize)> {
-  if offsets.len() < doc + 2 {
+  let start = *offsets.get(doc)? as usize;
+  let end = *offsets.get(doc.checked_add(1)?)? as usize;
+  if start > end {
     return None;
   }
-  let start = offsets[doc] as usize;
-  let end = offsets[doc + 1] as usize;
   Some((start, end))
 }
 
 fn object_range(offsets: &[u32], object_idx: usize) -> Option<(usize, usize)> {
-  if offsets.len() < object_idx + 2 {
+  let start = *offsets.get(object_idx)? as usize;
+  let end = *offsets.get(object_idx.checked_add(1)?)? as usize;
+  if start > end {
     return None;
   }
-  let start = offsets[object_idx] as usize;
-  let end = offsets[object_idx + 1] as usize;
   Some((start, end))
 }
 
@@ -1278,6 +1278,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "I64List")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1304,6 +1305,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "I64Nested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1313,6 +1315,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "I64Nested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1359,6 +1362,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "F64List")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1385,6 +1389,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "F64Nested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1394,6 +1399,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "F64Nested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1481,6 +1487,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "StrList")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1527,6 +1534,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "StrNested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1536,6 +1544,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "StrNested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1570,6 +1579,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "NestedParent")?;
         let total = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1629,6 +1639,23 @@ fn checked_add_one(count: usize) -> Result<usize> {
   count
     .checked_add(1)
     .ok_or_else(|| anyhow!("fast field element count {count} + 1 overflows usize"))
+}
+
+/// Validate that an offset array is monotonically non-decreasing. Corrupt or
+/// adversarially crafted fast-field files can contain non-monotonic offsets
+/// which would cause `values[start..end]` to panic when `start > end`.
+/// Surfacing this at load time prevents silent panics at query time.
+fn validate_monotonic_offsets(offsets: &[u32], column_kind: &str) -> Result<()> {
+  for window in offsets.windows(2) {
+    if window[0] > window[1] {
+      return Err(anyhow!(
+        "non-monotonic offsets in fast field {column_kind} column: {} > {}",
+        window[0],
+        window[1]
+      ));
+    }
+  }
+  Ok(())
 }
 
 fn read_u8(cursor: &mut usize, buf: &[u8]) -> Result<u8> {
@@ -2064,5 +2091,196 @@ mod tests {
       checked_add_one(u32::MAX as usize).unwrap(),
       u32::MAX as usize + 1
     );
+  }
+
+  // --- Non-monotonic offset regression tests (BUG-253) ---
+  //
+  // Each test below hand-crafts a fast-field buffer whose offset array
+  // contains a non-monotonic pair (start > end). Before the fix,
+  // `values[start..end]` would panic at query time. `read_fields` must
+  // now reject these at load time.
+
+  fn assert_monotonicity_rejected(err: anyhow::Error) {
+    let msg = err.to_string();
+    assert!(
+      msg.contains("non-monotonic offsets"),
+      "expected a non-monotonic offsets error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64List, 2); // 2 docs → 3 offsets
+                                                   // offsets: [0, 5, 3] — doc 1 has start=5, end=3
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64List, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, 2);
+    // doc_offsets: [0, 3, 1] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, 1);
+    // doc_offsets: [0, 2] — valid, 2 objects
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // object_offsets: [0, 5, 3] — non-monotonic at index 1→2
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, 1);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrList, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+                                                // offsets: [0, 5, 3] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrNested, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrNested, 1);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+                                                // doc_offsets: [0, 2] — valid
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // object_offsets: [0, 5, 3] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_nested_parent_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::NestedParent, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_accepts_monotonic_offsets() {
+    // Monotonically non-decreasing offsets (including equal adjacent
+    // values, which represent empty ranges) must be accepted.
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64List, 3); // 3 docs → 4 offsets
+                                                   // offsets: [0, 0, 2, 2] — doc 0 empty, doc 1 has 2 values, doc 2 empty
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // 2 i64 values
+    buf.extend_from_slice(&42i64.to_le_bytes());
+    buf.extend_from_slice(&99i64.to_le_bytes());
+    let fields = read_fields(&buf).unwrap();
+    assert!(fields.contains_key(""));
+  }
+
+  #[test]
+  fn doc_range_returns_none_for_inverted_offsets() {
+    // Defense-in-depth: even if offsets somehow bypass load-time validation,
+    // doc_range must return None rather than yielding a start > end pair.
+    let offsets = vec![0u32, 5, 3, 10];
+    assert_eq!(doc_range(&offsets, 0), Some((0, 5)));
+    assert_eq!(doc_range(&offsets, 1), None); // 5 > 3, inverted
+    assert_eq!(doc_range(&offsets, 2), Some((3, 10)));
+  }
+
+  #[test]
+  fn object_range_returns_none_for_inverted_offsets() {
+    let offsets = vec![0u32, 5, 3, 10];
+    assert_eq!(object_range(&offsets, 0), Some((0, 5)));
+    assert_eq!(object_range(&offsets, 1), None);
+    assert_eq!(object_range(&offsets, 2), Some((3, 10)));
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_empty() {
+    validate_monotonic_offsets(&[], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_single() {
+    validate_monotonic_offsets(&[42], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_equal_adjacent() {
+    validate_monotonic_offsets(&[0, 0, 5, 5, 10], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_rejects_decreasing() {
+    let err = validate_monotonic_offsets(&[0, 5, 3], "TestCol").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("non-monotonic offsets"));
+    assert!(msg.contains("TestCol"));
+    assert!(msg.contains("5 > 3"));
   }
 }
