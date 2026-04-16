@@ -198,6 +198,7 @@ fn collapse_rejects_multivalued_fast_field() {
 struct FailingManifestStorage {
   inner: searchlite_core::storage::InMemoryStorage,
   fail_manifest: std::sync::atomic::AtomicBool,
+  fail_pending_manifest: std::sync::atomic::AtomicBool,
 }
 
 impl FailingManifestStorage {
@@ -205,20 +206,43 @@ impl FailingManifestStorage {
     Self {
       inner: searchlite_core::storage::InMemoryStorage::new(root),
       fail_manifest: std::sync::atomic::AtomicBool::new(false),
+      fail_pending_manifest: std::sync::atomic::AtomicBool::new(false),
     }
   }
 
+  #[allow(dead_code)]
   fn fail_next_manifest_store(&self) {
     self
       .fail_manifest
       .store(true, std::sync::atomic::Ordering::SeqCst);
   }
 
+  fn fail_next_pending_manifest_store(&self) {
+    self
+      .fail_pending_manifest
+      .store(true, std::sync::atomic::Ordering::SeqCst);
+  }
+
   fn should_fail(&self, path: &Path) -> bool {
-    path.ends_with("MANIFEST.json")
+    let name = path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or_default();
+    if name == "MANIFEST.json.pending"
+      && self
+        .fail_pending_manifest
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+      return true;
+    }
+    if name == "MANIFEST.json"
       && self
         .fail_manifest
         .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+      return true;
+    }
+    false
   }
 }
 
@@ -273,6 +297,12 @@ impl Storage for FailingManifestStorage {
 
 #[test]
 fn failed_manifest_persistence_does_not_publish_in_memory_state() {
+  // The pre-fence manifest stage (`MANIFEST.json.pending`) is the last
+  // recoverable failure point in the BUG-018 ordering — anything past it
+  // crosses the WAL durability fence and is treated as a successful
+  // commit. This test pins the original "if persistence fails, in-memory
+  // state stays put and the WAL replays cleanly" contract on the
+  // pre-fence path, where it still applies.
   let dir = tempdir().unwrap();
   let storage = Arc::new(FailingManifestStorage::new(dir.path().to_path_buf()));
   let mut opts = opts(dir.path());
@@ -291,12 +321,14 @@ fn failed_manifest_persistence_does_not_publish_in_memory_state() {
       vec![("body", json!("commit failure should rollback"))],
     ))
     .unwrap();
-  storage.fail_next_manifest_store();
+  storage.fail_next_pending_manifest_store();
   let err = writer.commit().unwrap_err();
+  let msg = format!("{err:#}");
   assert!(
-    err.to_string().contains("manifest write failed")
-      || err.to_string().contains("writing manifest"),
-    "unexpected error: {err}"
+    msg.contains("manifest write failed")
+      || msg.contains("staging manifest")
+      || msg.contains("writing manifest"),
+    "unexpected error: {msg}"
   );
   // Manifest in memory should not show the failed segment.
   assert_eq!(idx.manifest().segments.len(), 0);

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
@@ -108,6 +108,10 @@ impl Index {
   pub fn open_with_storage(opts: IndexOptions, storage: Arc<dyn Storage>) -> Result<Self> {
     ensure_root(storage.as_ref(), &opts.path)?;
     let manifest_path = Manifest::manifest_path(&opts.path);
+    // BUG-018 recovery: if a previous `Writer::commit` crashed between the
+    // WAL commit fence and the live manifest publish, finish promoting the
+    // staged manifest now (or discard it if the WAL never crossed the fence).
+    reconcile_pending_manifest(storage.as_ref(), &opts.path, &manifest_path)?;
     let manifest = if storage.exists(&manifest_path) {
       Manifest::load(storage.as_ref(), &manifest_path)?
     } else if opts.create_if_missing {
@@ -446,6 +450,48 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
   }
 }
 
+/// Reconcile a `MANIFEST.json.pending` left behind by a crashed `Writer::commit`.
+///
+/// The commit pipeline writes the staged manifest to `MANIFEST.json.pending`
+/// *before* appending the WAL commit record (the durability fence), then
+/// promotes the staging file to `MANIFEST.json` once the fence has been crossed.
+/// A crash between those steps therefore leaves one of two recoverable states:
+///
+/// * **Trailing WAL `Commit` present** — the batch was durably committed but
+///   the live manifest publish (or the cleanup that follows it) did not
+///   complete. The staged file is the authoritative manifest for that batch
+///   and we promote it now so the next reader/writer sees a consistent index.
+///
+/// * **No trailing WAL `Commit`** — the WAL never crossed the durability fence,
+///   so the staged manifest belongs to a batch that was effectively rolled
+///   back. The pending entries still in the WAL will replay through the next
+///   commit; we discard the staging file.
+///
+/// In either case the staging file is removed before we return, so subsequent
+/// opens see a clean slate. This is the BUG-018 reconciler.
+fn reconcile_pending_manifest(
+  storage: &dyn Storage,
+  root: &Path,
+  manifest_path: &Path,
+) -> Result<()> {
+  let pending_path = Manifest::manifest_pending_path(root);
+  if !storage.exists(&pending_path) {
+    return Ok(());
+  }
+  let wal_path = directory::wal_path(root);
+  if Wal::has_trailing_commit(storage, &wal_path)? {
+    let pending_data = storage
+      .read_to_end(&pending_path)
+      .with_context(|| format!("reading staged manifest at {pending_path:?}"))?;
+    storage
+      .atomic_write(manifest_path, &pending_data)
+      .with_context(|| format!("promoting staged manifest to {manifest_path:?}"))?;
+  }
+  // Best-effort cleanup of the staging file in either branch.
+  let _ = storage.remove(&pending_path);
+  Ok(())
+}
+
 pub(crate) fn cleanup_segments(
   storage: &dyn Storage,
   segments: &[crate::index::manifest::SegmentMeta],
@@ -498,6 +544,80 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
+  }
+
+  #[test]
+  fn reconcile_pending_manifest_promotes_when_wal_has_trailing_commit() {
+    // BUG-018: a `.pending` manifest paired with a trailing WAL `Commit`
+    // marker means the prior commit crossed the durability fence but the
+    // live `MANIFEST.json` was never published. Recovery must copy the
+    // staged content over and clean up the staging file.
+    let dir = tempdir().unwrap();
+    let storage: Arc<dyn Storage> =
+      Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    ensure_root(storage.as_ref(), dir.path()).unwrap();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    let live = Manifest::new(Schema::default_text_body());
+    live.store(storage.as_ref(), &manifest_path).unwrap();
+    let mut staged = live.clone();
+    staged.committed_at = "2099-01-01T00:00:00+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+
+    // Simulate "WAL crossed the fence": append a commit marker.
+    {
+      let mut wal = Wal::open(storage.clone(), &directory::wal_path(dir.path())).unwrap();
+      wal.append_commit().unwrap();
+    }
+
+    super::reconcile_pending_manifest(storage.as_ref(), dir.path(), &manifest_path).unwrap();
+
+    let promoted = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    assert_eq!(
+      promoted.committed_at, "2099-01-01T00:00:00+00:00",
+      "the staged manifest should have been promoted to MANIFEST.json",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the staging file must be removed after promotion",
+    );
+  }
+
+  #[test]
+  fn reconcile_pending_manifest_discards_when_wal_has_no_trailing_commit() {
+    // BUG-018: a `.pending` manifest with no trailing WAL `Commit`
+    // corresponds to a commit that never reached the durability fence —
+    // its pending ops will be replayed via the WAL, so the staged file
+    // is stale and must be discarded without touching the live manifest.
+    let dir = tempdir().unwrap();
+    let storage: Arc<dyn Storage> =
+      Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    ensure_root(storage.as_ref(), dir.path()).unwrap();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    let live = Manifest::new(Schema::default_text_body());
+    live.store(storage.as_ref(), &manifest_path).unwrap();
+    let original_committed_at = live.committed_at.clone();
+    let mut staged = live.clone();
+    staged.committed_at = "2099-01-01T00:00:00+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+
+    // No WAL written → no trailing commit.
+    super::reconcile_pending_manifest(storage.as_ref(), dir.path(), &manifest_path).unwrap();
+
+    let live_after = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    assert_eq!(
+      live_after.committed_at, original_committed_at,
+      "the live manifest must be untouched when the WAL did not cross the fence",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the orphan staging file must be removed even when not promoted",
+    );
   }
 
   #[test]

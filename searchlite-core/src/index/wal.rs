@@ -227,6 +227,30 @@ impl Wal {
     }
     Ok((binding, pending))
   }
+
+  /// Returns `true` when the most recent data entry in the WAL (i.e. the last
+  /// `AddDoc` / `DeleteDocId` / `Commit`, ignoring `WriteBinding` framing) is a
+  /// `Commit` record.
+  ///
+  /// This is the durability oracle used by recovery to distinguish "the
+  /// previous commit's WAL fence completed" (trailing `Commit`, ops are
+  /// durable) from "the previous commit was rolled back or never reached the
+  /// fence" (trailing data entries with no `Commit` after them).
+  pub fn has_trailing_commit(storage: &dyn Storage, path: &Path) -> Result<bool> {
+    if !storage.exists(path) {
+      return Ok(false);
+    }
+    let (_, entries) = Self::replay_with_binding(storage, path)?;
+    let mut last_data_was_commit = false;
+    for entry in entries {
+      match entry {
+        WalEntry::Commit => last_data_was_commit = true,
+        WalEntry::AddDoc(_) | WalEntry::DeleteDocId(_) => last_data_was_commit = false,
+        WalEntry::WriteBinding(_) => {} // already stripped above, but be defensive
+      }
+    }
+    Ok(last_data_was_commit)
+  }
 }
 
 #[cfg(test)]
@@ -411,6 +435,52 @@ mod tests {
       1,
       "bad-checksum tail must stop replay silently, not abort",
     );
+  }
+
+  #[test]
+  fn has_trailing_commit_distinguishes_pending_from_committed_tail() {
+    // BUG-018 oracle: `has_trailing_commit` is the recovery primitive that
+    // tells `Index::open` whether a `MANIFEST.json.pending` file should be
+    // promoted (WAL crossed the durability fence) or discarded (it didn't).
+    // Pin every state transition on a single WAL so a future change to the
+    // entry filtering can't silently flip the answer.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    // No WAL on disk → false (treat as fresh index).
+    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+
+    let mut wal = Wal::open(storage.clone(), &path).unwrap();
+    // Empty WAL file → false.
+    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+
+    let doc = Document {
+      fields: [("body".into(), serde_json::json!("first"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc).unwrap();
+    wal.sync().unwrap();
+    // AddDoc with no following Commit → false.
+    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+
+    wal.append_commit().unwrap();
+    // AddDoc, Commit → true.
+    assert!(Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+
+    let doc2 = Document {
+      fields: [("body".into(), serde_json::json!("second"))]
+        .into_iter()
+        .collect(),
+    };
+    wal.append_add_doc(&doc2).unwrap();
+    wal.sync().unwrap();
+    // ..., Commit, AddDoc → false (the tail is no longer Commit).
+    assert!(!Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
+
+    wal.append_commit().unwrap();
+    // ..., AddDoc, Commit → true again.
+    assert!(Wal::has_trailing_commit(storage.as_ref(), &path).unwrap());
   }
 
   #[test]
