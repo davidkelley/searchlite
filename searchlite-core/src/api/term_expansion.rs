@@ -1346,4 +1346,31 @@ mod tests {
     let tokens = analyze_pattern_tokens(analyzer, "HELLO", &wildcard);
     assert_eq!(tokens, vec!["hello"]);
   }
+
+  #[test]
+  fn analyze_pattern_tokens_wildcard_non_ascii_uppercase_matches_default_tokenizer() {
+    // BUG-255 repro: wildcard pattern "RÉS*" with the default analyzer.
+    // default_tokenize uses ASCII-only lowering, so indexed term for "RÉSUMÉ"
+    // is "rÉsumÉ". normalize_pattern must produce "rÉs*" (not "rés*") so
+    // that the prefix matches the indexed form.
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let wildcard = TermExpansion::Wildcard {
+      max_expansions: 100,
+    };
+    let tokens = analyze_pattern_tokens(analyzer, "RÉS*", &wildcard);
+    assert_eq!(tokens, vec!["rÉs*"]);
+  }
+
+  #[test]
+  fn analyze_pattern_tokens_regex_non_ascii_uppercase_matches_default_tokenizer() {
+    // Same BUG-255 scenario but for regex expansion.
+    let registry = AnalyzerRegistry::with_default();
+    let analyzer = registry.get("default").unwrap();
+    let regex = TermExpansion::Regex {
+      max_expansions: 100,
+    };
+    let tokens = analyze_pattern_tokens(analyzer, "RÉS.+", &regex);
+    assert_eq!(tokens, vec!["rÉs.+"]);
+  }
 }

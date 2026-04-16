@@ -490,3 +490,74 @@ fn keyword_match_and_filter_agree_on_non_ascii_case() {
     .collect();
   assert_eq!(cyrillic_query_ids, cyrillic_filter_ids);
 }
+
+/// Regression test for davidkelley/searchlite#255.
+///
+/// The default tokenizer applies ASCII-only case-folding
+/// (`char::to_ascii_lowercase`), so "RÉSUMÉ" is indexed as the token
+/// "rÉsumÉ" (É is not ASCII and stays uppercase). Before the fix,
+/// `normalize_pattern` applied full Unicode lowering (`str::to_lowercase`),
+/// producing "rés*" for the wildcard pattern "RÉS*". The byte sequences
+/// diverge (É = 0xC3 0x89 vs é = 0xC3 0xA9), so the prefix match failed
+/// and the document was silently omitted from results.
+///
+/// After the fix, `normalize_pattern` uses ASCII-only lowering when the
+/// tokenizer is `Default`, producing "rÉs*" which correctly matches the
+/// indexed prefix "rÉs".
+#[test]
+fn wildcard_query_matches_non_ascii_uppercase_with_default_tokenizer() {
+  let dir = tempdir().unwrap();
+  let path = dir.path().to_path_buf();
+  let idx = Index::create(&path, Schema::default_text_body(), opts(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "resume_doc",
+        vec![("body", json!("RÉSUMÉ WRITING GUIDE"))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "plain_doc",
+        vec![("body", json!("REGULAR WRITING GUIDE"))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+
+  // Wildcard query "RÉS*" must match the document with "RÉSUMÉ".
+  let wildcard_req = SearchRequest {
+    query: Query::Node(QueryNode::Wildcard {
+      field: "body".into(),
+      value: "RÉS*".into(),
+      max_expansions: None,
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let wildcard_ids: Vec<String> = reader
+    .search(&wildcard_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(wildcard_ids, vec!["resume_doc".to_string()]);
+
+  // A query-string search for the same term should also find the document,
+  // confirming both paths agree on case folding.
+  let match_req = SearchRequest {
+    query: Query::String("RÉSUMÉ".into()),
+    ..base_request("", None)
+  };
+  let match_ids: Vec<String> = reader
+    .search(&match_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(match_ids, vec!["resume_doc".to_string()]);
+}
