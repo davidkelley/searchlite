@@ -427,8 +427,11 @@ fn edge_ngrams(tokens: Vec<Token>, cfg: &EdgeNgramConfig) -> Vec<Token> {
   let mut out = Vec::new();
   for token in tokens.into_iter() {
     let len = token.text.chars().count();
+    if len < cfg.min {
+      continue;
+    }
     let max = usize::min(cfg.max, len);
-    let min = usize::min(cfg.min, max);
+    let min = cfg.min;
     if min == 0 || max == 0 {
       continue;
     }
@@ -571,6 +574,34 @@ mod tests {
       texts,
       vec!["r".to_string(), "ru".to_string(), "rus".to_string()]
     );
+  }
+
+  #[test]
+  fn edge_ngram_skips_tokens_shorter_than_min() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::EdgeNgram(EdgeNgramConfig {
+        min: 3,
+        max: 5,
+      })],
+      "ab",
+    );
+    assert!(
+      tokens.is_empty(),
+      "tokens shorter than min should produce no ngrams"
+    );
+  }
+
+  #[test]
+  fn edge_ngram_includes_token_equal_to_min() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::EdgeNgram(EdgeNgramConfig {
+        min: 3,
+        max: 5,
+      })],
+      "abc",
+    );
+    let texts: Vec<String> = tokens.into_iter().map(|t| t.text).collect();
+    assert_eq!(texts, vec!["abc".to_string()]);
   }
 
   #[test]
