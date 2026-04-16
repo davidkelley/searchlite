@@ -5,8 +5,8 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, CompositeAggregation, CompositeSource, DateHistogramAggregation,
   DateHistogramBounds, Document, ExecutionStrategy, HistogramAggregation, HistogramBounds,
-  IndexOptions, KeywordField, MetricAggregation, NumericField, Schema, SearchRequest, SortOrder,
-  SortSpec, StorageType, TermsAggregation, TopHitsAggregation,
+  IndexOptions, KeywordField, MetricAggregation, MovingAvgAggregation, NumericField, Schema,
+  SearchRequest, SortOrder, SortSpec, StorageType, TermsAggregation, TopHitsAggregation,
 };
 use searchlite_core::api::Index;
 use serde_json::json;
@@ -1894,5 +1894,572 @@ mod bug_200 {
       elapsed < Duration::from_secs(5),
       "pathological date_histogram must not loop: took {elapsed:?}"
     );
+  }
+}
+
+/// Regression tests for BUG-221 — `MovingAvgAggregation::predict` is fed
+/// straight into `vec![last_avg; predict]` inside `apply_moving_avg_pipeline`.
+/// Without a request-time bound, a tiny request body (well under the HTTP
+/// 50 MiB cap) could request multi-gigabyte allocations during response
+/// finalization and OOM the server.
+mod bug_221 {
+  use super::*;
+  use searchlite_core::api::types::GapPolicy;
+
+  fn views_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "n".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = Index::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Two docs in distinct histogram buckets so the bucketing agg has at
+      // least one non-empty bucket — the precondition for the `predict`
+      // branch in `apply_moving_avg_pipeline` to allocate.
+      writer
+        .add_document(&doc(
+          "a",
+          vec![("body", json!("rust")), ("n", json!(1_i64))],
+        ))
+        .unwrap();
+      writer
+        .add_document(&doc(
+          "b",
+          vec![("body", json!("rust")), ("n", json!(2_i64))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn moving_avg_request(predict: Option<usize>, window: usize) -> BTreeMap<String, Aggregation> {
+    let mut hist_aggs = BTreeMap::new();
+    hist_aggs.insert(
+      "mov".into(),
+      Aggregation::MovingAvg(MovingAvgAggregation {
+        buckets_path: "_count".into(),
+        window,
+        predict,
+        gap_policy: Some(GapPolicy::Skip),
+      }),
+    );
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "n".into(),
+        interval: 1.0,
+        offset: None,
+        min_doc_count: Some(0),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: hist_aggs,
+      })),
+    );
+    aggs
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  #[test]
+  fn huge_predict_is_rejected_without_allocation() {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // ~8 GiB of `f64` if it ever reached `vec![..; predict]`.
+    let aggs = moving_avg_request(Some(1_073_741_824), 1);
+
+    let start = Instant::now();
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("moving_avg with predict above MAX_PREDICTIONS must be rejected");
+    let elapsed = start.elapsed();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("predict") && msg.contains("exceeds limit"),
+      "expected predict-bound error, got: {msg}"
+    );
+    // The validator runs before any allocation; rejection must be effectively
+    // instantaneous, never paying the cost of `vec![..; predict]`.
+    assert!(
+      elapsed < Duration::from_secs(2),
+      "moving_avg validation must reject quickly without allocating: took {elapsed:?}"
+    );
+  }
+
+  #[test]
+  fn predict_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // `MAX_PREDICTIONS` is 10_000; exercise the strict `>` boundary.
+    let aggs = moving_avg_request(Some(10_001), 1);
+    let err =
+      search_with_agg(&idx, aggs).expect_err("predict = MAX_PREDICTIONS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("predict") && msg.contains("10001"),
+      "expected predict bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn predict_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // 10_000 forecast points of an `f64` is ~80 KiB — well within budget and
+    // intentionally accepted so legitimate clients keep working.
+    let aggs = moving_avg_request(Some(10_000), 1);
+    search_with_agg(&idx, aggs).expect("predict at the cap must be accepted");
+  }
+
+  #[test]
+  fn small_predict_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    let aggs = moving_avg_request(Some(3), 2);
+    search_with_agg(&idx, aggs).expect("typical predict values must be accepted");
+  }
+
+  #[test]
+  fn huge_window_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    // `window` is not itself an unbounded allocation today, but a runaway
+    // value is meaningless and must be rejected so future maintainers cannot
+    // accidentally turn it into one.
+    let aggs = moving_avg_request(None, 1_000_000);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("moving_avg window above MAX_BUCKETS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("window") && msg.contains("exceeds limit"),
+      "expected window-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn zero_window_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = views_index(tmp.path());
+
+    let aggs = moving_avg_request(None, 0);
+    let err = search_with_agg(&idx, aggs).expect_err("window = 0 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("window") && msg.contains(">= 1"),
+      "expected zero-window error, got: {msg}"
+    );
+  }
+}
+
+/// Regression coverage for BUG-215: `top_hits` with `from > 0` on a
+/// multi-segment index must return the globally `from`-th through
+/// `(from + size - 1)`-th best documents.
+///
+/// Before the fix, `TopHitsCollector::finish` dropped items at per-segment
+/// ranks `[0, from)` *before* `merge_top_hits` could compare them across
+/// segments. On a two-segment index that produced an answer drawn from the
+/// per-segment `[from, from + size)` window of each segment, which is not
+/// the same as the global top `(from + size)` window.
+mod bug_215 {
+  use super::*;
+
+  #[test]
+  fn top_hits_from_offset_is_global_across_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Segment A: scores 10, 8, 6, 4, 2.
+      for (id, s) in [(1_i64, 10_i64), (2, 8), (3, 6), (4, 4), (5, 2)] {
+        writer
+          .add_document(&doc(
+            &format!("a-{id}"),
+            vec![("body", json!("rust")), ("score", json!(s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      // Segment B: scores 9, 7, 5, 3, 1. Separate commit creates a second
+      // segment, which is the precondition for the bug.
+      for (id, s) in [(6_i64, 9_i64), (7, 7), (8, 5), (9, 3), (10, 1)] {
+        writer
+          .add_document(&doc(
+            &format!("b-{id}"),
+            vec![("body", json!("rust")), ("score", json!(s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size: 2,
+        from: 1,
+        fields: Some(vec!["score".into()]),
+        sort: vec![SortSpec {
+          field: "score".into(),
+          order: Some(SortOrder::Desc),
+        }],
+        highlight_field: None,
+      }),
+    );
+
+    let resp = idx
+      .reader()
+      .unwrap()
+      .search(&SearchRequest {
+        query: "rust".into(),
+        fields: None,
+        filter: None,
+        limit: 1,
+        from: 0,
+        return_hits: true,
+        candidate_size: None,
+        #[cfg(feature = "vectors")]
+        max_global_vector_candidates: None,
+        sort: Vec::new(),
+        cursor: None,
+        search_after: None,
+        execution: ExecutionStrategy::Wand,
+        bmw_block_size: None,
+        fuzzy: None,
+        track_total_hits: None,
+        #[cfg(feature = "vectors")]
+        vector_query: None,
+        #[cfg(feature = "vectors")]
+        vector_filter: None,
+        return_stored: false,
+        highlight_field: None,
+        highlight: None,
+        collapse: None,
+        aggs,
+        suggest: BTreeMap::new(),
+        rescore: None,
+        explain: false,
+        profile: false,
+      })
+      .unwrap();
+
+    let agg = resp.aggregations.get("hits").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::TopHits(top_hits) = agg {
+      assert_eq!(top_hits.total, 10);
+      let scores: Vec<_> = top_hits
+        .hits
+        .iter()
+        .map(|h| {
+          h.fields
+            .as_ref()
+            .and_then(|f| f.get("score"))
+            .and_then(|v| v.as_i64())
+            .unwrap()
+        })
+        .collect();
+      // Global sorted order is [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]; skipping
+      // `from = 1` and taking `size = 2` yields [9, 8]. The pre-fix
+      // behaviour returned [7, 6] because segment B's top-ranked doc
+      // (score 9) was discarded by the per-segment `from` skip before the
+      // cross-segment merge ever saw it.
+      assert_eq!(scores, vec![9, 8]);
+    } else {
+      panic!("expected top hits response");
+    }
+  }
+
+  /// Deep `from` (larger than any single segment's per-segment `from`
+  /// window alone) still returns globally-correct results.
+  #[test]
+  fn top_hits_deep_from_across_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Segment A: odd scores 1, 3, ..., 19.
+      let odd: Vec<i64> = (1..=19).filter(|s| s % 2 == 1).collect();
+      for s in &odd {
+        writer
+          .add_document(&doc(
+            &format!("a-{s}"),
+            vec![("body", json!("rust")), ("score", json!(*s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      // Segment B: even scores 2, 4, ..., 20.
+      let even: Vec<i64> = (2..=20).filter(|s| s % 2 == 0).collect();
+      for s in &even {
+        writer
+          .add_document(&doc(
+            &format!("b-{s}"),
+            vec![("body", json!("rust")), ("score", json!(*s))],
+          ))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size: 3,
+        from: 4,
+        fields: Some(vec!["score".into()]),
+        sort: vec![SortSpec {
+          field: "score".into(),
+          order: Some(SortOrder::Desc),
+        }],
+        highlight_field: None,
+      }),
+    );
+
+    let mut req = SearchRequest::new("rust");
+    req.limit = 1;
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).unwrap();
+
+    let agg = resp.aggregations.get("hits").unwrap();
+    if let searchlite_core::api::types::AggregationResponse::TopHits(top_hits) = agg {
+      assert_eq!(top_hits.total, 20);
+      let scores: Vec<_> = top_hits
+        .hits
+        .iter()
+        .map(|h| {
+          h.fields
+            .as_ref()
+            .and_then(|f| f.get("score"))
+            .and_then(|v| v.as_i64())
+            .unwrap()
+        })
+        .collect();
+      // Global descending order is 20, 19, ..., 1. Skipping `from = 4`
+      // and taking `size = 3` yields [16, 15, 14].
+      assert_eq!(scores, vec![16, 15, 14]);
+    } else {
+      panic!("expected top hits response");
+    }
+  }
+}
+
+/// Regression tests for BUG-222 — `TopHitsAggregation::size` and `from` are
+/// forwarded straight into `TopHitsCollector::new`, which uses them to size a
+/// per-segment `BinaryHeap<RankedDoc>`. Without a request-time bound, a tiny
+/// request body (well under the HTTP 50 MiB cap) could ask for `size = 10^10`
+/// and grow the heap until the segment is exhausted or the process OOMs.
+mod bug_222 {
+  use super::*;
+
+  fn corpus_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "n".into(),
+      i64: true,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    let idx = IndexBuilder::create(path, schema, build_base_options(path)).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      // Two docs is enough to exercise the heap-growth branch in `collect`;
+      // the bug is about how the heap is *sized*, not about the number of
+      // matching docs.
+      writer
+        .add_document(&doc(
+          "a",
+          vec![("body", json!("rust")), ("n", json!(1_i64))],
+        ))
+        .unwrap();
+      writer
+        .add_document(&doc(
+          "b",
+          vec![("body", json!("rust")), ("n", json!(2_i64))],
+        ))
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    idx
+  }
+
+  fn top_hits_request(size: usize, from: usize) -> BTreeMap<String, Aggregation> {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hits".into(),
+      Aggregation::TopHits(TopHitsAggregation {
+        size,
+        from,
+        fields: None,
+        sort: Vec::new(),
+        highlight_field: None,
+      }),
+    );
+    aggs
+  }
+
+  fn search_with_agg(
+    idx: &searchlite_core::api::Index,
+    aggs: BTreeMap<String, Aggregation>,
+  ) -> anyhow::Result<()> {
+    let mut req = SearchRequest::new("rust");
+    req.limit = 1;
+    req.aggs = aggs;
+    idx.reader().unwrap().search(&req)?;
+    Ok(())
+  }
+
+  #[test]
+  fn huge_size_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // `usize::MAX` is the largest possible value the deserializer can hand us;
+    // it is also portable across 32- and 64-bit targets, where a literal like
+    // `10_000_000_000` would overflow on 32-bit. The validator must reject it
+    // outright — without the bound, the per-segment heap would grow until the
+    // segment is exhausted or the process OOMs.
+    let aggs = top_hits_request(usize::MAX, 0);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("top_hits with size above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size") && msg.contains("exceeds limit"),
+      "expected size-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn huge_from_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // See `huge_size_is_rejected` — `usize::MAX` keeps the test 32-bit safe.
+    let aggs = top_hits_request(1, usize::MAX);
+    let err = search_with_agg(&idx, aggs)
+      .expect_err("top_hits with from above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("from") && msg.contains("exceeds limit"),
+      "expected from-bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // `MAX_TOP_HITS` is 10_000; exercise the strict `>` boundary on `size`.
+    let aggs = top_hits_request(10_001, 0);
+    let err = search_with_agg(&idx, aggs).expect_err("size = MAX_TOP_HITS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size") && msg.contains("10001"),
+      "expected size bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn from_just_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    let aggs = top_hits_request(0, 10_001);
+    let err = search_with_agg(&idx, aggs).expect_err("from = MAX_TOP_HITS + 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("from") && msg.contains("10001"),
+      "expected from bound error mentioning the offending value, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_plus_from_above_cap_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // Each value is below the cap, but the sum exceeds it. Without the
+    // additive check, an attacker could pick `size = cap` and `from = cap`
+    // to size the heap at `2 * cap` and bypass the per-dimension bound.
+    let aggs = top_hits_request(10_000, 1);
+    let err =
+      search_with_agg(&idx, aggs).expect_err("size + from above MAX_TOP_HITS must be rejected");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("size + from") && msg.contains("exceeds limit"),
+      "expected combined bound error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn size_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // 10_000 hits is intentionally accepted so legitimate clients keep working.
+    let aggs = top_hits_request(10_000, 0);
+    search_with_agg(&idx, aggs).expect("size at the cap must be accepted");
+  }
+
+  #[test]
+  fn size_plus_from_at_cap_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    // The combined bound is `<= MAX_TOP_HITS`, not `<`. Exercise the boundary
+    // so a future tightening of the check does not silently break clients
+    // that already rely on `size + from = cap`.
+    let aggs = top_hits_request(9_000, 1_000);
+    search_with_agg(&idx, aggs).expect("size + from at the cap must be accepted");
+  }
+
+  #[test]
+  fn small_top_hits_request_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = corpus_index(tmp.path());
+
+    let aggs = top_hits_request(2, 1);
+    search_with_agg(&idx, aggs).expect("typical top_hits values must be accepted");
   }
 }

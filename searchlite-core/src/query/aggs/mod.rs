@@ -42,6 +42,22 @@ pub struct AggregationContext<'a> {
 /// still allowing thousands of buckets. Deployments that need a different limit can adjust this
 /// constant at compile time.
 pub(crate) const MAX_BUCKETS: usize = 10_000;
+/// Upper bound on the number of forecast points a single `moving_avg` pipeline may emit.
+///
+/// `predict` controls a `Vec<f64>` allocation in [`apply_moving_avg_pipeline`] sized directly by
+/// untrusted user input (BUG-221). Without a cap, a tiny request body can drive an unbounded heap
+/// allocation during response finalization. We share the same `10_000` ceiling as `MAX_BUCKETS`
+/// so the forecast horizon never grows past the materialization budget for any other bucketing
+/// aggregation in the same request.
+pub(crate) const MAX_PREDICTIONS: usize = MAX_BUCKETS;
+/// Upper bound on the number of hits a single `top_hits` sub-aggregation may track per segment.
+///
+/// `size` and `from` control the per-segment `BinaryHeap<RankedDoc>` allocation in
+/// [`TopHitsCollector`]; without a cap, a tiny request body can size the heap from untrusted user
+/// input and drive an unbounded heap growth during collection (BUG-222). We share the same
+/// `10_000` ceiling as `MAX_BUCKETS` so the materialized hit set never grows past the
+/// materialization budget for any other bucketing aggregation in the same request.
+pub(crate) const MAX_TOP_HITS: usize = MAX_BUCKETS;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
 
@@ -1102,7 +1118,7 @@ impl<'a> RangeCollector<'a> {
     for entry in self.ranges.iter_mut() {
       if values.iter().any(|val| {
         let ge_from = entry.from.map(|f| *val >= f).unwrap_or(true);
-        let lt_to = entry.to.map(|t| *val <= t).unwrap_or(true);
+        let lt_to = entry.to.map(|t| *val < t).unwrap_or(true);
         ge_from && lt_to
       }) {
         entry.bucket.doc_count += 1;
@@ -2090,10 +2106,23 @@ impl<'a> TopHitsCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &TopHitsAggregation) -> Self {
     let plan = SortPlan::from_request(ctx.schema, &agg.sort)
       .expect("top_hits sort validated during request planning");
+    // Defense-in-depth: clamp `size` and `from` to `MAX_TOP_HITS` so an internal caller that
+    // bypasses `validate_aggregations_in_scope` cannot drive an unbounded `BinaryHeap` here
+    // (BUG-222). The request validator rejects values past the cap up-front; the `min` calls are
+    // a hard ceiling on the per-segment heap. We persist the bounded values into the struct so
+    // every downstream use (heap sizing, `finish`'s `start + size` arithmetic, the
+    // `Vec::with_capacity` for hits) stays within the cap and consistent with `limit`. `.max(1)`
+    // on `limit` preserves the legacy invariant that the collector retains the best hit even
+    // when callers ask for `size = 0` so the merge step has a candidate to pick from.
+    let bounded_size = agg.size.min(MAX_TOP_HITS);
+    let bounded_from = agg.from.min(MAX_TOP_HITS);
+    let limit = bounded_size
+      .saturating_add(bounded_from)
+      .clamp(1, MAX_TOP_HITS);
     Self {
-      size: agg.size,
-      from: agg.from,
-      limit: agg.size.saturating_add(agg.from).max(agg.size).max(1),
+      size: bounded_size,
+      from: bounded_from,
+      limit,
       heap: BinaryHeap::new(),
       total: 0,
       fields: agg.fields.clone(),
@@ -2126,11 +2155,14 @@ impl<'a> TopHitsCollector<'a> {
   fn finish(mut self) -> TopHitsState {
     let mut ranked: Vec<RankedDoc> = self.heap.drain().collect();
     ranked.sort_by(|a, b| a.key.cmp(&b.key));
-    let start = self.from.min(ranked.len());
-    let end = (start + self.size).min(ranked.len());
-    let mut hits = Vec::with_capacity(end.saturating_sub(start));
-    for doc in ranked.into_iter().skip(start).take(self.size) {
-      let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    // Keep all top `(from + size)` ranked items for this segment; the final
+    // `from` skip is applied once globally after segments are merged in
+    // `finalize_response`. Applying the skip here would discard items whose
+    // segment-local rank is `< from` but whose global rank is within the
+    // requested `[from, from + size)` page — see BUG-215 for details.
+    let mut hits = Vec::with_capacity(ranked.len());
+    let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    for doc in ranked.into_iter() {
       let fetched = if need_doc {
         self.ctx.segment.get_doc(doc.doc_id).ok()
       } else {
@@ -2687,8 +2719,11 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
   }
   let mut hits: Vec<_> = heap.into_iter().collect();
   hits.sort_by(|a, b| a.key.cmp(&b.key));
-  let start = target.from.min(hits.len());
-  target.hits = hits.into_iter().skip(start).take(target.size).collect();
+  // Keep the full merged top `(from + size)` window; the `from` skip is
+  // applied once in `finalize_response` so that per-segment items at ranks
+  // `[0, from)` are not discarded before the merge can compare them against
+  // other segments (BUG-215).
+  target.hits = hits;
 }
 
 fn bucket_key_string(key: &serde_json::Value) -> String {
@@ -2933,10 +2968,24 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
         values: compute_percentile_ranks_from_state(state),
       })
     }
-    AggregationIntermediate::TopHits(state) => AggregationResponse::TopHits(TopHitsResponse {
-      total: state.total,
-      hits: state.hits.into_iter().map(|h| h.hit).collect(),
-    }),
+    AggregationIntermediate::TopHits(state) => {
+      // `state.hits` holds the top `(from + size)` merged hits; apply the
+      // final `from` skip and truncate to `size` to produce the response
+      // page. Doing the skip here (instead of per-segment) ensures items at
+      // segment-local ranks `[0, from)` can still win the global `[from,
+      // from + size)` window after cross-segment merging.
+      let start = state.from.min(state.hits.len());
+      AggregationResponse::TopHits(TopHitsResponse {
+        total: state.total,
+        hits: state
+          .hits
+          .into_iter()
+          .skip(start)
+          .take(state.size)
+          .map(|h| h.hit)
+          .collect(),
+      })
+    }
     AggregationIntermediate::Filter {
       bucket,
       pipeline,
@@ -3112,6 +3161,15 @@ fn apply_moving_avg_pipeline(
   let series = bucket_metric_series(buckets, &cfg.buckets_path);
   let policy = cfg.gap_policy.unwrap_or(GapPolicy::Skip);
   let mut window_values: VecDeque<f64> = VecDeque::new();
+  // The request validator rejects `window = 0` (BUG-221) so this is the documented
+  // precondition; assert it loudly in dev/test builds. The `.max(1)` survives as a
+  // production safety net so an internal caller that bypasses validation still gets
+  // a windowed average rather than the deque growing unboundedly to `buckets.len()`.
+  debug_assert!(
+    cfg.window >= 1,
+    "moving_avg window must be >= 1; got {}",
+    cfg.window
+  );
   let window = cfg.window.max(1);
   let mut avgs = Vec::with_capacity(buckets.len());
   for (idx, bucket) in buckets.iter_mut().enumerate() {
@@ -3143,6 +3201,11 @@ fn apply_moving_avg_pipeline(
   let mut predictions = Vec::new();
   if let Some(predict) = cfg.predict {
     if let Some(last_avg) = avgs.last().and_then(|v| *v) {
+      // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
+      // that bypasses `validate_aggregations_in_scope` cannot drive an unbounded
+      // allocation here (BUG-221). The request validator rejects values past the cap
+      // up-front; this `min` is just a hard ceiling on the materialization step.
+      let predict = predict.min(MAX_PREDICTIONS);
       // Simple forecast that repeats the last observed average to avoid feedback loops.
       predictions = vec![last_avg; predict];
     }

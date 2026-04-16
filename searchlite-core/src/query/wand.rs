@@ -256,6 +256,41 @@ impl TermState {
     }
     self.idx.saturating_sub(prev)
   }
+
+  /// Skip forward through blocks whose per-block max-tf score contribution
+  /// is below `min_contribution`. Stops at the first block whose upper bound
+  /// meets the threshold, or at the end of the postings list.
+  ///
+  /// This is the BMW (Block-Max WAND) optimisation described in BUG-005:
+  /// during the advancement phase, blocks whose max-tf cannot contribute
+  /// enough to push a candidate past the heap threshold are skipped entirely,
+  /// avoiding unnecessary `advance_to` work within those blocks.
+  fn skip_blocks_below_bound(&mut self, min_contribution: f32) -> usize {
+    if min_contribution <= 0.0 {
+      return 0;
+    }
+    let prev = self.idx;
+    let mut block_idx = self.block_index();
+    while block_idx < self.block_meta.tfs.len() {
+      let tf = self.block_meta.tfs[block_idx];
+      let bound = score_tf(
+        tf,
+        self.df,
+        self.min_doc_len,
+        self.avgdl,
+        self.docs,
+        self.k1,
+        self.b,
+        self.weight,
+      );
+      if bound >= min_contribution {
+        break;
+      }
+      block_idx += 1;
+      self.idx = (block_idx * self.block_meta.block_size).min(self.postings.len());
+    }
+    self.idx.saturating_sub(prev)
+  }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -827,16 +862,42 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         }
       }
     } else {
-      // Pivot > Smallest. Advance terms < pivot to pivot_doc
-      for term in queue[0..p_idx].iter_mut() {
-        if use_block_bounds {
+      // Pivot > Smallest. Advance terms < pivot to pivot_doc.
+      //
+      // BMW optimisation (BUG-005): when we have a full top-k heap and
+      // block-level bounds are available, skip blocks whose per-block
+      // max-tf score cannot contribute enough to push a candidate past
+      // the heap threshold. For each term being advanced, the minimum
+      // contribution needed from this term is:
+      //   min_needed = heap_threshold - Σ UB_global(other terms)
+      // because the global upper bound of every other term is an upper
+      // bound on what those terms could contribute at any doc_id.
+      if use_block_bounds && rank_hits && heap.len() >= k {
+        let total_ub: f32 = queue.iter().map(|t| t.upper_bound()).sum();
+        for term in queue[0..p_idx].iter_mut() {
+          let other_ub = total_ub - term.upper_bound();
+          let min_needed = (heap_threshold - other_ub).max(0.0);
+          let moved = term.skip_blocks_below_bound(min_needed);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
           let moved = term.skip_to_block(pivot_doc);
           with_stats(&mut stats, |s| s.postings_advanced += moved);
+          let moved = term.advance_to(pivot_doc);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
+          if term.is_done() {
+            prune_done = true;
+          }
         }
-        let moved = term.advance_to(pivot_doc);
-        with_stats(&mut stats, |s| s.postings_advanced += moved);
-        if term.is_done() {
-          prune_done = true;
+      } else {
+        for term in queue[0..p_idx].iter_mut() {
+          if use_block_bounds {
+            let moved = term.skip_to_block(pivot_doc);
+            with_stats(&mut stats, |s| s.postings_advanced += moved);
+          }
+          let moved = term.advance_to(pivot_doc);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
+          if term.is_done() {
+            prune_done = true;
+          }
         }
       }
       // Reposition only the advanced prefix.
@@ -995,5 +1056,341 @@ mod tests {
     let mut ids: Vec<DocId> = collector.docs.iter().map(|(id, _)| *id).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
+  }
+
+  /// Helper that builds a ScoredTerm with a specific block size so the caller
+  /// can control per-block tf upper bounds in tests.
+  fn term_from_entries_with_block_size(entries: &[PostingEntry], block_size: usize) -> ScoredTerm {
+    let reader = PostingsReader::from_entries_for_test(entries.to_vec(), block_size);
+    let max_doc = entries.iter().map(|e| e.doc_id).max().unwrap_or(0) as usize;
+    let doc_lengths = Arc::new(vec![10.0; max_doc.saturating_add(1)]);
+    ScoredTerm {
+      postings: reader,
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(doc_lengths),
+      min_doc_len: Some(10.0),
+    }
+  }
+
+  #[test]
+  fn bmw_produces_same_top_k_as_wand() {
+    // Two terms with overlapping postings; verify BMW and WAND return
+    // identical top-k results (correctness invariant).
+    let term1 = term_from_entries(&[
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 3,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 5,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 8,
+        term_freq: 2,
+        positions: smallvec![],
+      },
+    ]);
+    let term2 = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 4,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 7,
+        term_freq: 6,
+        positions: smallvec![],
+      },
+    ]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let wand = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![term1.clone(), term2.clone()],
+      3,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+    let bmw = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![term1, term2],
+      3,
+      ExecutionStrategy::Bmw,
+      None,
+      &mut accept,
+      None,
+    );
+    assert_eq!(
+      wand.len(),
+      bmw.len(),
+      "WAND and BMW should return same count"
+    );
+    for (w, b) in wand.iter().zip(bmw.iter()) {
+      assert_eq!(w.doc_id, b.doc_id, "doc_id mismatch");
+      assert!(
+        (w.score - b.score).abs() < 1e-6,
+        "score mismatch: wand={} bmw={}",
+        w.score,
+        b.score
+      );
+    }
+  }
+
+  #[test]
+  fn bmw_block_tf_skipping_exercises_advancement_path() {
+    // Regression test for BUG-005: exercises the `pivot_doc > smallest_doc`
+    // advancement branch where `skip_blocks_below_bound` is called.
+    //
+    // Layout (block_size = 4):
+    //
+    //   anchor: 8 entries at doc_ids [0..4, 40..44], all tf=20
+    //     block 0 (entries 0-3): docs [0,1,2,3],     max_tf=20
+    //     block 1 (entries 4-7): docs [40,41,42,43],  max_tf=20
+    //
+    //   spread: 44 entries at doc_ids [0..4] tf=20, [4..40] tf=1, [40..44] tf=20
+    //     block 0  (entries 0-3):   docs [0,1,2,3],     max_tf=20
+    //     block 1  (entries 4-7):   docs [4,5,6,7],     max_tf=1   ← skippable
+    //     block 2  (entries 8-11):  docs [8,9,10,11],   max_tf=1   ← skippable
+    //     ...
+    //     block 9  (entries 36-39): docs [36,37,38,39], max_tf=1   ← skippable
+    //     block 10 (entries 40-43): docs [40,41,42,43], max_tf=20
+    //
+    // Phase 1 (docs 0-3): both terms score together (tf=20 each).
+    //   The top-k heap fills with high combined scores (k=3).
+    //
+    // Phase 2: anchor jumps to doc 40. spread is at doc 4.
+    //   Queue: [spread(4), anchor(40)]
+    //   Pivot scan accumulates spread.block_ub(tf=1) + anchor.block_ub(tf=20).
+    //   pivot_doc = 40 > smallest_doc = 4 → advancement branch entered.
+    //   spread must advance from doc 4 to doc 40 through 9 blocks of tf=1.
+    //   skip_blocks_below_bound skips those low-tf blocks.
+    let block_size = 4;
+
+    // anchor: high-tf entries at low and high doc_ids with a gap.
+    let mut anchor_entries = Vec::new();
+    for doc_id in 0..4 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 40..44 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    let anchor = term_from_entries_with_block_size(&anchor_entries, block_size);
+
+    // spread: overlaps anchor at both ends, with many low-tf entries in between.
+    let mut spread_entries = Vec::new();
+    for doc_id in 0..4 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 4..40 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 1,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 40..44 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    let spread = term_from_entries_with_block_size(&spread_entries, block_size);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+
+    // Run with plain WAND (no block-tf skipping)
+    let mut wand_stats = QueryStats::default();
+    let wand_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor.clone(), spread.clone()],
+      3,
+      ExecutionStrategy::Wand,
+      Some(block_size),
+      &mut accept,
+      None,
+      Some(&mut wand_stats),
+    );
+
+    // Run with BMW (block-tf skipping active)
+    let mut bmw_stats = QueryStats::default();
+    let bmw_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, spread],
+      3,
+      ExecutionStrategy::Bmw,
+      Some(block_size),
+      &mut accept,
+      None,
+      Some(&mut bmw_stats),
+    );
+
+    // Results must be identical (correctness).
+    assert_eq!(
+      wand_results.len(),
+      bmw_results.len(),
+      "WAND and BMW should return same number of results"
+    );
+    for (w, b) in wand_results.iter().zip(bmw_results.iter()) {
+      assert_eq!(w.doc_id, b.doc_id, "doc_id mismatch");
+      assert!(
+        (w.score - b.score).abs() < 1e-6,
+        "score mismatch at doc {}: wand={} bmw={}",
+        w.doc_id,
+        w.score,
+        b.score
+      );
+    }
+
+    // BMW should advance strictly fewer postings than plain WAND because
+    // spread's low-tf blocks (doc_ids 4-39) are skipped in the advancement
+    // phase rather than walked entry-by-entry.
+    assert!(
+      bmw_stats.postings_advanced < wand_stats.postings_advanced,
+      "BMW should advance strictly fewer postings than WAND: bmw={} wand={}",
+      bmw_stats.postings_advanced,
+      wand_stats.postings_advanced
+    );
+  }
+
+  #[test]
+  fn skip_blocks_below_bound_skips_low_tf_blocks() {
+    // Directly test the skip_blocks_below_bound method on a TermState
+    // with known block-level tf values.
+    let block_size = 2;
+    // 3 blocks: block 0 (tf=1), block 1 (tf=1), block 2 (tf=10)
+    let entries = vec![
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 3,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 4,
+        term_freq: 10,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 10,
+        positions: smallvec![],
+      },
+    ];
+    let term = ScoredTerm {
+      postings: PostingsReader::from_entries_for_test(entries, block_size),
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 6])),
+      min_doc_len: Some(10.0),
+    };
+    let mut state = TermState::new(term, block_size);
+
+    // Compute the score bound for tf=1 (low blocks) and tf=10 (high block)
+    let low_bound = score_tf(1.0, 6.0, 10.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+    let high_bound = score_tf(10.0, 6.0, 10.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+
+    // Set min_contribution between low and high so low blocks are skipped
+    let threshold = (low_bound + high_bound) / 2.0;
+    assert!(
+      threshold > low_bound,
+      "threshold must exceed low block bound"
+    );
+    assert!(
+      threshold < high_bound,
+      "threshold must be below high block bound"
+    );
+
+    // Start at block 0 (idx=0). Calling skip_blocks_below_bound should skip
+    // blocks 0 and 1 (both have tf=1 < threshold) and land at block 2 (idx=4).
+    let skipped = state.skip_blocks_below_bound(threshold);
+    assert_eq!(state.idx, 4, "should advance to block 2 (idx=4)");
+    assert_eq!(skipped, 4, "should have skipped 4 postings");
+
+    // Verify the block at idx=4 has doc_id=4
+    assert_eq!(state.doc_id(), 4);
+  }
+
+  #[test]
+  fn skip_blocks_below_bound_noop_when_threshold_zero() {
+    let block_size = 2;
+    let entries = vec![
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ];
+    let term = ScoredTerm {
+      postings: PostingsReader::from_entries_for_test(entries, block_size),
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 2])),
+      min_doc_len: Some(10.0),
+    };
+    let mut state = TermState::new(term, block_size);
+
+    // With threshold <= 0, nothing should be skipped
+    let skipped = state.skip_blocks_below_bound(0.0);
+    assert_eq!(skipped, 0);
+    assert_eq!(state.idx, 0);
+
+    let skipped = state.skip_blocks_below_bound(-1.0);
+    assert_eq!(skipped, 0);
+    assert_eq!(state.idx, 0);
   }
 }

@@ -83,6 +83,17 @@ impl Manifest {
   pub fn manifest_path(root: &Path) -> PathBuf {
     root.join("MANIFEST.json")
   }
+
+  /// Path for a staged manifest that has been written but not yet promoted
+  /// to the live `MANIFEST.json`.
+  ///
+  /// `Writer::commit` stages the new manifest here *before* appending the
+  /// WAL commit record (the durability fence). On a crash between the WAL
+  /// commit fence and the live manifest publish, [`Index::open`] reconciles
+  /// the two by promoting this file to `MANIFEST.json` (see BUG-018).
+  pub fn manifest_pending_path(root: &Path) -> PathBuf {
+    root.join("MANIFEST.json.pending")
+  }
 }
 
 #[derive(Debug, Clone, Default)]
