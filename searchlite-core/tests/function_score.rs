@@ -363,6 +363,46 @@ fn rank_feature_uses_numeric_fast_field() {
 }
 
 #[test]
+fn log2p_modifier_uses_natural_log_of_value_plus_two() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::Log2p),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-1=10, doc-3=5, doc-2=1
+  // Log2p = ln(value + 2): ln(12) ≈ 2.485, ln(7) ≈ 1.946, ln(3) ≈ 1.099
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(
+    (scores[0] - 12_f64.ln() as f32).abs() < 1e-4,
+    "doc-1: {}",
+    scores[0]
+  );
+  assert!(
+    (scores[1] - 7_f64.ln() as f32).abs() < 1e-4,
+    "doc-3: {}",
+    scores[1]
+  );
+  assert!(
+    (scores[2] - 3_f64.ln() as f32).abs() < 1e-4,
+    "doc-2: {}",
+    scores[2]
+  );
+}
+
+#[test]
 fn script_score_evaluates_expression_with_score_and_field() {
   let reader = setup_reader();
   let req = base_request(QueryNode::ScriptScore {
