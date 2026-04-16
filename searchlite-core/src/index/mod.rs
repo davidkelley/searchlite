@@ -7,6 +7,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 
+use crate::api::errors::WriteKeyError;
 use crate::api::types::{Document, IndexOptions, StorageType};
 use crate::index::directory::ensure_root;
 use crate::index::manifest::{Manifest, Schema};
@@ -186,14 +187,14 @@ impl Index {
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest_snapshot.write_key.as_ref() {
           crate::util::write_key::verify_write_key(key, meta)?;
         }
         let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
         for seg_binding in seg_bindings.iter() {
           if !crate::util::write_key::verify_binding(seg_binding, &binding) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         write_binding = Some(binding);
@@ -201,7 +202,7 @@ impl Index {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
     if manifest_snapshot.segments.len() <= 1 {
@@ -330,14 +331,14 @@ impl Index {
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for merge"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest_snapshot.write_key.as_ref() {
           crate::util::write_key::verify_write_key(key, meta)?;
         }
         let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
         for seg_binding in seg_bindings.iter() {
           if !crate::util::write_key::verify_binding(seg_binding, &binding) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         write_binding = Some(binding);
@@ -345,7 +346,7 @@ impl Index {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
 

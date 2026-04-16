@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
-use crate::api::errors::PatchError;
+use crate::api::errors::{PatchError, WriteKeyError};
 use crate::api::reader::IndexReader;
 use crate::api::types::Document;
 use crate::index::manifest::{Manifest, NestedField, NestedProperty, Schema};
@@ -122,25 +122,23 @@ impl IndexWriter {
     if binding_required {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest.write_key.as_ref() {
           verify_write_key(key, meta)?;
         }
         let candidate = binding_for_uuid(key, &manifest.uuid);
         if let Some(b) = wal_binding.as_ref() {
           if !verify_binding(b, &candidate) {
-            bail!("write key does not match WAL binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("WAL binding; index may be tampered").into());
           }
         }
         for seg_binding in segments_binding.iter() {
           if !verify_binding(seg_binding, &candidate) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
-          bail!(
-            "write key metadata missing but bindings exist; index metadata was likely tampered"
-          );
+          return Err(WriteKeyError::MetadataTampered.into());
         }
         write_binding = Some(candidate.clone());
         if wal_binding.is_none() {
@@ -151,7 +149,7 @@ impl IndexWriter {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
@@ -526,10 +524,14 @@ impl IndexWriter {
   /// `commit_with_merge_and_key` instead.
   pub fn commit_with_merge(&mut self, merge: bool) -> Result<()> {
     if merge && self.write_binding.is_some() {
-      bail!(
+      // Classify as a typed write-key error so FFI / downstream callers can
+      // recognise it via `downcast_ref::<WriteKeyError>` without sniffing the
+      // error's Display string. Attach the API-hint as anyhow context so the
+      // human-readable advice (`use commit_with_merge_and_key ...`) survives.
+      return Err(anyhow::Error::from(WriteKeyError::Required).context(
         "this index requires a write key for merge; \
-         use commit_with_merge_and_key(merge, Some(key)) instead"
-      );
+         use commit_with_merge_and_key(merge, Some(key)) instead",
+      ));
     }
     self.commit_with_merge_and_key(merge, None)
   }
