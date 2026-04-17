@@ -4058,11 +4058,12 @@ fn bucket_start(value: i64, offset: i64, interval: &DateInterval) -> Option<i64>
 
 /// Advance a bucket key to the next bucket key for the fill loop.
 ///
-/// Unlike [`add_interval`], this is offset-aware: for `Calendar` intervals it
-/// strips the offset to recover the calendar-aligned (day=1, hms=0) timestamp
-/// produced by `truncate_calendar`, advances that aligned value by one
-/// calendar unit, then re-applies the offset. Callers must pass a `current`
-/// that is itself a valid [`bucket_start`] output (i.e. already offset-shifted).
+/// Offset-aware: for `Calendar` intervals this strips the offset to recover
+/// the calendar-aligned (day=1, hms=0) timestamp produced by
+/// `truncate_calendar`, advances that aligned value by one calendar unit, then
+/// re-applies the offset. For `Fixed` intervals the offset is ignored and the
+/// step is simply added. Callers must pass a `current` that is itself a valid
+/// [`bucket_start`] output (i.e. already offset-shifted).
 ///
 /// This round-trip avoids the iterative day-of-month drift that afflicts
 /// chained [`add_calendar`] calls in the fill loop: once a short month
@@ -5112,7 +5113,7 @@ mod tests {
     ];
 
     // Sanity: every expected key round-trips through bucket_start for a doc
-    // one day into the *next* month (proves these really are the canonical
+    // in the middle of each month (proves these really are the canonical
     // keys that `DateHistogramCollector::collect` stores for documents).
     let doc_probes = [
       to_ms(2024, 1, 15, 12),
@@ -5225,9 +5226,10 @@ mod tests {
   /// Regression for BUG-293: `date_histogram_span_exceeds_cap` uses the same
   /// fill-loop traversal as the collector (via `next_bucket_start`), so the
   /// drift-fix must also keep its counting loop from overshooting `MAX_BUCKETS`
-  /// or undercounting due to misaligned keys. Verify an `extended_bounds` span
-  /// of January through May 2024 with a `-2h` offset reports exactly five
-  /// buckets (under the cap), matching the fill-loop output.
+  /// or undercounting due to misaligned keys. Verify that an `extended_bounds`
+  /// span of January through May 2024 with a `-2h` offset both (a) reports the
+  /// span as under the cap and (b) produces exactly five aligned monthly keys
+  /// when traversed via `next_bucket_start`, matching the collector's output.
   #[test]
   fn date_histogram_span_exceeds_cap_counts_through_february_without_drift() {
     use chrono::{NaiveDate, Utc};
@@ -5238,16 +5240,43 @@ mod tests {
         .unwrap();
       chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
     };
-    let extended = Some((to_ms(2024, 1, 1, 0), to_ms(2024, 5, 31, 23)));
+    // max deliberately sits inside the May bucket (docs at/after 22:00 on
+    // May 31 shift past midnight and would land in the June bucket, padding
+    // the fill range to six keys and obscuring the aligned-key assertion).
+    let (min, max) = (to_ms(2024, 1, 1, 0), to_ms(2024, 5, 31, 21));
     let offset_ms: i64 = -2 * 3_600_000;
-    // Five inclusive monthly buckets — comfortably under MAX_BUCKETS.
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+
+    // (a) Boolean span check: five inclusive monthly buckets — under the cap.
     assert!(!date_histogram_span_exceeds_cap(
-      extended,
+      Some((min, max)),
       None,
       offset_ms,
       None,
       Some(CalendarUnit::Month)
     ));
+
+    // (b) Reproduce the same fill-loop traversal the cap check performs and
+    // assert it yields exactly five aligned monthly keys, matching the keys
+    // `DateHistogramCollector::finish` would emit for this configuration.
+    let mut cur = bucket_start(min, offset_ms, &interval).unwrap();
+    let end = bucket_start(max, offset_ms, &interval).unwrap();
+    let mut keys = vec![cur];
+    while cur < end {
+      cur = next_bucket_start(cur, offset_ms, &interval).unwrap();
+      keys.push(cur);
+    }
+    let expected = vec![
+      to_ms(2023, 12, 31, 22), // January docs
+      to_ms(2024, 1, 31, 22),  // February docs
+      to_ms(2024, 2, 29, 22),  // March docs
+      to_ms(2024, 3, 31, 22),  // April docs
+      to_ms(2024, 4, 30, 22),  // May docs
+    ];
+    assert_eq!(
+      keys, expected,
+      "span-cap fill-loop traversal must produce five drift-free monthly keys"
+    );
   }
 
   /// Regression test for #249: finalize_response must rank significant_terms
