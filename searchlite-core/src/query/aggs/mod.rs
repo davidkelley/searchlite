@@ -4671,25 +4671,55 @@ mod tests {
       CalendarUnit::Quarter,
       CalendarUnit::Year,
     ];
-    // Values chosen so that `value - offset` (or `start + offset`) would
-    // overflow an `i64` under unchecked arithmetic.
-    let cases: &[(i64, i64)] = &[
+    // Cases where `value - offset` (or `start + offset`) would overflow
+    // an `i64` under unchecked arithmetic, so the correct result is `None`.
+    let must_be_none: &[(i64, i64)] = &[
       (i64::MIN + 500, 1_000),  // subtraction overflow on the way in
       (i64::MIN, 1),            // exact `i64::MIN` with positive offset
       (i64::MAX - 500, -1_000), // addition overflow on the way in
       (i64::MAX, -1),           // exact `i64::MAX` with negative offset
     ];
     for unit in units {
-      for &(value, offset) in cases {
-        // Must not panic under debug overflow checks, and must not wrap.
+      for &(value, offset) in must_be_none {
+        // Must not panic under debug overflow checks. Because
+        // `value.checked_sub(offset)` overflows for these inputs, the
+        // calendar path must short-circuit to `None` rather than wrap
+        // and produce a silently incorrect bucket key.
         let result = bucket_start(value, offset, &DateInterval::Calendar(unit));
-        if let Some(start) = result {
-          assert!(
-            start.checked_add(offset).is_some(),
-            "bucket_start returned a value that cannot represent the \
-             offset-adjusted bucket key for value={value}, offset={offset}"
-          );
-        }
+        assert_eq!(
+          result, None,
+          "bucket_start must return None when `value - offset` overflows \
+           (unit={unit:?}, value={value}, offset={offset}); unchecked \
+           arithmetic would have wrapped to an incorrect bucket key"
+        );
+      }
+    }
+
+    // Non-overflowing cases near the bounds: bucket_start must agree with
+    // a locally-computed reference that performs the same checked
+    // sub -> truncate_calendar -> checked_add pipeline. This catches any
+    // future regression that re-introduces wrapping on the inner values
+    // even if the outer arithmetic happens to round-trip.
+    let safe_cases: &[(i64, i64)] = &[
+      (0, 0),
+      (0, 1_000),
+      (1_000, 0),
+      (-1_000, 0),
+      (1_577_836_800_000, 3_600_000), // 2020-01-01T00:00:00Z, +1h offset
+      (-62_135_596_800_000, 0),       // year 1 CE, no offset
+    ];
+    for unit in units {
+      for &(value, offset) in safe_cases {
+        let expected = value
+          .checked_sub(offset)
+          .and_then(|shifted| truncate_calendar(shifted, unit))
+          .and_then(|start| start.checked_add(offset));
+        let actual = bucket_start(value, offset, &DateInterval::Calendar(unit));
+        assert_eq!(
+          actual, expected,
+          "bucket_start disagrees with the reference checked pipeline \
+           for unit={unit:?}, value={value}, offset={offset}"
+        );
       }
     }
   }
