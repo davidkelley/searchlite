@@ -1,13 +1,24 @@
-use hashbrown::HashMap;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::api::scoring::score_sort_key;
 use crate::api::types::SortOrder;
 use crate::index::segment::SegmentReader;
 use crate::query::sort::{SortKey, SortPlan, SortValue};
 use crate::DocId;
+
+/// Compact entry list for `DocLookupMap`. A given `doc_id` usually lives in a
+/// single segment, so the inline capacity of `1` keeps the common case off the
+/// heap while still supporting multi-segment tombstones for updated documents.
+pub(crate) type DocLookupEntries = SmallVec<[(u32, DocId); 1]>;
+
+/// Map from `doc_id` to the `(segment_ord, doc_idx)` pairs that currently host
+/// it. Keys are cheaply shared `Arc<str>` clones of the segment-owned doc_ids.
+pub(crate) type DocLookupMap = HashMap<Arc<str>, DocLookupEntries>;
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 21;
@@ -218,7 +229,7 @@ pub(crate) fn decode_search_after_token(
   token: &[serde_json::Value],
   sort_plan: &SortPlan,
   segments: &[SegmentReader],
-  doc_lookup: &HashMap<String, Vec<(usize, DocId)>>,
+  doc_lookup: &DocLookupMap,
 ) -> Result<SortKey> {
   if token.len() < sort_plan.len().saturating_add(2) {
     bail!(
@@ -252,7 +263,7 @@ pub(crate) fn decode_search_after_token(
     .and_then(|entries| {
       entries
         .iter()
-        .find(|(seg_idx, _)| *seg_idx == segment_ord as usize)
+        .find(|(seg_idx, _)| *seg_idx == segment_ord)
         .map(|(_, doc_idx)| *doc_idx)
     })
     .or_else(|| seg.find_doc_id(&doc_id_str))
