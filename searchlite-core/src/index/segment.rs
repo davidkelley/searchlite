@@ -1290,7 +1290,7 @@ pub struct SegmentReader {
 impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
-    let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     #[cfg(not(feature = "zstd"))]
     if seg_meta.use_zstd {
       bail!(
@@ -1362,10 +1362,9 @@ impl SegmentReader {
         );
       }
     }
-    let doc_ids: Vec<Arc<str>> = seg_meta
-      .doc_ids
-      .iter()
-      .map(|s| Arc::<str>::from(s.as_str()))
+    let doc_ids: Vec<Arc<str>> = std::mem::take(&mut seg_meta.doc_ids)
+      .into_iter()
+      .map(Arc::<str>::from)
       .collect();
     Ok(Self {
       meta,

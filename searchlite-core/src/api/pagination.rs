@@ -1,12 +1,24 @@
-use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::api::reader::DocLookupMap;
+use anyhow::{bail, Context, Result};
+use hashbrown::HashMap;
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
 use crate::api::scoring::score_sort_key;
 use crate::api::types::SortOrder;
 use crate::index::segment::SegmentReader;
 use crate::query::sort::{SortKey, SortPlan, SortValue};
 use crate::DocId;
+
+/// Compact entry list for `DocLookupMap`. A given `doc_id` usually lives in a
+/// single segment, so the inline capacity of `1` keeps the common case off the
+/// heap while still supporting multi-segment tombstones for updated documents.
+pub(crate) type DocLookupEntries = SmallVec<[(u32, DocId); 1]>;
+
+/// Map from `doc_id` to the `(segment_ord, doc_idx)` pairs that currently host
+/// it. Keys are cheaply shared `Arc<str>` clones of the segment-owned doc_ids.
+pub(crate) type DocLookupMap = HashMap<Arc<str>, DocLookupEntries>;
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 21;

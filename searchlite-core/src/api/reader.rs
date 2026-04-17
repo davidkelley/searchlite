@@ -45,6 +45,7 @@ use crate::DocId;
 
 use super::pagination::{
   decode_cursor, decode_search_after_token, encode_cursor, encode_search_after_token, CursorState,
+  DocLookupMap,
 };
 use super::phrase::{
   build_phrase_runtimes, build_phrase_term_map, build_term_doc_lists, expand_phrase_fields,
@@ -314,9 +315,6 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
     RootFilter::Node(filter) => passes_filter(reader, doc_id, filter),
   }
 }
-
-pub(crate) type DocLookupEntries = SmallVec<[(u32, DocId); 1]>;
-pub(crate) type DocLookupMap = HashMap<Arc<str>, DocLookupEntries>;
 
 pub struct IndexReader {
   pub manifest: Manifest,
