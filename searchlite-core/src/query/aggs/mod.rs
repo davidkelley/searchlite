@@ -3578,11 +3578,26 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
   let mut stack: Vec<f64> = Vec::new();
   for token in tokens.into_iter() {
     match token {
-      ScriptToken::Number(v) => stack.push(v),
-      ScriptToken::Var(name) => stack.push(*vars.get(&name)?),
+      ScriptToken::Number(v) => {
+        if !v.is_finite() {
+          return None;
+        }
+        stack.push(v);
+      }
+      ScriptToken::Var(name) => {
+        let v = *vars.get(&name)?;
+        if !v.is_finite() {
+          return None;
+        }
+        stack.push(v);
+      }
       ScriptToken::Neg => {
         let a = stack.pop()?;
-        stack.push(-a);
+        let val = -a;
+        if !val.is_finite() {
+          return None;
+        }
+        stack.push(val);
       }
       ScriptToken::Op(op) => {
         let b = stack.pop()?;
@@ -3599,13 +3614,21 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
           }
           _ => return None,
         };
+        if !result.is_finite() {
+          return None;
+        }
         stack.push(result);
       }
       ScriptToken::LParen | ScriptToken::RParen => {}
     }
   }
   if stack.len() == 1 {
-    stack.pop()
+    let val = stack.pop()?;
+    if val.is_finite() {
+      Some(val)
+    } else {
+      None
+    }
   } else {
     None
   }
@@ -4285,6 +4308,69 @@ mod tests {
     vars.insert("b".to_string(), 2.0);
     let value = eval_bucket_script("a / -b", &vars).unwrap();
     assert!((value - (-5.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_rejects_multiplication_overflow() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1e200);
+    vars.insert("b".to_string(), 1e200);
+    assert!(eval_bucket_script("a * b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_addition_overflow() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::MAX);
+    vars.insert("b".to_string(), f64::MAX);
+    assert!(eval_bucket_script("a + b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_subtraction_overflow() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), -f64::MAX);
+    vars.insert("b".to_string(), f64::MAX);
+    assert!(eval_bucket_script("a - b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_infinity_literal() {
+    let vars = BTreeMap::new();
+    // The tokenizer accepts only digits and '.' for numeric literals (no scientific
+    // notation), so to exercise the `Number(f64::INFINITY)` path we use a decimal
+    // string long enough to overflow `f64` on parse (`f64::MAX` ≈ 1.8e308).
+    let inf_literal = format!("1{}", "0".repeat(309));
+    assert!(eval_bucket_script(&inf_literal, &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_non_finite_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::INFINITY);
+    assert!(eval_bucket_script("a", &vars).is_none());
+
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::NAN);
+    assert!(eval_bucket_script("a + 1", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_negation_of_non_finite_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::INFINITY);
+    assert!(eval_bucket_script("-a", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_overflowing_subexpression() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1e200);
+    vars.insert("b".to_string(), 1e200);
+    // With per-operation finite checks, the `(a * b)` overflow is rejected before
+    // the subtraction runs. This verifies that an overflowing sub-expression
+    // surfaces as None rather than leaking a non-finite value into the outer op.
+    assert!(eval_bucket_script("(a * b) - (a * b)", &vars).is_none());
   }
 
   #[test]
