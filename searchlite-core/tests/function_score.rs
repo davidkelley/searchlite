@@ -686,3 +686,73 @@ fn max_boost_caps_function_score_before_boost_mode_multiply() {
     );
   }
 }
+
+#[test]
+fn rescore_sort_window_excludes_non_rescored_after_removal() {
+  // Regression test for BUG-291: when rescore drops hits from within the
+  // window (via function_score + min_score causing evaluate_compiled_score
+  // to return None), the sort window must shrink by the number of removed
+  // hits. Otherwise non-rescored hits that shifted left into the original
+  // window bounds get re-sorted against rescored hits whose scores are on
+  // a different scale, producing incorrect ranking.
+  let reader = setup_reader();
+  // Base query: MatchAll scored by popularity (field_value_factor, Replace).
+  // Raw scores → doc-1: 10, doc-3: 5, doc-2: 1. Initial order: [doc-1, doc-3, doc-2].
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore window covers only the first two hits (doc-1 and doc-3). The
+  // rescore query yields 0.01 for doc-1 and 0.005 for doc-3; min_score=0.008
+  // drops doc-3 (returns None) but keeps doc-1. With RescoreMode::Multiply:
+  // doc-1 combined = 10 * 0.01 = 0.1. doc-2 sits outside the window and
+  // keeps its raw score of 1.0. If the sort window is not shrunk, the
+  // post-removal sort would re-order doc-2 (1.0) above doc-1 (0.1), even
+  // though doc-2 was never rescored.
+  req.rescore = Some(RescoreRequest {
+    window_size: 2,
+    query: QueryNode::FunctionScore {
+      query: Box::new(QueryNode::MatchAll { boost: None }),
+      functions: vec![FunctionSpec::FieldValueFactor {
+        field: "popularity".into(),
+        factor: 0.001,
+        modifier: Some(FieldValueModifier::None),
+        missing: None,
+        filter: None,
+      }],
+      score_mode: Some(FunctionScoreMode::Sum),
+      boost_mode: Some(FunctionBoostMode::Replace),
+      max_boost: None,
+      min_score: Some(0.008),
+      boost: None,
+    },
+    score_mode: RescoreMode::Multiply,
+  });
+  let resp = reader.search(&req).unwrap();
+  // doc-3 was dropped by rescore; doc-1 stays first (rescored), doc-2 stays
+  // second (non-rescored raw score preserved at its original rank).
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-2"]);
+  let doc1 = resp.hits.iter().find(|h| h.doc_id == "doc-1").unwrap();
+  let doc2 = resp.hits.iter().find(|h| h.doc_id == "doc-2").unwrap();
+  assert!(
+    (doc1.score - 0.1).abs() < 1e-6,
+    "doc-1 combined score should be 10 * 0.01 = 0.1, got {}",
+    doc1.score
+  );
+  assert!(
+    (doc2.score - 1.0).abs() < 1e-6,
+    "doc-2 raw score should be preserved at 1.0, got {}",
+    doc2.score
+  );
+}
