@@ -4044,7 +4044,14 @@ fn bucket_start(value: i64, offset: i64, interval: &DateInterval) -> Option<i64>
       Some(bucket.saturating_mul(*step).saturating_add(offset))
     }
     DateInterval::Calendar(unit) => {
-      truncate_calendar(value - offset, *unit).map(|start| start + offset)
+      // Use checked arithmetic to match the overflow hardening of the
+      // fixed-interval branch above (BUG-289). Plain `value - offset` /
+      // `start + offset` panics in debug builds and wraps silently in
+      // release builds for timestamps near the `i64` bounds; `None`
+      // propagates as "skip this document" through the collector's
+      // existing `None` handling.
+      let shifted = value.checked_sub(offset)?;
+      truncate_calendar(shifted, *unit).and_then(|start| start.checked_add(offset))
     }
   }
 }
@@ -4643,6 +4650,103 @@ mod tests {
           "truncate_calendar returned None for {date} with unit {name}; \
            DateHistogramCollector would silently drop this document",
         );
+      }
+    }
+  }
+
+  /// BUG-289: the calendar path of `bucket_start` previously used plain
+  /// `value - offset` / `start + offset`, which overflows `i64` when a
+  /// document timestamp sits near `i64::MIN`/`i64::MAX` with a non-zero
+  /// offset. In debug builds this panics ("attempt to subtract with
+  /// overflow") on a path reachable from the public search API; in release
+  /// builds it wraps silently and places the document in a bucket that can
+  /// be off by the full `i64` range. With `checked_*` the function returns
+  /// `None`, which the collector already treats as "skip this document".
+  #[test]
+  fn bucket_start_calendar_does_not_overflow_near_i64_bounds() {
+    let units = [
+      CalendarUnit::Day,
+      CalendarUnit::Week,
+      CalendarUnit::Month,
+      CalendarUnit::Quarter,
+      CalendarUnit::Year,
+    ];
+    // Cases where `value - offset` (or `start + offset`) would overflow
+    // an `i64` under unchecked arithmetic, so the correct result is `None`.
+    let must_be_none: &[(i64, i64)] = &[
+      (i64::MIN + 500, 1_000),  // subtraction overflow on the way in
+      (i64::MIN, 1),            // exact `i64::MIN` with positive offset
+      (i64::MAX - 500, -1_000), // addition overflow on the way in
+      (i64::MAX, -1),           // exact `i64::MAX` with negative offset
+    ];
+    for unit in units {
+      for &(value, offset) in must_be_none {
+        // Must not panic under debug overflow checks. Because
+        // `value.checked_sub(offset)` overflows for these inputs, the
+        // calendar path must short-circuit to `None` rather than wrap
+        // and produce a silently incorrect bucket key.
+        let result = bucket_start(value, offset, &DateInterval::Calendar(unit));
+        assert_eq!(
+          result, None,
+          "bucket_start must return None when `value - offset` overflows \
+           (unit={unit:?}, value={value}, offset={offset}); unchecked \
+           arithmetic would have wrapped to an incorrect bucket key"
+        );
+      }
+    }
+
+    // Non-overflowing cases near the bounds: bucket_start must agree with
+    // a locally-computed reference that performs the same checked
+    // sub -> truncate_calendar -> checked_add pipeline. This catches any
+    // future regression that re-introduces wrapping on the inner values
+    // even if the outer arithmetic happens to round-trip.
+    let safe_cases: &[(i64, i64)] = &[
+      (0, 0),
+      (0, 1_000),
+      (1_000, 0),
+      (-1_000, 0),
+      (1_577_836_800_000, 3_600_000), // 2020-01-01T00:00:00Z, +1h offset
+      (-62_135_596_800_000, 0),       // year 1 CE, no offset
+    ];
+    for unit in units {
+      for &(value, offset) in safe_cases {
+        let expected = value
+          .checked_sub(offset)
+          .and_then(|shifted| truncate_calendar(shifted, unit))
+          .and_then(|start| start.checked_add(offset));
+        let actual = bucket_start(value, offset, &DateInterval::Calendar(unit));
+        assert_eq!(
+          actual, expected,
+          "bucket_start disagrees with the reference checked pipeline \
+           for unit={unit:?}, value={value}, offset={offset}"
+        );
+      }
+    }
+  }
+
+  /// BUG-289 cross-path consistency: the calendar and fixed-interval
+  /// branches of `bucket_start` must both tolerate extreme timestamps
+  /// without panicking. The fixed path already used saturating arithmetic;
+  /// the calendar path now uses checked arithmetic. Neither must panic for
+  /// any `(value, offset)` near the `i64` bounds.
+  #[test]
+  fn bucket_start_never_panics_near_i64_bounds() {
+    let intervals = [
+      DateInterval::Fixed(86_400_000), // 1 day
+      DateInterval::Calendar(CalendarUnit::Day),
+      DateInterval::Calendar(CalendarUnit::Month),
+      DateInterval::Calendar(CalendarUnit::Year),
+    ];
+    let values = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+    let offsets = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+    for interval in &intervals {
+      for &value in &values {
+        for &offset in &offsets {
+          // Must return Some or None, never panic. Debug builds would
+          // previously panic on the calendar path with
+          // "attempt to subtract with overflow".
+          let _ = bucket_start(value, offset, interval);
+        }
       }
     }
   }
