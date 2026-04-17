@@ -51,7 +51,9 @@ pub fn highlight_fragments(
       // `replace_all` on the truncated fragment silently fails to highlight.
       let match_len = m.end() - m.start();
       let effective_size = opts.fragment_size.max(match_len);
-      let raw_start = m.start().saturating_sub(effective_size.saturating_sub(match_len) / 2);
+      let raw_start = m
+        .start()
+        .saturating_sub(effective_size.saturating_sub(match_len) / 2);
       let raw_end = usize::min(
         text.len(),
         raw_start.saturating_add(effective_size).max(m.end()),
@@ -152,8 +154,7 @@ mod tests {
     let text = "aaaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee \
                 the quick brown fox jumps over the lazy dog near the river yyyy";
     let phrase: Vec<String> = [
-      "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
-      "river",
+      "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the", "river",
     ]
     .iter()
     .map(|s| s.to_string())
