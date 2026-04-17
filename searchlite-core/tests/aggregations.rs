@@ -3475,7 +3475,7 @@ fn bucket_sort_and_avg_bucket_pipeline() {
     if let Some(searchlite_core::api::types::AggregationResponse::AvgBucket(val)) =
       aggregations.get("avg_scores")
     {
-      assert!(val.value > 0.0);
+      assert!(val.value.expect("avg_bucket value") > 0.0);
     } else {
       panic!("expected avg_bucket");
     }
