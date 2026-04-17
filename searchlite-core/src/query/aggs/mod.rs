@@ -6,14 +6,14 @@ use std::collections::{
 use std::hash::{Hash, Hasher};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, BucketMetricResponse, BucketResponse,
-  BucketScriptAggregation, BucketSortAggregation, BucketSortSpec, CardinalityResponse,
-  CompositeAggregation, CompositeSource, DateHistogramAggregation, DateRangeAggregation,
-  DerivativeAggregation, Filter, FilterAggregation, GapPolicy, HistogramAggregation,
-  MovingAvgAggregation, MovingAvgResponse, NestedAggregation, OptionalBucketMetricResponse,
-  PercentileRanksResponse, PercentilesResponse, RangeAggregation, RareTermsAggregation,
-  SignificantBucketResponse, SignificantTermsAggregation, SortOrder, StatsResponse,
-  TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse, ValueCountResponse,
+  Aggregation, AggregationResponse, AggregationSampling, BucketResponse, BucketScriptAggregation,
+  BucketSortAggregation, BucketSortSpec, CardinalityResponse, CompositeAggregation,
+  CompositeSource, DateHistogramAggregation, DateRangeAggregation, DerivativeAggregation, Filter,
+  FilterAggregation, GapPolicy, HistogramAggregation, MovingAvgAggregation, MovingAvgResponse,
+  NestedAggregation, OptionalBucketMetricResponse, PercentileRanksResponse, PercentilesResponse,
+  RangeAggregation, RareTermsAggregation, SignificantBucketResponse, SignificantTermsAggregation,
+  SortOrder, StatsResponse, TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse,
+  ValueCountResponse,
 };
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
@@ -3204,10 +3204,14 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
-        let value = if count > 0 { sum / count as f64 } else { 0.0 };
+        let value = if count > 0 {
+          Some(sum / count as f64)
+        } else {
+          None
+        };
         responses.insert(
           name.to_string(),
-          AggregationResponse::AvgBucket(BucketMetricResponse { value }),
+          AggregationResponse::AvgBucket(OptionalBucketMetricResponse { value }),
         );
       }
       Aggregation::SumBucket(cfg) => {
@@ -3219,7 +3223,7 @@ fn apply_pipeline_aggs(
         }
         responses.insert(
           name.to_string(),
-          AggregationResponse::SumBucket(BucketMetricResponse { value: sum }),
+          AggregationResponse::SumBucket(OptionalBucketMetricResponse { value: Some(sum) }),
         );
       }
       Aggregation::Derivative(cfg) => {
@@ -3719,7 +3723,7 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) 
       let key = path?;
       vals.values.get(key).copied()
     }
-    AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => Some(val.value),
+    AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => val.value,
     AggregationResponse::Derivative(val) => val.value,
     AggregationResponse::MovingAvg(val) => val.value,
     AggregationResponse::BucketScript(val) => val.value,
@@ -5397,5 +5401,139 @@ mod tests {
       dc_pos < adj_pos,
       "daily_change must come before adjusted, got dc={dc_pos} adj={adj_pos}"
     );
+  }
+
+  #[test]
+  fn avg_bucket_returns_none_when_all_buckets_missing_metric() {
+    use crate::api::types::BucketMetricAggregation;
+
+    // Buckets exist but none of them carry the referenced sub-aggregation,
+    // mirroring the case where every parent bucket has zero matching docs
+    // for the inner avg metric.
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::new(),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 2,
+        aggregations: BTreeMap::new(),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must return None when no bucket contributes a metric value"
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn avg_bucket_returns_none_serializes_without_value_field() {
+    let resp = AggregationResponse::AvgBucket(OptionalBucketMetricResponse { value: None });
+    let json = serde_json::to_value(&resp).unwrap();
+    // Mirrors derivative/bucket_script: when there is no value, the field is
+    // omitted from the JSON output rather than being serialized as 0.0.
+    assert!(
+      json.get("value").is_none(),
+      "expected `value` to be absent when None, got: {json}"
+    );
+  }
+
+  #[test]
+  fn avg_bucket_returns_some_average_when_buckets_have_metric() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 20.0,
+            max: 20.0,
+            sum: 20.0,
+            avg: 20.0,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(val.value, Some(15.0));
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_returns_some_zero_when_no_buckets_contribute() {
+    use crate::api::types::BucketMetricAggregation;
+
+    // sum_bucket follows the additive identity convention: the sum of an
+    // empty set is 0, and the value is wrapped in Some so it round-trips
+    // through the (now optional) response shape.
+    let mut buckets = vec![BucketResponse {
+      key: serde_json::json!("a"),
+      doc_count: 1,
+      aggregations: BTreeMap::new(),
+    }];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "sum_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("sum_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(val.value, Some(0.0));
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
   }
 }
