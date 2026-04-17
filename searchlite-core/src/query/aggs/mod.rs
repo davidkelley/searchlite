@@ -1551,7 +1551,7 @@ impl<'a> DateHistogramCollector<'a> {
           if materialized >= MAX_BUCKETS {
             break;
           }
-          current = match add_interval(current, &self.interval) {
+          current = match next_bucket_start(current, self.offset_millis, &self.interval) {
             Some(next) => next,
             None => break,
           };
@@ -3950,9 +3950,9 @@ fn intersect_fill_range_i64(
 ///
 /// The computation mirrors [`DateHistogramCollector::finish`] exactly: both
 /// sides of the range are pushed through [`bucket_start`] first, then for
-/// `Calendar` intervals we walk the range with [`add_interval`] (bailing out
-/// the moment we cross `MAX_BUCKETS`), and for `Fixed` intervals we divide the
-/// inclusive span by the step. Using a naive `(max - min) / interval` here
+/// `Calendar` intervals we walk the range with [`next_bucket_start`] (bailing
+/// out the moment we cross `MAX_BUCKETS`), and for `Fixed` intervals we divide
+/// the inclusive span by the step. Using a naive `(max - min) / interval` here
 /// would miss the fence-post bucket and ignore `offset`, letting a pathological
 /// request slip past the cap by one or two buckets.
 ///
@@ -3999,7 +3999,7 @@ pub(crate) fn date_histogram_span_exceeds_cap(
       let mut cur = start;
       let mut count: usize = 1;
       while cur < end {
-        cur = match add_interval(cur, &interval) {
+        cur = match next_bucket_start(cur, offset_ms, &interval) {
           Some(next) => next,
           None => break,
         };
@@ -4056,10 +4056,30 @@ fn bucket_start(value: i64, offset: i64, interval: &DateInterval) -> Option<i64>
   }
 }
 
-fn add_interval(current: i64, interval: &DateInterval) -> Option<i64> {
+/// Advance a bucket key to the next bucket key for the fill loop.
+///
+/// Unlike [`add_interval`], this is offset-aware: for `Calendar` intervals it
+/// strips the offset to recover the calendar-aligned (day=1, hms=0) timestamp
+/// produced by `truncate_calendar`, advances that aligned value by one
+/// calendar unit, then re-applies the offset. Callers must pass a `current`
+/// that is itself a valid [`bucket_start`] output (i.e. already offset-shifted).
+///
+/// This round-trip avoids the iterative day-of-month drift that afflicts
+/// chained [`add_calendar`] calls in the fill loop: once a short month
+/// (e.g. February) clamps the preserved `date.day()` from 31 to 29, all
+/// subsequent iterations remain stuck at day 29, causing fill-loop keys to
+/// diverge from the keys `bucket_start` computes for documents starting in
+/// the following month (BUG-293, issue #293). By advancing the calendar-aligned
+/// form (which is always day=1), clamping never happens and each next key is
+/// recomputed canonically from the calendar boundary.
+fn next_bucket_start(current: i64, offset: i64, interval: &DateInterval) -> Option<i64> {
   match interval {
     DateInterval::Fixed(step) => current.checked_add(*step),
-    DateInterval::Calendar(unit) => add_calendar(current, *unit),
+    DateInterval::Calendar(unit) => {
+      let aligned = current.checked_sub(offset)?;
+      let next_aligned = add_calendar(aligned, *unit)?;
+      next_aligned.checked_add(offset)
+    }
   }
 }
 
@@ -4882,12 +4902,12 @@ mod tests {
       "fill loop must produce keys at T01:00:00Z, not T00:00:00Z"
     );
 
-    // Also verify bucket_start + add_interval round-trip consistency
+    // Also verify bucket_start + next_bucket_start round-trip consistency
     let interval = DateInterval::Calendar(CalendarUnit::Month);
     let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
     for expected in &expected_keys {
       assert_eq!(cur, *expected);
-      cur = add_interval(cur, &interval).unwrap();
+      cur = next_bucket_start(cur, offset_ms, &interval).unwrap();
     }
   }
 
@@ -4980,12 +5000,12 @@ mod tests {
       "fill loop must produce keys at day 3, not day 1"
     );
 
-    // Verify bucket_start + add_interval round-trip consistency
+    // Verify bucket_start + next_bucket_start round-trip consistency
     let interval = DateInterval::Calendar(CalendarUnit::Month);
     let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
     for expected in &expected_keys {
       assert_eq!(cur, *expected);
-      cur = add_interval(cur, &interval).unwrap();
+      cur = next_bucket_start(cur, offset_ms, &interval).unwrap();
     }
   }
 
@@ -5052,6 +5072,182 @@ mod tests {
       next_year, expected_year_ts,
       "Feb 29 + Year must clamp to Feb 28 in a non-leap year"
     );
+  }
+
+  /// Regression for BUG-293 (#293): the fill loop must never drift out of
+  /// alignment with `bucket_start` after passing through a short month.
+  ///
+  /// With a sub-day negative offset (`-2h`) and a `calendar_interval: "month"`
+  /// starting at `2023-12-31T22:00Z` (December's bucket key), the fill-loop
+  /// chain must produce keys at `2024-{01-31,02-29,03-31,04-30,05-31}T22:00Z`
+  /// — the same keys `bucket_start` computes for documents in each month.
+  ///
+  /// The previous iterative `add_calendar` approach clamped `date.day()` from
+  /// 31 to 29 when crossing February, then kept day=29 forever after, producing
+  /// `...,03-29,04-29,05-29` instead of the correct `...,03-31,04-30,05-31`.
+  /// `next_bucket_start` re-derives each step from the calendar-aligned form
+  /// (day=1 after stripping the offset), so clamping never persists.
+  #[test]
+  fn next_bucket_start_month_fill_loop_does_not_drift_through_february() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = -2 * 3_600_000; // -2 hours
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+
+    let to_ms = |y, m, d, h| -> i64 {
+      let dt = NaiveDate::from_ymd_opt(y, m, d)
+        .unwrap()
+        .and_hms_opt(h, 0, 0)
+        .unwrap();
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+    };
+
+    // bucket_start keys for documents in each month with offset = -2h.
+    let expected = [
+      to_ms(2023, 12, 31, 22), // December bucket (from Jan 2024 fill start)
+      to_ms(2024, 1, 31, 22),  // January bucket (February's docs)
+      to_ms(2024, 2, 29, 22),  // February bucket (March's docs)
+      to_ms(2024, 3, 31, 22),  // March bucket  (April's docs)
+      to_ms(2024, 4, 30, 22),  // April bucket  (May's docs)
+      to_ms(2024, 5, 31, 22),  // May bucket    (June's docs)
+    ];
+
+    // Sanity: every expected key round-trips through bucket_start for a doc
+    // one day into the *next* month (proves these really are the canonical
+    // keys that `DateHistogramCollector::collect` stores for documents).
+    let doc_probes = [
+      to_ms(2024, 1, 15, 12),
+      to_ms(2024, 2, 15, 12),
+      to_ms(2024, 3, 15, 12),
+      to_ms(2024, 4, 15, 12),
+      to_ms(2024, 5, 15, 12),
+      to_ms(2024, 6, 15, 12),
+    ];
+    for (probe, exp) in doc_probes.iter().zip(expected.iter()) {
+      assert_eq!(
+        bucket_start(*probe, offset_ms, &interval).unwrap(),
+        *exp,
+        "bucket_start must key docs to the offset-shifted month boundary"
+      );
+    }
+
+    // Walking forward with next_bucket_start must produce the same keys.
+    let mut current = expected[0];
+    let mut keys = vec![current];
+    for _ in 1..expected.len() {
+      current = next_bucket_start(current, offset_ms, &interval).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys,
+      expected.to_vec(),
+      "fill loop must stay aligned with bucket_start across short months"
+    );
+  }
+
+  /// Regression for BUG-293: the same drift affects Quarter and Year because
+  /// they share the `date.day()` preservation pattern. Verify both units stay
+  /// aligned when the starting key sits on the 30th/31st of a month whose
+  /// successor has fewer days.
+  #[test]
+  fn next_bucket_start_quarter_and_year_do_not_drift() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = -2 * 3_600_000; // -2 hours
+
+    let to_ms = |y, m, d, h| -> i64 {
+      let dt = NaiveDate::from_ymd_opt(y, m, d)
+        .unwrap()
+        .and_hms_opt(h, 0, 0)
+        .unwrap();
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+    };
+
+    // Quarter: keys at 2023-12-31T22, 2024-03-31T22, 2024-06-30T22, 2024-09-30T22.
+    let q_interval = DateInterval::Calendar(CalendarUnit::Quarter);
+    let q_expected = [
+      to_ms(2023, 12, 31, 22),
+      to_ms(2024, 3, 31, 22),
+      to_ms(2024, 6, 30, 22),
+      to_ms(2024, 9, 30, 22),
+    ];
+    let mut current = q_expected[0];
+    let mut keys = vec![current];
+    for _ in 1..q_expected.len() {
+      current = next_bucket_start(current, offset_ms, &q_interval).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys,
+      q_expected.to_vec(),
+      "Quarter fill loop must not drift across variable-length quarters"
+    );
+
+    // Year: leap-year boundary. Start at 2023-12-31T22 (key for Jan 2024 docs),
+    // then 2024-12-31T22 (key for Jan 2025 docs), etc. No drift should occur
+    // even though 2024 is a leap year and 2025/2026 are not.
+    let y_interval = DateInterval::Calendar(CalendarUnit::Year);
+    let y_expected = [
+      to_ms(2023, 12, 31, 22),
+      to_ms(2024, 12, 31, 22),
+      to_ms(2025, 12, 31, 22),
+      to_ms(2026, 12, 31, 22),
+    ];
+    let mut current = y_expected[0];
+    let mut keys = vec![current];
+    for _ in 1..y_expected.len() {
+      current = next_bucket_start(current, offset_ms, &y_interval).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys,
+      y_expected.to_vec(),
+      "Year fill loop must not drift across leap-year boundaries"
+    );
+  }
+
+  /// Regression for BUG-293: for Fixed intervals `next_bucket_start` must be
+  /// exactly equivalent to `current + step`, matching the previous
+  /// `add_interval` behavior so offset-less fixed_interval histograms are
+  /// unaffected.
+  #[test]
+  fn next_bucket_start_fixed_interval_matches_add_interval() {
+    let interval = DateInterval::Fixed(3_600_000); // 1 hour
+    let base: i64 = 1_700_000_000_000;
+    for offset in [0_i64, 3_600_000, -3_600_000, 86_400_000] {
+      let next = next_bucket_start(base, offset, &interval).unwrap();
+      assert_eq!(
+        next,
+        base + 3_600_000,
+        "Fixed intervals ignore offset and simply add the step"
+      );
+    }
+  }
+
+  /// Regression for BUG-293: `date_histogram_span_exceeds_cap` uses the same
+  /// fill-loop traversal as the collector (via `next_bucket_start`), so the
+  /// drift-fix must also keep its counting loop from overshooting `MAX_BUCKETS`
+  /// or undercounting due to misaligned keys. Verify an `extended_bounds` span
+  /// of January through May 2024 with a `-2h` offset reports exactly five
+  /// buckets (under the cap), matching the fill-loop output.
+  #[test]
+  fn date_histogram_span_exceeds_cap_counts_through_february_without_drift() {
+    use chrono::{NaiveDate, Utc};
+    let to_ms = |y, m, d, h| -> i64 {
+      let dt = NaiveDate::from_ymd_opt(y, m, d)
+        .unwrap()
+        .and_hms_opt(h, 0, 0)
+        .unwrap();
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+    };
+    let extended = Some((to_ms(2024, 1, 1, 0), to_ms(2024, 5, 31, 23)));
+    let offset_ms: i64 = -2 * 3_600_000;
+    // Five inclusive monthly buckets — comfortably under MAX_BUCKETS.
+    assert!(!date_histogram_span_exceeds_cap(
+      extended,
+      None,
+      offset_ms,
+      None,
+      Some(CalendarUnit::Month)
+    ));
   }
 
   /// Regression test for #249: finalize_response must rank significant_terms
