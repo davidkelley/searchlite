@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::mem;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::storage::Storage;
 use crate::DocId;
@@ -1185,20 +1185,20 @@ fn write_presence(iter: impl Iterator<Item = bool>, buf: &mut Vec<u8>) {
 }
 
 fn doc_range(offsets: &[u32], doc: usize) -> Option<(usize, usize)> {
-  if offsets.len() < doc + 2 {
+  let start = *offsets.get(doc)? as usize;
+  let end = *offsets.get(doc.checked_add(1)?)? as usize;
+  if start > end {
     return None;
   }
-  let start = offsets[doc] as usize;
-  let end = offsets[doc + 1] as usize;
   Some((start, end))
 }
 
 fn object_range(offsets: &[u32], object_idx: usize) -> Option<(usize, usize)> {
-  if offsets.len() < object_idx + 2 {
+  let start = *offsets.get(object_idx)? as usize;
+  let end = *offsets.get(object_idx.checked_add(1)?)? as usize;
+  if start > end {
     return None;
   }
-  let start = offsets[object_idx] as usize;
-  let end = offsets[object_idx + 1] as usize;
   Some((start, end))
 }
 
@@ -1238,7 +1238,16 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
     if cursor + name_len > data.len() {
       return Err(anyhow!("invalid fast field name length"));
     }
-    let name = String::from_utf8_lossy(&data[cursor..cursor + name_len]).into_owned();
+    // Fast-field names are written from `&str` by `write_field`, so they are
+    // valid UTF-8 by construction. Any non-UTF-8 bytes on disk are therefore
+    // a corruption signal — surface them as a structured error instead of
+    // silently mapping to U+FFFD via `from_utf8_lossy`. Mirrors BUG-010's
+    // fix in `terms.rs::read_terms`; see BUG-217.
+    let name = std::str::from_utf8(&data[cursor..cursor + name_len])
+      .with_context(|| {
+        format!("fast-field file contains non-UTF-8 bytes at offset {cursor} (field name)")
+      })?
+      .to_string();
     cursor += name_len;
     let ty = FieldType::from_u8(read_u8(&mut cursor, data)?)
       .ok_or_else(|| anyhow!("invalid fast field type"))?;
@@ -1269,6 +1278,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "I64List")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1295,6 +1305,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "I64Nested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1304,6 +1315,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "I64Nested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1350,6 +1362,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "F64List")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1376,6 +1389,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "F64Nested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1385,6 +1399,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "F64Nested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           8,
@@ -1420,7 +1435,13 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           if cursor + slen > data.len() {
             return Err(anyhow!("unexpected end of fast field dict"));
           }
-          let s = String::from_utf8_lossy(&data[cursor..cursor + slen]).into_owned();
+          let s = std::str::from_utf8(&data[cursor..cursor + slen])
+            .with_context(|| {
+              format!(
+                "fast-field file contains non-UTF-8 bytes at offset {cursor} (Str dict entry)"
+              )
+            })?
+            .to_string();
           cursor += slen;
           dict.push(s);
         }
@@ -1451,7 +1472,13 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           if cursor + slen > data.len() {
             return Err(anyhow!("unexpected end of fast field dict"));
           }
-          let s = String::from_utf8_lossy(&data[cursor..cursor + slen]).into_owned();
+          let s = std::str::from_utf8(&data[cursor..cursor + slen])
+            .with_context(|| {
+              format!(
+                "fast-field file contains non-UTF-8 bytes at offset {cursor} (StrList dict entry)"
+              )
+            })?
+            .to_string();
           cursor += slen;
           dict.push(s);
         }
@@ -1460,6 +1487,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "StrList")?;
         let total_vals = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1491,7 +1519,13 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
           if cursor + slen > data.len() {
             return Err(anyhow!("unexpected end of fast field dict"));
           }
-          let s = String::from_utf8_lossy(&data[cursor..cursor + slen]).into_owned();
+          let s = std::str::from_utf8(&data[cursor..cursor + slen])
+            .with_context(|| {
+              format!(
+                "fast-field file contains non-UTF-8 bytes at offset {cursor} (StrNested dict entry)"
+              )
+            })?
+            .to_string();
           cursor += slen;
           dict.push(s);
         }
@@ -1500,6 +1534,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..doc_offsets_count {
           doc_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&doc_offsets, "StrNested doc")?;
         let object_offsets_count = checked_count(
           checked_add_one(*doc_offsets.last().unwrap_or(&0) as usize)?,
           4,
@@ -1509,6 +1544,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..object_offsets_count {
           object_offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&object_offsets, "StrNested object")?;
         let total_vals = checked_count(
           *object_offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1543,6 +1579,7 @@ fn read_fields(data: &[u8]) -> Result<HashMap<String, Column>> {
         for _ in 0..offsets_count {
           offsets.push(read_u32(&mut cursor, data)?);
         }
+        validate_monotonic_offsets(&offsets, "NestedParent")?;
         let total = checked_count(
           *offsets.last().unwrap_or(&0) as usize,
           4,
@@ -1602,6 +1639,23 @@ fn checked_add_one(count: usize) -> Result<usize> {
   count
     .checked_add(1)
     .ok_or_else(|| anyhow!("fast field element count {count} + 1 overflows usize"))
+}
+
+/// Validate that an offset array is monotonically non-decreasing. Corrupt or
+/// adversarially crafted fast-field files can contain non-monotonic offsets
+/// which would cause `values[start..end]` to panic when `start > end`.
+/// Surfacing this at load time prevents silent panics at query time.
+fn validate_monotonic_offsets(offsets: &[u32], column_kind: &str) -> Result<()> {
+  for window in offsets.windows(2) {
+    if window[0] > window[1] {
+      return Err(anyhow!(
+        "non-monotonic offsets in fast field {column_kind} column: {} > {}",
+        window[0],
+        window[1]
+      ));
+    }
+  }
+  Ok(())
 }
 
 fn read_u8(cursor: &mut usize, buf: &[u8]) -> Result<u8> {
@@ -1890,6 +1944,121 @@ mod tests {
     assert_capacity_rejected(read_fields(&buf).unwrap_err());
   }
 
+  // --- Non-UTF-8 corruption regression tests (BUG-217) ---
+  //
+  // `write_field` always emits field names and string-dictionary entries from
+  // Rust `&str` values, which are valid UTF-8 by construction. Any non-UTF-8
+  // bytes observed by `read_fields` are therefore a corruption signal. Each
+  // test below hand-crafts a minimal `FFV1` buffer whose only corruption is
+  // an ill-formed UTF-8 sequence at one of the four affected sites and
+  // asserts that `read_fields` surfaces a structured error (preserving the
+  // underlying `Utf8Error`) rather than silently mapping to `U+FFFD`. The
+  // sequence `[0xC3, 0x28, 0xA0]` is rejected by strict UTF-8 decoding
+  // because `0xC3` is a 2-byte lead that requires a continuation byte in
+  // `0x80..=0xBF`, and `0x28` falls outside that range.
+  const INVALID_UTF8: [u8; 3] = [0xC3, 0x28, 0xA0];
+
+  fn assert_non_utf8_rejected(err: anyhow::Error, label: &str) {
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("non-UTF-8 bytes"),
+      "expected non-UTF-8 error for {label}, got: {msg}"
+    );
+    assert!(
+      msg.contains(label),
+      "expected error for {label} to mention the label, got: {msg}"
+    );
+    // Preserve the underlying `Utf8Error` in the chain so operators can
+    // identify the low-level cause without relying on message text.
+    assert!(
+      err.chain().any(|cause| cause.is::<std::str::Utf8Error>()),
+      "expected Utf8Error in error chain for {label}, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn read_fields_rejects_non_utf8_field_name() {
+    let mut buf = header_with(1);
+    buf.extend_from_slice(&(INVALID_UTF8.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&INVALID_UTF8);
+    // The `checked_count` guard at the top of the field loop enforces a
+    // 9-byte minimum stride per field (4-byte name length + 0 bytes name
+    // + 1-byte type tag + 4-byte doc_len), so append a type byte and a
+    // `doc_len` of zero to satisfy it. The buffer still reaches the UTF-8
+    // check before any of those trailing bytes are consumed.
+    buf.push(FieldType::I64.as_u8());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    assert_non_utf8_rejected(read_fields(&buf).unwrap_err(), "field name");
+  }
+
+  /// Push an empty-name `Str`/`StrList`/`StrNested` field header whose
+  /// dictionary contains a single entry with non-UTF-8 bytes. The loop
+  /// rejects the entry before any `doc_len`-sized allocation matters, so
+  /// `doc_len = 0` keeps the buffer minimal.
+  fn push_str_field_with_invalid_dict_entry(buf: &mut Vec<u8>, ty: FieldType) {
+    field_prefix(buf, ty, 0);
+    buf.extend_from_slice(&1u32.to_le_bytes()); // dict_len = 1
+    buf.extend_from_slice(&(INVALID_UTF8.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&INVALID_UTF8);
+  }
+
+  #[test]
+  fn read_fields_rejects_non_utf8_str_dict_entry() {
+    let mut buf = header_with(1);
+    push_str_field_with_invalid_dict_entry(&mut buf, FieldType::Str);
+    assert_non_utf8_rejected(read_fields(&buf).unwrap_err(), "Str dict entry");
+  }
+
+  #[test]
+  fn read_fields_rejects_non_utf8_str_list_dict_entry() {
+    let mut buf = header_with(1);
+    push_str_field_with_invalid_dict_entry(&mut buf, FieldType::StrList);
+    assert_non_utf8_rejected(read_fields(&buf).unwrap_err(), "StrList dict entry");
+  }
+
+  #[test]
+  fn read_fields_rejects_non_utf8_str_nested_dict_entry() {
+    let mut buf = header_with(1);
+    push_str_field_with_invalid_dict_entry(&mut buf, FieldType::StrNested);
+    assert_non_utf8_rejected(read_fields(&buf).unwrap_err(), "StrNested dict entry");
+  }
+
+  /// End-to-end variant: round-trip a valid `Str` column through
+  /// `FastFieldsWriter` + `FastFieldsReader::open`, mutate the on-disk
+  /// dictionary entry to be ill-formed UTF-8, and confirm the reader
+  /// surfaces the corruption instead of returning a `U+FFFD`-substituted
+  /// column. Mirrors `terms::tests::invalid_utf8_term_errors`.
+  #[test]
+  fn open_rejects_non_utf8_str_dict_entry_on_disk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fast.ff");
+    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+
+    let mut writer = FastFieldsWriter::new();
+    writer.set("tag", 0, FastValue::Str("valid".into()));
+    writer.write_to(&storage, &path).unwrap();
+
+    // The writer emits the ASCII `valid` byte sequence verbatim into the
+    // dictionary; find and overwrite its leading byte with the start of a
+    // 2-byte UTF-8 sequence so the entry is no longer valid UTF-8.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let needle = b"valid";
+    let idx = bytes
+      .windows(needle.len())
+      .position(|w| w == needle)
+      .expect("expected ASCII dict entry in on-disk buffer");
+    bytes[idx] = 0xC3;
+    std::fs::write(&path, bytes).unwrap();
+
+    // `FastFieldsReader` does not implement `Debug`, so `.unwrap_err()` is
+    // not available here — match the `Result` explicitly.
+    let err = match FastFieldsReader::open(&storage, &path) {
+      Ok(_) => panic!("expected non-UTF-8 error, got Ok"),
+      Err(e) => e,
+    };
+    assert_non_utf8_rejected(err, "Str dict entry");
+  }
+
   #[test]
   fn checked_count_accepts_zero_count() {
     // Guard against the helper over-rejecting legitimate empty columns.
@@ -1922,5 +2091,196 @@ mod tests {
       checked_add_one(u32::MAX as usize).unwrap(),
       u32::MAX as usize + 1
     );
+  }
+
+  // --- Non-monotonic offset regression tests (BUG-253) ---
+  //
+  // Each test below hand-crafts a fast-field buffer whose offset array
+  // contains a non-monotonic pair (start > end). Before the fix,
+  // `values[start..end]` would panic at query time. `read_fields` must
+  // now reject these at load time.
+
+  fn assert_monotonicity_rejected(err: anyhow::Error) {
+    let msg = err.to_string();
+    assert!(
+      msg.contains("non-monotonic offsets"),
+      "expected a non-monotonic offsets error, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64List, 2); // 2 docs → 3 offsets
+                                                   // offsets: [0, 5, 3] — doc 1 has start=5, end=3
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64List, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, 2);
+    // doc_offsets: [0, 3, 1] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_i64_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64Nested, 1);
+    // doc_offsets: [0, 2] — valid, 2 objects
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // object_offsets: [0, 5, 3] — non-monotonic at index 1→2
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_f64_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::F64Nested, 1);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_list_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrList, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+                                                // offsets: [0, 5, 3] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_nested_doc_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrNested, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_str_nested_object_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::StrNested, 1);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // dict_len = 0
+                                                // doc_offsets: [0, 2] — valid
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // object_offsets: [0, 5, 3] — non-monotonic
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&5u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_rejects_non_monotonic_nested_parent_offsets() {
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::NestedParent, 2);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    assert_monotonicity_rejected(read_fields(&buf).unwrap_err());
+  }
+
+  #[test]
+  fn read_fields_accepts_monotonic_offsets() {
+    // Monotonically non-decreasing offsets (including equal adjacent
+    // values, which represent empty ranges) must be accepted.
+    let mut buf = header_with(1);
+    field_prefix(&mut buf, FieldType::I64List, 3); // 3 docs → 4 offsets
+                                                   // offsets: [0, 0, 2, 2] — doc 0 empty, doc 1 has 2 values, doc 2 empty
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    // 2 i64 values
+    buf.extend_from_slice(&42i64.to_le_bytes());
+    buf.extend_from_slice(&99i64.to_le_bytes());
+    let fields = read_fields(&buf).unwrap();
+    assert!(fields.contains_key(""));
+  }
+
+  #[test]
+  fn doc_range_returns_none_for_inverted_offsets() {
+    // Defense-in-depth: even if offsets somehow bypass load-time validation,
+    // doc_range must return None rather than yielding a start > end pair.
+    let offsets = vec![0u32, 5, 3, 10];
+    assert_eq!(doc_range(&offsets, 0), Some((0, 5)));
+    assert_eq!(doc_range(&offsets, 1), None); // 5 > 3, inverted
+    assert_eq!(doc_range(&offsets, 2), Some((3, 10)));
+  }
+
+  #[test]
+  fn object_range_returns_none_for_inverted_offsets() {
+    let offsets = vec![0u32, 5, 3, 10];
+    assert_eq!(object_range(&offsets, 0), Some((0, 5)));
+    assert_eq!(object_range(&offsets, 1), None);
+    assert_eq!(object_range(&offsets, 2), Some((3, 10)));
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_empty() {
+    validate_monotonic_offsets(&[], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_single() {
+    validate_monotonic_offsets(&[42], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_accepts_equal_adjacent() {
+    validate_monotonic_offsets(&[0, 0, 5, 5, 10], "test").unwrap();
+  }
+
+  #[test]
+  fn validate_monotonic_offsets_rejects_decreasing() {
+    let err = validate_monotonic_offsets(&[0, 5, 3], "TestCol").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("non-monotonic offsets"));
+    assert!(msg.contains("TestCol"));
+    assert!(msg.contains("5 > 3"));
   }
 }

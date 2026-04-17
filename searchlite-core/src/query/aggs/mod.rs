@@ -6,14 +6,14 @@ use std::collections::{
 use std::hash::{Hash, Hasher};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, BucketMetricResponse, BucketResponse,
-  BucketScriptAggregation, BucketSortAggregation, BucketSortSpec, CardinalityResponse,
-  CompositeAggregation, CompositeSource, DateHistogramAggregation, DateRangeAggregation,
-  DerivativeAggregation, Filter, FilterAggregation, GapPolicy, HistogramAggregation,
-  MovingAvgAggregation, MovingAvgResponse, NestedAggregation, OptionalBucketMetricResponse,
-  PercentileRanksResponse, PercentilesResponse, RangeAggregation, RareTermsAggregation,
-  SignificantBucketResponse, SignificantTermsAggregation, SortOrder, StatsResponse,
-  TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse, ValueCountResponse,
+  Aggregation, AggregationResponse, AggregationSampling, BucketResponse, BucketScriptAggregation,
+  BucketSortAggregation, BucketSortSpec, CardinalityResponse, CompositeAggregation,
+  CompositeSource, DateHistogramAggregation, DateRangeAggregation, DerivativeAggregation, Filter,
+  FilterAggregation, GapPolicy, HistogramAggregation, MovingAvgAggregation, MovingAvgResponse,
+  NestedAggregation, OptionalBucketMetricResponse, PercentileRanksResponse, PercentilesResponse,
+  RangeAggregation, RareTermsAggregation, SignificantBucketResponse, SignificantTermsAggregation,
+  SortOrder, StatsResponse, TermsAggregation, TopHit, TopHitsAggregation, TopHitsResponse,
+  ValueCountResponse,
 };
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::highlight::make_snippet;
@@ -42,6 +42,22 @@ pub struct AggregationContext<'a> {
 /// still allowing thousands of buckets. Deployments that need a different limit can adjust this
 /// constant at compile time.
 pub(crate) const MAX_BUCKETS: usize = 10_000;
+/// Upper bound on the number of forecast points a single `moving_avg` pipeline may emit.
+///
+/// `predict` controls a `Vec<f64>` allocation in [`apply_moving_avg_pipeline`] sized directly by
+/// untrusted user input (BUG-221). Without a cap, a tiny request body can drive an unbounded heap
+/// allocation during response finalization. We share the same `10_000` ceiling as `MAX_BUCKETS`
+/// so the forecast horizon never grows past the materialization budget for any other bucketing
+/// aggregation in the same request.
+pub(crate) const MAX_PREDICTIONS: usize = MAX_BUCKETS;
+/// Upper bound on the number of hits a single `top_hits` sub-aggregation may track per segment.
+///
+/// `size` and `from` control the per-segment `BinaryHeap<RankedDoc>` allocation in
+/// [`TopHitsCollector`]; without a cap, a tiny request body can size the heap from untrusted user
+/// input and drive an unbounded heap growth during collection (BUG-222). We share the same
+/// `10_000` ceiling as `MAX_BUCKETS` so the materialized hit set never grows past the
+/// materialization budget for any other bucketing aggregation in the same request.
+pub(crate) const MAX_TOP_HITS: usize = MAX_BUCKETS;
 const TDIGEST_MAX_SIZE: usize = 200;
 const PERCENTILE_EXACT_LIMIT: usize = 256;
 
@@ -241,7 +257,27 @@ impl<'a> SignificantTermsCollector<'a> {
       .into_values()
       .filter(|b| b.doc_count >= self.min_doc_count)
       .collect();
-    buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+    // Sort by significance score proxy (doc_count / bg_count) descending
+    // before truncation. Since the foreground/background totals are constant
+    // across all buckets, this proxy is monotonically related to the full
+    // significance score `(doc_count/fg_total) / (bg_count/bg_total)`.
+    //
+    // Buckets with bg_count == 0 are treated as score 0 to match the final
+    // scoring guard in finalize_response. Compare ratios via integer
+    // cross-multiplication to avoid float rounding.
+    buckets.sort_by(|a, b| {
+      let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater, // a has score 0, b > 0 → b first
+        (false, true) => Ordering::Less,    // b has score 0, a > 0 → a first
+        (false, false) => {
+          let left = (a.doc_count as u128) * (b.bg_count as u128);
+          let right = (b.doc_count as u128) * (a.bg_count as u128);
+          right.cmp(&left)
+        }
+      };
+      score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+    });
     let limit = self.size.unwrap_or(buckets.len()).min(MAX_BUCKETS);
     buckets.truncate(limit);
     AggregationIntermediate::SignificantTerms {
@@ -686,7 +722,7 @@ enum DateInterval {
   Calendar(CalendarUnit),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CalendarUnit {
   Day,
   Week,
@@ -1102,7 +1138,7 @@ impl<'a> RangeCollector<'a> {
     for entry in self.ranges.iter_mut() {
       if values.iter().any(|val| {
         let ge_from = entry.from.map(|f| *val >= f).unwrap_or(true);
-        let lt_to = entry.to.map(|t| *val <= t).unwrap_or(true);
+        let lt_to = entry.to.map(|t| *val < t).unwrap_or(true);
         ge_from && lt_to
       }) {
         entry.bucket.doc_count += 1;
@@ -1256,12 +1292,13 @@ impl<'a> HistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
+      let bucket_id = self.bucket_key(val);
       if let Some((min, max)) = self.hard_bounds {
-        if val < min || val > max {
+        let bucket_val = bucket_id as f64 * self.interval + self.offset;
+        if bucket_val < min || bucket_val >= max {
           continue;
         }
       }
-      let bucket_id = self.bucket_key(val);
       if !seen.insert(bucket_id) {
         continue;
       }
@@ -1336,6 +1373,16 @@ impl<'a> HistogramCollector<'a> {
           }
         }
       }
+    }
+    // BUG-269: the fill loop maps `hard_bounds` values to bucket keys via
+    // `floor()`, which can produce keys below `hard_bounds.min` or at
+    // `hard_bounds.max`. Drop any bucket whose key-value falls outside the
+    // half-open range `[hard_bounds.min, hard_bounds.max)`.
+    if let Some((hmin, hmax)) = hard_bounds {
+      buckets.retain(|bucket_id, _| {
+        let bv = bucket_value(*bucket_id);
+        bv >= hmin && bv < hmax
+      });
     }
     let mut buckets: Vec<BucketIntermediate> = buckets
       .into_values()
@@ -1441,15 +1488,15 @@ impl<'a> DateHistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
-      if let Some((min, max)) = self.hard_bounds {
-        if val < min || val > max {
-          continue;
-        }
-      }
       let bucket_start = match bucket_start(val, self.offset_millis, &self.interval) {
         Some(v) => v,
         None => continue,
       };
+      if let Some((min, max)) = self.hard_bounds {
+        if bucket_start < min || bucket_start >= max {
+          continue;
+        }
+      }
       if !seen.insert(bucket_start) {
         continue;
       }
@@ -1510,6 +1557,13 @@ impl<'a> DateHistogramCollector<'a> {
           };
         }
       }
+    }
+    // BUG-269: the fill loop maps `hard_bounds` timestamps to bucket starts
+    // via `bucket_start()`, which can produce a bucket start below
+    // `hard_bounds.min` or at `hard_bounds.max`. Drop any bucket whose start
+    // falls outside the half-open range `[hard_bounds.min, hard_bounds.max)`.
+    if let Some((hmin, hmax)) = self.hard_bounds {
+      buckets.retain(|&bucket_start, _| bucket_start >= hmin && bucket_start < hmax);
     }
     let mut buckets: Vec<BucketIntermediate> = buckets
       .into_values()
@@ -2090,10 +2144,23 @@ impl<'a> TopHitsCollector<'a> {
   fn new(ctx: AggregationContext<'a>, agg: &TopHitsAggregation) -> Self {
     let plan = SortPlan::from_request(ctx.schema, &agg.sort)
       .expect("top_hits sort validated during request planning");
+    // Defense-in-depth: clamp `size` and `from` to `MAX_TOP_HITS` so an internal caller that
+    // bypasses `validate_aggregations_in_scope` cannot drive an unbounded `BinaryHeap` here
+    // (BUG-222). The request validator rejects values past the cap up-front; the `min` calls are
+    // a hard ceiling on the per-segment heap. We persist the bounded values into the struct so
+    // every downstream use (heap sizing, `finish`'s `start + size` arithmetic, the
+    // `Vec::with_capacity` for hits) stays within the cap and consistent with `limit`. `.max(1)`
+    // on `limit` preserves the legacy invariant that the collector retains the best hit even
+    // when callers ask for `size = 0` so the merge step has a candidate to pick from.
+    let bounded_size = agg.size.min(MAX_TOP_HITS);
+    let bounded_from = agg.from.min(MAX_TOP_HITS);
+    let limit = bounded_size
+      .saturating_add(bounded_from)
+      .clamp(1, MAX_TOP_HITS);
     Self {
-      size: agg.size,
-      from: agg.from,
-      limit: agg.size.saturating_add(agg.from).max(agg.size).max(1),
+      size: bounded_size,
+      from: bounded_from,
+      limit,
       heap: BinaryHeap::new(),
       total: 0,
       fields: agg.fields.clone(),
@@ -2126,11 +2193,14 @@ impl<'a> TopHitsCollector<'a> {
   fn finish(mut self) -> TopHitsState {
     let mut ranked: Vec<RankedDoc> = self.heap.drain().collect();
     ranked.sort_by(|a, b| a.key.cmp(&b.key));
-    let start = self.from.min(ranked.len());
-    let end = (start + self.size).min(ranked.len());
-    let mut hits = Vec::with_capacity(end.saturating_sub(start));
-    for doc in ranked.into_iter().skip(start).take(self.size) {
-      let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    // Keep all top `(from + size)` ranked items for this segment; the final
+    // `from` skip is applied once globally after segments are merged in
+    // `finalize_response`. Applying the skip here would discard items whose
+    // segment-local rank is `< from` but whose global rank is within the
+    // requested `[from, from + size)` page — see BUG-215 for details.
+    let mut hits = Vec::with_capacity(ranked.len());
+    let need_doc = self.fields.is_some() || self.highlight_field.is_some();
+    for doc in ranked.into_iter() {
       let fetched = if need_doc {
         self.ctx.segment.get_doc(doc.doc_id).ok()
       } else {
@@ -2345,7 +2415,23 @@ fn merge_intermediate_in_place(
       let limit = target_size
         .unwrap_or_else(|| target_buckets.len())
         .min(MAX_BUCKETS);
-      target_buckets.sort_by(|a, b| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count));
+      // Sort by significance score proxy (doc_count/bg_count) to preserve
+      // high-significance low-frequency terms during truncation. Buckets with
+      // bg_count == 0 are treated as score 0 to match finalize_response.
+      // Compare ratios via integer cross-multiplication to avoid float rounding.
+      target_buckets.sort_by(|a, b| {
+        let score_cmp = match (a.bg_count == 0, b.bg_count == 0) {
+          (true, true) => Ordering::Equal,
+          (true, false) => Ordering::Greater,
+          (false, true) => Ordering::Less,
+          (false, false) => {
+            let left = (a.doc_count as u128) * (b.bg_count as u128);
+            let right = (b.doc_count as u128) * (a.bg_count as u128);
+            right.cmp(&left)
+          }
+        };
+        score_cmp.then_with(|| terms_bucket_cmp(&a.key, a.doc_count, &b.key, b.doc_count))
+      });
       if target_buckets.len() > limit {
         target_buckets.truncate(limit);
       }
@@ -2687,8 +2773,11 @@ fn merge_top_hits(target: &mut TopHitsState, incoming: TopHitsState) {
   }
   let mut hits: Vec<_> = heap.into_iter().collect();
   hits.sort_by(|a, b| a.key.cmp(&b.key));
-  let start = target.from.min(hits.len());
-  target.hits = hits.into_iter().skip(start).take(target.size).collect();
+  // Keep the full merged top `(from + size)` window; the `from` skip is
+  // applied once in `finalize_response` so that per-segment items at ranks
+  // `[0, from)` are not discarded before the merge can compare them against
+  // other segments (BUG-215).
+  target.hits = hits;
 }
 
 fn bucket_key_string(key: &serde_json::Value) -> String {
@@ -2933,10 +3022,24 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
         values: compute_percentile_ranks_from_state(state),
       })
     }
-    AggregationIntermediate::TopHits(state) => AggregationResponse::TopHits(TopHitsResponse {
-      total: state.total,
-      hits: state.hits.into_iter().map(|h| h.hit).collect(),
-    }),
+    AggregationIntermediate::TopHits(state) => {
+      // `state.hits` holds the top `(from + size)` merged hits; apply the
+      // final `from` skip and truncate to `size` to produce the response
+      // page. Doing the skip here (instead of per-segment) ensures items at
+      // segment-local ranks `[0, from)` can still win the global `[from,
+      // from + size)` window after cross-segment merging.
+      let start = state.from.min(state.hits.len());
+      AggregationResponse::TopHits(TopHitsResponse {
+        total: state.total,
+        hits: state
+          .hits
+          .into_iter()
+          .skip(start)
+          .take(state.size)
+          .map(|h| h.hit)
+          .collect(),
+      })
+    }
     AggregationIntermediate::Filter {
       bucket,
       pipeline,
@@ -2997,27 +3100,100 @@ fn finalize_bucket(bucket: BucketIntermediate) -> BucketResponse {
   }
 }
 
+fn pipeline_agg_dependencies<'a>(
+  agg: &'a Aggregation,
+  pipeline_keys: &HashSet<&str>,
+) -> Vec<&'a str> {
+  let paths: Vec<&str> = match agg {
+    Aggregation::AvgBucket(cfg) => vec![&cfg.buckets_path],
+    Aggregation::SumBucket(cfg) => vec![&cfg.buckets_path],
+    Aggregation::Derivative(cfg) => vec![&cfg.buckets_path],
+    Aggregation::MovingAvg(cfg) => vec![&cfg.buckets_path],
+    Aggregation::BucketScript(cfg) => cfg.buckets_path.values().map(|s| s.as_str()).collect(),
+    _ => vec![],
+  };
+  paths
+    .into_iter()
+    .filter_map(|path| {
+      let agg_name = path.split('.').next().unwrap_or(path);
+      if pipeline_keys.contains(agg_name) {
+        Some(agg_name)
+      } else {
+        None
+      }
+    })
+    .collect()
+}
+
+fn topological_sort_pipeline(pipeline: &BTreeMap<String, Aggregation>) -> Vec<&str> {
+  let pipeline_keys: HashSet<&str> = pipeline
+    .iter()
+    .filter(|(_, agg)| {
+      matches!(
+        agg,
+        Aggregation::Derivative(_) | Aggregation::MovingAvg(_) | Aggregation::BucketScript(_)
+      )
+    })
+    .map(|(k, _)| k.as_str())
+    .collect();
+  let mut in_degree: BTreeMap<&str, usize> = BTreeMap::new();
+  let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+  for key in pipeline.keys() {
+    in_degree.entry(key.as_str()).or_insert(0);
+  }
+  for (name, agg) in pipeline.iter() {
+    if matches!(agg, Aggregation::BucketSort(_)) {
+      continue;
+    }
+    let deps = pipeline_agg_dependencies(agg, &pipeline_keys);
+    *in_degree.entry(name.as_str()).or_insert(0) += deps.len();
+    for dep in deps {
+      dependents.entry(dep).or_default().push(name.as_str());
+    }
+  }
+  let mut queue: VecDeque<&str> = in_degree
+    .iter()
+    .filter(|(_, &deg)| deg == 0)
+    .map(|(&k, _)| k)
+    .collect();
+  let mut order = Vec::with_capacity(pipeline.len());
+  while let Some(node) = queue.pop_front() {
+    order.push(node);
+    if let Some(deps) = dependents.get(node) {
+      for &dep in deps {
+        if let Some(deg) = in_degree.get_mut(dep) {
+          *deg -= 1;
+          if *deg == 0 {
+            queue.push_back(dep);
+          }
+        }
+      }
+    }
+  }
+  // Append cycle members in BTreeMap key order so they still execute
+  // (with unresolved deps) rather than being silently dropped.
+  if order.len() < pipeline.len() {
+    let in_order: HashSet<&str> = order.iter().copied().collect();
+    for key in pipeline.keys() {
+      if !in_order.contains(key.as_str()) {
+        order.push(key.as_str());
+      }
+    }
+  }
+  order
+}
+
 fn apply_pipeline_aggs(
   pipeline: &BTreeMap<String, Aggregation>,
   buckets: &mut Vec<BucketResponse>,
 ) -> BTreeMap<String, AggregationResponse> {
   let mut responses = BTreeMap::new();
-  for (name, agg) in pipeline
-    .iter()
-    .filter(|(_, a)| matches!(a, Aggregation::BucketSort(_)))
-  {
-    if let Aggregation::BucketSort(cfg) = agg {
-      bucket_sort_buckets(buckets, cfg);
-      responses.insert(
-        name.clone(),
-        AggregationResponse::BucketSort {
-          from: cfg.from.unwrap_or(0),
-          size: cfg.size,
-        },
-      );
-    }
-  }
-  for (name, agg) in pipeline.iter() {
+  let order = topological_sort_pipeline(pipeline);
+  for name in &order {
+    let agg = match pipeline.get(*name) {
+      Some(a) => a,
+      None => continue,
+    };
     match agg {
       Aggregation::AvgBucket(cfg) => {
         let mut sum = 0.0_f64;
@@ -3028,10 +3204,14 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
-        let value = if count > 0 { sum / count as f64 } else { 0.0 };
+        let value = if count > 0 {
+          Some(sum / count as f64)
+        } else {
+          None
+        };
         responses.insert(
-          name.clone(),
-          AggregationResponse::AvgBucket(BucketMetricResponse { value }),
+          name.to_string(),
+          AggregationResponse::AvgBucket(OptionalBucketMetricResponse { value }),
         );
       }
       Aggregation::SumBucket(cfg) => {
@@ -3042,8 +3222,8 @@ fn apply_pipeline_aggs(
           }
         }
         responses.insert(
-          name.clone(),
-          AggregationResponse::SumBucket(BucketMetricResponse { value: sum }),
+          name.to_string(),
+          AggregationResponse::SumBucket(OptionalBucketMetricResponse { value: Some(sum) }),
         );
       }
       Aggregation::Derivative(cfg) => {
@@ -3057,6 +3237,21 @@ fn apply_pipeline_aggs(
       }
       Aggregation::BucketSort(_) => {}
       _ => {}
+    }
+  }
+  for (name, agg) in pipeline
+    .iter()
+    .filter(|(_, a)| matches!(a, Aggregation::BucketSort(_)))
+  {
+    if let Aggregation::BucketSort(cfg) = agg {
+      bucket_sort_buckets(buckets, cfg);
+      responses.insert(
+        name.clone(),
+        AggregationResponse::BucketSort {
+          from: cfg.from.unwrap_or(0),
+          size: cfg.size,
+        },
+      );
     }
   }
   responses
@@ -3112,6 +3307,15 @@ fn apply_moving_avg_pipeline(
   let series = bucket_metric_series(buckets, &cfg.buckets_path);
   let policy = cfg.gap_policy.unwrap_or(GapPolicy::Skip);
   let mut window_values: VecDeque<f64> = VecDeque::new();
+  // The request validator rejects `window = 0` (BUG-221) so this is the documented
+  // precondition; assert it loudly in dev/test builds. The `.max(1)` survives as a
+  // production safety net so an internal caller that bypasses validation still gets
+  // a windowed average rather than the deque growing unboundedly to `buckets.len()`.
+  debug_assert!(
+    cfg.window >= 1,
+    "moving_avg window must be >= 1; got {}",
+    cfg.window
+  );
   let window = cfg.window.max(1);
   let mut avgs = Vec::with_capacity(buckets.len());
   for (idx, bucket) in buckets.iter_mut().enumerate() {
@@ -3120,17 +3324,20 @@ fn apply_moving_avg_pipeline(
       (None, GapPolicy::InsertZeros) => Some(0.0),
       (None, GapPolicy::Skip) => None,
     };
+    // Compute the average from preceding values only (look-back). The current
+    // bucket's value must NOT be included — Elasticsearch's moving_avg emits
+    // the mean of the *previous* window at each position.
+    let avg = if window_values.is_empty() {
+      None
+    } else {
+      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+    };
     if let Some(val) = current {
       if window_values.len() == window {
         window_values.pop_front();
       }
       window_values.push_back(val);
     }
-    let avg = if window_values.is_empty() {
-      None
-    } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
-    };
     avgs.push(avg);
     bucket.aggregations.insert(
       name.to_string(),
@@ -3142,9 +3349,22 @@ fn apply_moving_avg_pipeline(
   }
   let mut predictions = Vec::new();
   if let Some(predict) = cfg.predict {
-    if let Some(last_avg) = avgs.last().and_then(|v| *v) {
+    // Seed predictions from the final window state (which includes the last
+    // bucket) rather than from `avgs.last()` (which is a look-back value that
+    // excludes the last bucket).
+    let seed = if window_values.is_empty() {
+      None
+    } else {
+      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+    };
+    if let Some(seed_val) = seed {
+      // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
+      // that bypasses `validate_aggregations_in_scope` cannot drive an unbounded
+      // allocation here (BUG-221). The request validator rejects values past the cap
+      // up-front; this `min` is just a hard ceiling on the materialization step.
+      let predict = predict.min(MAX_PREDICTIONS);
       // Simple forecast that repeats the last observed average to avoid feedback loops.
-      predictions = vec![last_avg; predict];
+      predictions = vec![seed_val; predict];
     }
   }
   responses.insert(
@@ -3198,6 +3418,7 @@ enum ScriptToken {
   Number(f64),
   Var(String),
   Op(char),
+  Neg,
   LParen,
   RParen,
 }
@@ -3206,6 +3427,7 @@ fn op_precedence(op: char) -> u8 {
   match op {
     '+' | '-' => 1,
     '*' | '/' => 2,
+    '~' => 3,
     _ => 0,
   }
 }
@@ -3272,6 +3494,11 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
     }
     match ch {
       '+' | '-' | '*' | '/' => {
+        if ch == '-' && expect_unary {
+          tokens.push(ScriptToken::Neg);
+          chars.next();
+          continue;
+        }
         tokens.push(ScriptToken::Op(ch));
         chars.next();
         expect_unary = true;
@@ -3292,20 +3519,30 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
   Some(tokens)
 }
 
+fn pop_op(op: char) -> ScriptToken {
+  if op == '~' {
+    ScriptToken::Neg
+  } else {
+    ScriptToken::Op(op)
+  }
+}
+
 fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
   let mut output = Vec::new();
   let mut ops: Vec<char> = Vec::new();
   for token in tokens.into_iter() {
     match token {
       ScriptToken::Number(_) | ScriptToken::Var(_) => output.push(token),
+      ScriptToken::Neg => {
+        ops.push('~');
+      }
       ScriptToken::Op(op) => {
         while let Some(&top) = ops.last() {
           if top == '(' {
             break;
           }
           if op_precedence(top) >= op_precedence(op) {
-            output.push(ScriptToken::Op(top));
-            ops.pop();
+            output.push(pop_op(ops.pop().unwrap()));
           } else {
             break;
           }
@@ -3314,19 +3551,25 @@ fn to_rpn(tokens: Vec<ScriptToken>) -> Option<Vec<ScriptToken>> {
       }
       ScriptToken::LParen => ops.push('('),
       ScriptToken::RParen => {
+        let mut found_lparen = false;
         while let Some(op) = ops.pop() {
           if op == '(' {
+            found_lparen = true;
             break;
           }
-          output.push(ScriptToken::Op(op));
+          output.push(pop_op(op));
+        }
+        if !found_lparen {
+          return None;
         }
       }
     }
   }
   while let Some(op) = ops.pop() {
-    if op != '(' {
-      output.push(ScriptToken::Op(op));
+    if op == '(' {
+      return None;
     }
+    output.push(pop_op(op));
   }
   Some(output)
 }
@@ -3337,6 +3580,10 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
     match token {
       ScriptToken::Number(v) => stack.push(v),
       ScriptToken::Var(name) => stack.push(*vars.get(&name)?),
+      ScriptToken::Neg => {
+        let a = stack.pop()?;
+        stack.push(-a);
+      }
       ScriptToken::Op(op) => {
         let b = stack.pop()?;
         let a = stack.pop()?;
@@ -3432,19 +3679,18 @@ fn bucket_metric_value(bucket: &BucketResponse, path: &str) -> Option<f64> {
   if path == "_count" {
     return Some(bucket.doc_count as f64);
   }
-  let mut parts: Vec<&str> = path.split('.').collect();
-  if parts.is_empty() {
-    return None;
-  }
-  let agg_name = parts.remove(0);
+  let (agg_name, sub_path) = match path.split_once('.') {
+    Some((name, rest)) => (name, Some(rest)),
+    None => (path, None),
+  };
   let agg = bucket.aggregations.get(agg_name)?;
-  extract_metric_from_response(agg, &parts)
+  extract_metric_from_response(agg, sub_path)
 }
 
-fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Option<f64> {
+fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) -> Option<f64> {
   match resp {
     AggregationResponse::Stats(stats) => {
-      let field = path.first().copied().unwrap_or("avg");
+      let field = path.unwrap_or("avg");
       match field {
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
@@ -3455,7 +3701,7 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Op
       }
     }
     AggregationResponse::ExtendedStats(stats) => {
-      let field = path.first().copied().unwrap_or("avg");
+      let field = path.unwrap_or("avg");
       match field {
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
@@ -3470,14 +3716,14 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: &[&str]) -> Op
     AggregationResponse::ValueCount(val) => Some(val.value as f64),
     AggregationResponse::Cardinality(val) => Some(val.value as f64),
     AggregationResponse::Percentiles(vals) => {
-      let key = path.first().copied()?;
+      let key = path?;
       vals.values.get(key).copied()
     }
     AggregationResponse::PercentileRanks(vals) => {
-      let key = path.first().copied()?;
+      let key = path?;
       vals.values.get(key).copied()
     }
-    AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => Some(val.value),
+    AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => val.value,
     AggregationResponse::Derivative(val) => val.value,
     AggregationResponse::MovingAvg(val) => val.value,
     AggregationResponse::BucketScript(val) => val.value,
@@ -3798,14 +4044,33 @@ fn truncate_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
     }
     CalendarUnit::Month => date.with_day(1)?,
     CalendarUnit::Quarter => {
+      // Normalize the day to 1 before changing the month. `with_month` fails
+      // when the resulting (year, target_month, original_day) triple is not a
+      // real date (e.g. 2024-05-31 → April, which has only 30 days), so the
+      // previous `with_month(..)?.with_day(1)?` ordering would short-circuit
+      // to `None` and cause `DateHistogramCollector::collect` to silently drop
+      // any `YYYY-05-31` document from the aggregation (BUG-233). Going
+      // day-first is always safe: day 1 is valid in every month.
       let month = date.month();
       let quarter_start = ((month - 1) / 3) * 3 + 1;
-      date.with_month(quarter_start)?.with_day(1)?
+      date.with_day(1)?.with_month(quarter_start)?
     }
     CalendarUnit::Year => date.with_month(1)?.with_day(1)?,
   };
   let start_dt = start_date.and_hms_opt(0, 0, 0)?;
   Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis())
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+  use chrono::Datelike;
+  if month == 12 {
+    31
+  } else {
+    chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+      .and_then(|d| d.pred_opt())
+      .map(|d| d.day())
+      .unwrap_or(28)
+  }
 }
 
 fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
@@ -3823,7 +4088,13 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
         month = 1;
         year += 1;
       }
-      date.with_year(year)?.with_month(month)?.with_day(1)?
+      let original_day = date.day();
+      // Normalize to day 1 before changing year/month to prevent
+      // `with_month` from failing when the source day exceeds the
+      // target month's length (BUG-233 pattern).
+      let base = date.with_day(1)?.with_year(year)?.with_month(month)?;
+      let max_day = last_day_of_month(year, month);
+      base.with_day(original_day.min(max_day))?
     }
     CalendarUnit::Quarter => {
       let mut month = date.month();
@@ -3833,14 +4104,27 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
         month -= 12;
         year += 1;
       }
-      date.with_year(year)?.with_month(month)?.with_day(1)?
+      let original_day = date.day();
+      let base = date.with_day(1)?.with_year(year)?.with_month(month)?;
+      let max_day = last_day_of_month(year, month);
+      base.with_day(original_day.min(max_day))?
     }
-    CalendarUnit::Year => date
-      .with_year(date.year() + 1)?
-      .with_month(1)?
-      .with_day(1)?,
+    CalendarUnit::Year => {
+      let new_year = date.year() + 1;
+      let original_day = date.day();
+      let original_month = date.month();
+      let base = date.with_day(1)?.with_year(new_year)?;
+      let max_day = last_day_of_month(new_year, original_month);
+      base
+        .with_month(original_month)?
+        .with_day(original_day.min(max_day))?
+    }
   };
-  let next_dt = next_date.and_hms_opt(0, 0, 0)?;
+  // Preserve the original time-of-day so that bucket keys remain aligned
+  // with any sub-day offset applied by `bucket_start`. Previously this
+  // hardcoded midnight via `and_hms_opt(0, 0, 0)`, which discarded the
+  // offset and produced misaligned fill-loop keys (issue #251).
+  let next_dt = next_date.and_time(dt.naive_utc().time());
   Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(next_dt, Utc).timestamp_millis())
 }
 
@@ -3930,6 +4214,77 @@ mod tests {
     vars.insert("a".to_string(), 1.0);
     vars.insert("b".to_string(), 1e-14);
     assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_unmatched_rparen() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    assert!(eval_bucket_script("a + b) * c", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_unmatched_lparen() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    assert!(eval_bucket_script("(a + b * c", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_accepts_matched_parentheses() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    vars.insert("c".to_string(), 4.0);
+    let value = eval_bucket_script("(a + b) * c", &vars).unwrap();
+    assert!((value - 20.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_negation_of_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    let value = eval_bucket_script("a * -b", &vars).unwrap();
+    assert!((value - (-6.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_leading_unary_negation_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 5.0);
+    let value = eval_bucket_script("-a", &vars).unwrap();
+    assert!((value - (-5.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_double_negation_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 3.0);
+    vars.insert("b".to_string(), 2.0);
+    let value = eval_bucket_script("a - -b", &vars).unwrap();
+    assert!((value - 5.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_negation_in_parens() {
+    let mut vars = BTreeMap::new();
+    vars.insert("b".to_string(), 4.0);
+    let value = eval_bucket_script("(-b)", &vars).unwrap();
+    assert!((value - (-4.0)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_division_by_negated_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 10.0);
+    vars.insert("b".to_string(), 2.0);
+    let value = eval_bucket_script("a / -b", &vars).unwrap();
+    assert!((value - (-5.0)).abs() < 1e-6);
   }
 
   #[test]
@@ -4139,6 +4494,73 @@ mod tests {
     ));
   }
 
+  /// BUG-233: `truncate_calendar` for `CalendarUnit::Quarter` used to change
+  /// the month before normalizing the day. When the source day was 31 and the
+  /// target quarter-start month was April (30 days), `with_month(4)` returned
+  /// `None`, cascading back into `DateHistogramCollector::collect`, which
+  /// silently dropped the document. The only real-world triggering date is
+  /// day 31 of May (any year). This regression pins the fixed
+  /// day-first ordering.
+  #[test]
+  fn truncate_calendar_quarter_handles_may_31_without_dropping_doc() {
+    fn ts(year: i32, month: u32, day: u32, hour: u32) -> i64 {
+      chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .and_hms_opt(hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+    }
+    // 2024-05-31T12:00:00Z → should truncate to 2024-04-01T00:00:00Z (Q2).
+    let input = ts(2024, 5, 31, 12);
+    let expected = ts(2024, 4, 1, 0);
+    assert_eq!(
+      truncate_calendar(input, CalendarUnit::Quarter),
+      Some(expected),
+      "May 31 must fall into the Q2 bucket keyed 2024-04-01T00:00:00Z, \
+       not disappear from the aggregation"
+    );
+    // The full collector path goes through `bucket_start`; assert that too.
+    assert_eq!(
+      bucket_start(input, 0, &DateInterval::Calendar(CalendarUnit::Quarter)),
+      Some(expected),
+      "bucket_start must propagate the truncated Q2 start, not None"
+    );
+  }
+
+  /// BUG-233 follow-up: exhaustive sweep over every day of a leap year
+  /// (which covers all 366 calendar slots, including Feb 29) × every calendar
+  /// unit. `truncate_calendar` must produce `Some(_)` for every valid
+  /// timestamp — `None` here is the exact failure mode that makes the
+  /// collector silently drop documents. Guards against any future
+  /// ordering regression in any branch of `truncate_calendar`.
+  #[test]
+  fn truncate_calendar_never_returns_none_for_valid_dates() {
+    let units = [
+      ("Day", CalendarUnit::Day),
+      ("Week", CalendarUnit::Week),
+      ("Month", CalendarUnit::Month),
+      ("Quarter", CalendarUnit::Quarter),
+      ("Year", CalendarUnit::Year),
+    ];
+    for ordinal in 1..=366u32 {
+      // 2024 is a leap year, so every ordinal in 1..=366 yields a valid date.
+      let date = chrono::NaiveDate::from_yo_opt(2024, ordinal).unwrap();
+      let millis = date
+        .and_hms_opt(23, 59, 59)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+      for (name, unit) in units {
+        assert!(
+          truncate_calendar(millis, unit).is_some(),
+          "truncate_calendar returned None for {date} with unit {name}; \
+           DateHistogramCollector would silently drop this document",
+        );
+      }
+    }
+  }
+
   #[test]
   fn derivative_pipeline_emits_expected_values() {
     let mut buckets = vec![
@@ -4178,5 +4600,940 @@ mod tests {
       panic!("missing derivative on bucket");
     }
     assert!(responses.contains_key("diff"));
+  }
+
+  /// Regression for #251: add_calendar must preserve the sub-day time
+  /// component so that bucket keys stay aligned with the offset applied by
+  /// bucket_start. Previously `and_hms_opt(0, 0, 0)` discarded the time,
+  /// snapping every bucket after the first to midnight.
+  #[test]
+  fn add_calendar_preserves_sub_day_time_component() {
+    use chrono::{NaiveDate, Utc};
+    // Input: 2024-04-01T01:00:00Z (midnight + 1h offset)
+    let dt = NaiveDate::from_ymd_opt(2024, 4, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+
+    // Month: expect 2024-05-01T01:00:00Z, NOT 2024-05-01T00:00:00Z
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 5, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "add_calendar(Month) must preserve 01:00:00 offset"
+    );
+
+    // Quarter: expect 2024-07-01T01:00:00Z
+    let next_q = add_calendar(ts, CalendarUnit::Quarter).unwrap();
+    let expected_q = NaiveDate::from_ymd_opt(2024, 7, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_q_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_q, Utc).timestamp_millis();
+    assert_eq!(
+      next_q, expected_q_ts,
+      "add_calendar(Quarter) must preserve 01:00:00 offset"
+    );
+
+    // Year: expect 2025-04-01T01:00:00Z (preserves month and day)
+    let next_y = add_calendar(ts, CalendarUnit::Year).unwrap();
+    let expected_y = NaiveDate::from_ymd_opt(2025, 4, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let expected_y_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_y, Utc).timestamp_millis();
+    assert_eq!(
+      next_y, expected_y_ts,
+      "add_calendar(Year) must preserve 01:00:00 offset"
+    );
+  }
+
+  /// Regression for #251: chained add_calendar calls (as the fill loop does)
+  /// must produce a monotonically increasing sequence where every bucket key
+  /// keeps the original sub-day offset.
+  #[test]
+  fn add_calendar_fill_loop_stays_aligned_with_offset() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = 3_600_000; // 1 hour
+    let start_dt = NaiveDate::from_ymd_opt(2024, 4, 1)
+      .unwrap()
+      .and_hms_opt(1, 0, 0)
+      .unwrap();
+    let start =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis();
+
+    let expected_keys: Vec<i64> = [(2024, 4, 1), (2024, 5, 1), (2024, 6, 1), (2024, 7, 1)]
+      .iter()
+      .map(|(y, m, d)| {
+        let dt = NaiveDate::from_ymd_opt(*y, *m, *d)
+          .unwrap()
+          .and_hms_opt(1, 0, 0)
+          .unwrap();
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+      })
+      .collect();
+
+    let mut current = start;
+    let mut keys = vec![current];
+    for _ in 0..3 {
+      current = add_calendar(current, CalendarUnit::Month).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys, expected_keys,
+      "fill loop must produce keys at T01:00:00Z, not T00:00:00Z"
+    );
+
+    // Also verify bucket_start + add_interval round-trip consistency
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+    let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
+    for expected in &expected_keys {
+      assert_eq!(cur, *expected);
+      cur = add_interval(cur, &interval).unwrap();
+    }
+  }
+
+  /// Regression for #257: add_calendar(Month) must preserve the day-of-month
+  /// when the input has day > 1 (as happens with offsets >= 24h). Previously
+  /// `.with_day(1)?` forced every bucket key to day 1, misaligning the fill
+  /// loop with `bucket_start` output.
+  #[test]
+  fn add_calendar_preserves_day_with_large_offset() {
+    use chrono::{NaiveDate, Utc};
+    // Input: 2024-06-03T00:00:00Z (day 3 from a 2-day offset)
+    let dt = NaiveDate::from_ymd_opt(2024, 6, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis();
+
+    // Month: expect 2024-07-03, NOT 2024-07-01
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 7, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "add_calendar(Month) must preserve the day-of-month"
+    );
+
+    // Quarter: expect 2024-09-03
+    let next_q = add_calendar(ts, CalendarUnit::Quarter).unwrap();
+    let expected_q = NaiveDate::from_ymd_opt(2024, 9, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_q_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_q, Utc).timestamp_millis();
+    assert_eq!(
+      next_q, expected_q_ts,
+      "add_calendar(Quarter) must preserve the day-of-month"
+    );
+
+    // Year: expect 2025-06-03
+    let next_y = add_calendar(ts, CalendarUnit::Year).unwrap();
+    let expected_y = NaiveDate::from_ymd_opt(2025, 6, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_y_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_y, Utc).timestamp_millis();
+    assert_eq!(
+      next_y, expected_y_ts,
+      "add_calendar(Year) must preserve the day-of-month"
+    );
+  }
+
+  /// Regression for #257: chained add_calendar calls with a 2-day offset must
+  /// produce keys at day 3 each month, matching bucket_start output.
+  #[test]
+  fn add_calendar_fill_loop_aligned_with_multi_day_offset() {
+    use chrono::{NaiveDate, Utc};
+    let offset_ms: i64 = 172_800_000; // 2 days
+    let start_dt = NaiveDate::from_ymd_opt(2024, 4, 3)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let start =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc).timestamp_millis();
+
+    let expected_keys: Vec<i64> = [(2024, 4, 3), (2024, 5, 3), (2024, 6, 3), (2024, 7, 3)]
+      .iter()
+      .map(|(y, m, d)| {
+        let dt = NaiveDate::from_ymd_opt(*y, *m, *d)
+          .unwrap()
+          .and_hms_opt(0, 0, 0)
+          .unwrap();
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp_millis()
+      })
+      .collect();
+
+    let mut current = start;
+    let mut keys = vec![current];
+    for _ in 0..3 {
+      current = add_calendar(current, CalendarUnit::Month).unwrap();
+      keys.push(current);
+    }
+    assert_eq!(
+      keys, expected_keys,
+      "fill loop must produce keys at day 3, not day 1"
+    );
+
+    // Verify bucket_start + add_interval round-trip consistency
+    let interval = DateInterval::Calendar(CalendarUnit::Month);
+    let mut cur = bucket_start(start, offset_ms, &interval).unwrap();
+    for expected in &expected_keys {
+      assert_eq!(cur, *expected);
+      cur = add_interval(cur, &interval).unwrap();
+    }
+  }
+
+  /// Regression for #257: day clamping when the original day exceeds the
+  /// target month's length (e.g. Jan 31 + 1 month → Feb 28/29).
+  #[test]
+  fn add_calendar_clamps_day_to_target_month_length() {
+    use chrono::{NaiveDate, Utc};
+
+    // Jan 31 + 1 month → Feb 29 (2024 is a leap year)
+    let jan31 = NaiveDate::from_ymd_opt(2024, 1, 31)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(jan31, Utc).timestamp_millis();
+
+    let next = add_calendar(ts, CalendarUnit::Month).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2024, 2, 29)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected, Utc).timestamp_millis();
+    assert_eq!(
+      next, expected_ts,
+      "Jan 31 + Month must clamp to Feb 29 in a leap year"
+    );
+
+    // Jan 31 + 1 month in a non-leap year → Feb 28
+    let jan31_nl = NaiveDate::from_ymd_opt(2023, 1, 31)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts_nl =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(jan31_nl, Utc).timestamp_millis();
+
+    let next_nl = add_calendar(ts_nl, CalendarUnit::Month).unwrap();
+    let expected_nl = NaiveDate::from_ymd_opt(2023, 2, 28)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_nl_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_nl, Utc).timestamp_millis();
+    assert_eq!(
+      next_nl, expected_nl_ts,
+      "Jan 31 + Month must clamp to Feb 28 in a non-leap year"
+    );
+
+    // Feb 29 (leap) + 1 year → Feb 28 (non-leap)
+    let feb29 = NaiveDate::from_ymd_opt(2024, 2, 29)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let ts_leap = chrono::DateTime::<Utc>::from_naive_utc_and_offset(feb29, Utc).timestamp_millis();
+
+    let next_year = add_calendar(ts_leap, CalendarUnit::Year).unwrap();
+    let expected_year = NaiveDate::from_ymd_opt(2025, 2, 28)
+      .unwrap()
+      .and_hms_opt(0, 0, 0)
+      .unwrap();
+    let expected_year_ts =
+      chrono::DateTime::<Utc>::from_naive_utc_and_offset(expected_year, Utc).timestamp_millis();
+    assert_eq!(
+      next_year, expected_year_ts,
+      "Feb 29 + Year must clamp to Feb 28 in a non-leap year"
+    );
+  }
+
+  /// Regression test for #249: finalize_response must rank significant_terms
+  /// buckets by significance score, not by doc_count. A low-frequency term
+  /// with a very low bg_count must outrank a high-frequency term with a high
+  /// bg_count when its significance score is higher.
+  #[test]
+  fn significant_terms_finalize_ranks_by_significance_score() {
+    use serde_json::json;
+
+    let intermediate = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        // "common": high doc_count, high bg_count → low significance
+        SignificantBucketIntermediate {
+          key: json!("common"),
+          doc_count: 80,
+          bg_count: 5000,
+          aggs: BTreeMap::new(),
+        },
+        // "frequent": medium doc_count, high bg_count → low significance
+        SignificantBucketIntermediate {
+          key: json!("frequent"),
+          doc_count: 50,
+          bg_count: 4000,
+          aggs: BTreeMap::new(),
+        },
+        // "rare_sig": low doc_count, very low bg_count → very high significance
+        SignificantBucketIntermediate {
+          key: json!("rare_sig"),
+          doc_count: 3,
+          bg_count: 5,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(2),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 100,
+      bg_count: 10_000,
+      sampled: false,
+    };
+
+    let response = finalize_response(intermediate);
+    if let AggregationResponse::SignificantTerms { buckets, .. } = response {
+      assert_eq!(buckets.len(), 2, "size=2 should yield 2 buckets");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "rare_sig",
+        "rare_sig (score=60.0) must be ranked #1"
+      );
+      assert!(
+        buckets[0].score > buckets[1].score,
+        "first bucket should have higher score"
+      );
+      // Verify that "rare_sig" was not discarded by intermediate truncation
+      let keys: Vec<&str> = buckets.iter().map(|b| b.key.as_str().unwrap()).collect();
+      assert!(
+        keys.contains(&"rare_sig"),
+        "rare_sig must survive truncation"
+      );
+    } else {
+      panic!("expected SignificantTerms response");
+    }
+  }
+
+  /// Zero bg_count buckets must not displace genuinely significant terms.
+  /// finalize_response assigns score 0.0 when bg_count == 0, so the
+  /// intermediate proxy sort must also treat them as score 0.0.
+  #[test]
+  fn significant_terms_zero_bg_count_does_not_displace_real_terms() {
+    use serde_json::json;
+
+    let intermediate = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        // "real_sig": genuinely significant (bg_count > 0)
+        SignificantBucketIntermediate {
+          key: json!("real_sig"),
+          doc_count: 5,
+          bg_count: 10,
+          aggs: BTreeMap::new(),
+        },
+        // "zero_bg": high doc_count but bg_count == 0 → final score 0.0
+        SignificantBucketIntermediate {
+          key: json!("zero_bg"),
+          doc_count: 90,
+          bg_count: 0,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 100,
+      bg_count: 10_000,
+      sampled: false,
+    };
+
+    let response = finalize_response(intermediate);
+    if let AggregationResponse::SignificantTerms { buckets, .. } = response {
+      assert_eq!(buckets.len(), 1, "size=1 should yield 1 bucket");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "real_sig",
+        "zero bg_count bucket must not displace genuinely significant term"
+      );
+      assert!(
+        buckets[0].score > 0.0,
+        "real_sig should have a positive score"
+      );
+    } else {
+      panic!("expected SignificantTerms response");
+    }
+  }
+
+  /// Regression test for #249: cross-segment merge must also sort by
+  /// significance score proxy before truncation.
+  #[test]
+  fn significant_terms_merge_preserves_high_significance_terms() {
+    use serde_json::json;
+
+    // Segment 1: contains "common" (high doc_count)
+    let mut seg1 = AggregationIntermediate::SignificantTerms {
+      buckets: vec![SignificantBucketIntermediate {
+        key: json!("common"),
+        doc_count: 40,
+        bg_count: 2500,
+        aggs: BTreeMap::new(),
+      }],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 50,
+      bg_count: 5000,
+      sampled: false,
+    };
+
+    // Segment 2: contains "common" (more) and "rare_sig" (low doc_count, very low bg_count)
+    let seg2 = AggregationIntermediate::SignificantTerms {
+      buckets: vec![
+        SignificantBucketIntermediate {
+          key: json!("common"),
+          doc_count: 40,
+          bg_count: 2500,
+          aggs: BTreeMap::new(),
+        },
+        SignificantBucketIntermediate {
+          key: json!("rare_sig"),
+          doc_count: 3,
+          bg_count: 5,
+          aggs: BTreeMap::new(),
+        },
+      ],
+      size: Some(1),
+      min_doc_count: 1,
+      pipeline: BTreeMap::new(),
+      doc_count: 50,
+      bg_count: 5000,
+      sampled: false,
+    };
+
+    merge_intermediate_in_place(&mut seg1, seg2);
+
+    // After merge with size=1, "rare_sig" should survive because its
+    // doc_count/bg_count ratio (3/5 = 0.6) is much higher than
+    // "common"'s (80/5000 = 0.016).
+    if let AggregationIntermediate::SignificantTerms { buckets, .. } = &seg1 {
+      assert_eq!(buckets.len(), 1, "size=1 should yield 1 bucket after merge");
+      assert_eq!(
+        buckets[0].key.as_str().unwrap(),
+        "rare_sig",
+        "rare_sig must survive merge truncation due to higher significance"
+      );
+    } else {
+      panic!("expected SignificantTerms intermediate");
+    }
+  }
+
+  #[test]
+  fn bucket_metric_value_resolves_decimal_percentile_key() {
+    let mut aggs = BTreeMap::new();
+    let mut pct_values = BTreeMap::new();
+    pct_values.insert("50".to_string(), 10.0);
+    pct_values.insert("99.9".to_string(), 42.5);
+    pct_values.insert("99.99".to_string(), 100.0);
+    aggs.insert(
+      "latency_pct".to_string(),
+      AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 1,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.99.9"), Some(42.5));
+    assert_eq!(
+      bucket_metric_value(&bucket, "latency_pct.99.99"),
+      Some(100.0)
+    );
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.50"), Some(10.0));
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.unknown"), None);
+  }
+
+  #[test]
+  fn bucket_metric_value_resolves_decimal_percentile_rank_key() {
+    let mut aggs = BTreeMap::new();
+    let mut rank_values = BTreeMap::new();
+    rank_values.insert("50.5".to_string(), 72.0);
+    rank_values.insert("100".to_string(), 99.0);
+    aggs.insert(
+      "rank_agg".to_string(),
+      AggregationResponse::PercentileRanks(PercentileRanksResponse {
+        values: rank_values,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 1,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "rank_agg.50.5"), Some(72.0));
+    assert_eq!(bucket_metric_value(&bucket, "rank_agg.100"), Some(99.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_stats_subfield_still_works() {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_stats".to_string(),
+      AggregationResponse::Stats(StatsResponse {
+        count: 10,
+        min: 1.0,
+        max: 100.0,
+        avg: 50.0,
+        sum: 500.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 10,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.max"), Some(100.0));
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.min"), Some(1.0));
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.avg"), Some(50.0));
+    assert_eq!(bucket_metric_value(&bucket, "_count"), Some(10.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_no_subpath_returns_default_for_stats() {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_stats".to_string(),
+      AggregationResponse::Stats(StatsResponse {
+        count: 5,
+        min: 0.0,
+        max: 10.0,
+        avg: 5.0,
+        sum: 25.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 5,
+      aggregations: aggs,
+    };
+
+    // Without a subpath, Stats defaults to "avg"
+    assert_eq!(bucket_metric_value(&bucket, "my_stats"), Some(5.0));
+  }
+
+  #[test]
+  fn moving_avg_pipeline_with_decimal_percentile_path() {
+    let mut pct_values = BTreeMap::new();
+    pct_values.insert("99.9".to_string(), 10.0);
+    let mut pct_values2 = BTreeMap::new();
+    pct_values2.insert("99.9".to_string(), 20.0);
+    let mut pct_values3 = BTreeMap::new();
+    pct_values3.insert("99.9".to_string(), 30.0);
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!(0),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(1),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse {
+            values: pct_values2,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(2),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "latency_pct".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse {
+            values: pct_values3,
+          }),
+        )]),
+      },
+    ];
+
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smoothed_p999",
+      &MovingAvgAggregation {
+        buckets_path: "latency_pct.99.9".to_string(),
+        window: 2,
+        predict: None,
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // First bucket: no preceding values → null (look-back window is empty)
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[0].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value, None);
+    } else {
+      panic!("expected moving_avg on bucket 0");
+    }
+    // Second bucket: preceding window [10.0] → avg = 10.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[1].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value.unwrap(), 10.0);
+    } else {
+      panic!("expected moving_avg on bucket 1");
+    }
+    // Third bucket: preceding window [10.0, 20.0] → avg = 15.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[2].aggregations.get("smoothed_p999")
+    {
+      assert_eq!(val.value.unwrap(), 15.0);
+    } else {
+      panic!("expected moving_avg on bucket 2");
+    }
+  }
+
+  #[test]
+  fn moving_avg_predictions_seed_from_final_window() {
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!(0),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 1.0,
+            max: 1.0,
+            sum: 1.0,
+            avg: 1.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!(1),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 100.0,
+            max: 100.0,
+            sum: 100.0,
+            avg: 100.0,
+          }),
+        )]),
+      },
+    ];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m".to_string(),
+        window: 2,
+        predict: Some(2),
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+    // Bucket 0: no preceding values → None
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[0].aggregations.get("smooth") {
+      assert_eq!(val.value, None);
+    } else {
+      panic!("expected moving_avg on bucket 0");
+    }
+    // Bucket 1: preceding window [1.0] → avg = 1.0
+    if let Some(AggregationResponse::MovingAvg(val)) = buckets[1].aggregations.get("smooth") {
+      assert_eq!(val.value.unwrap(), 1.0);
+    } else {
+      panic!("expected moving_avg on bucket 1");
+    }
+    // Predictions seed from final window [1.0, 100.0] → 50.5
+    if let Some(AggregationResponse::MovingAvg(resp)) = responses.get("smooth") {
+      assert_eq!(resp.predictions, vec![50.5, 50.5]);
+    } else {
+      panic!("missing moving_avg pipeline response");
+    }
+  }
+
+  #[test]
+  fn pipeline_aggs_respect_dependency_order_not_alphabetical() {
+    use crate::api::types::{BucketScriptAggregation, DerivativeAggregation};
+
+    fn stats_bucket(key: i64, revenue: f64) -> BucketResponse {
+      let mut m = BTreeMap::new();
+      m.insert(
+        "revenue".to_string(),
+        AggregationResponse::Stats(StatsResponse {
+          count: 1,
+          min: revenue,
+          max: revenue,
+          sum: revenue,
+          avg: revenue,
+        }),
+      );
+      BucketResponse {
+        key: serde_json::Value::Number(serde_json::Number::from(key)),
+        doc_count: 1,
+        aggregations: m,
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(1, 100.0),
+      stats_bucket(2, 150.0),
+      stats_bucket(3, 200.0),
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    // "adjusted" sorts before "daily_change" alphabetically, but depends on it
+    pipeline.insert(
+      "adjusted".to_string(),
+      Aggregation::BucketScript(BucketScriptAggregation {
+        buckets_path: {
+          let mut bp = BTreeMap::new();
+          bp.insert("d".to_string(), "daily_change".to_string());
+          bp
+        },
+        script: "d * 100".to_string(),
+      }),
+    );
+    pipeline.insert(
+      "daily_change".to_string(),
+      Aggregation::Derivative(DerivativeAggregation {
+        buckets_path: "revenue".to_string(),
+        gap_policy: None,
+        unit: None,
+      }),
+    );
+
+    let _responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+
+    // Bucket 0: derivative is None (no previous), so adjusted should be None
+    let adj0 = buckets[0].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj0 {
+      assert!(v.value.is_none(), "bucket 0 adjusted should be None");
+    } else {
+      panic!("expected BucketScript response");
+    }
+
+    // Bucket 1: derivative = 150 - 100 = 50, adjusted = 50 * 100 = 5000
+    let adj1 = buckets[1].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj1 {
+      assert!(
+        v.value.is_some(),
+        "bucket 1 adjusted must not be None (dependency ordering bug)"
+      );
+      assert!(
+        (v.value.unwrap() - 5000.0).abs() < 1e-6,
+        "expected 5000.0, got {:?}",
+        v.value
+      );
+    } else {
+      panic!("expected BucketScript response");
+    }
+
+    // Bucket 2: derivative = 200 - 150 = 50, adjusted = 50 * 100 = 5000
+    let adj2 = buckets[2].aggregations.get("adjusted").unwrap();
+    if let AggregationResponse::BucketScript(v) = adj2 {
+      assert!(
+        v.value.is_some(),
+        "bucket 2 adjusted must not be None (dependency ordering bug)"
+      );
+      assert!(
+        (v.value.unwrap() - 5000.0).abs() < 1e-6,
+        "expected 5000.0, got {:?}",
+        v.value
+      );
+    } else {
+      panic!("expected BucketScript response");
+    }
+  }
+
+  #[test]
+  fn topological_sort_orders_dependencies_first() {
+    use crate::api::types::{BucketScriptAggregation, DerivativeAggregation};
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "adjusted".to_string(),
+      Aggregation::BucketScript(BucketScriptAggregation {
+        buckets_path: {
+          let mut bp = BTreeMap::new();
+          bp.insert("d".to_string(), "daily_change".to_string());
+          bp
+        },
+        script: "d * 100".to_string(),
+      }),
+    );
+    pipeline.insert(
+      "daily_change".to_string(),
+      Aggregation::Derivative(DerivativeAggregation {
+        buckets_path: "revenue".to_string(),
+        gap_policy: None,
+        unit: None,
+      }),
+    );
+
+    let order = topological_sort_pipeline(&pipeline);
+    let dc_pos = order.iter().position(|&n| n == "daily_change").unwrap();
+    let adj_pos = order.iter().position(|&n| n == "adjusted").unwrap();
+    assert!(
+      dc_pos < adj_pos,
+      "daily_change must come before adjusted, got dc={dc_pos} adj={adj_pos}"
+    );
+  }
+
+  #[test]
+  fn avg_bucket_returns_none_when_all_buckets_missing_metric() {
+    use crate::api::types::BucketMetricAggregation;
+
+    // Buckets exist but none of them carry the referenced sub-aggregation,
+    // mirroring the case where every parent bucket has zero matching docs
+    // for the inner avg metric.
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::new(),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 2,
+        aggregations: BTreeMap::new(),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must return None when no bucket contributes a metric value"
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn avg_bucket_returns_none_serializes_without_value_field() {
+    let resp = AggregationResponse::AvgBucket(OptionalBucketMetricResponse { value: None });
+    let json = serde_json::to_value(&resp).unwrap();
+    // Mirrors derivative/bucket_script: when there is no value, the field is
+    // omitted from the JSON output rather than being serialized as 0.0.
+    assert!(
+      json.get("value").is_none(),
+      "expected `value` to be absent when None, got: {json}"
+    );
+  }
+
+  #[test]
+  fn avg_bucket_returns_some_average_when_buckets_have_metric() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 20.0,
+            max: 20.0,
+            sum: 20.0,
+            avg: 20.0,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(val.value, Some(15.0));
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_returns_some_zero_when_no_buckets_contribute() {
+    use crate::api::types::BucketMetricAggregation;
+
+    // sum_bucket follows the additive identity convention: the sum of an
+    // empty set is 0, and the value is wrapped in Some so it round-trips
+    // through the (now optional) response shape.
+    let mut buckets = vec![BucketResponse {
+      key: serde_json::json!("a"),
+      doc_count: 1,
+      aggregations: BTreeMap::new(),
+    }];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "sum_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("sum_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(val.value, Some(0.0));
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
   }
 }

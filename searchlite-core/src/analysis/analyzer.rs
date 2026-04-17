@@ -30,16 +30,21 @@ impl Analyzer {
 
   /// Applies inexpensive, structure-preserving normalization suitable for patterns
   /// (e.g., wildcard/regex) without re-tokenizing or stripping delimiters.
+  ///
+  /// The folding strategy must match the tokenizer so that pattern terms align
+  /// with indexed terms. The `Unicode` tokenizer and the `Lowercase` filter
+  /// both apply full Unicode case-folding (`str::to_lowercase`), while the
+  /// `Default` tokenizer applies ASCII-only folding (`char::to_ascii_lowercase`).
   pub fn normalize_pattern(&self, pattern: &str) -> String {
-    let lowercases = matches!(
-      self.tokenizer,
-      TokenizerKind::Default | TokenizerKind::Unicode
-    ) || self
-      .filters
-      .iter()
-      .any(|f| matches!(f, TokenFilter::Lowercase));
-    if lowercases {
+    let has_unicode_lower = matches!(self.tokenizer, TokenizerKind::Unicode)
+      || self
+        .filters
+        .iter()
+        .any(|f| matches!(f, TokenFilter::Lowercase));
+    if has_unicode_lower {
       pattern.to_lowercase()
+    } else if matches!(self.tokenizer, TokenizerKind::Default) {
+      pattern.chars().map(|c| c.to_ascii_lowercase()).collect()
     } else {
       pattern.to_string()
     }
@@ -422,8 +427,11 @@ fn edge_ngrams(tokens: Vec<Token>, cfg: &EdgeNgramConfig) -> Vec<Token> {
   let mut out = Vec::new();
   for token in tokens.into_iter() {
     let len = token.text.chars().count();
+    if len < cfg.min {
+      continue;
+    }
     let max = usize::min(cfg.max, len);
-    let min = usize::min(cfg.min, max);
+    let min = cfg.min;
     if min == 0 || max == 0 {
       continue;
     }
@@ -566,5 +574,78 @@ mod tests {
       texts,
       vec!["r".to_string(), "ru".to_string(), "rus".to_string()]
     );
+  }
+
+  #[test]
+  fn edge_ngram_skips_tokens_shorter_than_min() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::EdgeNgram(EdgeNgramConfig {
+        min: 3,
+        max: 5,
+      })],
+      "ab",
+    );
+    assert!(
+      tokens.is_empty(),
+      "tokens shorter than min should produce no ngrams"
+    );
+  }
+
+  #[test]
+  fn edge_ngram_includes_token_equal_to_min() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::EdgeNgram(EdgeNgramConfig {
+        min: 3,
+        max: 5,
+      })],
+      "abc",
+    );
+    let texts: Vec<String> = tokens.into_iter().map(|t| t.text).collect();
+    assert_eq!(texts, vec!["abc".to_string()]);
+  }
+
+  #[test]
+  fn normalize_pattern_default_uses_ascii_only_folding() {
+    let analyzer = Analyzer::default_analyzer();
+    // ASCII uppercase is lowered.
+    assert_eq!(analyzer.normalize_pattern("RÉS*"), "rÉs*");
+    // Non-ASCII uppercase is preserved (É stays É), matching default_tokenize.
+    assert_eq!(analyzer.normalize_pattern("RÉSUMÉ"), "rÉsumÉ");
+    // Pure ASCII still works as expected.
+    assert_eq!(analyzer.normalize_pattern("HELLO*"), "hello*");
+  }
+
+  #[test]
+  fn normalize_pattern_unicode_uses_full_unicode_folding() {
+    let analyzer = Analyzer {
+      tokenizer: TokenizerKind::Unicode,
+      filters: vec![],
+    };
+    // Full Unicode: É → é.
+    assert_eq!(analyzer.normalize_pattern("RÉS*"), "rés*");
+    assert_eq!(analyzer.normalize_pattern("RÉSUMÉ"), "résumé");
+  }
+
+  #[test]
+  fn normalize_pattern_default_with_lowercase_filter_uses_unicode_folding() {
+    let analyzer = Analyzer {
+      tokenizer: TokenizerKind::Default,
+      filters: vec![TokenFilter::Lowercase],
+    };
+    // The Lowercase filter applies full Unicode folding, so normalize_pattern
+    // should match that behavior even though the tokenizer is Default.
+    assert_eq!(analyzer.normalize_pattern("RÉS*"), "rés*");
+    assert_eq!(analyzer.normalize_pattern("RÉSUMÉ"), "résumé");
+  }
+
+  #[test]
+  fn normalize_pattern_whitespace_no_filters_preserves_case() {
+    let analyzer = Analyzer {
+      tokenizer: TokenizerKind::Whitespace,
+      filters: vec![],
+    };
+    // Whitespace tokenizer does not lowercase at all.
+    assert_eq!(analyzer.normalize_pattern("RÉS*"), "RÉS*");
+    assert_eq!(analyzer.normalize_pattern("HELLO"), "HELLO");
   }
 }

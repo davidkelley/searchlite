@@ -354,13 +354,14 @@ pub(crate) fn evaluate_compiled_score(
       }
       let mut combined =
         if let Some(func_score) = combine_function_scores(&function_values, *score_mode) {
-          apply_boost_mode(effective_base, func_score, *boost_mode)
+          let capped = match max_boost {
+            Some(max) => func_score.min(*max),
+            None => func_score,
+          };
+          apply_boost_mode(effective_base, capped, *boost_mode)
         } else {
           effective_base
         };
-      if let Some(max) = max_boost {
-        combined = combined.min(*max);
-      }
       if let Some(min) = min_score {
         if combined < *min {
           return None;

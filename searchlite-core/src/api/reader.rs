@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
   Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
-  HistogramAggregation, IndexOptions, MgetDoc, Query, RescoreMode, RescoreRequest, SearchRequest,
-  SortOrder, SuggestResult,
+  HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation, Query, RescoreMode,
+  RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -2060,6 +2060,26 @@ impl IndexReader {
           continue;
         }
         if !query_eval.matches(doc_id) {
+          let hit = hits.get_mut(hit_idx).unwrap();
+          let orig_score = hit.score;
+          let combined = combine_rescore_scores(rescore.score_mode, orig_score, 0.0);
+          hit.score = combined;
+          hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
+          if req.explain {
+            let mut expl = hit.explanation.take().unwrap_or(HitExplanation {
+              base_score: orig_score,
+              functions: Vec::new(),
+              rescore: None,
+              final_score: orig_score,
+            });
+            expl.rescore = Some(RescoreExplanation {
+              rescore_score: 0.0,
+              combined_score: combined,
+              functions: Vec::new(),
+            });
+            expl.final_score = combined;
+            hit.explanation = Some(expl);
+          }
           continue;
         }
         stats.candidates_examined += 1;
@@ -2403,12 +2423,9 @@ fn validate_aggregations_in_scope(
       | Aggregation::AvgBucket(_)
       | Aggregation::SumBucket(_)
       | Aggregation::Derivative(_)
-      | Aggregation::MovingAvg(_)
       | Aggregation::BucketScript(_) => {}
-      Aggregation::TopHits(t) => {
-        SortPlan::from_request(schema, &t.sort)
-          .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
-      }
+      Aggregation::MovingAvg(m) => validate_moving_avg_config(name, m)?,
+      Aggregation::TopHits(t) => validate_top_hits_config(schema, name, t)?,
     }
   }
   Ok(())
@@ -2867,6 +2884,105 @@ fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Resu
         .into(),
       );
     }
+  }
+  Ok(())
+}
+
+/// Reject `moving_avg` requests that would let untrusted input drive an unbounded
+/// `Vec<f64>` allocation in the response finalization step (BUG-221).
+///
+/// `predict` is fed straight into `vec![last_avg; predict]` inside
+/// `apply_moving_avg_pipeline`; without this gate a tiny request body (well under
+/// the HTTP body cap) can request multi-gigabyte allocations and OOM the process.
+/// We also bound `window` to the same ceiling so a runaway value cannot mask
+/// other validation failures or surprise future maintainers, even though `window`
+/// is not itself a direct allocation source today.
+fn validate_moving_avg_config(name: &str, agg: &MovingAvgAggregation) -> Result<()> {
+  if agg.window == 0 {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("moving_avg `{name}` requires window >= 1 (got 0)"),
+      }
+      .into(),
+    );
+  }
+  if agg.window > crate::query::aggs::MAX_BUCKETS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "moving_avg `{name}` window {} exceeds limit {}",
+          agg.window,
+          crate::query::aggs::MAX_BUCKETS
+        ),
+      }
+      .into(),
+    );
+  }
+  if let Some(predict) = agg.predict {
+    if predict > crate::query::aggs::MAX_PREDICTIONS {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "moving_avg `{name}` predict {predict} exceeds limit {}",
+            crate::query::aggs::MAX_PREDICTIONS
+          ),
+        }
+        .into(),
+      );
+    }
+  }
+  Ok(())
+}
+
+/// Reject `top_hits` requests that would let untrusted input drive an unbounded
+/// `BinaryHeap<RankedDoc>` allocation in the per-segment collector (BUG-222).
+///
+/// `size` and `from` are forwarded directly into `TopHitsCollector::new` and used
+/// to size the per-segment heap (`size + from`). Without a request-time gate, a
+/// tiny request body can ask for `size = 10_000_000_000` and OOM the process as
+/// the heap grows during collection. We reject `size`, `from`, and the saturating
+/// sum independently so the error message names the offending dimension and so
+/// the additive case (`size = cap`, `from = cap`) cannot bypass either single
+/// bound. The existing sort-plan validation is preserved so a malformed sort
+/// surfaces at request-parse time rather than a collector panic.
+fn validate_top_hits_config(schema: &Schema, name: &str, agg: &TopHitsAggregation) -> Result<()> {
+  SortPlan::from_request(schema, &agg.sort)
+    .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
+  if agg.size > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size {} exceeds limit {}",
+          agg.size,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  if agg.from > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` from {} exceeds limit {}",
+          agg.from,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  let combined = agg.size.saturating_add(agg.from);
+  if combined > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size + from = {combined} exceeds limit {}",
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
   }
   Ok(())
 }
@@ -4069,6 +4185,232 @@ mod tests {
     assert!(question_keys.contains("body:roast"));
     assert!(question_keys.contains("body:roost"));
     assert_eq!(question_keys.len(), 2);
+  }
+
+  #[test]
+  fn wildcard_expansion_handles_trailing_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-trailing-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [
+      ("1", "hello"),
+      ("2", "helloworld"),
+      ("3", "help"),
+      ("4", "world"),
+    ] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Trailing wildcard: "hello*" must match "hello" and "helloworld".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "hello*".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:hello"),
+      "trailing star must match exact term"
+    );
+    assert!(
+      keys.contains("body:helloworld"),
+      "trailing star must match extended term"
+    );
+    assert!(
+      !keys.contains("body:help"),
+      "trailing star must not match non-prefix term"
+    );
+    assert!(
+      !keys.contains("body:world"),
+      "trailing star must not match unrelated term"
+    );
+  }
+
+  #[test]
+  fn wildcard_expansion_handles_leading_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-leading-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "helloworld"), ("2", "bigworld"), ("3", "hello")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Leading wildcard: "*world" must match terms ending in "world".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "*world".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:helloworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      keys.contains("body:bigworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      !keys.contains("body:hello"),
+      "leading star must not match term without suffix"
+    );
+  }
+
+  #[test]
+  fn regex_expansion_handles_trailing_metacharacters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-trailing");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "ruby"), ("3", "rope"), ("4", "run")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Regex "r.+" must match any term starting with 'r' followed by one or more chars.
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "r.+".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(keys.contains("body:rust"), "r.+ must match 'rust'");
+    assert!(keys.contains("body:ruby"), "r.+ must match 'ruby'");
+    assert!(keys.contains("body:rope"), "r.+ must match 'rope'");
+    assert!(keys.contains("body:run"), "r.+ must match 'run'");
   }
 
   #[test]

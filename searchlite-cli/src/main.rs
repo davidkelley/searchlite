@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -287,9 +287,14 @@ fn cmd_add(index: &Path, doc_path: &Path, write_key: Option<&str>) -> Result<()>
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
-  let content =
-    fs::read_to_string(doc_path).with_context(|| format!("reading docs from {doc_path:?}"))?;
-  for (line_no, line) in content.lines().enumerate() {
+  // Stream the NDJSON input line-by-line so memory stays bounded by the
+  // longest single document rather than by the total file size.
+  let file = fs::File::open(doc_path).with_context(|| format!("reading docs from {doc_path:?}"))?;
+  let reader = BufReader::new(file);
+  for (line_no, line) in reader.lines().enumerate() {
+    let line =
+      line.with_context(|| format!("reading docs from {doc_path:?} at line {}", line_no + 1))?;
+    let line = line.strip_suffix('\r').unwrap_or(&line);
     if line.trim().is_empty() {
       continue;
     }
@@ -311,11 +316,20 @@ fn cmd_delete(index: &Path, ids_path: &Path, write_key: Option<&str>) -> Result<
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
-  let content = fs::read_to_string(ids_path)
-    .with_context(|| format!("reading document ids from {ids_path:?}"))?;
+  // Stream the id list line-by-line so memory stays bounded regardless of
+  // total file size.
+  let file =
+    fs::File::open(ids_path).with_context(|| format!("reading document ids from {ids_path:?}"))?;
+  let reader = BufReader::new(file);
   let mut ids = Vec::new();
-  for (line_no, line) in content.lines().enumerate() {
-    let line = line.strip_suffix('\r').unwrap_or(line);
+  for (line_no, line) in reader.lines().enumerate() {
+    let line = line.with_context(|| {
+      format!(
+        "reading document ids from {ids_path:?} at line {}",
+        line_no + 1
+      )
+    })?;
+    let line = line.strip_suffix('\r').unwrap_or(&line);
     if line.trim().is_empty() {
       continue;
     }
@@ -735,6 +749,128 @@ mod tests {
     assert!(
       err.to_string().contains("index does not exist"),
       "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn cmd_add_handles_crlf_line_endings_with_streaming_reader() {
+    // Regression for BUG-017: the streaming BufReader path does not collapse
+    // CRLF into LF the way `str::lines()` did, so the manual `\r` strip must
+    // keep working across many lines of a realistic NDJSON file.
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx-crlf");
+    let schema_path = dir.path().join("schema.json");
+    let schema = searchlite_core::api::types::Schema::default_text_body();
+    fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+
+    let docs_path = dir.path().join("docs.jsonl");
+    let mut contents = String::new();
+    for i in 0..32 {
+      contents.push_str(&format!("{{\"_id\":\"{i}\",\"body\":\"doc {i}\"}}\r\n"));
+    }
+    // Include a blank line (pure CRLF) to confirm the empty-line skip still
+    // fires even when the reader hands us `\r` before the strip.
+    contents.push_str("\r\n");
+    fs::write(&docs_path, contents).unwrap();
+
+    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
+    cmd_commit(index.as_path(), None).unwrap();
+
+    let opts = options(index.as_path(), false);
+    let idx = Index::open(opts).unwrap();
+    let reader = idx.reader().unwrap();
+    let request = SearchRequest {
+      query: "doc".into(),
+      fields: None,
+      filter: None,
+      limit: 100,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    let result = reader.search(&request).unwrap();
+    assert_eq!(
+      result.hits.len(),
+      32,
+      "expected all CRLF-terminated docs ingested"
+    );
+  }
+
+  #[test]
+  fn cmd_add_reports_line_number_on_invalid_json() {
+    // Regression for BUG-017: per-line error context must still reference the
+    // 1-based line number even though the reader now hands us lines
+    // incrementally rather than as a slice of a fully buffered string.
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx-badline");
+    let schema_path = dir.path().join("schema.json");
+    let schema = searchlite_core::api::types::Schema::default_text_body();
+    fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+
+    let docs_path = dir.path().join("docs.jsonl");
+    fs::write(
+      &docs_path,
+      "{\"_id\":\"1\",\"body\":\"ok\"}\n\
+       {\"_id\":\"2\",\"body\":\"ok\"}\n\
+       not-valid-json\n",
+    )
+    .unwrap();
+
+    let err = cmd_add(index.as_path(), docs_path.as_path(), None).unwrap_err();
+    let chain: String = err
+      .chain()
+      .map(|e| e.to_string())
+      .collect::<Vec<_>>()
+      .join(" | ");
+    assert!(
+      chain.contains("invalid JSON on line 3"),
+      "expected per-line error referencing line 3, got: {chain}"
+    );
+  }
+
+  #[test]
+  fn cmd_delete_streaming_reports_line_number_on_invalid_id() {
+    // Regression for BUG-017: cmd_delete must still surface the 1-based line
+    // number for invalid IDs after switching to the streaming reader.
+    let dir = tempdir().unwrap();
+    let index = dir.path().join("idx-badid");
+    let schema_path = dir.path().join("schema.json");
+    let schema = searchlite_core::api::types::Schema::default_text_body();
+    fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
+    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+
+    let ids_path = dir.path().join("ids.txt");
+    // Second ID contains a NUL byte, which validate_doc_id rejects.
+    fs::write(&ids_path, "good-id\nbad\0id\n").unwrap();
+
+    let err = cmd_delete(index.as_path(), ids_path.as_path(), None).unwrap_err();
+    assert!(
+      err.to_string().contains("invalid id on line 2"),
+      "expected per-line error referencing line 2, got: {err}"
     );
   }
 

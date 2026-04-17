@@ -12,6 +12,7 @@ use crate::api::reader::IndexReader;
 use crate::api::types::{FuzzyOptions, SuggestOption, SuggestRequest, SuggestResult};
 use crate::index::manifest::FieldKind;
 use crate::index::segment::SegmentReader;
+use crate::util::case_fold::fold_keyword;
 
 #[derive(Default)]
 struct SuggestCandidate {
@@ -74,8 +75,15 @@ fn collect_completion_candidates(
       let prefix = char_prefix(term, prefix_len);
       let prefix_key = build_term_key(field, prefix);
       let field_prefix_len = field.len() + 1;
-      let mut global_cap = fuzzy.max_expansions.min(MAX_SUGGEST_CANDIDATES);
-      global_cap = global_cap.max(size);
+      // Bound the inner-iteration cap against the hard ceiling even when the
+      // caller asks for a very large final `size`. Before the fix, a request
+      // with `size: 1_000_000` and `max_expansions: 1` lifted the cap to
+      // 1_000_000 and forced a full bounded_levenshtein scan over every
+      // prefix-matching term in the segment — an unauthenticated DoS vector
+      // (BUG-024). `max_expansions` is still honoured as the lower bound
+      // when it is larger than `size`, so legitimate callers that request
+      // wider expansion continue to get the same behaviour up to the cap.
+      let global_cap = fuzzy.max_expansions.max(size).min(MAX_SUGGEST_CANDIDATES);
       for seg in segments.iter() {
         for key in seg.terms_with_prefix(&prefix_key) {
           if expanded_total >= global_cap {
@@ -133,7 +141,7 @@ impl IndexReader {
         inputs.dedup();
         Ok(inputs)
       }
-      FieldKind::Keyword => Ok(vec![prefix.to_ascii_lowercase()]),
+      FieldKind::Keyword => Ok(vec![fold_keyword(prefix).into_owned()]),
       FieldKind::Numeric | FieldKind::Unknown => {
         bail!("completion suggest is only supported on text/keyword fields")
       }

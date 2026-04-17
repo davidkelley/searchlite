@@ -24,7 +24,7 @@ use searchlite_core::api::types::{
   Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
 };
 use searchlite_core::api::PatchError;
-use searchlite_core::api::{MultiSearchResponse, SearchResult};
+use searchlite_core::api::{IndexReader, MultiSearchResponse, SearchResult};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
@@ -370,7 +370,6 @@ impl ManagedIndex {
 
     Ok(IndexDescriptor {
       name: self.name.clone(),
-      path: self.path.display().to_string(),
       exists,
       committed_at,
       doc_count,
@@ -838,10 +837,13 @@ struct HealthResponse {
   status: String,
 }
 
+// Note: `path` was removed from this descriptor as a Security fix (BUG-219),
+// mirroring the BUG-015 fix to `StatsResponse`. The on-disk filesystem path of
+// an index is an operator-side implementation detail and must not be exposed
+// to unauthenticated callers of `/indexes`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct IndexDescriptor {
   name: String,
-  path: String,
   exists: bool,
   committed_at: Option<String>,
   doc_count: Option<u64>,
@@ -2220,8 +2222,33 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
+  // Share a bounded pool of IndexReaders across sub-searches rather than
+  // re-opening one per task. Pool size matches the effective concurrency so
+  // each permit is always backed by an available reader, and reuse eliminates
+  // the repeated segment-open cost for large multi_search payloads.
+  let pool_size = max_concurrency.min(searches.len()).max(1);
   let idx = index.clone();
-  let semaphore = Arc::new(Semaphore::new(max_concurrency));
+  let readers = {
+    let idx_for_pool = idx.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<IndexReader>> {
+      let mut readers = Vec::with_capacity(pool_size);
+      for _ in 0..pool_size {
+        readers.push(idx_for_pool.reader()?);
+      }
+      Ok(readers)
+    })
+    .await
+    .map_err(|err| {
+      HttpError::from_anyhow(
+        "multi_search_join",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!(err.to_string()),
+      )
+    })?
+    .map_err(|err| HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err))?
+  };
+  let pool = Arc::new(tokio::sync::Mutex::new(readers));
+  let semaphore = Arc::new(Semaphore::new(pool_size));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
   for (search_idx, mut req) in searches.into_iter().enumerate() {
     if req.cursor.is_some() {
@@ -2229,6 +2256,7 @@ async fn multi_search(
       req.from = 0;
     }
     let semaphore_clone = semaphore.clone();
+    let pool_clone = pool.clone();
     let index_clone = idx.clone();
     tasks.push(async move {
       let permit = semaphore_clone.acquire_owned().await.map_err(|err| {
@@ -2238,19 +2266,39 @@ async fn multi_search(
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
-        let _permit = permit;
-        let reader = index_clone.reader()?;
-        reader.search(&req)
+      // Holding a permit guarantees a reader is available in steady state.
+      // The pool can briefly be empty if a prior blocking task panicked and
+      // dropped its reader; defer the fallback open into the blocking task
+      // below so file I/O never runs on a Tokio worker thread.
+      let pooled = pool_clone.lock().await.pop();
+      // Keep `permit` in the outer async scope so it is not released until
+      // after the reader is returned to the pool. Dropping it inside the
+      // blocking closure (i.e. as soon as `reader.search` returns) would let
+      // a waiting task acquire the freed permit, find the pool momentarily
+      // empty, and open a new reader — growing the pool past its bound.
+      let handle = tokio::task::spawn_blocking(move || {
+        let reader = match pooled {
+          Some(reader) => reader,
+          None => match index_clone.reader() {
+            Ok(reader) => reader,
+            Err(err) => return (None, Err(err)),
+          },
+        };
+        let result = reader.search(&req);
+        (Some(reader), result)
       });
-      let joined = handle.await.map_err(|err: tokio::task::JoinError| {
+      let (reader, result) = handle.await.map_err(|err: tokio::task::JoinError| {
         HttpError::from_anyhow(
           "multi_search_join",
           StatusCode::INTERNAL_SERVER_ERROR,
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let search_res = joined.map_err(|err| {
+      if let Some(reader) = reader {
+        pool_clone.lock().await.push(reader);
+      }
+      drop(permit);
+      let search_res = result.map_err(|err| {
         HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
       })?;
       Ok::<(usize, SearchResult), HttpError>((search_idx, search_res))
@@ -2720,6 +2768,107 @@ mod tests {
     assert_eq!(stats["index_name"], INDEX_NAME);
     assert!(stats["index_uuid"].as_str().is_some());
     assert_eq!(stats["documents"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  // Regression test for BUG-219: the public `/indexes` endpoint must not leak
+  // the on-disk filesystem path of any mounted index. This mirrors BUG-015,
+  // which removed the same field from `/stats`. Read-side endpoints are
+  // unauthenticated by design, so the response surface is restricted to
+  // operator-chosen logical identifiers and aggregate counts.
+  #[tokio::test]
+  async fn list_indexes_response_does_not_expose_filesystem_path() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-list-no-path");
+    let (client, base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
+
+    // Walk the parsed JSON and check string values directly so we are not
+    // tricked by JSON escaping (e.g. Windows backslashes are doubled in the
+    // raw serialized form, which would let a regression slip past a naive
+    // substring check on the wire bytes).
+    fn json_contains_string_value(value: &serde_json::Value, target: &str) -> bool {
+      match value {
+        serde_json::Value::String(s) => s == target,
+        serde_json::Value::Array(values) => values
+          .iter()
+          .any(|value| json_contains_string_value(value, target)),
+        serde_json::Value::Object(map) => map
+          .values()
+          .any(|value| json_contains_string_value(value, target)),
+        _ => false,
+      }
+    }
+
+    let fs_path_str = index_path.display().to_string();
+
+    // Pre-init: descriptor still must not carry the path.
+    let before: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_before = before["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_before.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_before:?}"
+    );
+    assert!(
+      !json_contains_string_value(&before, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {before:?}"
+    );
+
+    // Post-init/commit: descriptor still must not carry the path even after
+    // the on-disk index has materialized.
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/add"))
+      .body("{\"_id\":\"1\",\"body\":\"doc\"}\n")
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let after: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_after = after["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_after.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_after:?}"
+    );
+    assert!(
+      !json_contains_string_value(&after, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {after:?}"
+    );
+
+    // Sanity: the public fields are still present.
+    assert_eq!(first_after["name"], INDEX_NAME);
+    assert_eq!(first_after["exists"], true);
+    assert_eq!(first_after["doc_count"], 1);
 
     handle.abort();
     let _ = handle.await;
@@ -3828,6 +3977,100 @@ mod tests {
     assert_eq!(body.results.len(), 2);
     assert!(body.results[0].hits.is_empty());
     assert_eq!(body.results[1].hits.first().unwrap().doc_id, "2");
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn multi_search_parallel_reuses_reader_pool() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-multi-pool");
+    let (client, _base, index_base, handle, state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson =
+      "{\"_id\":\"1\",\"body\":\"rust\"}\n{\"_id\":\"2\",\"body\":\"go\"}\n{\"_id\":\"3\",\"body\":\"rust go\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    // Capture the baseline reader-open count *after* init/add/commit so the
+    // assertion below only measures opens caused by this multi_search call.
+    let managed = state.registry().resolve(INDEX_NAME).unwrap();
+    let index = managed.require_index().await.unwrap();
+    let opens_before = index.reader_open_count();
+
+    // Eight sub-searches with a pool capped at two exercises reader reuse:
+    // the pool is strictly smaller than the search count, so correctness here
+    // depends on readers being handed back and picked up again by later tasks.
+    const POOL_SIZE: usize = 2;
+    let searches: Vec<serde_json::Value> = (0..8)
+      .map(|i| {
+        let term = if i % 2 == 0 { "rust" } else { "go" };
+        json!({ "query": term, "limit": 5, "return_stored": false })
+      })
+      .collect();
+    let req = json!({
+      "searches": searches,
+      "parallel": true,
+      "max_concurrency": POOL_SIZE
+    });
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MultiSearchResponse = res.json().await.unwrap();
+    assert_eq!(body.results.len(), 8);
+    for (i, result) in body.results.iter().enumerate() {
+      let ids: Vec<&str> = result.hits.iter().map(|h| h.doc_id.as_str()).collect();
+      if i % 2 == 0 {
+        assert!(
+          ids.contains(&"1"),
+          "expected doc 1 for rust query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for rust query #{i}: {ids:?}"
+        );
+      } else {
+        assert!(
+          ids.contains(&"2"),
+          "expected doc 2 for go query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for go query #{i}: {ids:?}"
+        );
+      }
+    }
+
+    // The pool caps concurrent readers at `POOL_SIZE`, so a multi_search with
+    // 8 sub-requests must open no more than that many fresh readers. Opening
+    // one per sub-search (the pre-fix behavior) would produce 8 here.
+    let opens_after = index.reader_open_count();
+    let opens_for_multi_search = opens_after - opens_before;
+    assert!(
+      opens_for_multi_search <= POOL_SIZE,
+      "expected at most {POOL_SIZE} reader opens from multi_search, observed {opens_for_multi_search}"
+    );
 
     handle.abort();
     let _ = handle.await;

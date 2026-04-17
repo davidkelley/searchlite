@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,89 +10,44 @@ use futures::channel::oneshot;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use searchlite_core::api::types::{
-  Aggregation, ExecutionStrategy, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest,
-  Query, QueryNode, SearchRequest, SortSpec, StorageType,
+  Aggregation, ExecutionStrategy, Filter, IndexOptions, Query, QueryNode, SearchRequest, SortSpec,
+  StorageType,
 };
-use searchlite_core::api::{Document, IndexReader, IndexWriter, MultiSearchResponse, PatchError};
+use searchlite_core::api::{Document, IndexReader, IndexWriter};
 use searchlite_core::storage::{DynFile, InMemoryStorage, Storage, StorageFile};
-use searchlite_core::util::doc_id::validate_doc_id;
-use searchlite_core::{Index, Manifest, Schema};
-use serde::de::DeserializeOwned;
+use searchlite_core::{Index, Schema};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
+#[cfg(feature = "threads")]
 use wasm_bindgen_futures::JsFuture;
 #[cfg(feature = "threads")]
 use wasm_bindgen_rayon::init_thread_pool;
 
 const STORE_NAME: &str = "searchlite_files";
-const REGISTRY_DB_NAME: &str = "searchlite_registry";
-const REGISTRY_STORE_NAME: &str = "indexes";
-const META_FILE_NAME: &str = ".searchlite_meta.json";
-const SCHEMA_VERSION_V1: u32 = 1;
-const IDB_WRITE_BATCH_SIZE: usize = 64;
 // BM25 defaults tuned for browser-based search; keep aligned with core defaults.
 const BM25_K1: f32 = 0.9;
 const BM25_B: f32 = 0.4;
-type EventHandler = Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>>;
+/// Hard ceiling on `from + limit` for any WASM-exported search entrypoint.
+/// Browser linear memory is capped at 4 GiB, so an unbounded `limit` from
+/// JavaScript can drive the result heap to OOM and abort the
+/// WebAssembly.Instance with no recovery path.
+///
+/// This must stay aligned with `MAX_PAGE_SIZE` in
+/// `searchlite-core/src/api/reader.rs` (and `searchlite-http/src/lib.rs`):
+/// those layers reject `from + size` above the same cap when `return_hits`
+/// is true, so any value the WASM validator lets through still has to fit
+/// core's contract. Callers needing more than this should paginate via
+/// `cursor` / `search_after`. `candidate_size` is intentionally not
+/// capped here — core silently clamps it at `MAX_CANDIDATE_SIZE` and HTTP
+/// does the same — so duplicating that as a hard reject would diverge.
+const WASM_MAX_PAGE_SIZE: usize = 1_000;
 
 thread_local! {
   // Per-thread (per WASM worker) cache of IndexedDB connections.
   // This avoids reconnecting for each persist operation on the same thread.
   static DB_CACHE: RefCell<HashMap<String, web_sys::IdbDatabase>> = RefCell::new(HashMap::new());
-}
-
-#[cfg(test)]
-thread_local! {
-  static MIGRATION_FAIL_AFTER_CLEAR: RefCell<bool> = const { RefCell::new(false) };
-  static FORCE_PERSIST_QUOTA_EXCEEDED: RefCell<bool> = const { RefCell::new(false) };
-  static PERSIST_BATCH_TX_COUNT: RefCell<u32> = const { RefCell::new(0) };
-}
-
-#[cfg(test)]
-fn set_migration_fail_after_clear(enabled: bool) {
-  MIGRATION_FAIL_AFTER_CLEAR.with(|flag| *flag.borrow_mut() = enabled);
-}
-
-#[cfg(test)]
-fn migration_fail_after_clear() -> bool {
-  MIGRATION_FAIL_AFTER_CLEAR.with(|flag| *flag.borrow())
-}
-
-#[cfg(test)]
-fn set_force_persist_quota_exceeded(enabled: bool) {
-  FORCE_PERSIST_QUOTA_EXCEEDED.with(|flag| *flag.borrow_mut() = enabled);
-}
-
-#[cfg(test)]
-fn force_persist_quota_exceeded() -> bool {
-  FORCE_PERSIST_QUOTA_EXCEEDED.with(|flag| *flag.borrow())
-}
-
-#[cfg(test)]
-fn reset_persist_batch_tx_count() {
-  PERSIST_BATCH_TX_COUNT.with(|count| *count.borrow_mut() = 0);
-}
-
-#[cfg(test)]
-fn persist_batch_tx_count() -> u32 {
-  PERSIST_BATCH_TX_COUNT.with(|count| *count.borrow())
-}
-
-#[cfg(test)]
-fn bump_persist_batch_tx_count() {
-  PERSIST_BATCH_TX_COUNT.with(|count| *count.borrow_mut() += 1);
-}
-
-#[cfg(not(test))]
-fn migration_fail_after_clear() -> bool {
-  false
-}
-
-#[cfg(not(test))]
-fn force_persist_quota_exceeded() -> bool {
-  false
 }
 
 #[derive(Clone, Copy)]
@@ -108,10 +62,7 @@ impl StorageMode {
       None => Ok(Self::IndexedDb),
       Some(value) if value.eq_ignore_ascii_case("indexeddb") => Ok(Self::IndexedDb),
       Some(value) if value.eq_ignore_ascii_case("memory") => Ok(Self::Memory),
-      Some(_) => Err(js_error(
-        "invalid_argument",
-        "storage must be 'indexeddb' or 'memory'",
-      )),
+      Some(_) => Err(JsValue::from_str("storage must be 'indexeddb' or 'memory'")),
     }
   }
 }
@@ -119,140 +70,6 @@ impl StorageMode {
 enum StorageBackend {
   IndexedDb(Arc<JsStorage>),
   Memory,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct WasmErrorPayload {
-  #[serde(rename = "type")]
-  error_type: String,
-  reason: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct IndexRegistryEntry {
-  db_name: String,
-  schema_version: u32,
-  schema_hash: String,
-  updated_at_ms: f64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct IndexMeta {
-  schema_version: u32,
-  schema_hash: String,
-}
-
-fn js_error(error_type: &str, reason: impl Into<String>) -> JsValue {
-  let payload = WasmErrorPayload {
-    error_type: error_type.to_string(),
-    reason: reason.into(),
-  };
-  serde_wasm_bindgen::to_value(&payload)
-    .unwrap_or_else(|_| JsValue::from_str("failed to serialize wasm error payload"))
-}
-
-fn to_js_error(err: impl std::fmt::Display) -> JsValue {
-  js_error("internal_error", err.to_string())
-}
-
-fn typed_js_error(error_type: &str, err: impl std::fmt::Display) -> JsValue {
-  js_error(error_type, err.to_string())
-}
-
-fn js_error_reason(err: &JsValue) -> String {
-  if let Some(reason) = js_sys::Reflect::get(err, &JsValue::from_str("reason"))
-    .ok()
-    .and_then(|value| value.as_string())
-  {
-    return reason;
-  }
-  err
-    .as_string()
-    .unwrap_or_else(|| format!("non-string js error: {err:?}"))
-}
-
-fn map_update_error(err: anyhow::Error) -> JsValue {
-  if let Some(patch_err) = err.downcast_ref::<PatchError>() {
-    return match patch_err {
-      PatchError::DocumentNotFound => js_error("document_not_found", err.to_string()),
-      PatchError::VectorFieldsUnsupported => js_error("vector_fields_unsupported", err.to_string()),
-    };
-  }
-  js_error("update_failed", err.to_string())
-}
-
-fn is_quota_exceeded_reason(reason: &str) -> bool {
-  let lower = reason.to_ascii_lowercase();
-  lower.contains("quotaexceedederror") || (lower.contains("quota") && lower.contains("exceed"))
-}
-
-fn map_storage_error(err: anyhow::Error, fallback_type: &str, action: &str) -> JsValue {
-  let reason = err.to_string();
-  if is_quota_exceeded_reason(&reason) {
-    return js_error(
-      "quota_exceeded",
-      format!(
-        "indexeddb quota exceeded while {action}; run compact(), remove stale indexes with Searchlite.cleanup_indexes(...), or clear/drop unused indexes before retrying. detail: {reason}"
-      ),
-    );
-  }
-  js_error(fallback_type, reason)
-}
-
-fn parse_timeout_ms(timeout_ms: Option<f64>) -> Result<Option<f64>, JsValue> {
-  match timeout_ms {
-    None => Ok(None),
-    Some(ms) if ms.is_finite() && ms >= 0.0 => Ok(Some(ms)),
-    _ => Err(js_error(
-      "invalid_timeout",
-      "timeout_ms must be a non-negative finite number",
-    )),
-  }
-}
-
-fn ensure_not_aborted(signal: Option<&web_sys::AbortSignal>) -> Result<(), JsValue> {
-  if signal.map(|sig| sig.aborted()).unwrap_or(false) {
-    return Err(js_error("aborted", "operation aborted by AbortSignal"));
-  }
-  Ok(())
-}
-
-fn ensure_not_timed_out(started_ms: f64, timeout_ms: Option<f64>) -> Result<(), JsValue> {
-  let Some(limit) = timeout_ms else {
-    return Ok(());
-  };
-  let elapsed_ms = now_ms() - started_ms;
-  if elapsed_ms >= limit {
-    return Err(js_error(
-      "timeout",
-      format!("operation exceeded timeout_ms={limit} (elapsed={elapsed_ms:.2}ms)"),
-    ));
-  }
-  Ok(())
-}
-
-fn parse_request_value<T>(value: JsValue, error_type: &str) -> Result<T, JsValue>
-where
-  T: DeserializeOwned,
-{
-  match serde_wasm_bindgen::from_value::<T>(value.clone()) {
-    Ok(parsed) => Ok(parsed),
-    Err(primary_err) => {
-      let fallback_json: serde_json::Value =
-        serde_wasm_bindgen::from_value(value).map_err(|json_err| {
-          typed_js_error(
-            error_type,
-            format!("primary decode failed: {primary_err}; json fallback failed: {json_err}"),
-          )
-        })?;
-      serde_json::from_value::<T>(fallback_json).map_err(|json_err| {
-        typed_js_error(
-          error_type,
-          format!("primary decode failed: {primary_err}; json struct decode failed: {json_err}"),
-        )
-      })
-    }
-  }
 }
 
 impl StorageBackend {
@@ -292,10 +109,64 @@ fn path_key(path: &Path) -> String {
   path.to_string_lossy().to_string()
 }
 
+fn to_js_error(err: impl std::fmt::Display) -> JsValue {
+  JsValue::from_str(&err.to_string())
+}
+
+/// Reject WASM search requests whose `limit`, `from`, or `from + limit`
+/// exceed [`WASM_MAX_PAGE_SIZE`]. A JS caller that passes `limit = u32::MAX`
+/// would otherwise drive the result heap until the WebAssembly linear
+/// memory aborts the module with no recovery path.
+///
+/// The cap is gated on `req.return_hits` to mirror `IndexReader::search()`
+/// in `searchlite-core` and `validate_search` in `searchlite-http`: those
+/// values only drive the top-k result heap when hits are actually
+/// returned, so aggregation-only or metadata queries (which set
+/// `return_hits = false`) can legitimately use larger pagination values
+/// without WASM rejecting requests that core and HTTP would accept.
+/// `candidate_size` is intentionally not validated here — core silently
+/// clamps it at `MAX_CANDIDATE_SIZE` and HTTP does not check it either,
+/// so duplicating that as a hard reject would diverge from both layers.
+fn validate_search_limits(req: &SearchRequest) -> Result<(), JsValue> {
+  if !req.return_hits {
+    return Ok(());
+  }
+  if req.limit > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "limit {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.limit
+    )));
+  }
+  if req.from > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "from {} exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.from
+    )));
+  }
+  if req.from.saturating_add(req.limit) > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "from + limit ({}) exceeds max page size {WASM_MAX_PAGE_SIZE}",
+      req.from.saturating_add(req.limit),
+    )));
+  }
+  Ok(())
+}
+
+/// Reject a `limit` argument supplied directly by JS to the convenience
+/// `search()` entrypoint, which always uses `from = 0`.
+fn validate_search_limit_arg(limit: usize) -> Result<(), JsValue> {
+  if limit > WASM_MAX_PAGE_SIZE {
+    return Err(JsValue::from_str(&format!(
+      "limit {limit} exceeds max page size {WASM_MAX_PAGE_SIZE}"
+    )));
+  }
+  Ok(())
+}
+
 fn value_to_document(value: serde_json::Value) -> Result<Document, JsValue> {
   let obj = value
     .as_object()
-    .ok_or_else(|| js_error("invalid_document", "document must be a JSON object"))?;
+    .ok_or_else(|| JsValue::from_str("document must be a JSON object"))?;
   let mut fields = BTreeMap::new();
   for (k, v) in obj.iter() {
     fields.insert(k.clone(), v.clone());
@@ -307,59 +178,30 @@ fn value_to_documents(value: serde_json::Value) -> Result<Vec<Document>, JsValue
   match value {
     serde_json::Value::Array(items) => items.into_iter().map(value_to_document).collect(),
     obj @ serde_json::Value::Object(_) => Ok(vec![value_to_document(obj)?]),
-    _ => Err(js_error(
-      "invalid_document_batch",
+    _ => Err(JsValue::from_str(
       "documents must be an object or array of objects",
     )),
   }
 }
 
-fn value_to_doc_ids(value: serde_json::Value) -> Result<Vec<String>, JsValue> {
-  match value {
-    serde_json::Value::String(id) => Ok(vec![id]),
-    serde_json::Value::Array(items) => {
-      let mut ids = Vec::with_capacity(items.len());
-      for item in items {
-        let serde_json::Value::String(id) = item else {
-          return Err(js_error(
-            "invalid_doc_id_batch",
-            "document ids must be a string or array of strings",
-          ));
-        };
-        ids.push(id);
-      }
-      Ok(ids)
-    }
-    _ => Err(js_error(
-      "invalid_doc_id_batch",
-      "document ids must be a string or array of strings",
-    )),
-  }
-}
-
-fn clear_request_handlers(req: &web_sys::IdbRequest, success: &EventHandler, error: &EventHandler) {
+fn clear_request_handlers(
+  req: &web_sys::IdbRequest,
+  success: &Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>>,
+  error: &Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>>,
+) {
   req.set_onsuccess(None);
   req.set_onerror(None);
   success.borrow_mut().take();
   error.borrow_mut().take();
 }
 
-fn dom_exception_to_anyhow(context: &str, dom: &web_sys::DomException) -> anyhow::Error {
-  anyhow!("{context}: {} ({})", dom.name(), dom.message())
-}
-
-fn js_error_to_anyhow(context: &str, err: &JsValue) -> anyhow::Error {
-  if let Ok(dom) = err.clone().dyn_into::<web_sys::DomException>() {
-    return dom_exception_to_anyhow(context, &dom);
-  }
-  anyhow!("{context}: {:?}", err)
-}
-
 fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output = Result<JsValue>> {
   let (tx, rx) = oneshot::channel::<Result<JsValue>>();
   let sender = Rc::new(RefCell::new(Some(tx)));
-  let success_handler: EventHandler = Rc::new(RefCell::new(None));
-  let error_handler: EventHandler = Rc::new(RefCell::new(None));
+  let success_handler: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
+    Rc::new(RefCell::new(None));
+  let error_handler: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
+    Rc::new(RefCell::new(None));
   let success_req_for_closure = req.clone();
   let success_req_for_handler = req.clone();
   let error_req_for_closure = req.clone();
@@ -402,13 +244,12 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
   let error_handler_clone = error_handler.clone();
   let sender_clone = sender.clone();
   let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-    let err = match error_req_for_closure.error() {
-      Ok(Some(dom)) => dom_exception_to_anyhow("indexeddb request error", &dom),
-      Ok(None) => anyhow!("indexeddb request error"),
-      Err(raw) => js_error_to_anyhow("indexeddb request error", &raw),
+    let err_val = match error_req_for_closure.error() {
+      Ok(e) => e.into(),
+      Err(_) => JsValue::from_str("indexeddb request error"),
     };
     if let Some(tx) = sender_clone.borrow_mut().take() {
-      let _ = tx.send(Err(err));
+      let _ = tx.send(Err(anyhow!("indexeddb request error: {:?}", err_val)));
     }
     clear_request_handlers(
       &error_req_for_closure,
@@ -434,155 +275,7 @@ fn request_future(req: &web_sys::IdbRequest) -> impl std::future::Future<Output 
   }
 }
 
-fn clear_transaction_handlers(
-  tx: &web_sys::IdbTransaction,
-  complete: &EventHandler,
-  error: &EventHandler,
-  abort: &EventHandler,
-) {
-  tx.set_oncomplete(None);
-  tx.set_onerror(None);
-  tx.set_onabort(None);
-  complete.borrow_mut().take();
-  error.borrow_mut().take();
-  abort.borrow_mut().take();
-}
-
-fn transaction_future(
-  tx: &web_sys::IdbTransaction,
-) -> impl std::future::Future<Output = Result<()>> {
-  let (tx_done, rx) = oneshot::channel::<Result<()>>();
-  let sender = Rc::new(RefCell::new(Some(tx_done)));
-  let complete_handler: EventHandler = Rc::new(RefCell::new(None));
-  let error_handler: EventHandler = Rc::new(RefCell::new(None));
-  let abort_handler: EventHandler = Rc::new(RefCell::new(None));
-
-  let tx_complete_for_closure = tx.clone();
-  let tx_complete_for_handler = tx.clone();
-  let tx_error_for_closure = tx.clone();
-  let tx_error_for_handler = tx.clone();
-  let tx_abort_for_closure = tx.clone();
-  let tx_abort_for_handler = tx.clone();
-
-  let complete_handler_clone = complete_handler.clone();
-  let error_handler_clone = error_handler.clone();
-  let abort_handler_clone = abort_handler.clone();
-  let sender_clone = sender.clone();
-  let complete = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-    if let Some(done) = sender_clone.borrow_mut().take() {
-      let _ = done.send(Ok(()));
-    }
-    clear_transaction_handlers(
-      &tx_complete_for_closure,
-      &complete_handler_clone,
-      &error_handler_clone,
-      &abort_handler_clone,
-    );
-  }) as Box<dyn FnMut(_)>);
-  *complete_handler.borrow_mut() = Some(complete);
-  tx_complete_for_handler.set_oncomplete(Some(
-    complete_handler
-      .borrow()
-      .as_ref()
-      .expect("transaction complete handler set")
-      .as_ref()
-      .unchecked_ref(),
-  ));
-
-  let complete_handler_clone = complete_handler.clone();
-  let error_handler_clone = error_handler.clone();
-  let abort_handler_clone = abort_handler.clone();
-  let sender_clone = sender.clone();
-  let error = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-    let err = tx_error_for_closure
-      .error()
-      .map(|dom| dom_exception_to_anyhow("indexeddb transaction error", &dom))
-      .unwrap_or_else(|| anyhow!("indexeddb transaction error"));
-    if let Some(done) = sender_clone.borrow_mut().take() {
-      let _ = done.send(Err(err));
-    }
-    clear_transaction_handlers(
-      &tx_error_for_closure,
-      &complete_handler_clone,
-      &error_handler_clone,
-      &abort_handler_clone,
-    );
-  }) as Box<dyn FnMut(_)>);
-  *error_handler.borrow_mut() = Some(error);
-  tx_error_for_handler.set_onerror(Some(
-    error_handler
-      .borrow()
-      .as_ref()
-      .expect("transaction error handler set")
-      .as_ref()
-      .unchecked_ref(),
-  ));
-
-  let complete_handler_clone = complete_handler.clone();
-  let error_handler_clone = error_handler.clone();
-  let abort_handler_clone = abort_handler.clone();
-  let sender_clone = sender.clone();
-  let abort = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-    let err = tx_abort_for_closure
-      .error()
-      .map(|dom| dom_exception_to_anyhow("indexeddb transaction aborted", &dom))
-      .unwrap_or_else(|| anyhow!("indexeddb transaction aborted"));
-    if let Some(done) = sender_clone.borrow_mut().take() {
-      let _ = done.send(Err(err));
-    }
-    clear_transaction_handlers(
-      &tx_abort_for_closure,
-      &complete_handler_clone,
-      &error_handler_clone,
-      &abort_handler_clone,
-    );
-  }) as Box<dyn FnMut(_)>);
-  *abort_handler.borrow_mut() = Some(abort);
-  tx_abort_for_handler.set_onabort(Some(
-    abort_handler
-      .borrow()
-      .as_ref()
-      .expect("transaction abort handler set")
-      .as_ref()
-      .unchecked_ref(),
-  ));
-
-  async move {
-    match rx.await {
-      Ok(result) => result,
-      Err(_) => Err(anyhow!("indexeddb transaction wait canceled")),
-    }
-  }
-}
-
-fn now_ms() -> f64 {
-  js_sys::Date::now()
-}
-
-fn schema_hash(schema: &Schema) -> Result<String, JsValue> {
-  let schema_json =
-    serde_json::to_vec(schema).map_err(|err| typed_js_error("schema_serialization_error", err))?;
-  // Use a deterministic FNV-1a hash so persisted schema fingerprints remain stable
-  // across process restarts and Rust/toolchain upgrades.
-  let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-  for byte in schema_json {
-    hash ^= byte as u64;
-    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-  }
-  Ok(format!("{hash:016x}"))
-}
-
-fn manifest_doc_counts(manifest: &Manifest) -> (u64, u64) {
-  let mut total_docs = 0u64;
-  let mut deleted_docs = 0u64;
-  for seg in manifest.segments.iter() {
-    total_docs = total_docs.saturating_add(seg.doc_count as u64);
-    deleted_docs = deleted_docs.saturating_add(seg.deleted_docs.len() as u64);
-  }
-  (total_docs.saturating_sub(deleted_docs), deleted_docs)
-}
-
-async fn open_db_with_store(name: &str, store_name: &str) -> Result<web_sys::IdbDatabase> {
+async fn open_db(name: &str) -> Result<web_sys::IdbDatabase> {
   if let Some(db) = DB_CACHE.with(|cache| cache.borrow().get(name).cloned()) {
     return Ok(db);
   }
@@ -590,7 +283,7 @@ async fn open_db_with_store(name: &str, store_name: &str) -> Result<web_sys::Idb
   let request = factory
     .open_with_u32(name, 1)
     .map_err(|e| anyhow!("indexed_db open error: {:?}", e))?;
-  let store = store_name.to_string();
+  let store = STORE_NAME.to_string();
   let upgrade = Closure::wrap(Box::new(move |event: web_sys::Event| {
     if let Some(target) = event.target() {
       if let Ok(req) = target.dyn_into::<web_sys::IdbOpenDbRequest>() {
@@ -620,226 +313,11 @@ async fn open_db_with_store(name: &str, store_name: &str) -> Result<web_sys::Idb
   Ok(db)
 }
 
-fn close_cached_db(name: &str) {
-  DB_CACHE.with(|cache| {
-    if let Some(db) = cache.borrow_mut().remove(name) {
-      db.close();
-    }
-  });
-}
-
-async fn open_data_db(name: &str) -> Result<web_sys::IdbDatabase> {
-  open_db_with_store(name, STORE_NAME).await
-}
-
-async fn open_registry_db() -> Result<web_sys::IdbDatabase> {
-  open_db_with_store(REGISTRY_DB_NAME, REGISTRY_STORE_NAME).await
-}
-
-async fn delete_database(name: &str) -> Result<()> {
-  close_cached_db(name);
-  let factory = indexed_db_factory()?;
-  let request = factory
-    .delete_database(name)
-    .map_err(|e| anyhow!("indexed_db delete_database error: {:?}", e))?;
-  let request_handle: web_sys::IdbRequest = request.into();
-  request_future(&request_handle).await?;
-  Ok(())
-}
-
-async fn clear_data_store(db_name: &str) -> Result<()> {
-  let db = open_data_db(db_name).await?;
-  let tx = db
-    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
-  let store = tx
-    .object_store(STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
-  let tx_done = transaction_future(&tx);
-  let req = store
-    .clear()
-    .map_err(|e| anyhow!("clear failed for {STORE_NAME}: {:?}", e))?;
-  request_future(&req).await?;
-  tx_done.await
-}
-
-async fn upsert_registry_entry(entry: &IndexRegistryEntry) -> Result<()> {
-  let db = open_registry_db().await?;
-  let tx = db
-    .transaction_with_str_and_mode(REGISTRY_STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .map_err(|e| {
-      anyhow!(
-        "opening read-write transaction for {REGISTRY_STORE_NAME}: {:?}",
-        e
-      )
-    })?;
-  let store = tx
-    .object_store(REGISTRY_STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let key = JsValue::from_str(&entry.db_name);
-  let value = serde_wasm_bindgen::to_value(entry)
-    .map_err(|e| anyhow!("serializing registry entry failed: {e}"))?;
-  let tx_done = transaction_future(&tx);
-  let req = store
-    .put_with_key(&value, &key)
-    .map_err(|e| anyhow!("put registry entry failed: {:?}", e))?;
-  request_future(&req).await?;
-  tx_done.await
-}
-
-async fn remove_registry_entry(db_name: &str) -> Result<()> {
-  let db = open_registry_db().await?;
-  let tx = db
-    .transaction_with_str_and_mode(REGISTRY_STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .map_err(|e| {
-      anyhow!(
-        "opening read-write transaction for {REGISTRY_STORE_NAME}: {:?}",
-        e
-      )
-    })?;
-  let tx_done = transaction_future(&tx);
-  let store = tx
-    .object_store(REGISTRY_STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let key = JsValue::from_str(db_name);
-  let req = store
-    .delete(&key)
-    .map_err(|e| anyhow!("delete registry entry failed: {:?}", e))?;
-  request_future(&req).await?;
-  tx_done.await
-}
-
-async fn get_registry_entry(db_name: &str) -> Result<Option<IndexRegistryEntry>> {
-  let db = open_registry_db().await?;
-  let tx = db
-    .transaction_with_str_and_mode(REGISTRY_STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-    .map_err(|e| anyhow!("opening transaction for {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let store = tx
-    .object_store(REGISTRY_STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let key = JsValue::from_str(db_name);
-  let req = store
-    .get(&key)
-    .map_err(|e| anyhow!("registry get failed: {:?}", e))?;
-  let row = request_future(&req).await?;
-  if row.is_null() || row.is_undefined() {
-    return Ok(None);
-  }
-  let entry: IndexRegistryEntry =
-    serde_wasm_bindgen::from_value(row).map_err(|e| anyhow!("registry decode failed: {e}"))?;
-  Ok(Some(entry))
-}
-
-async fn restore_registry_entry(db_name: &str, entry: Option<&IndexRegistryEntry>) -> Result<()> {
-  match entry {
-    Some(existing) => upsert_registry_entry(existing).await,
-    None => remove_registry_entry(db_name).await,
-  }
-}
-
-async fn list_registry_entries() -> Result<Vec<IndexRegistryEntry>> {
-  let db = open_registry_db().await?;
-  let tx = db
-    .transaction_with_str_and_mode(REGISTRY_STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-    .map_err(|e| anyhow!("opening transaction for {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let store = tx
-    .object_store(REGISTRY_STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {REGISTRY_STORE_NAME}: {:?}", e))?;
-  let req = store
-    .get_all()
-    .map_err(|e| anyhow!("registry get_all failed: {:?}", e))?;
-  let val = request_future(&req).await?;
-  let rows: js_sys::Array = val
-    .dyn_into()
-    .map_err(|_| anyhow!("registry get_all expected an array"))?;
-  let mut entries = Vec::with_capacity(rows.length() as usize);
-  for row in rows.iter() {
-    if row.is_undefined() || row.is_null() {
-      continue;
-    }
-    let entry: IndexRegistryEntry = serde_wasm_bindgen::from_value(row)
-      .map_err(|e| anyhow!("registry entry decode failed: {e}"))?;
-    entries.push(entry);
-  }
-  entries.sort_by(|a, b| a.db_name.cmp(&b.db_name));
-  Ok(entries)
-}
-
-#[derive(Debug)]
-enum PersistOperation {
-  Put(Vec<u8>),
-  Delete,
-}
-
-fn chunk_operations(
-  operations: Vec<(PathBuf, PersistOperation)>,
-  chunk_size: usize,
-) -> Vec<Vec<(PathBuf, PersistOperation)>> {
-  let mut chunks = Vec::new();
-  let mut current = Vec::with_capacity(chunk_size.max(1));
-  for operation in operations {
-    current.push(operation);
-    if current.len() >= chunk_size {
-      chunks.push(current);
-      current = Vec::with_capacity(chunk_size.max(1));
-    }
-  }
-  if !current.is_empty() {
-    chunks.push(current);
-  }
-  chunks
-}
-
-async fn persist_operations_batch(
-  db_name: &str,
-  operations: &[(PathBuf, PersistOperation)],
-) -> Result<()> {
-  if operations.is_empty() {
-    return Ok(());
-  }
-  if force_persist_quota_exceeded() {
-    return Err(anyhow!(
-      "QuotaExceededError: synthetic quota failure for wasm persistence test"
-    ));
-  }
-  #[cfg(test)]
-  bump_persist_batch_tx_count();
-
-  let db = open_data_db(db_name).await?;
-  let tx = db
-    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
-  let tx_done = transaction_future(&tx);
-  let store = tx
-    .object_store(STORE_NAME)
-    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
-  // Queue every request synchronously before yielding. Awaiting each request
-  // individually can let Chrome auto-close the transaction between awaits.
-  for (path, operation) in operations.iter() {
-    let key = JsValue::from_str(&path_key(path));
-    match operation {
-      PersistOperation::Put(data) => {
-        let value: JsValue = js_sys::Uint8Array::from(data.as_slice()).into();
-        store
-          .put_with_key(&value, &key)
-          .map_err(|e| anyhow!("put_with_key failed for {:?}: {:?}", path, e))?;
-      }
-      PersistOperation::Delete => {
-        store
-          .delete(&key)
-          .map_err(|e| anyhow!("delete failed for {:?}: {:?}", path, e))?;
-      }
-    };
-  }
-  tx_done.await
-}
-
 async fn load_snapshot(db_name: &str) -> Result<HashMap<PathBuf, Vec<u8>>> {
-  let db = open_data_db(db_name).await?;
+  let db = open_db(db_name).await?;
   let tx = db
     .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readonly)
     .map_err(|e| anyhow!("opening transaction for {STORE_NAME}: {:?}", e))?;
-  let tx_done = transaction_future(&tx);
   let store = tx
     .object_store(STORE_NAME)
     .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
@@ -851,76 +329,64 @@ async fn load_snapshot(db_name: &str) -> Result<HashMap<PathBuf, Vec<u8>>> {
     .map_err(|e| anyhow!("get_all failed: {:?}", e))?;
   let keys_val = request_future(&keys_req).await?;
   let values_val = request_future(&values_req).await?;
-  tx_done.await?;
-
-  let keys: js_sys::Array = keys_val
-    .dyn_into()
-    .map_err(|_| anyhow!("get_all_keys expected an array"))?;
-  let values: js_sys::Array = values_val
-    .dyn_into()
-    .map_err(|_| anyhow!("get_all expected an array"))?;
-
-  let keys_len = keys.length() as usize;
-  let values_len = values.length() as usize;
-  let paired_len = keys_len.min(values_len);
-  if keys_len != values_len {
-    web_sys::console::warn_1(&JsValue::from_str(&format!(
-      "IndexedDB snapshot load for '{db_name}' returned mismatched key/value counts: keys={keys_len}, values={values_len}",
-    )));
-  }
-
-  let mut map = HashMap::with_capacity(paired_len);
-  for idx in 0..paired_len {
-    let key = keys.get(idx as u32);
-    let Some(name) = key.as_string() else {
+  let keys: js_sys::Array = match keys_val.dyn_into() {
+    Ok(array) => array,
+    Err(_) => {
       web_sys::console::warn_1(&JsValue::from_str(&format!(
-        "IndexedDB snapshot load for '{db_name}' skipped non-string key: {key:?}",
+        "IndexedDB snapshot load for '{db_name}' expected array keys; skipping stored files"
       )));
-      continue;
-    };
-    let value = values.get(idx as u32);
-    let bytes = js_sys::Uint8Array::new(&value).to_vec();
-    map.insert(PathBuf::from(name), bytes);
+      js_sys::Array::new()
+    }
+  };
+  let values: js_sys::Array = match values_val.dyn_into() {
+    Ok(array) => array,
+    Err(_) => {
+      web_sys::console::warn_1(&JsValue::from_str(&format!(
+        "IndexedDB snapshot load for '{db_name}' expected array values; skipping stored files"
+      )));
+      js_sys::Array::new()
+    }
+  };
+  let mut map = HashMap::new();
+  for (key, value) in keys.iter().zip(values.iter()) {
+    if let Some(name) = key.as_string() {
+      let bytes = js_sys::Uint8Array::new(&value).to_vec();
+      map.insert(PathBuf::from(name), bytes);
+    }
   }
   Ok(map)
 }
 
-async fn list_stored_paths(db_name: &str) -> Result<Vec<PathBuf>> {
-  let db = open_data_db(db_name).await?;
+async fn persist_file(db_name: &str, path: &Path, data: Vec<u8>) -> Result<()> {
+  let db = open_db(db_name).await?;
   let tx = db
-    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-    .map_err(|e| anyhow!("opening transaction for {STORE_NAME}: {:?}", e))?;
-  let tx_done = transaction_future(&tx);
+    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
   let store = tx
     .object_store(STORE_NAME)
     .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
+  let key = JsValue::from_str(&path_key(path));
+  let value: JsValue = js_sys::Uint8Array::from(data.as_slice()).into();
   let req = store
-    .get_all_keys()
-    .map_err(|e| anyhow!("get_all_keys failed: {:?}", e))?;
-  let keys = request_future(&req).await?;
-  tx_done.await?;
-  let rows: js_sys::Array = keys
-    .dyn_into()
-    .map_err(|_| anyhow!("get_all_keys expected an array"))?;
-  let mut paths = Vec::with_capacity(rows.length() as usize);
-  for row in rows.iter() {
-    if let Some(name) = row.as_string() {
-      paths.push(PathBuf::from(name));
-    }
-  }
-  Ok(paths)
+    .put_with_key(&value, &key)
+    .map_err(|e| anyhow!("put_with_key failed: {:?}", e))?;
+  request_future(&req).await?;
+  Ok(())
 }
 
-async fn restore_snapshot(db_name: &str, snapshot: &HashMap<PathBuf, Vec<u8>>) -> Result<()> {
-  clear_data_store(db_name).await?;
-  let mut operations: Vec<_> = snapshot
-    .iter()
-    .map(|(path, bytes)| (path.clone(), PersistOperation::Put(bytes.clone())))
-    .collect();
-  operations.sort_by(|(left, _), (right, _)| left.cmp(right));
-  for batch in chunk_operations(operations, IDB_WRITE_BATCH_SIZE) {
-    persist_operations_batch(db_name, &batch).await?;
-  }
+async fn delete_file(db_name: &str, path: &Path) -> Result<()> {
+  let db = open_db(db_name).await?;
+  let tx = db
+    .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+    .map_err(|e| anyhow!("opening read-write transaction for {STORE_NAME}: {:?}", e))?;
+  let store = tx
+    .object_store(STORE_NAME)
+    .map_err(|e| anyhow!("opening object store {STORE_NAME}: {:?}", e))?;
+  let key = JsValue::from_str(&path_key(path));
+  let req = store
+    .delete(&key)
+    .map_err(|e| anyhow!("delete failed: {:?}", e))?;
+  request_future(&req).await?;
   Ok(())
 }
 
@@ -928,17 +394,13 @@ async fn restore_snapshot(db_name: &str, snapshot: &HashMap<PathBuf, Vec<u8>>) -
 struct PendingWrites {
   db_name: String,
   pending: Arc<Mutex<Vec<oneshot::Receiver<Result<()>>>>>,
-  state: Arc<Mutex<PendingQueueState>>,
-}
-
-struct PendingQueueState {
-  queue: BTreeMap<PathBuf, PendingEntry>,
-  worker_running: bool,
+  queue: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
 }
 
 struct PendingEntry {
-  operation: PersistOperation,
+  pending: Option<Vec<u8>>,
   waiters: Vec<oneshot::Sender<Result<()>>>,
+  inflight: bool,
 }
 
 impl PendingWrites {
@@ -946,80 +408,55 @@ impl PendingWrites {
     Self {
       db_name,
       pending: Arc::new(Mutex::new(Vec::new())),
-      state: Arc::new(Mutex::new(PendingQueueState {
-        queue: BTreeMap::new(),
-        worker_running: false,
-      })),
+      queue: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
   fn schedule(&self, path: PathBuf, data: Vec<u8>) {
-    self.enqueue(path, PersistOperation::Put(data));
+    let (tx, rx) = oneshot::channel();
+    self.pending.lock().push(rx);
+    let mut guard = self.queue.lock();
+    let entry = guard.entry(path.clone()).or_insert(PendingEntry {
+      pending: None,
+      waiters: Vec::new(),
+      inflight: false,
+    });
+    entry.pending = Some(data);
+    entry.waiters.push(tx);
+    if entry.inflight {
+      return;
+    }
+    entry.inflight = true;
+    drop(guard);
+    let db = self.db_name.clone();
+    let queue = self.queue.clone();
+    spawn_local(async move {
+      persist_queue(db, path, queue).await;
+    });
   }
 
   fn schedule_delete(&self, path: PathBuf) {
-    self.enqueue(path, PersistOperation::Delete);
-  }
-
-  fn enqueue(&self, path: PathBuf, operation: PersistOperation) {
-    let (tx, rx) = oneshot::channel();
-    self.pending.lock().push(rx);
-    let mut guard = self.state.lock();
-    if let Some(entry) = guard.queue.get_mut(&path) {
-      entry.operation = operation;
-      entry.waiters.push(tx);
-    } else {
-      guard.queue.insert(
-        path,
-        PendingEntry {
-          operation,
-          waiters: vec![tx],
-        },
-      );
+    {
+      let mut guard = self.queue.lock();
+      guard.remove(&path);
     }
-    if guard.worker_running {
-      return;
-    }
-    guard.worker_running = true;
-    let db_name = self.db_name.clone();
-    let state = self.state.clone();
+    let db = self.db_name.clone();
     spawn_local(async move {
-      persist_queue_worker(db_name, state).await;
+      if let Err(err) = delete_file(&db, &path).await {
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+          "delete error for {:?}: {}",
+          path, err
+        )));
+      }
     });
   }
 
   async fn flush(&self) -> Result<()> {
-    let mut first_error = None;
-    // If a previous batch failed and re-queued operations, spawn a new worker
-    // to retry before draining receivers. Attach a waiter to the LAST queued
-    // entry so we block until the worker either completes the entire queue
-    // or fails (in which case all remaining waiters are drained with the
-    // error by the worker's failure path). We only make ONE retry attempt
-    // per flush() call — a persistent failure returns an error immediately
-    // instead of looping.
-    {
-      let mut guard = self.state.lock();
-      if !guard.queue.is_empty() && !guard.worker_running {
-        let (tx, rx) = oneshot::channel();
-        if let Some(entry) = guard.queue.values_mut().next_back() {
-          entry.waiters.push(tx);
-          self.pending.lock().push(rx);
-        } else {
-          drop(tx);
-        }
-        guard.worker_running = true;
-        let db_name = self.db_name.clone();
-        let state = self.state.clone();
-        spawn_local(async move {
-          persist_queue_worker(db_name, state).await;
-        });
-      }
-    }
-    // Drain all pending receivers (from enqueues plus any retry waiter).
     let receivers = {
       let mut guard = self.pending.lock();
       std::mem::take(&mut *guard)
     };
+    let mut first_error = None;
     for rx in receivers {
       match rx.await {
         Ok(Ok(())) => {}
@@ -1043,78 +480,45 @@ impl PendingWrites {
   }
 }
 
-async fn persist_queue_worker(db_name: String, state: Arc<Mutex<PendingQueueState>>) {
+async fn persist_queue(
+  db_name: String,
+  path: PathBuf,
+  queue: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
+) {
   loop {
-    let batch_entries = {
-      let mut guard = state.lock();
-      if guard.queue.is_empty() {
-        guard.worker_running = false;
-        return;
-      }
-      let keys: Vec<PathBuf> = guard
-        .queue
-        .keys()
-        .take(IDB_WRITE_BATCH_SIZE)
-        .cloned()
-        .collect();
-      let mut entries = Vec::with_capacity(keys.len());
-      for key in keys {
-        if let Some(entry) = guard.queue.remove(&key) {
-          entries.push((key, entry));
+    let (data, waiters) = {
+      let mut guard = queue.lock();
+      let entry = match guard.get_mut(&path) {
+        Some(entry) => entry,
+        None => return,
+      };
+      let data = match entry.pending.take() {
+        Some(data) => data,
+        None => {
+          entry.inflight = false;
+          if entry.waiters.is_empty() {
+            guard.remove(&path);
+          }
+          return;
         }
-      }
-      entries
+      };
+      let waiters = std::mem::take(&mut entry.waiters);
+      (data, waiters)
     };
-
-    let mut operations = Vec::with_capacity(batch_entries.len());
-    let mut waiter_sets = Vec::with_capacity(batch_entries.len());
-    for (path, entry) in batch_entries {
-      operations.push((path, entry.operation));
-      waiter_sets.push(entry.waiters);
-    }
-    let result = persist_operations_batch(&db_name, &operations).await;
+    let result = persist_file(&db_name, &path, data).await;
     let err_msg = result.as_ref().err().map(|err| err.to_string());
     if let Some(msg) = &err_msg {
-      web_sys::console::error_1(&JsValue::from_str(&format!("persist batch error: {msg}")));
-      // Re-insert failed operations so a subsequent flush can retry.
-      // Do not overwrite entries added concurrently during this batch.
-      // Stop the worker after re-queuing to avoid an infinite retry loop;
-      // the next explicit flush() will spawn a new worker.
-      // Also drain any waiters attached to remaining queued entries (batches
-      // that were never attempted) so flush() can return the error without
-      // hanging or looping.
-      let mut pending_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
-      {
-        let mut guard = state.lock();
-        for (path, op) in operations {
-          guard.queue.entry(path).or_insert_with(|| PendingEntry {
-            operation: op,
-            waiters: Vec::new(),
-          });
-        }
-        for entry in guard.queue.values_mut() {
-          pending_waiters.append(&mut entry.waiters);
-        }
-        guard.worker_running = false;
-      }
-      for waiters in waiter_sets {
-        for tx in waiters {
-          let _ = tx.send(Err(anyhow!(msg.clone())));
-        }
-      }
-      for tx in pending_waiters {
-        let _ = tx.send(Err(anyhow!(msg.clone())));
-      }
-      return;
+      web_sys::console::error_1(&JsValue::from_str(&format!(
+        "persist error for {:?}: {}",
+        path, msg
+      )));
     }
-    for waiters in waiter_sets {
-      for tx in waiters {
-        let send_result = match &err_msg {
-          Some(msg) => Err(anyhow!(msg.clone())),
-          None => Ok(()),
-        };
-        let _ = tx.send(send_result);
-      }
+    for tx in waiters {
+      let send_result = match &err_msg {
+        Some(msg) => Err(anyhow!(msg.clone())),
+        None => Ok(()),
+      };
+      let _ = tx.send(send_result);
     }
   }
 }
@@ -1149,13 +553,6 @@ impl JsStorage {
 
   fn schedule_persist(&self, path: PathBuf, data: Vec<u8>) {
     self.pending.schedule(path, data);
-  }
-
-  fn remove_cached_paths(&self, paths: &[PathBuf]) {
-    let mut guard = self.files.write();
-    for path in paths {
-      guard.remove(path);
-    }
   }
 
   pub async fn flush(&self) -> Result<()> {
@@ -1364,285 +761,8 @@ impl StorageFile for JsFile {
   }
 }
 
-fn meta_path(root: &Path) -> PathBuf {
-  root.join(META_FILE_NAME)
-}
-
-fn write_index_meta(storage: &dyn Storage, root: &Path, schema: &Schema) -> Result<(), JsValue> {
-  let meta = IndexMeta {
-    schema_version: SCHEMA_VERSION_V1,
-    schema_hash: schema_hash(schema)?,
-  };
-  let json = serde_json::to_vec(&meta).map_err(|err| typed_js_error("meta_encode_error", err))?;
-  storage
-    .write_all(&meta_path(root), &json)
-    .map_err(|err| typed_js_error("storage_write_error", err))
-}
-
-fn read_index_meta(storage: &dyn Storage, root: &Path) -> Result<Option<IndexMeta>, JsValue> {
-  let path = meta_path(root);
-  if !storage.exists(&path) {
-    return Ok(None);
-  }
-  let bytes = storage
-    .read_to_end(&path)
-    .map_err(|err| typed_js_error("storage_read_error", err))?;
-  let meta = serde_json::from_slice::<IndexMeta>(&bytes)
-    .map_err(|err| typed_js_error("meta_decode_error", err))?;
-  Ok(Some(meta))
-}
-
-fn schema_mismatch_error() -> JsValue {
-  js_error(
-    "schema_mismatch",
-    "schema mismatch for existing index; use Searchlite.plan_migration(...) and Searchlite.migrate_index(...), or clear/drop the index",
-  )
-}
-
-fn schemas_match(existing: &Schema, requested: &Schema) -> Result<bool, JsValue> {
-  serde_json::to_value(existing)
-    .and_then(|existing_json| {
-      serde_json::to_value(requested).map(|requested_json| existing_json == requested_json)
-    })
-    .map_err(|err| typed_js_error("schema_serialization_error", err))
-}
-
-fn open_opts(path: PathBuf) -> IndexOptions {
-  IndexOptions {
-    path,
-    create_if_missing: false,
-    enable_positions: true,
-    bm25_k1: BM25_K1,
-    bm25_b: BM25_B,
-    storage: StorageType::InMemory,
-    #[cfg(feature = "vectors")]
-    vector_defaults: None,
-  }
-}
-
-fn registry_entry(db_name: &str, schema: &Schema) -> Result<IndexRegistryEntry, JsValue> {
-  Ok(IndexRegistryEntry {
-    db_name: db_name.to_string(),
-    schema_version: SCHEMA_VERSION_V1,
-    schema_hash: schema_hash(schema)?,
-    updated_at_ms: now_ms(),
-  })
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct MigrationPlan {
-  db_name: String,
-  status: String,
-  rebuild_required: bool,
-  schema_version: u32,
-  existing_schema_hash: Option<String>,
-  requested_schema_hash: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct MigrationExecutionResult {
-  db_name: String,
-  status: String,
-  rebuild_performed: bool,
-  schema_version: u32,
-  existing_schema_hash: Option<String>,
-  requested_schema_hash: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct UpdateRequestPayload {
-  id: String,
-  #[serde(default)]
-  set: BTreeMap<String, serde_json::Value>,
-  #[serde(default)]
-  unset: Vec<String>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct CompactResponse {
-  compacted: bool,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct InspectResponse {
-  manifest: Manifest,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct StatsResponse {
-  documents: u64,
-  deleted_documents: u64,
-  segments: usize,
-  committed_at: String,
-  index_uuid: String,
-  index_path: String,
-  index_name: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct StorageUsageResponse {
-  supported: bool,
-  usage_bytes: Option<u64>,
-  quota_bytes: Option<u64>,
-  remaining_bytes: Option<u64>,
-  persisted: Option<bool>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  note: Option<String>,
-}
-
-impl StorageUsageResponse {
-  fn unsupported(note: impl Into<String>) -> Self {
-    Self {
-      supported: false,
-      usage_bytes: None,
-      quota_bytes: None,
-      remaining_bytes: None,
-      persisted: None,
-      note: Some(note.into()),
-    }
-  }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct CleanupIndexesResponse {
-  scanned: usize,
-  matched: usize,
-  dropped: Vec<String>,
-  kept: Vec<String>,
-  dry_run: bool,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct CleanupOrphanedFilesResponse {
-  scanned: usize,
-  orphaned: usize,
-  removed: Vec<String>,
-  dry_run: bool,
-}
-
-fn f64_to_u64_bytes(value: f64) -> Option<u64> {
-  if !value.is_finite() || value < 0.0 {
-    return None;
-  }
-  Some(value.floor() as u64)
-}
-
-async fn browser_storage_usage() -> Result<StorageUsageResponse, JsValue> {
-  // Use Reflect to access navigator.storage so this works in both Window and
-  // Worker contexts (Window exposes Navigator, Workers expose WorkerNavigator,
-  // but both provide a StorageManager via navigator.storage).
-  let global = js_sys::global();
-  let navigator = match js_sys::Reflect::get(&global, &JsValue::from_str("navigator")) {
-    Ok(nav) if !nav.is_undefined() && !nav.is_null() => nav,
-    _ => {
-      return Ok(StorageUsageResponse::unsupported(
-        "navigator is unavailable",
-      ));
-    }
-  };
-  let storage = match js_sys::Reflect::get(&navigator, &JsValue::from_str("storage")) {
-    Ok(s) if !s.is_undefined() && !s.is_null() => s,
-    _ => {
-      return Ok(StorageUsageResponse::unsupported(
-        "navigator.storage is unavailable",
-      ));
-    }
-  };
-  let estimate_fn = match js_sys::Reflect::get(&storage, &JsValue::from_str("estimate")) {
-    Ok(f) if f.is_function() => f.dyn_into::<js_sys::Function>().unwrap(),
-    _ => {
-      return Ok(StorageUsageResponse::unsupported(
-        "storage.estimate is unavailable",
-      ));
-    }
-  };
-  let estimate_promise = match estimate_fn.call0(&storage) {
-    Ok(promise) => promise,
-    Err(err) => {
-      return Ok(StorageUsageResponse::unsupported(format!(
-        "storage estimate unavailable: {err:?}"
-      )));
-    }
-  };
-  let estimate_value = match JsFuture::from(js_sys::Promise::from(estimate_promise)).await {
-    Ok(value) => value,
-    Err(err) => {
-      return Ok(StorageUsageResponse::unsupported(format!(
-        "storage estimate failed: {err:?}"
-      )));
-    }
-  };
-
-  let usage = js_sys::Reflect::get(&estimate_value, &JsValue::from_str("usage"))
-    .ok()
-    .and_then(|value| value.as_f64())
-    .and_then(f64_to_u64_bytes);
-  let quota = js_sys::Reflect::get(&estimate_value, &JsValue::from_str("quota"))
-    .ok()
-    .and_then(|value| value.as_f64())
-    .and_then(f64_to_u64_bytes);
-  let remaining = match (usage, quota) {
-    (Some(used), Some(limit)) => Some(limit.saturating_sub(used)),
-    _ => None,
-  };
-  // Check navigator.storage.persisted() via Reflect as well.
-  let persisted = match js_sys::Reflect::get(&storage, &JsValue::from_str("persisted")) {
-    Ok(f) if f.is_function() => {
-      let func = f.dyn_into::<js_sys::Function>().unwrap();
-      match func.call0(&storage) {
-        Ok(promise) => match JsFuture::from(js_sys::Promise::from(promise)).await {
-          Ok(value) => value.as_bool(),
-          Err(_) => None,
-        },
-        Err(_) => None,
-      }
-    }
-    _ => None,
-  };
-  Ok(StorageUsageResponse {
-    supported: true,
-    usage_bytes: usage,
-    quota_bytes: quota,
-    remaining_bytes: remaining,
-    persisted,
-    note: None,
-  })
-}
-
-fn expected_live_paths(root: &Path, manifest: &Manifest) -> (HashSet<PathBuf>, Vec<PathBuf>) {
-  let mut exact = HashSet::new();
-  exact.insert(Manifest::manifest_path(root));
-  exact.insert(meta_path(root));
-  exact.insert(root.join("wal.log"));
-  #[cfg(feature = "vectors")]
-  let mut prefixes = Vec::new();
-  #[cfg(not(feature = "vectors"))]
-  let prefixes: Vec<PathBuf> = Vec::new();
-  for seg in manifest.segments.iter() {
-    exact.insert(PathBuf::from(seg.paths.terms.clone()));
-    exact.insert(PathBuf::from(seg.paths.postings.clone()));
-    exact.insert(PathBuf::from(seg.paths.docstore.clone()));
-    exact.insert(PathBuf::from(seg.paths.fast.clone()));
-    exact.insert(PathBuf::from(seg.paths.meta.clone()));
-    #[cfg(feature = "vectors")]
-    if let Some(vector_dir) = seg.paths.vector_dir.as_ref() {
-      prefixes.push(PathBuf::from(vector_dir));
-    }
-  }
-  (exact, prefixes)
-}
-
-fn path_is_live(path: &Path, live_exact: &HashSet<PathBuf>, live_prefixes: &[PathBuf]) -> bool {
-  if live_exact.contains(path) {
-    return true;
-  }
-  live_prefixes.iter().any(|prefix| path.starts_with(prefix))
-}
-
 #[wasm_bindgen]
 pub struct Searchlite {
-  db_name: String,
-  schema_hash: String,
   index: Index,
   storage: StorageBackend,
 }
@@ -1654,24 +774,15 @@ impl Searchlite {
     schema_json: String,
     storage_mode: StorageMode,
   ) -> Result<Searchlite, JsValue> {
-    if db_name == REGISTRY_DB_NAME {
-      return Err(js_error(
-        "reserved_name",
-        format!(
-          "'{REGISTRY_DB_NAME}' is reserved for internal use and cannot be used as an index name"
-        ),
-      ));
-    }
-    let schema: Schema = serde_json::from_str(&schema_json)
-      .map_err(|err| typed_js_error("invalid_schema_json", err))?;
-    let requested_schema_hash = schema_hash(&schema)?;
+    let schema: Schema =
+      serde_json::from_str(&schema_json).map_err(|err| JsValue::from_str(&err.to_string()))?;
     let root = PathBuf::from(db_name.clone());
     let (storage, backend) = match storage_mode {
       StorageMode::IndexedDb => {
         let storage = Arc::new(
           JsStorage::new(db_name.clone(), root.clone())
             .await
-            .map_err(|err| typed_js_error("storage_open_error", err))?,
+            .map_err(to_js_error)?,
         );
         (
           storage.clone() as Arc<dyn Storage>,
@@ -1701,31 +812,21 @@ impl Searchlite {
         create_if_missing: false,
         ..opts.clone()
       };
-      let index = Index::open_with_storage(open_opts, storage.clone())
-        .map_err(|err| typed_js_error("index_open_error", err))?;
+      let index = Index::open_with_storage(open_opts, storage).map_err(to_js_error)?;
       let existing_schema = index.manifest().schema;
-      if !schemas_match(&existing_schema, &schema)? {
-        return Err(schema_mismatch_error());
+      let existing = serde_json::to_value(&existing_schema).map_err(to_js_error)?;
+      let requested = serde_json::to_value(&schema).map_err(to_js_error)?;
+      if existing != requested {
+        return Err(JsValue::from_str(
+          "schema mismatch for existing index; use a new db_name or delete the stored index",
+        ));
       }
       index
     } else {
-      Index::create_with_storage(&root, schema.clone(), opts, storage.clone())
-        .map_err(|err| typed_js_error("index_create_error", err))?
+      Index::create_with_storage(&root, schema, opts, storage).map_err(to_js_error)?
     };
-    write_index_meta(storage.as_ref(), &root, &schema)?;
-    if matches!(storage_mode, StorageMode::IndexedDb) {
-      let entry = registry_entry(&db_name, &schema)?;
-      upsert_registry_entry(&entry)
-        .await
-        .map_err(|err| typed_js_error("registry_write_error", err))?;
-    }
-    backend
-      .flush()
-      .await
-      .map_err(|err| map_storage_error(err, "storage_flush_error", "initializing index storage"))?;
+    backend.flush().await.map_err(to_js_error)?;
     Ok(Searchlite {
-      db_name,
-      schema_hash: requested_schema_hash,
       index,
       storage: backend,
     })
@@ -1746,327 +847,6 @@ impl Searchlite {
     Self::create(db_name, schema_json, storage_mode).await
   }
 
-  #[wasm_bindgen(js_name = list_indexes)]
-  pub async fn list_indexes() -> Result<JsValue, JsValue> {
-    let entries = list_registry_entries()
-      .await
-      .map_err(|err| typed_js_error("registry_read_error", err))?;
-    serde_wasm_bindgen::to_value(&entries).map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  #[wasm_bindgen(js_name = clear_index)]
-  pub async fn clear_index(db_name: String) -> Result<(), JsValue> {
-    if db_name == REGISTRY_DB_NAME {
-      return Err(js_error(
-        "reserved_name",
-        format!("'{REGISTRY_DB_NAME}' is reserved for internal use"),
-      ));
-    }
-    clear_data_store(&db_name)
-      .await
-      .map_err(|err| typed_js_error("storage_clear_error", err))?;
-    Ok(())
-  }
-
-  #[wasm_bindgen(js_name = drop_index)]
-  pub async fn drop_index(db_name: String) -> Result<(), JsValue> {
-    if db_name == REGISTRY_DB_NAME {
-      return Err(js_error(
-        "reserved_name",
-        format!("'{REGISTRY_DB_NAME}' is reserved for internal use"),
-      ));
-    }
-    delete_database(&db_name)
-      .await
-      .map_err(|err| typed_js_error("storage_delete_error", err))?;
-    remove_registry_entry(&db_name)
-      .await
-      .map_err(|err| typed_js_error("registry_delete_error", err))?;
-    Ok(())
-  }
-
-  #[wasm_bindgen(js_name = storage_usage)]
-  pub async fn storage_usage() -> Result<JsValue, JsValue> {
-    let usage = browser_storage_usage().await?;
-    serde_wasm_bindgen::to_value(&usage).map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  #[wasm_bindgen(js_name = cleanup_indexes)]
-  pub async fn cleanup_indexes(
-    stale_older_than_ms: f64,
-    dry_run: Option<bool>,
-  ) -> Result<JsValue, JsValue> {
-    if !stale_older_than_ms.is_finite() || stale_older_than_ms < 0.0 {
-      return Err(js_error(
-        "invalid_cleanup_request",
-        "stale_older_than_ms must be a non-negative number",
-      ));
-    }
-    let dry_run = dry_run.unwrap_or(false);
-    let now = now_ms();
-    let entries = list_registry_entries()
-      .await
-      .map_err(|err| typed_js_error("registry_read_error", err))?;
-    let scanned = entries.len();
-    let mut matched = 0usize;
-    let mut dropped = Vec::new();
-    let mut kept = Vec::new();
-    for entry in entries {
-      let age = if now >= entry.updated_at_ms {
-        now - entry.updated_at_ms
-      } else {
-        0.0
-      };
-      if age < stale_older_than_ms {
-        kept.push(entry.db_name);
-        continue;
-      }
-      matched += 1;
-      let db_name = entry.db_name.clone();
-      if !dry_run {
-        delete_database(&db_name)
-          .await
-          .map_err(|err| typed_js_error("storage_delete_error", err))?;
-        remove_registry_entry(&db_name)
-          .await
-          .map_err(|err| typed_js_error("registry_delete_error", err))?;
-      }
-      dropped.push(db_name);
-    }
-    serde_wasm_bindgen::to_value(&CleanupIndexesResponse {
-      scanned,
-      matched,
-      dropped,
-      kept,
-      dry_run,
-    })
-    .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  #[wasm_bindgen(js_name = cleanup_orphaned_files)]
-  pub async fn cleanup_orphaned_files(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
-    let dry_run = dry_run.unwrap_or(false);
-    let StorageBackend::IndexedDb(storage) = &self.storage else {
-      return serde_wasm_bindgen::to_value(&CleanupOrphanedFilesResponse {
-        scanned: 0,
-        orphaned: 0,
-        removed: Vec::new(),
-        dry_run,
-      })
-      .map_err(|err| typed_js_error("serialization_error", err));
-    };
-
-    let root = PathBuf::from(self.db_name.clone());
-    let manifest = self.index.manifest();
-    let (live_exact, live_prefixes) = expected_live_paths(&root, &manifest);
-    let mut stored_paths = list_stored_paths(&self.db_name)
-      .await
-      .map_err(|err| typed_js_error("storage_list_error", err))?;
-    stored_paths.sort();
-    stored_paths.dedup();
-    let scanned = stored_paths.len();
-    let orphaned_paths: Vec<PathBuf> = stored_paths
-      .into_iter()
-      .filter(|path| !path_is_live(path, &live_exact, &live_prefixes))
-      .collect();
-    if !dry_run && !orphaned_paths.is_empty() {
-      let operations: Vec<_> = orphaned_paths
-        .iter()
-        .cloned()
-        .map(|path| (path, PersistOperation::Delete))
-        .collect();
-      for batch in chunk_operations(operations, IDB_WRITE_BATCH_SIZE) {
-        persist_operations_batch(&self.db_name, &batch)
-          .await
-          .map_err(|err| {
-            map_storage_error(err, "storage_cleanup_error", "removing orphaned files")
-          })?;
-      }
-      storage.remove_cached_paths(&orphaned_paths);
-    }
-    let removed = orphaned_paths
-      .iter()
-      .map(|path| path_key(path))
-      .collect::<Vec<_>>();
-    serde_wasm_bindgen::to_value(&CleanupOrphanedFilesResponse {
-      scanned,
-      orphaned: removed.len(),
-      removed,
-      dry_run,
-    })
-    .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  async fn plan_migration_internal(
-    db_name: &str,
-    requested_schema: &Schema,
-  ) -> Result<MigrationPlan, JsValue> {
-    let requested_schema_hash = schema_hash(requested_schema)?;
-    let root = PathBuf::from(db_name.to_string());
-    let storage = Arc::new(
-      JsStorage::new(db_name.to_string(), root.clone())
-        .await
-        .map_err(|err| typed_js_error("storage_open_error", err))?,
-    );
-    let manifest_path = root.join("MANIFEST.json");
-    if !storage.exists(&manifest_path) {
-      return Ok(MigrationPlan {
-        db_name: db_name.to_string(),
-        status: "missing".to_string(),
-        rebuild_required: false,
-        schema_version: SCHEMA_VERSION_V1,
-        existing_schema_hash: None,
-        requested_schema_hash,
-      });
-    }
-
-    let index = Index::open_with_storage(open_opts(root.clone()), storage.clone())
-      .map_err(|err| typed_js_error("index_open_error", err))?;
-    let existing_schema = index.manifest().schema;
-    let existing_schema_hash = match read_index_meta(storage.as_ref(), &root)? {
-      Some(meta) => meta.schema_hash,
-      None => schema_hash(&existing_schema)?,
-    };
-    let compatible = schemas_match(&existing_schema, requested_schema)?;
-    Ok(MigrationPlan {
-      db_name: db_name.to_string(),
-      status: if compatible {
-        "compatible".to_string()
-      } else {
-        "rebuild_required".to_string()
-      },
-      rebuild_required: !compatible,
-      schema_version: SCHEMA_VERSION_V1,
-      existing_schema_hash: Some(existing_schema_hash),
-      requested_schema_hash,
-    })
-  }
-
-  #[wasm_bindgen(js_name = plan_migration)]
-  pub async fn plan_migration(db_name: String, schema_json: String) -> Result<JsValue, JsValue> {
-    let requested_schema: Schema = serde_json::from_str(&schema_json)
-      .map_err(|err| typed_js_error("invalid_schema_json", err))?;
-    let plan = Self::plan_migration_internal(&db_name, &requested_schema).await?;
-    serde_wasm_bindgen::to_value(&plan).map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  #[wasm_bindgen(js_name = migrate_index)]
-  pub async fn migrate_index(db_name: String, schema_json: String) -> Result<JsValue, JsValue> {
-    let requested_schema: Schema = serde_json::from_str(&schema_json)
-      .map_err(|err| typed_js_error("invalid_schema_json", err))?;
-    let plan = Self::plan_migration_internal(&db_name, &requested_schema).await?;
-    let requested_schema_hash = plan.requested_schema_hash.clone();
-    let existing_schema_hash = plan.existing_schema_hash.clone();
-
-    if plan.status == "missing" {
-      let created = Self::create(db_name.clone(), schema_json, StorageMode::IndexedDb).await?;
-      created.commit().await?;
-      let result = MigrationExecutionResult {
-        db_name,
-        status: "created".to_string(),
-        rebuild_performed: false,
-        schema_version: SCHEMA_VERSION_V1,
-        existing_schema_hash: None,
-        requested_schema_hash,
-      };
-      return serde_wasm_bindgen::to_value(&result)
-        .map_err(|err| typed_js_error("serialization_error", err));
-    }
-
-    if !plan.rebuild_required {
-      let result = MigrationExecutionResult {
-        db_name,
-        status: "compatible".to_string(),
-        rebuild_performed: false,
-        schema_version: SCHEMA_VERSION_V1,
-        existing_schema_hash,
-        requested_schema_hash,
-      };
-      return serde_wasm_bindgen::to_value(&result)
-        .map_err(|err| typed_js_error("serialization_error", err));
-    }
-
-    let snapshot = load_snapshot(&db_name)
-      .await
-      .map_err(|err| typed_js_error("storage_snapshot_error", err))?;
-    let previous_registry = get_registry_entry(&db_name)
-      .await
-      .map_err(|err| typed_js_error("registry_read_error", err))?;
-    clear_data_store(&db_name)
-      .await
-      .map_err(|err| typed_js_error("storage_clear_error", err))?;
-
-    let rebuild_attempt = async {
-      if migration_fail_after_clear() {
-        return Err(js_error(
-          "migration_injected_failure",
-          "injected migration failure after clear for rollback testing",
-        ));
-      }
-      let migrated =
-        Self::create(db_name.clone(), schema_json.clone(), StorageMode::IndexedDb).await?;
-      migrated.commit().await?;
-      Ok::<(), JsValue>(())
-    }
-    .await;
-
-    match rebuild_attempt {
-      Ok(()) => {
-        let result = MigrationExecutionResult {
-          db_name,
-          status: "rebuilt".to_string(),
-          rebuild_performed: true,
-          schema_version: SCHEMA_VERSION_V1,
-          existing_schema_hash,
-          requested_schema_hash,
-        };
-        serde_wasm_bindgen::to_value(&result)
-          .map_err(|err| typed_js_error("serialization_error", err))
-      }
-      Err(rebuild_err) => {
-        let snapshot_restore_err = restore_snapshot(&db_name, &snapshot).await.err();
-        let registry_restore_err = restore_registry_entry(&db_name, previous_registry.as_ref())
-          .await
-          .err();
-        if snapshot_restore_err.is_none() && registry_restore_err.is_none() {
-          return Err(js_error(
-            "migration_rebuild_failed",
-            format!(
-              "migration rebuild failed but prior snapshot was restored: {}",
-              js_error_reason(&rebuild_err)
-            ),
-          ));
-        }
-        let mut reason = format!(
-          "migration rebuild failed and rollback was incomplete: {}",
-          js_error_reason(&rebuild_err)
-        );
-        if let Some(err) = snapshot_restore_err {
-          reason.push_str(&format!("; snapshot restore failed: {err}"));
-        }
-        if let Some(err) = registry_restore_err {
-          reason.push_str(&format!("; registry restore failed: {err}"));
-        }
-        Err(js_error("migration_rollback_failed", reason))
-      }
-    }
-  }
-
-  async fn touch_registry(&self) -> Result<(), JsValue> {
-    if !matches!(self.storage, StorageBackend::IndexedDb(_)) {
-      return Ok(());
-    }
-    let entry = IndexRegistryEntry {
-      db_name: self.db_name.clone(),
-      schema_version: SCHEMA_VERSION_V1,
-      schema_hash: self.schema_hash.clone(),
-      updated_at_ms: now_ms(),
-    };
-    upsert_registry_entry(&entry)
-      .await
-      .map_err(|err| typed_js_error("registry_write_error", err))
-  }
-
   /// Initialize the rayon pool for threaded execution. COOP/COEP (cross-origin isolation) must
   /// be handled by the embedding app; this helper does not set headers for you.
   #[cfg(feature = "threads")]
@@ -2075,14 +855,13 @@ impl Searchlite {
     JsFuture::from(init_thread_pool(desired as usize))
       .await
       .map(|_| ())
-      .map_err(|err| typed_js_error("thread_pool_init_error", format!("{err:?}")))
+      .map_err(|err| JsValue::from_str(&format!("{err:?}")))
   }
 
   /// Threaded mode is disabled unless the `threads` feature is enabled.
   #[cfg(not(feature = "threads"))]
   pub async fn init_threads(&self, _threads: Option<u32>) -> Result<(), JsValue> {
-    Err(js_error(
-      "threads_feature_disabled",
+    Err(JsValue::from_str(
       "threads feature is disabled; rebuild searchlite-wasm with --features threads and enable wasm atomics/COOP+COEP",
     ))
   }
@@ -2095,163 +874,26 @@ impl Searchlite {
     Ok(())
   }
 
-  fn delete_documents_internal(&self, doc_ids: Vec<String>) -> Result<(), JsValue> {
-    let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
-    writer.delete_documents(&doc_ids).map_err(to_js_error)?;
-    Ok(())
-  }
-
   /// Add a document to the index. Call `commit` to make it searchable and persist it.
   pub fn add_document(&self, doc: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
-      serde_wasm_bindgen::from_value(doc).map_err(|err| typed_js_error("invalid_json", err))?;
+      serde_wasm_bindgen::from_value(doc).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(vec![value_to_document(value)?])
   }
 
   /// Add multiple documents to the index. Call `commit` to persist changes.
   pub fn add_documents(&self, docs: JsValue) -> Result<(), JsValue> {
     let value: serde_json::Value =
-      serde_wasm_bindgen::from_value(docs).map_err(|err| typed_js_error("invalid_json", err))?;
+      serde_wasm_bindgen::from_value(docs).map_err(|err| JsValue::from_str(&err.to_string()))?;
     self.add_documents_internal(value_to_documents(value)?)
-  }
-
-  /// Queue deletion for a single `_id`/doc id. Call `commit` to persist removal.
-  pub fn delete_document(&self, doc_id: String) -> Result<(), JsValue> {
-    validate_doc_id(&doc_id)
-      .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
-    self.delete_documents_internal(vec![doc_id])
-  }
-
-  /// Queue deletions for one or more doc ids. Accepts a string or array of strings.
-  /// Call `commit` to persist removals.
-  pub fn delete_documents(&self, doc_ids: JsValue) -> Result<(), JsValue> {
-    let value: serde_json::Value = serde_wasm_bindgen::from_value(doc_ids)
-      .map_err(|err| typed_js_error("invalid_doc_id_batch", err))?;
-    let ids = value_to_doc_ids(value)?;
-    for id in ids.iter() {
-      validate_doc_id(id)
-        .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
-    }
-    self.delete_documents_internal(ids)
-  }
-
-  /// Queue a partial document update by id using set/unset patch semantics.
-  /// `request` shape: `{ id: string, set?: object, unset?: string[] }`.
-  pub fn update_document(&self, request: JsValue) -> Result<(), JsValue> {
-    let payload: UpdateRequestPayload = parse_request_value(request, "invalid_update_request")?;
-    if payload.set.is_empty() && payload.unset.is_empty() {
-      return Err(js_error(
-        "missing_patch",
-        "update must include at least one set or unset field",
-      ));
-    }
-    validate_doc_id(&payload.id)
-      .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
-    let mut writer = self
-      .index
-      .writer()
-      .map_err(|err| typed_js_error("writer_open_error", err))?;
-    writer
-      .apply_patch(&payload.id, &payload.set, &payload.unset)
-      .map_err(map_update_error)?;
-    Ok(())
   }
 
   /// Commit pending documents and flush the configured storage backend.
   pub async fn commit(&self) -> Result<(), JsValue> {
     let mut writer: IndexWriter = self.index.writer().map_err(to_js_error)?;
     writer.commit().map_err(to_js_error)?;
-    self
-      .storage
-      .flush()
-      .await
-      .map_err(|err| map_storage_error(err, "storage_flush_error", "committing index data"))?;
-    self.touch_registry().await?;
+    self.storage.flush().await.map_err(to_js_error)?;
     Ok(())
-  }
-
-  /// Compact segments to reduce fragmentation.
-  /// Returns `{ compacted: boolean }`, where `false` means no merge was needed.
-  pub async fn compact(&self) -> Result<JsValue, JsValue> {
-    let before = self.index.manifest().segments.len();
-    self
-      .index
-      .compact()
-      .map_err(|err| typed_js_error("compact_failed", err))?;
-    self
-      .storage
-      .flush()
-      .await
-      .map_err(|err| map_storage_error(err, "storage_flush_error", "compacting index data"))?;
-    self.touch_registry().await?;
-    let after = self.index.manifest().segments.len();
-    serde_wasm_bindgen::to_value(&CompactResponse {
-      compacted: after < before,
-    })
-    .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  /// Return the current manifest with write-key metadata redacted.
-  pub fn inspect(&self) -> Result<JsValue, JsValue> {
-    let mut manifest = self.index.manifest();
-    manifest.write_key = None;
-    for seg in manifest.segments.iter_mut() {
-      seg.write_binding_b64 = None;
-    }
-    serde_wasm_bindgen::to_value(&InspectResponse { manifest })
-      .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  /// Return high-level index statistics.
-  pub fn stats(&self) -> Result<JsValue, JsValue> {
-    let manifest = self.index.manifest();
-    let (live_docs, deleted_docs) = manifest_doc_counts(&manifest);
-    serde_wasm_bindgen::to_value(&StatsResponse {
-      documents: live_docs,
-      deleted_documents: deleted_docs,
-      segments: manifest.segments.len(),
-      committed_at: manifest.committed_at.clone(),
-      index_uuid: manifest.uuid.to_string(),
-      index_path: self.db_name.clone(),
-      index_name: self.db_name.clone(),
-    })
-    .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  /// Fetch documents by id with optional stored fields, preserving request order.
-  /// `request` shape: `{ ids: string[], return_stored?: boolean }`.
-  pub fn mget(&self, request: JsValue) -> Result<JsValue, JsValue> {
-    let req: MgetRequest = parse_request_value(request, "invalid_mget_request")?;
-    for id in req.ids.iter() {
-      validate_doc_id(id)
-        .map_err(|err| js_error("invalid_id", format!("invalid document id: {err}")))?;
-    }
-    let reader: IndexReader = self
-      .index
-      .reader()
-      .map_err(|err| typed_js_error("reader_open_error", err))?;
-    let docs = reader
-      .mget(&req.ids, req.return_stored)
-      .map_err(|err| typed_js_error("mget_failed", err))?;
-    serde_wasm_bindgen::to_value(&MgetResponse { docs })
-      .map_err(|err| typed_js_error("serialization_error", err))
-  }
-
-  /// Execute multiple search requests in order and return ordered results.
-  /// `request` shape: `{ searches: SearchRequest[], parallel?: boolean, max_concurrency?: number }`.
-  /// Note: `parallel` and `max_concurrency` are accepted for API compatibility
-  /// but have no effect in single-threaded WASM — searches always run serially.
-  pub fn multi_search(&self, request: JsValue) -> Result<JsValue, JsValue> {
-    let req: MultiSearchRequest = parse_request_value(request, "invalid_multi_search_request")?;
-    let reader: IndexReader = self
-      .index
-      .reader()
-      .map_err(|err| typed_js_error("reader_open_error", err))?;
-    let results = reader
-      .multi_search(&req.searches)
-      .map_err(|err| typed_js_error("multi_search_failed", err))?;
-    serde_wasm_bindgen::to_value(&MultiSearchResponse { results })
-      .map_err(|err| typed_js_error("serialization_error", err))
   }
 
   pub fn search(
@@ -2260,6 +902,7 @@ impl Searchlite {
     limit: usize,
     return_stored: Option<bool>,
   ) -> Result<JsValue, JsValue> {
+    validate_search_limit_arg(limit)?;
     let parsed_query = serde_json::from_str::<QueryNode>(&query)
       .map(Query::Node)
       .unwrap_or(Query::String(query));
@@ -2298,125 +941,29 @@ impl Searchlite {
     self.run_search(request)
   }
 
-  #[wasm_bindgen(js_name = search_controlled)]
-  pub fn search_controlled(
-    &self,
-    query: String,
-    limit: usize,
-    return_stored: Option<bool>,
-    abort_signal: Option<web_sys::AbortSignal>,
-    timeout_ms: Option<f64>,
-  ) -> Result<JsValue, JsValue> {
-    let parsed_query = serde_json::from_str::<QueryNode>(&query)
-      .map(Query::Node)
-      .unwrap_or(Query::String(query));
-    let request = SearchRequest {
-      query: parsed_query,
-      fields: None,
-      filter: None,
-      limit,
-      from: 0,
-      return_hits: true,
-      candidate_size: None,
-      #[cfg(feature = "vectors")]
-      max_global_vector_candidates: None,
-      sort: Vec::<SortSpec>::new(),
-      cursor: None,
-      search_after: None,
-      execution: ExecutionStrategy::Wand,
-      bmw_block_size: None,
-      fuzzy: None,
-      track_total_hits: None,
-      #[cfg(feature = "vectors")]
-      vector_query: None,
-      #[cfg(feature = "vectors")]
-      vector_filter: None,
-      return_stored: return_stored.unwrap_or(false),
-      highlight_field: None,
-      highlight: None,
-      collapse: None,
-      aggs: BTreeMap::<String, Aggregation>::new(),
-      suggest: BTreeMap::new(),
-      rescore: None,
-      explain: false,
-      profile: false,
-    };
-    self.run_search_controlled(request, abort_signal, timeout_ms)
-  }
-
   pub fn search_request(&self, request_json: String) -> Result<JsValue, JsValue> {
     let req: SearchRequest = serde_json::from_str(&request_json)
-      .map_err(|err| typed_js_error("invalid_search_request", err))?;
+      .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    validate_search_limits(&req)?;
     self.run_search(req)
-  }
-
-  #[wasm_bindgen(js_name = search_request_controlled)]
-  pub fn search_request_controlled(
-    &self,
-    request_json: String,
-    abort_signal: Option<web_sys::AbortSignal>,
-    timeout_ms: Option<f64>,
-  ) -> Result<JsValue, JsValue> {
-    let req: SearchRequest = serde_json::from_str(&request_json)
-      .map_err(|err| typed_js_error("invalid_search_request", err))?;
-    self.run_search_controlled(req, abort_signal, timeout_ms)
   }
 
   pub fn search_request_value(&self, request: JsValue) -> Result<JsValue, JsValue> {
-    let req: SearchRequest = parse_request_value(request, "invalid_search_request")?;
+    let req: SearchRequest = serde_wasm_bindgen::from_value(request)
+      .map_err(|err| JsValue::from_str(&format!("invalid search request: {err}")))?;
+    validate_search_limits(&req)?;
     self.run_search(req)
   }
 
-  #[wasm_bindgen(js_name = search_request_value_controlled)]
-  pub fn search_request_value_controlled(
-    &self,
-    request: JsValue,
-    abort_signal: Option<web_sys::AbortSignal>,
-    timeout_ms: Option<f64>,
-  ) -> Result<JsValue, JsValue> {
-    let req: SearchRequest = parse_request_value(request, "invalid_search_request")?;
-    self.run_search_controlled(req, abort_signal, timeout_ms)
-  }
-
-  /// Worker-oriented async search entrypoint with optional timeout/abort checks.
-  #[wasm_bindgen(js_name = search_request_value_async)]
-  pub async fn search_request_value_async(
-    &self,
-    request: JsValue,
-    abort_signal: Option<web_sys::AbortSignal>,
-    timeout_ms: Option<f64>,
-  ) -> Result<JsValue, JsValue> {
-    self.search_request_value_controlled(request, abort_signal, timeout_ms)
-  }
-
   fn run_search(&self, req: SearchRequest) -> Result<JsValue, JsValue> {
-    self.run_search_controlled(req, None, None)
-  }
-
-  fn run_search_controlled(
-    &self,
-    req: SearchRequest,
-    abort_signal: Option<web_sys::AbortSignal>,
-    timeout_ms: Option<f64>,
-  ) -> Result<JsValue, JsValue> {
-    let timeout_ms = parse_timeout_ms(timeout_ms)?;
-    let started_ms = now_ms();
-    ensure_not_aborted(abort_signal.as_ref())?;
-    ensure_not_timed_out(started_ms, timeout_ms)?;
     let reader: IndexReader = self.index.reader().map_err(to_js_error)?;
     let result = reader.search(&req).map_err(to_js_error)?;
-    ensure_not_aborted(abort_signal.as_ref())?;
-    ensure_not_timed_out(started_ms, timeout_ms)?;
-    serde_wasm_bindgen::to_value(&result).map_err(|err| typed_js_error("serialization_error", err))
+    serde_wasm_bindgen::to_value(&result).map_err(|err| JsValue::from_str(&err.to_string()))
   }
 
   /// Wait for pending storage writes; `commit` already calls this.
   pub async fn flush_storage(&self) -> Result<(), JsValue> {
-    self
-      .storage
-      .flush()
-      .await
-      .map_err(|err| map_storage_error(err, "storage_flush_error", "flushing storage"))?;
+    self.storage.flush().await.map_err(to_js_error)?;
     Ok(())
   }
 }
@@ -2425,7 +972,6 @@ impl Searchlite {
 mod tests {
   use super::*;
   use searchlite_core::api::types::ExecutionStrategy;
-  use std::cell::Cell;
   use std::io::{Read, Seek, SeekFrom, Write};
   use wasm_bindgen_test::*;
 
@@ -2433,225 +979,6 @@ mod tests {
 
   fn unique_db(name: &str) -> String {
     format!("{name}-{}", js_sys::Date::now() as u64)
-  }
-
-  fn set_timeout_once(ms: i32, callback: impl FnOnce() + 'static) {
-    let cb = Closure::once(callback);
-    web_sys::window()
-      .unwrap()
-      .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), ms)
-      .unwrap();
-    cb.forget();
-  }
-
-  async fn fetch_ok(path: &str) -> bool {
-    let Some(window) = web_sys::window() else {
-      return false;
-    };
-    let response = match JsFuture::from(window.fetch_with_str(path)).await {
-      Ok(response) => response,
-      Err(_) => return false,
-    };
-    js_sys::Reflect::get(&response, &JsValue::from_str("ok"))
-      .ok()
-      .and_then(|value| value.as_bool())
-      .unwrap_or(false)
-  }
-
-  async fn demo_worker_assets_available() -> bool {
-    fetch_ok("./searchlite-demo-worker.mjs").await
-      && fetch_ok("./searchlite-worker-client.mjs").await
-      && fetch_ok("./pkg/searchlite_wasm.js").await
-  }
-
-  fn js_error_type(err: &JsValue) -> Option<String> {
-    js_sys::Reflect::get(err, &JsValue::from_str("type"))
-      .ok()
-      .and_then(|value| value.as_string())
-  }
-
-  fn skip_if_worker_runtime_unavailable(err: &JsValue) -> bool {
-    matches!(
-      js_error_type(err).as_deref(),
-      Some("worker_error")
-        | Some("worker_spawn_error")
-        | Some("worker_module_import_error")
-        | Some("worker_client_init_error")
-    )
-  }
-
-  async fn new_worker_client_instance() -> Result<JsValue, JsValue> {
-    let module_url = js_sys::eval(
-      "new URL('./searchlite-worker-client.mjs', (self.location && self.location.href) || 'http://localhost/').href",
-    )
-    .ok()
-    .and_then(|value| value.as_string())
-    .unwrap_or_else(|| "./searchlite-worker-client.mjs".to_string());
-    let import_expr = format!(
-      "import({})",
-      serde_json::to_string(&module_url)
-        .unwrap_or_else(|_| "'./searchlite-worker-client.mjs'".into())
-    );
-    let module_promise = js_sys::eval(&import_expr)
-      .map_err(|err| js_error("worker_module_import_error", format!("{err:?}")))?
-      .dyn_into::<js_sys::Promise>()
-      .map_err(|_| {
-        js_error(
-          "worker_module_import_error",
-          "import did not return a Promise",
-        )
-      })?;
-    let module = JsFuture::from(module_promise)
-      .await
-      .map_err(|err| js_error("worker_module_import_error", format!("{err:?}")))?;
-    let ctor = js_sys::Reflect::get(&module, &JsValue::from_str("SearchliteWorkerClient"))?
-      .dyn_into::<js_sys::Function>()
-      .map_err(|_| {
-        js_error(
-          "worker_module_import_error",
-          "SearchliteWorkerClient export missing",
-        )
-      })?;
-    js_sys::Reflect::construct(&ctor, &js_sys::Array::new())
-      .map_err(|err| js_error("worker_client_init_error", format!("{err:?}")))
-  }
-
-  fn call_worker_client_method(
-    client: &JsValue,
-    method: &str,
-    args: &js_sys::Array,
-  ) -> Result<js_sys::Promise, JsValue> {
-    let method_fn = js_sys::Reflect::get(client, &JsValue::from_str(method))?
-      .dyn_into::<js_sys::Function>()
-      .map_err(|_| {
-        js_error(
-          "worker_client_method_error",
-          format!("missing method {method}"),
-        )
-      })?;
-    let value = method_fn.apply(client, args)?;
-    value.dyn_into::<js_sys::Promise>().map_err(|_| {
-      js_error(
-        "worker_client_method_error",
-        format!("method {method} did not return a Promise"),
-      )
-    })
-  }
-
-  fn spawn_demo_worker() -> Result<web_sys::Worker, JsValue> {
-    let worker_js = js_sys::eval("new Worker('./searchlite-demo-worker.mjs', { type: 'module' })")
-      .map_err(|err| js_error("worker_spawn_error", format!("{err:?}")))?;
-    worker_js
-      .dyn_into::<web_sys::Worker>()
-      .map_err(|_| js_error("worker_spawn_error", "failed to cast JS worker"))
-  }
-
-  async fn worker_call(
-    worker: &web_sys::Worker,
-    id: u32,
-    action: &str,
-    payload: JsValue,
-  ) -> Result<JsValue, JsValue> {
-    let (tx, rx) = oneshot::channel::<Result<JsValue, JsValue>>();
-    let tx = Rc::new(RefCell::new(Some(tx)));
-
-    let message_tx = tx.clone();
-    let message_worker = worker.clone();
-    let onmessage =
-      Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
-        let data = event.data();
-        let msg_id = js_sys::Reflect::get(&data, &JsValue::from_str("id"))
-          .ok()
-          .and_then(|raw| raw.as_f64())
-          .map(|raw| raw as u32);
-        if msg_id != Some(id) {
-          return;
-        }
-        let ok = js_sys::Reflect::get(&data, &JsValue::from_str("ok"))
-          .ok()
-          .and_then(|raw| raw.as_bool())
-          .unwrap_or(false);
-        let key = if ok { "payload" } else { "error" };
-        let value = js_sys::Reflect::get(&data, &JsValue::from_str(key)).unwrap_or(JsValue::NULL);
-        if let Some(sender) = message_tx.borrow_mut().take() {
-          let _ = sender.send(if ok { Ok(value) } else { Err(value) });
-        }
-        message_worker.set_onmessage(None);
-        message_worker.set_onerror(None);
-      });
-
-    let error_tx = tx.clone();
-    let error_worker = worker.clone();
-    let onerror = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-      let reason = js_sys::Reflect::get(event.as_ref(), &JsValue::from_str("message"))
-        .ok()
-        .and_then(|raw| raw.as_string())
-        .unwrap_or_else(|| "worker runtime error".to_string());
-      if let Some(sender) = error_tx.borrow_mut().take() {
-        let _ = sender.send(Err(js_error("worker_error", reason)));
-      }
-      error_worker.set_onmessage(None);
-      error_worker.set_onerror(None);
-    });
-
-    worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-    onmessage.forget();
-    onerror.forget();
-
-    let msg = js_sys::Object::new();
-    js_sys::Reflect::set(
-      &msg,
-      &JsValue::from_str("id"),
-      &JsValue::from_f64(f64::from(id)),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-      &msg,
-      &JsValue::from_str("action"),
-      &JsValue::from_str(action),
-    )
-    .unwrap();
-    js_sys::Reflect::set(&msg, &JsValue::from_str("payload"), &payload).unwrap();
-    worker.post_message(&msg)?;
-
-    match rx.await {
-      Ok(result) => result,
-      Err(_) => Err(js_error(
-        "worker_channel_closed",
-        "worker response channel closed",
-      )),
-    }
-  }
-
-  struct MigrationFailureGuard;
-
-  impl MigrationFailureGuard {
-    fn enable() -> Self {
-      set_migration_fail_after_clear(true);
-      Self
-    }
-  }
-
-  impl Drop for MigrationFailureGuard {
-    fn drop(&mut self) {
-      set_migration_fail_after_clear(false);
-    }
-  }
-
-  struct PersistQuotaFailureGuard;
-
-  impl PersistQuotaFailureGuard {
-    fn enable() -> Self {
-      set_force_persist_quota_exceeded(true);
-      Self
-    }
-  }
-
-  impl Drop for PersistQuotaFailureGuard {
-    fn drop(&mut self) {
-      set_force_persist_quota_exceeded(false);
-    }
   }
 
   #[wasm_bindgen_test]
@@ -2666,27 +993,6 @@ mod tests {
     let restored = JsStorage::new(db, root.clone()).await.unwrap();
     let contents = restored.read_to_end(&path).unwrap();
     assert_eq!(contents, b"hello wasm");
-  }
-
-  #[wasm_bindgen_test]
-  fn schema_hash_is_deterministic() {
-    let schema = Schema::default_text_body();
-    let hash_a = schema_hash(&schema).unwrap();
-    let hash_b = schema_hash(&schema).unwrap();
-    assert_eq!(hash_a, hash_b);
-
-    let mut schema_v2 = Schema::default_text_body();
-    schema_v2
-      .keyword_fields
-      .push(searchlite_core::api::types::KeywordField {
-        name: "category".to_string(),
-        stored: true,
-        indexed: true,
-        fast: true,
-        nullable: false,
-      });
-    let hash_c = schema_hash(&schema_v2).unwrap();
-    assert_ne!(hash_a, hash_c);
   }
 
   #[wasm_bindgen_test]
@@ -2728,38 +1034,6 @@ mod tests {
     storage.flush().await.unwrap();
     let contents = storage.read_to_end(&atomic_path).unwrap();
     assert_eq!(contents, b"atomic");
-  }
-
-  #[wasm_bindgen_test]
-  async fn js_storage_flush_batches_indexeddb_transactions() {
-    let db = unique_db("searchlite-storage-batch");
-    let root = PathBuf::from("idx-batch");
-    reset_persist_batch_tx_count();
-    let storage = JsStorage::new(db.clone(), root.clone()).await.unwrap();
-    for idx in 0..12 {
-      let path = root.join(format!("file-{idx}.bin"));
-      let payload = format!("payload-{idx}");
-      storage.write_all(&path, payload.as_bytes()).unwrap();
-    }
-    storage.flush().await.unwrap();
-    assert_eq!(persist_batch_tx_count(), 1);
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn js_storage_flush_waits_for_deletes() {
-    let db = unique_db("searchlite-storage-delete-flush");
-    let root = PathBuf::from("idx-delete");
-    let storage = JsStorage::new(db.clone(), root.clone()).await.unwrap();
-    let path = root.join("remove-me.bin");
-    storage.write_all(&path, b"delete me").unwrap();
-    storage.flush().await.unwrap();
-    storage.remove(&path).unwrap();
-    storage.flush().await.unwrap();
-    drop(storage);
-    let restored = JsStorage::new(db.clone(), root.clone()).await.unwrap();
-    assert!(!restored.exists(&path));
-    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
@@ -2901,505 +1175,142 @@ mod tests {
     assert_eq!(hits.len(), 1);
   }
 
+  // BUG-025: a JS caller passing `limit = 4_000_000_000` to `search()` would
+  // grow the result heap until the WebAssembly linear memory aborts with no
+  // recovery path. The validator must surface a `page_too_large`-style error
+  // before any allocation happens.
   #[wasm_bindgen_test]
-  async fn delete_document_roundtrip() {
-    let db = unique_db("searchlite-delete-document");
+  async fn search_rejects_limit_above_max_page_size() {
+    let db = unique_db("searchlite-bug-025-search");
     let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
     let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![
-      serde_json::json!({ "_id": "doc-1", "body": "alpha token" }),
-      serde_json::json!({ "_id": "doc-2", "body": "beta token" }),
-    ];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
     idx.commit().await.unwrap();
 
-    idx.delete_document("doc-1".to_string()).unwrap();
-    idx.commit().await.unwrap();
-
-    let deleted = idx.search("alpha".to_string(), 5, Some(true)).unwrap();
-    let deleted_json: serde_json::Value = serde_wasm_bindgen::from_value(deleted).unwrap();
-    assert_eq!(deleted_json["hits"].as_array().unwrap().len(), 0);
-
-    let retained = idx.search("beta".to_string(), 5, Some(true)).unwrap();
-    let retained_json: serde_json::Value = serde_wasm_bindgen::from_value(retained).unwrap();
-    assert_eq!(retained_json["hits"].as_array().unwrap().len(), 1);
-  }
-
-  #[wasm_bindgen_test]
-  async fn delete_documents_roundtrip() {
-    let db = unique_db("searchlite-delete-documents");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![
-      serde_json::json!({ "_id": "doc-1", "body": "alpha token" }),
-      serde_json::json!({ "_id": "doc-2", "body": "beta token" }),
-      serde_json::json!({ "_id": "doc-3", "body": "gamma token" }),
-    ];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let ids = vec!["doc-1", "doc-3"];
-    idx
-      .delete_documents(serde_wasm_bindgen::to_value(&ids).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let alpha = idx.search("alpha".to_string(), 5, Some(true)).unwrap();
-    let alpha_json: serde_json::Value = serde_wasm_bindgen::from_value(alpha).unwrap();
-    assert_eq!(alpha_json["hits"].as_array().unwrap().len(), 0);
-
-    let gamma = idx.search("gamma".to_string(), 5, Some(true)).unwrap();
-    let gamma_json: serde_json::Value = serde_wasm_bindgen::from_value(gamma).unwrap();
-    assert_eq!(gamma_json["hits"].as_array().unwrap().len(), 0);
-
-    let beta = idx.search("beta".to_string(), 5, Some(true)).unwrap();
-    let beta_json: serde_json::Value = serde_wasm_bindgen::from_value(beta).unwrap();
-    assert_eq!(beta_json["hits"].as_array().unwrap().len(), 1);
-  }
-
-  #[wasm_bindgen_test]
-  async fn delete_documents_rejects_non_string_ids() {
-    let db = unique_db("searchlite-delete-invalid");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-
-    let invalid = serde_json::json!(["doc-1", 42]);
     let err = idx
-      .delete_documents(serde_wasm_bindgen::to_value(&invalid).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_doc_id_batch");
-  }
+      .search("hello".to_string(), WASM_MAX_PAGE_SIZE + 1, Some(true))
+      .expect_err("limit above WASM_MAX_PAGE_SIZE must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
 
-  #[wasm_bindgen_test]
-  async fn delete_document_rejects_invalid_id() {
-    let db = unique_db("searchlite-del-invalid-id");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let err = idx.delete_document("  ".to_string()).unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_id");
-  }
-
-  #[wasm_bindgen_test]
-  async fn delete_documents_rejects_invalid_ids() {
-    let db = unique_db("searchlite-dels-invalid-id");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let ids = vec!["valid-doc", "\n"];
-    let err = idx
-      .delete_documents(serde_wasm_bindgen::to_value(&ids).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_id");
-  }
-
-  #[wasm_bindgen_test]
-  async fn update_document_set_and_unset_roundtrip() {
-    let db = unique_db("searchlite-update-document");
-    let mut schema = Schema::default_text_body();
-    schema
-      .keyword_fields
-      .push(searchlite_core::api::types::KeywordField {
-        name: "category".to_string(),
-        stored: true,
-        indexed: true,
-        fast: true,
-        nullable: true,
-      });
-    let schema_json = serde_json::to_string(&schema).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![serde_json::json!({
-      "_id": "doc-1",
-      "body": "hello patch",
-      "category": "guide"
-    })];
+    // The cap itself is allowed.
     idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
+      .search("hello".to_string(), WASM_MAX_PAGE_SIZE, Some(true))
+      .expect("limit at the cap must still be accepted");
+  }
+
+  // BUG-025: the JSON-decoded `search_request` path must also reject huge
+  // `limit`, `from`, and `from + limit`, rather than allocating a million-slot
+  // top-k heap.
+  #[wasm_bindgen_test]
+  async fn search_request_rejects_oversized_limits() {
+    let db = unique_db("searchlite-bug-025-request");
+    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
+    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
     idx.commit().await.unwrap();
 
-    let patch = serde_json::json!({
-      "id": "doc-1",
-      "set": { "body": "updated patch" },
-      "unset": ["category"]
-    });
-    idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let result = idx.search("updated".to_string(), 5, Some(true)).unwrap();
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = parsed["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["fields"]["body"], "updated patch");
-    assert!(hits[0]["fields"]["category"].is_null());
-  }
-
-  #[wasm_bindgen_test]
-  async fn update_document_rejects_missing_patch() {
-    let db = unique_db("searchlite-update-missing-patch");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-
-    let patch = serde_json::json!({ "id": "doc-1" });
-    let err = idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "missing_patch");
-  }
-
-  #[wasm_bindgen_test]
-  async fn update_document_rejects_invalid_id() {
-    let db = unique_db("searchlite-update-invalid-id");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-
-    let patch = serde_json::json!({
-      "id": "   ",
-      "set": { "body": "x" }
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "return_stored": true,
     });
     let err = idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_id");
-  }
+      .search_request(request.to_string())
+      .expect_err("oversized limit must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
 
-  #[wasm_bindgen_test]
-  async fn update_document_reports_not_found() {
-    let db = unique_db("searchlite-update-not-found");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-
-    let patch = serde_json::json!({
-      "id": "missing",
-      "set": { "body": "x" }
+    // `from + limit` over the cap is also rejected, even when `limit` alone
+    // fits.
+    let paginated = serde_json::json!({
+      "query": "hello",
+      "from": WASM_MAX_PAGE_SIZE,
+      "limit": 1,
+      "return_stored": true,
     });
     let err = idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "document_not_found");
+      .search_request(paginated.to_string())
+      .expect_err("from + limit above cap must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
   }
 
+  // BUG-025: the JsValue-decoded entrypoint shares the same allocation hazard
+  // as `search_request`, so it must enforce the same cap.
   #[wasm_bindgen_test]
-  async fn update_document_rejects_unknown_field() {
-    let db = unique_db("searchlite-update-unknown-field");
+  async fn search_request_value_rejects_oversized_limit() {
+    let db = unique_db("searchlite-bug-025-request-value");
     let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
     let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![serde_json::json!({
-      "_id": "doc-1",
-      "body": "hello patch"
-    })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
     idx.commit().await.unwrap();
 
-    let patch = serde_json::json!({
-      "id": "doc-1",
-      "set": { "unknown": "x" }
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "return_stored": true,
     });
+    let request_js = serde_wasm_bindgen::to_value(&request).unwrap();
     let err = idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "update_failed");
-    assert!(payload.reason.contains("unknown field"));
+      .search_request_value(request_js)
+      .expect_err("oversized limit must be rejected");
+    assert!(
+      err
+        .as_string()
+        .unwrap_or_default()
+        .contains("max page size"),
+      "expected 'max page size' message, got {err:?}"
+    );
   }
 
+  // BUG-025 follow-up: aggregation-only / metadata queries that disable
+  // hits don't grow the result heap, so the page-size cap must mirror
+  // core's behavior and skip the `limit`/`from`/`from + limit` checks
+  // when `return_hits = false`. Matching what `IndexReader::search()` and
+  // `searchlite-http`'s `validate_search` already accept.
   #[wasm_bindgen_test]
-  async fn mget_returns_found_missing_and_preserves_order() {
-    let db = unique_db("searchlite-mget-order");
+  async fn search_request_skips_page_cap_when_return_hits_false() {
+    let db = unique_db("searchlite-bug-025-no-hits");
     let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
     let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![
-      serde_json::json!({ "_id": "doc-1", "body": "alpha" }),
-      serde_json::json!({ "_id": "doc-2", "body": "beta" }),
-    ];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
+    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello" })];
+    let docs_js = serde_wasm_bindgen::to_value(&docs).unwrap();
+    idx.add_documents(docs_js).unwrap();
     idx.commit().await.unwrap();
 
-    let req = serde_json::json!({
-      "ids": ["doc-2", "missing", "doc-1"],
-      "return_stored": true
-    });
-    let result = idx
-      .mget(serde_wasm_bindgen::to_value(&req).unwrap())
-      .unwrap();
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let out = parsed["docs"].as_array().unwrap();
-    assert_eq!(out.len(), 3);
-    assert_eq!(out[0]["doc_id"], "doc-2");
-    assert_eq!(out[1]["doc_id"], "missing");
-    assert_eq!(out[2]["doc_id"], "doc-1");
-    assert_eq!(out[0]["found"], true);
-    assert_eq!(out[1]["found"], false);
-    assert_eq!(out[2]["found"], true);
-    assert_eq!(out[0]["_source"]["body"], "beta");
-    assert!(out[1]["_source"].is_null());
-    assert_eq!(out[2]["_source"]["body"], "alpha");
-  }
-
-  #[wasm_bindgen_test]
-  async fn mget_respects_return_stored_false() {
-    let db = unique_db("searchlite-mget-return-stored-false");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "alpha" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let req = serde_json::json!({
-      "ids": ["doc-1"],
-      "return_stored": false
-    });
-    let result = idx
-      .mget(serde_wasm_bindgen::to_value(&req).unwrap())
-      .unwrap();
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let out = parsed["docs"].as_array().unwrap();
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0]["found"], true);
-    assert!(out[0]["_source"].is_null());
-  }
-
-  #[wasm_bindgen_test]
-  async fn mget_rejects_invalid_ids() {
-    let db = unique_db("searchlite-mget-invalid-id");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let req = serde_json::json!({
-      "ids": ["doc-1", "  "],
-      "return_stored": true
-    });
-    let err = idx
-      .mget(serde_wasm_bindgen::to_value(&req).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_id");
-  }
-
-  #[wasm_bindgen_test]
-  async fn multi_search_returns_ordered_results() {
-    let db = unique_db("searchlite-multi-search");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![
-      serde_json::json!({ "_id": "doc-1", "body": "alpha token" }),
-      serde_json::json!({ "_id": "doc-2", "body": "beta token" }),
-    ];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let req = serde_json::json!({
-      "searches": [
-        { "query": "alpha", "limit": 5, "return_stored": true },
-        { "query": "beta", "limit": 5, "return_stored": true }
-      ]
-    });
-    let result = idx
-      .multi_search(serde_wasm_bindgen::to_value(&req).unwrap())
-      .unwrap();
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let results = parsed["results"].as_array().unwrap();
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0]["hits"][0]["fields"]["body"], "alpha token");
-    assert_eq!(results[1]["hits"][0]["fields"]["body"], "beta token");
-  }
-
-  #[wasm_bindgen_test]
-  async fn multi_search_rejects_invalid_request() {
-    let db = unique_db("searchlite-multi-search-invalid");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-
-    let req = serde_json::json!({ "searches": "not-an-array" });
-    let err = idx
-      .multi_search(serde_wasm_bindgen::to_value(&req).unwrap())
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_multi_search_request");
-  }
-
-  #[wasm_bindgen_test]
-  async fn compact_stats_and_inspect_roundtrip() {
-    let db = unique_db("searchlite-maintenance");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json, None)
-      .await
-      .unwrap();
-
-    let docs_a = vec![serde_json::json!({ "_id": "doc-1", "body": "alpha" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs_a).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let docs_b = vec![serde_json::json!({ "_id": "doc-2", "body": "beta" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs_b).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let stats_before_js = idx.stats().unwrap();
-    let stats_before: StatsResponse = serde_wasm_bindgen::from_value(stats_before_js).unwrap();
-    assert_eq!(stats_before.documents, 2);
-    assert_eq!(stats_before.deleted_documents, 0);
-    assert_eq!(stats_before.index_name, db);
-    assert!(stats_before.segments >= 2);
-
-    let compact_js = idx.compact().await.unwrap();
-    let compact: CompactResponse = serde_wasm_bindgen::from_value(compact_js).unwrap();
-    assert!(compact.compacted);
-
-    let stats_after_js = idx.stats().unwrap();
-    let stats_after: StatsResponse = serde_wasm_bindgen::from_value(stats_after_js).unwrap();
-    assert_eq!(stats_after.documents, 2);
-    assert_eq!(stats_after.deleted_documents, 0);
-    assert_eq!(stats_after.segments, 1);
-
-    let inspect_js = idx.inspect().unwrap();
-    let inspect: InspectResponse = serde_wasm_bindgen::from_value(inspect_js).unwrap();
-    assert!(inspect.manifest.write_key.is_none());
-    assert_eq!(inspect.manifest.segments.len(), stats_after.segments);
-    assert!(inspect
-      .manifest
-      .segments
-      .iter()
-      .all(|seg| seg.write_binding_b64.is_none()));
-  }
-
-  #[wasm_bindgen_test]
-  async fn wasm_core_parity_search_mget_multi_search_update_delete() {
-    let db = unique_db("searchlite-parity");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![
-      serde_json::json!({ "_id": "doc-1", "body": "alpha token" }),
-      serde_json::json!({ "_id": "doc-2", "body": "beta token" }),
-      serde_json::json!({ "_id": "doc-3", "body": "gamma token" }),
-    ];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let search_req: SearchRequest = serde_json::from_value(serde_json::json!({
-      "query": "alpha",
-      "limit": 5,
-      "return_stored": true
-    }))
-    .unwrap();
-    let wasm_search = idx
-      .search_request_value(serde_wasm_bindgen::to_value(&search_req).unwrap())
-      .unwrap();
-    let wasm_search_json: serde_json::Value = serde_wasm_bindgen::from_value(wasm_search).unwrap();
-    let core_search = idx.index.reader().unwrap().search(&search_req).unwrap();
-    let core_search_json = serde_json::to_value(core_search).unwrap();
-    assert_eq!(wasm_search_json, core_search_json);
-
-    let mget_req = MgetRequest {
-      ids: vec![
-        "doc-2".to_string(),
-        "missing".to_string(),
-        "doc-1".to_string(),
-      ],
-      return_stored: true,
-    };
-    let wasm_mget = idx
-      .mget(serde_wasm_bindgen::to_value(&mget_req).unwrap())
-      .unwrap();
-    let wasm_mget_json: serde_json::Value = serde_wasm_bindgen::from_value(wasm_mget).unwrap();
-    let core_mget_docs = idx
-      .index
-      .reader()
-      .unwrap()
-      .mget(&mget_req.ids, mget_req.return_stored)
-      .unwrap();
-    let core_mget_json = serde_json::to_value(MgetResponse {
-      docs: core_mget_docs,
-    })
-    .unwrap();
-    assert_eq!(wasm_mget_json, core_mget_json);
-
-    let multi_req = MultiSearchRequest {
-      searches: vec![
-        serde_json::from_value(serde_json::json!({
-          "query": "alpha",
-          "limit": 5,
-          "return_stored": true
-        }))
-        .unwrap(),
-        serde_json::from_value(serde_json::json!({
-          "query": "beta",
-          "limit": 5,
-          "return_stored": true
-        }))
-        .unwrap(),
-      ],
-      parallel: false,
-      max_concurrency: None,
-    };
-    let wasm_multi = idx
-      .multi_search(serde_wasm_bindgen::to_value(&multi_req).unwrap())
-      .unwrap();
-    let wasm_multi_json: serde_json::Value = serde_wasm_bindgen::from_value(wasm_multi).unwrap();
-    let core_multi_results = idx
-      .index
-      .reader()
-      .unwrap()
-      .multi_search(&multi_req.searches)
-      .unwrap();
-    let core_multi_json = serde_json::to_value(MultiSearchResponse {
-      results: core_multi_results,
-    })
-    .unwrap();
-    assert_eq!(wasm_multi_json, core_multi_json);
-
-    let patch = serde_json::json!({
-      "id": "doc-1",
-      "set": { "body": "alpha updated" }
+    // `from + limit` well above the cap, but `return_hits = false` — must
+    // be accepted, matching `IndexReader::search()`.
+    let request = serde_json::json!({
+      "query": "hello",
+      "limit": WASM_MAX_PAGE_SIZE + 1,
+      "from": WASM_MAX_PAGE_SIZE + 1,
+      "return_hits": false,
     });
     idx
-      .update_document(serde_wasm_bindgen::to_value(&patch).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-    idx.delete_document("doc-2".to_string()).unwrap();
-    idx.commit().await.unwrap();
-
-    let verify_req = MgetRequest {
-      ids: vec!["doc-1".to_string(), "doc-2".to_string()],
-      return_stored: true,
-    };
-    let wasm_verify = idx
-      .mget(serde_wasm_bindgen::to_value(&verify_req).unwrap())
-      .unwrap();
-    let wasm_verify_json: serde_json::Value = serde_wasm_bindgen::from_value(wasm_verify).unwrap();
-    let core_verify_docs = idx
-      .index
-      .reader()
-      .unwrap()
-      .mget(&verify_req.ids, verify_req.return_stored)
-      .unwrap();
-    let core_verify_json = serde_json::to_value(MgetResponse {
-      docs: core_verify_docs,
-    })
-    .unwrap();
-    assert_eq!(wasm_verify_json, core_verify_json);
+      .search_request(request.to_string())
+      .expect("oversized limit/from must be allowed when return_hits=false");
   }
 
   #[wasm_bindgen_test]
@@ -3441,385 +1352,6 @@ mod tests {
   }
 
   #[wasm_bindgen_test]
-  async fn search_request_value_controlled_rejects_invalid_timeout() {
-    let db = unique_db("searchlite-controlled-invalid-timeout");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let req = serde_json::json!({ "query": "hello", "limit": 5, "return_stored": true });
-    let err = idx
-      .search_request_value_controlled(
-        serde_wasm_bindgen::to_value(&req).unwrap(),
-        None,
-        Some(-1.0),
-      )
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_timeout");
-  }
-
-  #[wasm_bindgen_test]
-  async fn search_request_value_controlled_aborts_with_preaborted_signal() {
-    let db = unique_db("searchlite-controlled-abort");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let req = serde_json::json!({ "query": "hello", "limit": 5, "return_stored": true });
-    let controller = web_sys::AbortController::new().unwrap();
-    controller.abort();
-    let err = idx
-      .search_request_value_controlled(
-        serde_wasm_bindgen::to_value(&req).unwrap(),
-        Some(controller.signal()),
-        None,
-      )
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "aborted");
-  }
-
-  #[wasm_bindgen_test]
-  async fn search_request_value_controlled_times_out() {
-    let db = unique_db("searchlite-controlled-timeout");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let req = serde_json::json!({ "query": "hello", "limit": 5, "return_stored": true });
-    let err = idx
-      .search_request_value_controlled(serde_wasm_bindgen::to_value(&req).unwrap(), None, Some(0.0))
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "timeout");
-  }
-
-  #[wasm_bindgen_test]
-  async fn search_request_value_async_roundtrip() {
-    let db = unique_db("searchlite-async-search");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "hello wasm async" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-    let req = serde_json::json!({ "query": "hello", "limit": 5, "return_stored": true });
-    let result = idx
-      .search_request_value_async(serde_wasm_bindgen::to_value(&req).unwrap(), None, None)
-      .await
-      .unwrap();
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = parsed["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-  }
-
-  #[wasm_bindgen_test]
-  async fn worker_search_request_keeps_main_thread_responsive() {
-    if !demo_worker_assets_available().await {
-      return;
-    }
-    let db = unique_db("searchlite-worker-responsive");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let worker = spawn_demo_worker().unwrap();
-
-    let init_payload = serde_json::json!({
-      "dbName": db,
-      "schemaJson": schema_json,
-      "storage": "indexeddb",
-    });
-    let init_result = worker_call(
-      &worker,
-      1,
-      "init_index",
-      serde_wasm_bindgen::to_value(&init_payload).unwrap(),
-    )
-    .await;
-    if let Err(err) = init_result {
-      if skip_if_worker_runtime_unavailable(&err) {
-        worker.terminate();
-        return;
-      }
-      panic!("worker init failed: {err:?}");
-    }
-
-    let docs_payload = serde_json::json!({
-      "docs": [{ "_id": "doc-1", "body": "hello from worker" }],
-    });
-    worker_call(
-      &worker,
-      2,
-      "add_documents",
-      serde_wasm_bindgen::to_value(&docs_payload).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let timer_fired = Rc::new(Cell::new(false));
-    let timer_fired_ref = Rc::clone(&timer_fired);
-    set_timeout_once(20, move || timer_fired_ref.set(true));
-
-    let request_payload = serde_json::json!({
-      "request": { "query": "hello", "limit": 5, "return_stored": true },
-      "delayMs": 200,
-      "timeoutMs": 800,
-    });
-    let result = match worker_call(
-      &worker,
-      3,
-      "search_request",
-      serde_wasm_bindgen::to_value(&request_payload).unwrap(),
-    )
-    .await
-    {
-      Ok(result) => result,
-      Err(err) if skip_if_worker_runtime_unavailable(&err) => {
-        worker.terminate();
-        let _ = Searchlite::drop_index(db).await;
-        return;
-      }
-      Err(err) => panic!("worker search failed: {err:?}"),
-    };
-    let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    assert_eq!(parsed["hits"].as_array().unwrap().len(), 1);
-    assert!(
-      timer_fired.get(),
-      "main thread timer should fire while worker search is in-flight"
-    );
-
-    worker.terminate();
-    let db_name = init_payload["dbName"].as_str().unwrap().to_string();
-    Searchlite::drop_index(db_name).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn worker_search_request_timeout_returns_typed_error() {
-    if !demo_worker_assets_available().await {
-      return;
-    }
-    let db = unique_db("searchlite-worker-timeout");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let worker = spawn_demo_worker().unwrap();
-
-    let init_payload = serde_json::json!({
-      "dbName": db,
-      "schemaJson": schema_json,
-      "storage": "indexeddb",
-    });
-    let init_result = worker_call(
-      &worker,
-      1,
-      "init_index",
-      serde_wasm_bindgen::to_value(&init_payload).unwrap(),
-    )
-    .await;
-    if let Err(err) = init_result {
-      if skip_if_worker_runtime_unavailable(&err) {
-        worker.terminate();
-        return;
-      }
-      panic!("worker init failed: {err:?}");
-    }
-
-    let docs_payload = serde_json::json!({
-      "docs": [{ "_id": "doc-1", "body": "timeout path" }],
-    });
-    worker_call(
-      &worker,
-      2,
-      "add_documents",
-      serde_wasm_bindgen::to_value(&docs_payload).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let request_payload = serde_json::json!({
-      "request": { "query": "timeout", "limit": 5, "return_stored": true },
-      "delayMs": 200,
-      "timeoutMs": 20,
-    });
-    let err = match worker_call(
-      &worker,
-      3,
-      "search_request",
-      serde_wasm_bindgen::to_value(&request_payload).unwrap(),
-    )
-    .await
-    {
-      Ok(_) => panic!("expected timeout error from worker search"),
-      Err(err) if skip_if_worker_runtime_unavailable(&err) => {
-        worker.terminate();
-        let _ = Searchlite::drop_index(db).await;
-        return;
-      }
-      Err(err) => err,
-    };
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "timeout");
-
-    worker.terminate();
-    let db_name = init_payload["dbName"].as_str().unwrap().to_string();
-    Searchlite::drop_index(db_name).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn worker_client_search_request_abort_returns_typed_error() {
-    if !demo_worker_assets_available().await {
-      return;
-    }
-    let db = unique_db("searchlite-worker-client-abort");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let client = match new_worker_client_instance().await {
-      Ok(client) => client,
-      Err(err) => {
-        if skip_if_worker_runtime_unavailable(&err) {
-          return;
-        }
-        panic!("worker client init failed: {err:?}");
-      }
-    };
-
-    let init_args = js_sys::Array::new();
-    init_args.push(&JsValue::from_str(&db));
-    init_args.push(&JsValue::from_str(&schema_json));
-    init_args.push(&JsValue::from_str("indexeddb"));
-    let init_res =
-      JsFuture::from(call_worker_client_method(&client, "initIndex", &init_args).unwrap()).await;
-    if let Err(err) = init_res {
-      if skip_if_worker_runtime_unavailable(&err) {
-        return;
-      }
-      panic!("worker client initIndex failed: {err:?}");
-    }
-
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "abort path" })];
-    let add_args = js_sys::Array::new();
-    add_args.push(&serde_wasm_bindgen::to_value(&docs).unwrap());
-    JsFuture::from(call_worker_client_method(&client, "addDocuments", &add_args).unwrap())
-      .await
-      .unwrap();
-
-    let controller = web_sys::AbortController::new().unwrap();
-    let controller_for_timeout = controller.clone();
-    set_timeout_once(20, move || controller_for_timeout.abort());
-
-    let request = serde_json::json!({ "query": "abort", "limit": 5, "return_stored": true });
-    let options = js_sys::Object::new();
-    js_sys::Reflect::set(
-      &options,
-      &JsValue::from_str("delayMs"),
-      &JsValue::from_f64(200.0),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-      &options,
-      &JsValue::from_str("timeoutMs"),
-      &JsValue::from_f64(800.0),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-      &options,
-      &JsValue::from_str("signal"),
-      controller.signal().as_ref(),
-    )
-    .unwrap();
-    let search_args = js_sys::Array::new();
-    search_args.push(&serde_wasm_bindgen::to_value(&request).unwrap());
-    search_args.push(options.as_ref());
-    let err = match JsFuture::from(
-      call_worker_client_method(&client, "searchRequest", &search_args).unwrap(),
-    )
-    .await
-    {
-      Ok(_) => panic!("expected abort error from worker client search"),
-      Err(err) if skip_if_worker_runtime_unavailable(&err) => {
-        return;
-      }
-      Err(err) => err,
-    };
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "aborted");
-
-    let dispose_args = js_sys::Array::new();
-    JsFuture::from(call_worker_client_method(&client, "dispose", &dispose_args).unwrap())
-      .await
-      .unwrap();
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn worker_client_search_request_rejects_invalid_timeout() {
-    if !demo_worker_assets_available().await {
-      return;
-    }
-    let db = unique_db("searchlite-worker-client-invalid-timeout");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let client = match new_worker_client_instance().await {
-      Ok(client) => client,
-      Err(err) => {
-        if skip_if_worker_runtime_unavailable(&err) {
-          return;
-        }
-        panic!("worker client init failed: {err:?}");
-      }
-    };
-
-    let init_args = js_sys::Array::new();
-    init_args.push(&JsValue::from_str(&db));
-    init_args.push(&JsValue::from_str(&schema_json));
-    init_args.push(&JsValue::from_str("indexeddb"));
-    let init_res =
-      JsFuture::from(call_worker_client_method(&client, "initIndex", &init_args).unwrap()).await;
-    if let Err(err) = init_res {
-      if skip_if_worker_runtime_unavailable(&err) {
-        return;
-      }
-      panic!("worker client initIndex failed: {err:?}");
-    }
-
-    let request = serde_json::json!({ "query": "timeout", "limit": 5, "return_stored": true });
-    let options = js_sys::Object::new();
-    js_sys::Reflect::set(
-      &options,
-      &JsValue::from_str("timeoutMs"),
-      &JsValue::from_f64(-1.0),
-    )
-    .unwrap();
-    let search_args = js_sys::Array::new();
-    search_args.push(&serde_wasm_bindgen::to_value(&request).unwrap());
-    search_args.push(options.as_ref());
-    let err = match JsFuture::from(
-      call_worker_client_method(&client, "searchRequest", &search_args).unwrap(),
-    )
-    .await
-    {
-      Ok(_) => panic!("expected invalid_timeout error from worker client search"),
-      Err(err) if skip_if_worker_runtime_unavailable(&err) => {
-        return;
-      }
-      Err(err) => err,
-    };
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "invalid_timeout");
-    assert!(payload.reason.contains("timeoutMs"));
-
-    let dispose_args = js_sys::Array::new();
-    JsFuture::from(call_worker_client_method(&client, "dispose", &dispose_args).unwrap())
-      .await
-      .unwrap();
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[cfg(not(feature = "threads"))]
-  #[wasm_bindgen_test]
-  async fn init_threads_without_feature_returns_typed_error() {
-    let db = unique_db("searchlite-threads-disabled");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json, None)
-      .await
-      .unwrap();
-    let err = idx.init_threads(None).await.unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "threads_feature_disabled");
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
   async fn init_reuses_existing_index() {
     let db = unique_db("searchlite-reopen");
     let schema = Schema::default_text_body();
@@ -3838,331 +1370,5 @@ mod tests {
     let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
     let hits = result_json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
-  }
-
-  #[wasm_bindgen_test]
-  async fn list_indexes_includes_initialized_db() {
-    let db = unique_db("searchlite-list-indexes");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json, None)
-      .await
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let indexes_js = Searchlite::list_indexes().await.unwrap();
-    let indexes: Vec<IndexRegistryEntry> = serde_wasm_bindgen::from_value(indexes_js).unwrap();
-    assert!(indexes.iter().any(|entry| entry.db_name == db));
-  }
-
-  #[wasm_bindgen_test]
-  async fn clear_index_resets_contents() {
-    let db = unique_db("searchlite-clear-index");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json.clone(), None)
-      .await
-      .unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "clear me" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    Searchlite::clear_index(db.clone()).await.unwrap();
-
-    // Verify the index remains discoverable in the registry after clear.
-    let indexes_js = Searchlite::list_indexes().await.unwrap();
-    let indexes: Vec<IndexRegistryEntry> = serde_wasm_bindgen::from_value(indexes_js).unwrap();
-    assert!(
-      indexes.iter().any(|entry| entry.db_name == db),
-      "clear_index should preserve the registry entry"
-    );
-
-    let reopened = Searchlite::init(db, schema_json, None).await.unwrap();
-    let result = reopened.search("clear".to_string(), 5, None).unwrap();
-    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = result_json["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 0);
-  }
-
-  #[wasm_bindgen_test]
-  async fn drop_index_removes_registry_entry() {
-    let db = unique_db("searchlite-drop-index");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json.clone(), None)
-      .await
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    Searchlite::drop_index(db.clone()).await.unwrap();
-
-    let indexes_js = Searchlite::list_indexes().await.unwrap();
-    let indexes: Vec<IndexRegistryEntry> = serde_wasm_bindgen::from_value(indexes_js).unwrap();
-    assert!(!indexes.iter().any(|entry| entry.db_name == db));
-
-    // Can recreate after deletion.
-    let recreated = Searchlite::init(db, schema_json, None).await.unwrap();
-    recreated.commit().await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn init_rejects_reserved_registry_name() {
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let result = Searchlite::init(REGISTRY_DB_NAME.to_string(), schema_json, None).await;
-    assert!(result.is_err(), "expected reserved_name error");
-    let err = result.err().unwrap();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "reserved_name");
-  }
-
-  #[wasm_bindgen_test]
-  async fn storage_usage_returns_supported_or_note() {
-    let usage_js = Searchlite::storage_usage().await.unwrap();
-    let usage: StorageUsageResponse = serde_wasm_bindgen::from_value(usage_js).unwrap();
-    assert!(usage.supported || usage.note.is_some());
-    if usage.supported {
-      assert!(
-        usage.usage_bytes.is_some() || usage.quota_bytes.is_some() || usage.persisted.is_some()
-      );
-    }
-  }
-
-  #[wasm_bindgen_test]
-  async fn commit_surfaces_quota_exceeded_error_type() {
-    let db = unique_db("searchlite-quota-error");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json, None)
-      .await
-      .unwrap();
-    idx
-      .add_document(
-        serde_wasm_bindgen::to_value(&serde_json::json!({ "_id": "doc-1", "body": "quota" }))
-          .unwrap(),
-      )
-      .unwrap();
-    let _guard = PersistQuotaFailureGuard::enable();
-    let err = idx.commit().await.unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "quota_exceeded");
-    assert!(payload.reason.contains("compact()"));
-    assert!(payload.reason.contains("cleanup_indexes"));
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn cleanup_indexes_drops_only_stale_entries() {
-    let fresh = unique_db("searchlite-cleanup-fresh");
-    let stale = unique_db("searchlite-cleanup-stale");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-
-    let fresh_idx = Searchlite::init(fresh.clone(), schema_json.clone(), None)
-      .await
-      .unwrap();
-    fresh_idx.commit().await.unwrap();
-    let stale_idx = Searchlite::init(stale.clone(), schema_json, None)
-      .await
-      .unwrap();
-    stale_idx.commit().await.unwrap();
-
-    let mut stale_entry = get_registry_entry(&stale).await.unwrap().unwrap();
-    stale_entry.updated_at_ms -= 60_000.0;
-    upsert_registry_entry(&stale_entry).await.unwrap();
-
-    let cleanup_js = Searchlite::cleanup_indexes(30_000.0, Some(false))
-      .await
-      .unwrap();
-    let cleanup: CleanupIndexesResponse = serde_wasm_bindgen::from_value(cleanup_js).unwrap();
-    assert!(cleanup.dropped.iter().any(|name| name == &stale));
-    assert!(cleanup.kept.iter().any(|name| name == &fresh));
-
-    let indexes_js = Searchlite::list_indexes().await.unwrap();
-    let indexes: Vec<IndexRegistryEntry> = serde_wasm_bindgen::from_value(indexes_js).unwrap();
-    assert!(indexes.iter().any(|entry| entry.db_name == fresh));
-    assert!(!indexes.iter().any(|entry| entry.db_name == stale));
-
-    Searchlite::drop_index(fresh).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn cleanup_orphaned_files_removes_only_unknown_paths() {
-    let db = unique_db("searchlite-cleanup-orphans");
-    let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_json, None)
-      .await
-      .unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "retain me" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let orphan_path = PathBuf::from(db.clone()).join("orphan.bin");
-    persist_operations_batch(
-      &db,
-      &[(orphan_path.clone(), PersistOperation::Put(vec![1, 2, 3]))],
-    )
-    .await
-    .unwrap();
-
-    let cleanup_js = idx.cleanup_orphaned_files(Some(false)).await.unwrap();
-    let cleanup: CleanupOrphanedFilesResponse = serde_wasm_bindgen::from_value(cleanup_js).unwrap();
-    assert!(cleanup
-      .removed
-      .iter()
-      .any(|path| path == &path_key(&orphan_path)));
-
-    let result = idx.search("retain".to_string(), 5, Some(true)).unwrap();
-    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = result_json["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-    Searchlite::drop_index(db).await.unwrap();
-  }
-
-  #[wasm_bindgen_test]
-  async fn plan_migration_reports_compatibility_and_rebuild() {
-    let db = unique_db("searchlite-plan-migration");
-    let schema_v1 = Schema::default_text_body();
-    let schema_v1_json = serde_json::to_string(&schema_v1).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_v1_json.clone(), None)
-      .await
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let compatible_js = Searchlite::plan_migration(db.clone(), schema_v1_json)
-      .await
-      .unwrap();
-    let compatible: MigrationPlan = serde_wasm_bindgen::from_value(compatible_js).unwrap();
-    assert_eq!(compatible.status, "compatible");
-    assert!(!compatible.rebuild_required);
-
-    let mut schema_v2 = Schema::default_text_body();
-    schema_v2
-      .keyword_fields
-      .push(searchlite_core::api::types::KeywordField {
-        name: "category".to_string(),
-        stored: true,
-        indexed: true,
-        fast: true,
-        nullable: false,
-      });
-    let schema_v2_json = serde_json::to_string(&schema_v2).unwrap();
-    let rebuild_js = Searchlite::plan_migration(db, schema_v2_json)
-      .await
-      .unwrap();
-    let rebuild: MigrationPlan = serde_wasm_bindgen::from_value(rebuild_js).unwrap();
-    assert_eq!(rebuild.status, "rebuild_required");
-    assert!(rebuild.rebuild_required);
-  }
-
-  #[wasm_bindgen_test]
-  async fn migrate_index_creates_missing_index() {
-    let db = unique_db("searchlite-migrate-create");
-    let schema = Schema::default_text_body();
-    let schema_json = serde_json::to_string(&schema).unwrap();
-
-    let created_js = Searchlite::migrate_index(db.clone(), schema_json.clone())
-      .await
-      .unwrap();
-    let created: MigrationExecutionResult = serde_wasm_bindgen::from_value(created_js).unwrap();
-    assert_eq!(created.status, "created");
-    assert!(!created.rebuild_performed);
-
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
-    let result = idx.search("anything".to_string(), 5, None).unwrap();
-    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = result_json["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 0);
-  }
-
-  #[wasm_bindgen_test]
-  async fn migrate_index_rebuilds_on_schema_change() {
-    let db = unique_db("searchlite-migrate-rebuild");
-    let schema_v1 = Schema::default_text_body();
-    let schema_v1_json = serde_json::to_string(&schema_v1).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_v1_json, None)
-      .await
-      .unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "keep me if rollback" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let mut schema_v2 = Schema::default_text_body();
-    schema_v2
-      .keyword_fields
-      .push(searchlite_core::api::types::KeywordField {
-        name: "category".to_string(),
-        stored: true,
-        indexed: true,
-        fast: true,
-        nullable: false,
-      });
-    let schema_v2_json = serde_json::to_string(&schema_v2).unwrap();
-
-    let rebuild_js = Searchlite::migrate_index(db.clone(), schema_v2_json.clone())
-      .await
-      .unwrap();
-    let rebuild: MigrationExecutionResult = serde_wasm_bindgen::from_value(rebuild_js).unwrap();
-    assert_eq!(rebuild.status, "rebuilt");
-    assert!(rebuild.rebuild_performed);
-
-    let reopened = Searchlite::init(db, schema_v2_json, None).await.unwrap();
-    let result = reopened
-      .search("rollback".to_string(), 5, Some(true))
-      .unwrap();
-    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = result_json["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 0);
-  }
-
-  #[wasm_bindgen_test]
-  async fn migrate_index_rolls_back_on_rebuild_failure() {
-    let db = unique_db("searchlite-migrate-rollback");
-    let schema_v1 = Schema::default_text_body();
-    let schema_v1_json = serde_json::to_string(&schema_v1).unwrap();
-    let idx = Searchlite::init(db.clone(), schema_v1_json.clone(), None)
-      .await
-      .unwrap();
-    let docs = vec![serde_json::json!({ "_id": "doc-1", "body": "rollback sentinel" })];
-    idx
-      .add_documents(serde_wasm_bindgen::to_value(&docs).unwrap())
-      .unwrap();
-    idx.commit().await.unwrap();
-
-    let mut schema_v2 = Schema::default_text_body();
-    schema_v2
-      .keyword_fields
-      .push(searchlite_core::api::types::KeywordField {
-        name: "category".to_string(),
-        stored: true,
-        indexed: true,
-        fast: true,
-        nullable: false,
-      });
-    let schema_v2_json = serde_json::to_string(&schema_v2).unwrap();
-
-    let _guard = MigrationFailureGuard::enable();
-    let err = Searchlite::migrate_index(db.clone(), schema_v2_json.clone())
-      .await
-      .unwrap_err();
-    let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
-    assert_eq!(payload.error_type, "migration_rebuild_failed");
-
-    let reopened = Searchlite::init(db.clone(), schema_v1_json, None)
-      .await
-      .unwrap();
-    let result = reopened
-      .search("sentinel".to_string(), 5, Some(true))
-      .unwrap();
-    let result_json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
-    let hits = result_json["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-
-    let mismatch = match Searchlite::init(db, schema_v2_json, None).await {
-      Ok(_) => panic!("expected schema mismatch after rollback"),
-      Err(err) => err,
-    };
-    let mismatch_payload: WasmErrorPayload = serde_wasm_bindgen::from_value(mismatch).unwrap();
-    assert_eq!(mismatch_payload.error_type, "schema_mismatch");
   }
 }
