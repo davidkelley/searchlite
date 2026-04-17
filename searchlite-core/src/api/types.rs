@@ -1411,8 +1411,8 @@ pub enum AggregationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     size: Option<usize>,
   },
-  AvgBucket(BucketMetricResponse),
-  SumBucket(BucketMetricResponse),
+  AvgBucket(OptionalBucketMetricResponse),
+  SumBucket(OptionalBucketMetricResponse),
   Derivative(OptionalBucketMetricResponse),
   MovingAvg(MovingAvgResponse),
   BucketScript(OptionalBucketMetricResponse),
@@ -1475,11 +1475,6 @@ pub struct TopHit {
   pub score: Option<f32>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BucketMetricResponse {
-  pub value: f64,
 }
 
 pub use crate::index::manifest::{
