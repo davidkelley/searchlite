@@ -47,8 +47,17 @@ pub fn highlight_fragments(
   let mut offset = 0usize;
   for _ in 0..opts.number_of_fragments {
     if let Some(m) = re.find_at(text, offset) {
-      let raw_start = m.start().saturating_sub(opts.fragment_size / 2);
-      let raw_end = usize::min(text.len(), raw_start.saturating_add(opts.fragment_size));
+      // Ensure the window is wide enough to fully contain the match; otherwise
+      // `replace_all` on the truncated fragment silently fails to highlight.
+      let match_len = m.end() - m.start();
+      let effective_size = opts.fragment_size.max(match_len);
+      let raw_start = m
+        .start()
+        .saturating_sub(effective_size.saturating_sub(match_len) / 2);
+      let raw_end = usize::min(
+        text.len(),
+        raw_start.saturating_add(effective_size).max(m.end()),
+      );
       // Snap to character boundaries to avoid slicing mid-character.
       let start = snap_char_boundary_left(text, raw_start);
       let end = snap_char_boundary_right(text, raw_end);
@@ -133,6 +142,43 @@ mod tests {
     assert!(
       frags[0].contains("<em>système</em>"),
       "fragment should contain highlighted term, got: {}",
+      frags[0]
+    );
+  }
+
+  #[test]
+  fn long_phrase_match_is_fully_contained_in_fragment() {
+    // Regression for issue #285: when a phrase match is longer than
+    // fragment_size / 2, the fragment window must still fully contain it so
+    // that `replace_all` can apply highlight tags.
+    let text = "aaaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee \
+                the quick brown fox jumps over the lazy dog near the river yyyy";
+    let phrase: Vec<String> = [
+      "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the", "river",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let frags = highlight_fragments(
+      text,
+      &[],
+      &[phrase],
+      HighlightOptions {
+        pre_tag: "<em>",
+        post_tag: "</em>",
+        fragment_size: 100,
+        number_of_fragments: 1,
+      },
+    );
+    assert!(!frags.is_empty(), "should produce a fragment");
+    assert!(
+      frags[0].contains("<em>") && frags[0].contains("</em>"),
+      "fragment should contain highlight tags, got: {}",
+      frags[0]
+    );
+    assert!(
+      frags[0].contains("river</em>"),
+      "fragment should fully contain the phrase match including 'river', got: {}",
       frags[0]
     );
   }
