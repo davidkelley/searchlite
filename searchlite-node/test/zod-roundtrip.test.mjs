@@ -94,9 +94,13 @@ describe("round-trip: keyword + integer", () => {
 		),
 	});
 
-	it("JSON outputs are structurally equal", () => {
-		expect(out.shorthand).toEqual(out.raw);
-		expect(out.zod).toEqual(out.shorthand);
+	it("keyword fields are structurally equal across all paths", () => {
+		expect(out.zod.properties.tag).toEqual(out.shorthand.properties.tag);
+	});
+
+	it("Zod integer adds stored: true (intentional DX divergence)", () => {
+		expect(out.zod.properties.year).toEqual({ type: "integer", "searchlite:stored": true });
+		expect(out.shorthand.properties.year).toEqual({ type: "integer" });
 	});
 });
 
@@ -174,9 +178,13 @@ describe("round-trip: float with fast: false", () => {
 		zod: sl.index(z.object({ r: sl.float({ fast: false }) })),
 	});
 
-	it("JSON outputs are structurally equal", () => {
+	it("shorthand and raw are equal", () => {
 		expect(out.shorthand).toEqual(out.raw);
-		expect(out.zod).toEqual(out.shorthand);
+	});
+
+	it("Zod adds stored: true (intentional DX divergence on numerics)", () => {
+		expect(out.zod.properties.r["searchlite:fast"]).toBe(false);
+		expect(out.zod.properties.r["searchlite:stored"]).toBe(true);
 	});
 });
 

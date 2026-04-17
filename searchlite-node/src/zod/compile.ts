@@ -164,13 +164,13 @@ function emitField(schema: unknown, path: string): Record<string, unknown> {
 
 	switch (effectiveKind) {
 		case "text":
-			return emitText(inner, nullable, meta);
+			return emitText(inner, path, nullable, meta);
 		case "keyword":
-			return emitKeyword(inner, nullable, meta);
+			return emitKeyword(inner, path, nullable, meta);
 		case "integer":
-			return emitInteger(inner, nullable, meta);
+			return emitInteger(inner, path, nullable, meta);
 		case "float":
-			return emitFloat(inner, nullable, meta);
+			return emitFloat(inner, path, nullable, meta);
 		default:
 			rejectUnsupported(inner, path);
 	}
@@ -180,13 +180,11 @@ function emitField(schema: unknown, path: string): Record<string, unknown> {
 
 function emitText(
 	inner: unknown,
+	path: string,
 	nullable: boolean,
 	meta: SearchliteFieldMetadata,
 ): Record<string, unknown> {
-	// Text accepts ZodString (default), ZodLiteral<string> (rare), ZodEnum (but
-	// enums infer to keyword already; reach here only via explicit override).
-	// Validate: the inner must resolve to a string-compatible JSON type.
-	ensureStringCompatible(inner);
+	if (!meta.kind) ensureStringCompatible(inner, path);
 
 	const prop: Record<string, unknown> = {
 		type: nullable ? ["string", "null"] : "string",
@@ -204,10 +202,11 @@ function emitText(
 
 function emitKeyword(
 	inner: unknown,
+	path: string,
 	nullable: boolean,
 	meta: SearchliteFieldMetadata,
 ): Record<string, unknown> {
-	ensureStringCompatible(inner);
+	if (!meta.kind) ensureStringCompatible(inner, path);
 
 	const prop: Record<string, unknown> = {
 		type: nullable ? ["string", "null"] : "string",
@@ -221,31 +220,45 @@ function emitKeyword(
 
 function emitInteger(
 	inner: unknown,
+	path: string,
 	nullable: boolean,
 	meta: SearchliteFieldMetadata,
 ): Record<string, unknown> {
-	ensureNumericCompatible(inner, "integer");
+	// Skip the compatibility guard when the kind was explicitly set by an
+	// sl.*() helper — the inner type may be a pipe (e.g., sl.integer()'s
+	// union([number, bigint]).pipe(coerce.number().int())) which doesn't match
+	// the "number" def type, but the user declared intent via metadata.
+	if (!meta.kind) ensureNumericCompatible(inner, path, "integer");
+
+	// Zod-path convention: numeric fields default to stored: true (unlike the
+	// shorthand path where numerics default to stored: false). Zod users who
+	// declare a field in their schema have a strong expectation it will round-
+	// trip through search results. Opt out with `sl.integer({ stored: false })`.
+	const stored = meta.stored ?? true;
 
 	const prop: Record<string, unknown> = {
 		type: nullable ? ["integer", "null"] : "integer",
 	};
 	if (meta.fast === false) prop["searchlite:fast"] = false;
-	if (meta.stored === true) prop["searchlite:stored"] = true;
+	if (stored) prop["searchlite:stored"] = true;
 	return prop;
 }
 
 function emitFloat(
 	inner: unknown,
+	path: string,
 	nullable: boolean,
 	meta: SearchliteFieldMetadata,
 ): Record<string, unknown> {
-	ensureNumericCompatible(inner, "float");
+	if (!meta.kind) ensureNumericCompatible(inner, path, "float");
+
+	const stored = meta.stored ?? true;
 
 	const prop: Record<string, unknown> = {
 		type: nullable ? ["number", "null"] : "number",
 	};
 	if (meta.fast === false) prop["searchlite:fast"] = false;
-	if (meta.stored === true) prop["searchlite:stored"] = true;
+	if (stored) prop["searchlite:stored"] = true;
 	return prop;
 }
 
@@ -388,7 +401,7 @@ function getArrayElement(schema: unknown): unknown {
 
 // ── Compatibility guards ─────────────────────────────────────────────────────
 
-function ensureStringCompatible(inner: unknown): void {
+function ensureStringCompatible(inner: unknown, path: string): void {
 	const t = getDefType(inner);
 	if (t === "string" || t === "enum") return;
 	if (t === "literal") {
@@ -396,12 +409,12 @@ function ensureStringCompatible(inner: unknown): void {
 		if (values.every((v) => typeof v === "string")) return;
 	}
 	throw new InvalidZodSchemaError({
-		path: "",
+		path,
 		message: `cannot emit string-kind field from non-string Zod type ${t ?? "unknown"}`,
 	});
 }
 
-function ensureNumericCompatible(inner: unknown, target: "integer" | "float"): void {
+function ensureNumericCompatible(inner: unknown, path: string, target: "integer" | "float"): void {
 	const t = getDefType(inner);
 	if (t === "number") return;
 	if (t === "literal") {
@@ -409,7 +422,7 @@ function ensureNumericCompatible(inner: unknown, target: "integer" | "float"): v
 		if (values.every((v) => typeof v === "number")) {
 			if (target === "integer" && !values.every((v) => Number.isInteger(v as number))) {
 				throw new InvalidZodSchemaError({
-					path: "",
+					path,
 					message: "integer field cannot be a non-integer literal",
 				});
 			}
@@ -417,7 +430,7 @@ function ensureNumericCompatible(inner: unknown, target: "integer" | "float"): v
 		}
 	}
 	throw new InvalidZodSchemaError({
-		path: "",
+		path,
 		message: `cannot emit numeric-kind field from non-numeric Zod type ${t ?? "unknown"}`,
 	});
 }
@@ -437,6 +450,8 @@ const UNSUPPORTED_HINTS: Record<string, string> = {
 		"heterogeneous arrays are unsupported. Use `z.array(z.object({...}))` with a discriminator field, or model as a fixed object.",
 	union:
 		"no core kind can represent a union of different types. Lift the discriminator to the parent object.",
+	discriminatedUnion:
+		"no core kind can represent a discriminated union. Extract the discriminator as a keyword field on the parent object and store variant-specific fields as optional.",
 	intersection:
 		"intersections can't be reconciled to a single index field. Merge at the `z.object({...})` level instead.",
 	lazy:
@@ -494,6 +509,8 @@ function zodTypeName(defType: string): string {
 			return "z.tuple(...)";
 		case "union":
 			return "z.union(...)";
+		case "discriminatedUnion":
+			return "z.discriminatedUnion(...)";
 		case "intersection":
 			return "z.intersection(...)";
 		case "lazy":

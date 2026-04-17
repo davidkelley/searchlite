@@ -110,12 +110,11 @@ export type ZodIntegerLike = z.ZodType<number, number | bigint>;
 /**
  * Declare an integer field.
  *
- * The returned Zod schema uses `z.coerce.number().int()` so values passed to
- * `add()` / returned from `search()` are accepted whether they come through
- * as a JS `number` or a `BigInt`. This matters because the NAPI binding
- * represents i64 values above the i32 range as `BigInt`, so a strict
- * `z.number()` would reject legitimately-sized epoch-ms timestamps or other
- * large integers.
+ * The returned schema uses a `z.union([z.number(), z.bigint()])` input guard
+ * piped through `z.coerce.number().int()`. This accepts JS `number` and
+ * `BigInt` — but NOT strings, booleans, or other types — so NAPI-returned
+ * large i64 values (which surface as BigInt for values above the i32 range)
+ * are handled seamlessly without silently coercing arbitrary inputs.
  */
 export function integer(opts?: NumericOpts): ZodIntegerLike;
 export function integer<S extends z.ZodNumber>(inner: S, opts?: NumericOpts): S;
@@ -129,7 +128,15 @@ export function integer(
 		inner = innerOrOpts.int();
 		opts = maybeOpts;
 	} else {
-		inner = z.coerce.number().int() as unknown as z.ZodType<number>;
+		// Accept number OR bigint, then coerce to number + validate .int().
+		// This is tighter than a blanket z.coerce.number() which would also
+		// accept strings, booleans, null, and Date objects.
+		// Accept number | bigint, then coerce to number and validate .int().
+		// The double cast is needed because Zod's pipe types are strict about
+		// intermediate _zod.input shapes that don't align with our ZodType<number>.
+		// At runtime, the pipeline is: accept number|bigint → coerce → int check.
+		const guard = z.union([z.number(), z.bigint()]) as z.ZodType<number | bigint>;
+		inner = guard.pipe(z.coerce.number().int() as z.ZodType<number, number | bigint>) as unknown as z.ZodType<number>;
 		opts = innerOrOpts as NumericOpts | undefined;
 	}
 	return attach(inner, { kind: "integer", ...opts });
@@ -203,6 +210,68 @@ export function index<TSchema extends z.ZodObject<z.ZodRawShape>>(
 	return schema as ZodIndexSchema<TSchema>;
 }
 
+// ── Typed factory functions ───────────────────────────────────────────────────
+//
+// These eliminate the `new EmbeddedIndex<z.infer<typeof Schema>>(...)` ceremony
+// by inferring `T` from the schema argument. They're the preferred entry point
+// for Zod-first users.
+
+// Lazy imports to avoid pulling in the entire embedded/remote module when only
+// the helpers are used (e.g., in a shared schema package that doesn't index).
+function lazyEmbedded() {
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	return require("../embedded") as typeof import("../embedded");
+}
+function lazyRemote() {
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	return require("../remote") as typeof import("../remote");
+}
+
+/**
+ * Create a typed `EmbeddedIndex` from a Zod-branded schema. The document type
+ * is inferred automatically — no explicit generic needed.
+ *
+ * @example
+ * ```ts
+ * const idx = sl.embedded("./data", UserSchema);
+ * await idx.add({ id: "...", name: "Alice" }); // typed as User
+ * ```
+ */
+export function embedded<TSchema extends z.ZodObject<z.ZodRawShape>>(
+	path: string,
+	schema: ZodIndexSchema<TSchema>,
+	options?: { writeKey?: string },
+): import("../embedded").EmbeddedIndex<z.infer<TSchema>> {
+	const { EmbeddedIndex } = lazyEmbedded();
+	return new EmbeddedIndex(path, {
+		...options,
+		schema: schema as unknown as ZodIndexSchema,
+	}) as import("../embedded").EmbeddedIndex<z.infer<TSchema>>;
+}
+
+/**
+ * Create a typed `RemoteIndex` from a Zod-branded schema. The document type
+ * is inferred automatically.
+ *
+ * @example
+ * ```ts
+ * const idx = sl.remote("http://srv", "users", UserSchema);
+ * const r = await idx.search("alice"); // r.hits[0].fields typed as User
+ * ```
+ */
+export function remote<TSchema extends z.ZodObject<z.ZodRawShape>>(
+	baseUrl: string,
+	indexName: string,
+	schema: ZodIndexSchema<TSchema>,
+	options?: { writeKey?: string; fetch?: typeof globalThis.fetch },
+): import("../remote").RemoteIndex<z.infer<TSchema>> {
+	const { RemoteIndex } = lazyRemote();
+	return new RemoteIndex(baseUrl, indexName, {
+		...options,
+		schema: schema as unknown as ZodIndexSchema,
+	}) as import("../remote").RemoteIndex<z.infer<TSchema>>;
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 function isZodString(x: unknown): x is z.ZodString {
@@ -243,4 +312,6 @@ export const sl = {
 	float,
 	vector,
 	index,
+	embedded,
+	remote,
 } as const;

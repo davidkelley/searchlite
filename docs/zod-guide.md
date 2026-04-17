@@ -39,36 +39,30 @@ Install:
 npm install searchlite-js zod
 ```
 
-Define your index:
+Here is a complete, runnable example — copy this into a `.ts` file and run
+with `tsx`:
 
 ```typescript
 import { z } from "zod";
-import { EmbeddedIndex, sl } from "searchlite-js";
+import { sl } from "searchlite-js";
 
+// 1. Define your schema once.
 const BlogSchema = sl.index(
   z.object({
     id:       z.string().uuid(),          // auto-promoted to keyword
     title:    z.string(),                  // text (full-text search)
-    slug:     sl.keyword(),                // keyword (exact match)
+    slug:     sl.keyword(),               // keyword (exact match)
     status:   z.enum(["draft", "published", "archived"]),
-    views:    sl.integer({ stored: true }),
+    views:    sl.integer(),               // stored by default in Zod path
     authorId: z.string().uuid(),
   }),
   { docIdField: "id" },
 );
 
-type BlogPost = z.infer<typeof BlogSchema>;
-```
+// 2. Create a typed index — T is inferred from the schema.
+const index = sl.embedded("./data/blog", BlogSchema);
 
-Create the index:
-
-```typescript
-const index = new EmbeddedIndex<BlogPost>("./data/blog", { schema: BlogSchema });
-```
-
-Insert — typed AND validated:
-
-```typescript
+// 3. Insert — typed AND validated (wrong types throw immediately).
 await index.add({
   id: "550e8400-e29b-41d4-a716-446655440000",
   title: "Hello world",
@@ -77,18 +71,18 @@ await index.add({
   views: 0,
   authorId: "550e8400-e29b-41d4-a716-446655440001",
 });
-// If you miss a field or get a type wrong, Zod throws with the field path.
-```
-
-Commit and search — the return type is inferred from the class generic:
-
-```typescript
 await index.commit();
 
+// 4. Search — hit.fields is auto-typed and auto-validated.
 const result = await index.search("hello");
-// result.hits[0].fields is typed as BlogPost
-console.log(result.hits[0].fields?.title);
+console.log(result.hits[0].fields?.title); // "Hello world"
+
+await index.close();
 ```
+
+The `sl.embedded()` factory infers the document type from the schema — no
+`<User>` annotation, no `z.infer<typeof ...>`, no options-bag ceremony. For a
+remote index, use `sl.remote(url, name, schema)` instead.
 
 ## Primitives
 
@@ -140,16 +134,20 @@ integers:
 
 ```typescript
 z.object({
-  price: z.number(),               // float
-  year:  z.number().int(),         // integer
+  price: z.number(),               // float, stored by default
+  year:  z.number().int(),         // integer, stored by default
   age:   sl.integer(),             // integer (equivalent; also attaches metadata)
-  score: sl.float({ stored: true }),
+  score: sl.float({ stored: false }),  // opt out of stored if you only need fast
 })
 ```
 
-Numeric fields default to `stored: false` and `fast: true` — they go into
-the columnar store for range filters and aggregations but aren't returned in
-hit.fields unless you explicitly opt in with `stored: true`.
+In the Zod path, numeric fields default to `stored: true` and `fast: true`
+— so any field you declare in your schema will round-trip through search
+results. This differs from the shorthand path (where numerics default to
+`stored: false`) because Zod users who explicitly declare a field have a
+strong expectation it will appear in `hit.fields`. Opt out with
+`sl.integer({ stored: false })` or `sl.float({ stored: false })` if you
+only need the fast columnar store for filtering/aggregations.
 
 ### Literals and enums
 

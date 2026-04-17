@@ -188,39 +188,37 @@ describe("compileZodSchema: keyword options", () => {
 // ── Numbers ──────────────────────────────────────────────────────────────────
 
 describe("compileZodSchema: numbers", () => {
-	it("z.number() → float", () => {
+	it("z.number() → float (stored: true by default in Zod path)", () => {
 		const out = compileZodSchema(sl.index(z.object({ price: z.number() })));
-		expect(out.properties.price).toEqual({ type: "number" });
+		expect(out.properties.price).toEqual({ type: "number", "searchlite:stored": true });
 	});
 
-	it("z.number().int() → integer", () => {
+	it("z.number().int() → integer (stored: true by default in Zod path)", () => {
 		const out = compileZodSchema(sl.index(z.object({ year: z.number().int() })));
-		expect(out.properties.year).toEqual({ type: "integer" });
+		expect(out.properties.year).toEqual({ type: "integer", "searchlite:stored": true });
 	});
 
-	it("sl.integer() is equivalent to z.number().int() with kind metadata", () => {
+	it("sl.integer() defaults to stored: true", () => {
 		const out = compileZodSchema(sl.index(z.object({ year: sl.integer() })));
+		expect(out.properties.year).toEqual({ type: "integer", "searchlite:stored": true });
+	});
+
+	it("sl.float() defaults to stored: true", () => {
+		const out = compileZodSchema(sl.index(z.object({ ratio: sl.float() })));
+		expect(out.properties.ratio).toEqual({ type: "number", "searchlite:stored": true });
+	});
+
+	it("sl.integer({stored: false}) opts out of stored", () => {
+		const out = compileZodSchema(sl.index(z.object({ year: sl.integer({ stored: false }) })));
 		expect(out.properties.year).toEqual({ type: "integer" });
 	});
 
-	it("sl.float() yields a plain number field", () => {
-		const out = compileZodSchema(sl.index(z.object({ ratio: sl.float() })));
-		expect(out.properties.ratio).toEqual({ type: "number" });
-	});
-
-	it("sl.integer({stored: true}) emits searchlite:stored", () => {
-		const out = compileZodSchema(sl.index(z.object({ year: sl.integer({ stored: true }) })));
-		expect(out.properties.year).toEqual({
-			type: "integer",
-			"searchlite:stored": true,
-		});
-	});
-
-	it("sl.float({fast: false}) emits searchlite:fast=false", () => {
+	it("sl.float({fast: false}) emits both fast=false and stored=true", () => {
 		const out = compileZodSchema(sl.index(z.object({ r: sl.float({ fast: false }) })));
 		expect(out.properties.r).toEqual({
 			type: "number",
 			"searchlite:fast": false,
+			"searchlite:stored": true,
 		});
 	});
 });
@@ -236,14 +234,14 @@ describe("compileZodSchema: literals and enums", () => {
 		});
 	});
 
-	it("z.literal(42) → integer", () => {
+	it("z.literal(42) → integer (stored: true)", () => {
 		const out = compileZodSchema(sl.index(z.object({ n: z.literal(42) })));
-		expect(out.properties.n).toEqual({ type: "integer" });
+		expect(out.properties.n).toEqual({ type: "integer", "searchlite:stored": true });
 	});
 
-	it("z.literal(3.14) → float", () => {
+	it("z.literal(3.14) → float (stored: true)", () => {
 		const out = compileZodSchema(sl.index(z.object({ n: z.literal(3.14) })));
-		expect(out.properties.n).toEqual({ type: "number" });
+		expect(out.properties.n).toEqual({ type: "number", "searchlite:stored": true });
 	});
 
 	it("z.literal(true) is rejected with a boolean-literal hint", () => {
@@ -540,16 +538,21 @@ describe("compileZodSchema: parity with expandSchema", () => {
 		expect(zod).toEqual(shorthand);
 	});
 
-	it("integer field", () => {
+	it("integer field (Zod defaults stored: true, shorthand defaults stored: false)", () => {
 		const zod = compileZodSchema(sl.index(z.object({ year: sl.integer() })));
 		const shorthand = expandSchema({ year: "integer" });
-		expect(zod).toEqual(shorthand);
+		// Intentional divergence: Zod-path numerics are stored by default so
+		// declared fields round-trip through search results.
+		expect(zod.properties.year.type).toEqual(shorthand.properties.year.type);
+		expect(zod.properties.year["searchlite:stored"]).toBe(true);
+		expect(shorthand.properties.year["searchlite:stored"]).toBeUndefined();
 	});
 
-	it("float field", () => {
+	it("float field (same intentional divergence)", () => {
 		const zod = compileZodSchema(sl.index(z.object({ price: sl.float() })));
 		const shorthand = expandSchema({ price: "float" });
-		expect(zod).toEqual(shorthand);
+		expect(zod.properties.price.type).toEqual(shorthand.properties.price.type);
+		expect(zod.properties.price["searchlite:stored"]).toBe(true);
 	});
 
 	it("text with custom analyzer", () => {
@@ -568,19 +571,20 @@ describe("compileZodSchema: parity with expandSchema", () => {
 		expect(zod).toEqual(shorthand);
 	});
 
-	it("integer stored: true", () => {
+	it("integer with explicit stored: true matches shorthand with stored: true", () => {
 		const zod = compileZodSchema(sl.index(z.object({ year: sl.integer({ stored: true }) })));
 		const shorthand = expandSchema({ year: { type: "integer", stored: true } });
 		expect(zod).toEqual(shorthand);
 	});
 
-	it("mixed fields with custom docIdField (docIdField not in schema)", () => {
+	it("mixed text + keyword fields with custom docIdField", () => {
+		// Compare only string fields (text + keyword) for full parity; numeric
+		// fields intentionally diverge on stored default.
 		const zod = compileZodSchema(
 			sl.index(
 				z.object({
 					title: z.string(),
 					tag: sl.keyword(),
-					year: sl.integer(),
 				}),
 				{ docIdField: "urn" },
 			),
@@ -589,7 +593,6 @@ describe("compileZodSchema: parity with expandSchema", () => {
 			doc_id_field: "urn",
 			title: "text",
 			tag: "keyword",
-			year: "integer",
 		});
 		expect(zod).toEqual(shorthand);
 	});
@@ -616,5 +619,90 @@ describe("compileZodSchema: Zod-specific behaviors", () => {
 		expect(out["searchlite:docIdField"]).toBe("urn");
 		expect(out.properties).not.toHaveProperty("urn");
 		expect(out.properties.title).toEqual({ type: "string" });
+	});
+});
+
+// ── Deep wrappers (P1: ensure metadata survives optional/nullable/default stacking)
+
+describe("compileZodSchema: deep wrappers", () => {
+	it("sl.keyword().nullable().optional() compiles as keyword + nullable", () => {
+		const out = compileZodSchema(
+			sl.index(z.object({ tag: sl.keyword().nullable().optional() })),
+		);
+		expect(out.properties.tag).toEqual({
+			type: ["string", "null"],
+			"searchlite:kind": "keyword",
+		});
+	});
+
+	it("sl.keyword().optional().nullable() (reversed order) compiles the same", () => {
+		const out = compileZodSchema(
+			sl.index(z.object({ tag: sl.keyword().optional().nullable() })),
+		);
+		expect(out.properties.tag).toEqual({
+			type: ["string", "null"],
+			"searchlite:kind": "keyword",
+		});
+	});
+
+	it("z.string().email().optional().nullable() auto-promotes to nullable keyword", () => {
+		const out = compileZodSchema(
+			sl.index(z.object({ email: z.string().email().optional().nullable() })),
+		);
+		expect(out.properties.email).toEqual({
+			type: ["string", "null"],
+			"searchlite:kind": "keyword",
+		});
+	});
+
+	it("sl.integer().nullable() compiles as nullable integer + stored", () => {
+		const out = compileZodSchema(
+			sl.index(z.object({ count: sl.integer().nullable() })),
+		);
+		expect(out.properties.count).toEqual({
+			type: ["integer", "null"],
+			"searchlite:stored": true,
+		});
+	});
+
+	it("sl.text({ analyzer: 'stemmed' }).default('untitled').optional() preserves analyzer", () => {
+		const out = compileZodSchema(
+			sl.index(
+				z.object({ title: sl.text({ analyzer: "stemmed" }).default("untitled").optional() }),
+			),
+		);
+		expect(out.properties.title).toEqual({
+			type: "string",
+			"searchlite:analyzer": "stemmed",
+		});
+	});
+});
+
+// ── sl.integer() coerce tightness ────────────────────────────────────────────
+
+describe("sl.integer: coerce behavior", () => {
+	it("accepts a plain number", () => {
+		const schema = sl.integer();
+		expect(schema.safeParse(42).success).toBe(true);
+	});
+
+	it("accepts a BigInt", () => {
+		const schema = sl.integer();
+		expect(schema.safeParse(42n).success).toBe(true);
+	});
+
+	it("rejects a string (tighter than blanket coerce)", () => {
+		const schema = sl.integer();
+		expect(schema.safeParse("42").success).toBe(false);
+	});
+
+	it("rejects null", () => {
+		const schema = sl.integer();
+		expect(schema.safeParse(null).success).toBe(false);
+	});
+
+	it("rejects a boolean", () => {
+		const schema = sl.integer();
+		expect(schema.safeParse(true).success).toBe(false);
 	});
 });
