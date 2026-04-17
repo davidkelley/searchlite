@@ -2129,14 +2129,22 @@ impl IndexReader {
         }
       }
     }
-    if !to_remove.is_empty() {
+    let removed = if !to_remove.is_empty() {
       to_remove.sort_unstable();
       to_remove.dedup();
+      let n = to_remove.len();
       for idx in to_remove.into_iter().rev() {
         hits.remove(idx);
       }
-    }
-    let sort_window = rescore.window_size.min(hits.len());
+      n
+    } else {
+      0
+    };
+    // Only hits that were actually rescored (the first `window - removed`
+    // survivors) are on the combined-score scale. Any hits that shifted left
+    // due to removals still carry raw scores and must not be re-sorted against
+    // rescored survivors.
+    let sort_window = window.saturating_sub(removed).min(hits.len());
     if sort_window > 0 {
       hits[..sort_window].sort_by(|a, b| a.key.cmp(&b.key));
     }
