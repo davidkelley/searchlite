@@ -4337,7 +4337,11 @@ mod tests {
   #[test]
   fn bucket_script_rejects_infinity_literal() {
     let vars = BTreeMap::new();
-    assert!(eval_bucket_script("1e309", &vars).is_none());
+    // The tokenizer accepts only digits and '.' for numeric literals (no scientific
+    // notation), so to exercise the `Number(f64::INFINITY)` path we use a decimal
+    // string long enough to overflow `f64` on parse (`f64::MAX` ≈ 1.8e308).
+    let inf_literal = format!("1{}", "0".repeat(309));
+    assert!(eval_bucket_script(&inf_literal, &vars).is_none());
   }
 
   #[test]
@@ -4359,13 +4363,13 @@ mod tests {
   }
 
   #[test]
-  fn bucket_script_rejects_nan_from_inf_minus_inf() {
+  fn bucket_script_rejects_overflowing_subexpression() {
     let mut vars = BTreeMap::new();
     vars.insert("a".to_string(), 1e200);
     vars.insert("b".to_string(), 1e200);
-    // (a * b) - (a * b) would be inf - inf = NaN, but the first inf is rejected;
-    // verify a direct NaN-producing intermediate is caught by using non-finite input indirectly.
-    // Here we simply confirm that an overflowing sub-expression surfaces as None.
+    // With per-operation finite checks, the `(a * b)` overflow is rejected before
+    // the subtraction runs. This verifies that an overflowing sub-expression
+    // surfaces as None rather than leaking a non-finite value into the outer op.
     assert!(eval_bucket_script("(a * b) - (a * b)", &vars).is_none());
   }
 
