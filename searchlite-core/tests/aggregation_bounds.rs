@@ -1805,10 +1805,7 @@ mod bug_030 {
         .collect();
       assert_eq!(
         observed,
-        vec![
-          (json!(-6 * HOUR_MS), 1),
-          (json!(18 * HOUR_MS), 2),
-        ],
+        vec![(json!(-6 * HOUR_MS), 1), (json!(18 * HOUR_MS), 2),],
         "offset=-6h must shift daily boundaries backward by six hours"
       );
     } else {
