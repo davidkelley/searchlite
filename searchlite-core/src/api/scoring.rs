@@ -52,14 +52,14 @@ pub(crate) fn apply_rank_modifier(value: f64, modifier: &RankFeatureModifier) ->
       if value <= 0.0 {
         0.0
       } else {
-        value.ln()
+        value.log10()
       }
     }
     RankFeatureModifier::Log1p => {
       if value <= -1.0 {
         0.0
       } else {
-        value.ln_1p()
+        (1.0 + value).log10()
       }
     }
     RankFeatureModifier::Sqrt => {
