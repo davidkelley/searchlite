@@ -587,9 +587,13 @@ impl QuantileState {
     self.values.clear();
   }
 
-  fn percentile(&mut self, pct: f64) -> f64 {
+  /// Returns `None` when no values have been observed (`count == 0`). Matches
+  /// Elasticsearch, which serializes empty percentile buckets as `null` so
+  /// pipeline aggregations skip them instead of folding a spurious `0.0`
+  /// into their running totals (BUG-303).
+  fn percentile(&mut self, pct: f64) -> Option<f64> {
     if self.count == 0 {
-      return 0.0;
+      return None;
     }
     if self.count <= PERCENTILE_EXACT_LIMIT && self.digest.is_none() {
       let mut vals = self.values.clone();
@@ -599,31 +603,29 @@ impl QuantileState {
       let low = rank.floor() as usize;
       let high = rank.ceil() as usize;
       if low == high {
-        return vals[low];
+        return Some(vals[low]);
       }
       let weight = rank - low as f64;
-      return vals[low] * (1.0 - weight) + vals[high] * weight;
+      return Some(vals[low] * (1.0 - weight) + vals[high] * weight);
     }
     self.ensure_digest();
-    let Some(digest) = self.digest.as_ref() else {
-      return 0.0;
-    };
+    let digest = self.digest.as_ref()?;
     let q = pct.clamp(0.0, 100.0) / 100.0;
-    digest.estimate_quantile(q)
+    Some(digest.estimate_quantile(q))
   }
 
-  fn percentile_rank(&mut self, target: f64) -> f64 {
+  /// Returns `None` when no values have been observed (`count == 0`). See
+  /// [`QuantileState::percentile`] for the rationale.
+  fn percentile_rank(&mut self, target: f64) -> Option<f64> {
     if self.count == 0 {
-      return 0.0;
+      return None;
     }
     if self.count <= PERCENTILE_EXACT_LIMIT && self.digest.is_none() {
       let count = self.values.iter().filter(|v| **v <= target).count();
-      return (count as f64 / self.values.len().max(1) as f64) * 100.0;
+      return Some((count as f64 / self.values.len().max(1) as f64) * 100.0);
     }
     self.ensure_digest();
-    let Some(digest) = self.digest.as_ref() else {
-      return 0.0;
-    };
+    let digest = self.digest.as_ref()?;
     let min_val = digest.estimate_quantile(0.0);
     // Use a strict `<` here so that `target == min_val` falls through to the
     // binary search, which matches the exact path's inclusive semantics
@@ -631,11 +633,11 @@ impl QuantileState {
     // to 0.0 whenever the caller targeted the observed minimum, even though one
     // or more values in the population are equal to it.
     if target < min_val {
-      return 0.0;
+      return Some(0.0);
     }
     let max_val = digest.estimate_quantile(1.0);
     if target >= max_val {
-      return 100.0;
+      return Some(100.0);
     }
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
@@ -651,7 +653,7 @@ impl QuantileState {
         break;
       }
     }
-    lo * 100.0
+    Some(lo * 100.0)
   }
 }
 
@@ -3773,11 +3775,14 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) 
     AggregationResponse::Cardinality(val) => Some(val.value as f64),
     AggregationResponse::Percentiles(vals) => {
       let key = path?;
-      vals.values.get(key).copied()
+      // Flatten `Option<Option<f64>>`: a missing key yields `None`, and so does a
+      // present-but-null entry. The latter is how empty buckets surface (BUG-303) —
+      // pipeline aggs must skip them rather than fold the prior `0.0` default.
+      vals.values.get(key).copied().flatten()
     }
     AggregationResponse::PercentileRanks(vals) => {
       let key = path?;
-      vals.values.get(key).copied()
+      vals.values.get(key).copied().flatten()
     }
     AggregationResponse::AvgBucket(val) | AggregationResponse::SumBucket(val) => val.value,
     AggregationResponse::Derivative(val) => val.value,
@@ -3794,7 +3799,7 @@ fn cmp_bucket_value(a: &serde_json::Value, b: &serde_json::Value) -> Ordering {
   a.to_string().cmp(&b.to_string())
 }
 
-fn compute_percentiles_from_state(mut state: PercentileState) -> BTreeMap<String, f64> {
+fn compute_percentiles_from_state(mut state: PercentileState) -> BTreeMap<String, Option<f64>> {
   let mut out = BTreeMap::new();
   for p in state.percents.iter() {
     out.insert(format!("{p}"), state.quantiles.percentile(*p));
@@ -3802,7 +3807,9 @@ fn compute_percentiles_from_state(mut state: PercentileState) -> BTreeMap<String
   out
 }
 
-fn compute_percentile_ranks_from_state(mut state: PercentileRankState) -> BTreeMap<String, f64> {
+fn compute_percentile_ranks_from_state(
+  mut state: PercentileRankState,
+) -> BTreeMap<String, Option<f64>> {
   let mut out = BTreeMap::new();
   for target in state.targets.iter() {
     out.insert(
@@ -4463,8 +4470,18 @@ mod tests {
     for v in [1.0, 2.0, 3.0, 4.0] {
       q.push(v);
     }
-    assert!((q.percentile(50.0) - 2.5).abs() < 1e-6);
-    assert!((q.percentile_rank(2.0) - 50.0).abs() < 1e-6);
+    assert!((q.percentile(50.0).unwrap() - 2.5).abs() < 1e-6);
+    assert!((q.percentile_rank(2.0).unwrap() - 50.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn quantile_state_empty_percentile_returns_none() {
+    // BUG-303: with no observed values, percentile() and percentile_rank()
+    // must return None rather than a spurious 0.0, so downstream consumers
+    // (pipeline aggs, serialized responses) can represent the bucket as null.
+    let mut q = QuantileState::default();
+    assert_eq!(q.percentile(50.0), None);
+    assert_eq!(q.percentile_rank(42.0), None);
   }
 
   #[test]
@@ -5683,9 +5700,9 @@ mod tests {
   fn bucket_metric_value_resolves_decimal_percentile_key() {
     let mut aggs = BTreeMap::new();
     let mut pct_values = BTreeMap::new();
-    pct_values.insert("50".to_string(), 10.0);
-    pct_values.insert("99.9".to_string(), 42.5);
-    pct_values.insert("99.99".to_string(), 100.0);
+    pct_values.insert("50".to_string(), Some(10.0));
+    pct_values.insert("99.9".to_string(), Some(42.5));
+    pct_values.insert("99.99".to_string(), Some(100.0));
     aggs.insert(
       "latency_pct".to_string(),
       AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
@@ -5709,8 +5726,8 @@ mod tests {
   fn bucket_metric_value_resolves_decimal_percentile_rank_key() {
     let mut aggs = BTreeMap::new();
     let mut rank_values = BTreeMap::new();
-    rank_values.insert("50.5".to_string(), 72.0);
-    rank_values.insert("100".to_string(), 99.0);
+    rank_values.insert("50.5".to_string(), Some(72.0));
+    rank_values.insert("100".to_string(), Some(99.0));
     aggs.insert(
       "rank_agg".to_string(),
       AggregationResponse::PercentileRanks(PercentileRanksResponse {
@@ -5725,6 +5742,166 @@ mod tests {
 
     assert_eq!(bucket_metric_value(&bucket, "rank_agg.50.5"), Some(72.0));
     assert_eq!(bucket_metric_value(&bucket, "rank_agg.100"), Some(99.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_percentiles_null_entry_returns_none() {
+    // BUG-303: when a percentiles sub-agg has no observed values, each level
+    // is serialized as null (`Option::None`). Pipeline aggregations resolving
+    // a path like "latency_pct.50" must treat that as missing — *not* as a
+    // spurious 0.0 folded into the running total.
+    let mut aggs = BTreeMap::new();
+    let mut pct_values = BTreeMap::new();
+    pct_values.insert("50".to_string(), None);
+    pct_values.insert("99".to_string(), None);
+    aggs.insert(
+      "latency_pct".to_string(),
+      AggregationResponse::Percentiles(PercentilesResponse { values: pct_values }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 3,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.50"), None);
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.99"), None);
+    // Missing key still resolves to None (no accidental regression to 0.0).
+    assert_eq!(bucket_metric_value(&bucket, "latency_pct.75"), None);
+  }
+
+  #[test]
+  fn bucket_metric_value_percentile_ranks_null_entry_returns_none() {
+    // BUG-303: same rule for percentile_ranks — a null rank must surface as
+    // None so pipeline aggs skip the bucket rather than average in a zero.
+    let mut aggs = BTreeMap::new();
+    let mut rank_values = BTreeMap::new();
+    rank_values.insert("42".to_string(), None);
+    aggs.insert(
+      "rank_agg".to_string(),
+      AggregationResponse::PercentileRanks(PercentileRanksResponse {
+        values: rank_values,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 3,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "rank_agg.42"), None);
+  }
+
+  #[test]
+  fn avg_bucket_pipeline_skips_empty_percentile_buckets() {
+    // BUG-303 end-to-end: verify that a bucket whose percentiles sub-agg had
+    // no data (values: {"50": null}) is excluded from avg_bucket's divisor,
+    // producing `(75 + 12) / 2 = 43.5` instead of `(75 + 0 + 12) / 3 = 29`.
+    use crate::api::types::BucketMetricAggregation;
+
+    let make_bucket = |key: i64, p50: Option<f64>| -> BucketResponse {
+      let mut values = BTreeMap::new();
+      values.insert("50".to_string(), p50);
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_pctiles".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse { values }),
+        )]),
+      }
+    };
+    let mut buckets = vec![
+      make_bucket(0, Some(75.0)),
+      make_bucket(1, None), // clothing: no docs with price — null, not 0.0
+      make_bucket(2, Some(12.0)),
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_median_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_pctiles.50".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_median_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        let got = val.value.expect("avg_bucket produced a value");
+        assert!(
+          (got - 43.5).abs() < 1e-9,
+          "avg_bucket must skip null percentile entries — got {got}, expected 43.5"
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_pipeline_skips_empty_percentile_buckets() {
+    // BUG-303: sum_bucket must also treat null percentile entries as missing
+    // rather than folding a spurious 0.0 into the running total.
+    use crate::api::types::BucketMetricAggregation;
+
+    let make_bucket = |key: i64, p50: Option<f64>| -> BucketResponse {
+      let mut values = BTreeMap::new();
+      values.insert("50".to_string(), p50);
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_pctiles".to_string(),
+          AggregationResponse::Percentiles(PercentilesResponse { values }),
+        )]),
+      }
+    };
+    let mut buckets = vec![make_bucket(0, Some(75.0)), make_bucket(1, None)];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_median_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_pctiles.50".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_median_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(val.value, Some(75.0));
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn percentiles_response_serializes_null_for_empty_buckets() {
+    // BUG-303: the JSON shape must match Elasticsearch — missing values are
+    // serialized as `null`, not as `0.0`. Pipeline aggs and external clients
+    // can then distinguish "no data" from "data that happens to be zero".
+    let mut values = BTreeMap::new();
+    values.insert("50".to_string(), None);
+    values.insert("99".to_string(), Some(12.5));
+    let resp = AggregationResponse::Percentiles(PercentilesResponse { values });
+    let json = serde_json::to_value(&resp).unwrap();
+    let map = json.get("values").and_then(|v| v.as_object()).unwrap();
+    assert!(map.get("50").unwrap().is_null());
+    assert_eq!(map.get("99").unwrap().as_f64().unwrap(), 12.5);
+  }
+
+  #[test]
+  fn percentile_ranks_response_serializes_null_for_empty_buckets() {
+    // BUG-303: sibling coverage for PercentileRanks — the widened
+    // `Option<f64>` map must also serialize `None` entries as JSON `null`.
+    let mut values = BTreeMap::new();
+    values.insert("42".to_string(), None);
+    values.insert("100".to_string(), Some(87.5));
+    let resp = AggregationResponse::PercentileRanks(PercentileRanksResponse { values });
+    let json = serde_json::to_value(&resp).unwrap();
+    let map = json.get("values").and_then(|v| v.as_object()).unwrap();
+    assert!(map.get("42").unwrap().is_null());
+    assert_eq!(map.get("100").unwrap().as_f64().unwrap(), 87.5);
   }
 
   #[test]
@@ -5976,11 +6153,11 @@ mod tests {
   #[test]
   fn moving_avg_pipeline_with_decimal_percentile_path() {
     let mut pct_values = BTreeMap::new();
-    pct_values.insert("99.9".to_string(), 10.0);
+    pct_values.insert("99.9".to_string(), Some(10.0));
     let mut pct_values2 = BTreeMap::new();
-    pct_values2.insert("99.9".to_string(), 20.0);
+    pct_values2.insert("99.9".to_string(), Some(20.0));
     let mut pct_values3 = BTreeMap::new();
-    pct_values3.insert("99.9".to_string(), 30.0);
+    pct_values3.insert("99.9".to_string(), Some(30.0));
 
     let mut buckets = vec![
       BucketResponse {
