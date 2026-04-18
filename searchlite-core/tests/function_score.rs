@@ -363,6 +363,68 @@ fn rank_feature_uses_numeric_fast_field() {
 }
 
 #[test]
+fn rank_feature_log_modifier_uses_log10_of_value() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::RankFeature {
+    field: "popularity".into(),
+    boost: Some(1.0),
+    modifier: Some(RankFeatureModifier::Log),
+    missing: Some(0.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-1=10, doc-3=5, doc-2=1
+  // Log = log10(value): log10(10) = 1.0, log10(5) ≈ 0.699, log10(1) = 0.0
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(
+    (scores[0] - 10_f32.log10()).abs() < 1e-6,
+    "doc-1: {}",
+    scores[0]
+  );
+  assert!(
+    (scores[1] - 5_f32.log10()).abs() < 1e-6,
+    "doc-3: {}",
+    scores[1]
+  );
+  assert!(
+    (scores[2] - 1_f32.log10()).abs() < 1e-6,
+    "doc-2: {}",
+    scores[2]
+  );
+}
+
+#[test]
+fn rank_feature_log1p_modifier_uses_log10_of_one_plus_value() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::RankFeature {
+    field: "popularity".into(),
+    boost: Some(1.0),
+    modifier: Some(RankFeatureModifier::Log1p),
+    missing: Some(0.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-1=10, doc-3=5, doc-2=1
+  // Log1p = log10(1 + value): log10(11) ≈ 1.041, log10(6) ≈ 0.778, log10(2) ≈ 0.301
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(
+    (scores[0] - 11_f32.log10()).abs() < 1e-6,
+    "doc-1: {}",
+    scores[0]
+  );
+  assert!(
+    (scores[1] - 6_f32.log10()).abs() < 1e-6,
+    "doc-3: {}",
+    scores[1]
+  );
+  assert!(
+    (scores[2] - 2_f32.log10()).abs() < 1e-6,
+    "doc-2: {}",
+    scores[2]
+  );
+}
+
+#[test]
 fn log2p_modifier_uses_log10_of_value_plus_two() {
   let reader = setup_reader();
   let req = base_request(QueryNode::FunctionScore {
