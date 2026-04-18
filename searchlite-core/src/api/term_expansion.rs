@@ -369,11 +369,11 @@ fn expand_prefix(
   let mut qualified = Vec::new();
   let mut keys = Vec::new();
   let mut seen = HashSet::new();
-  for seg in segments.iter() {
-    let mut expanded = 0usize;
+  let mut expanded = 0usize;
+  'segments: for seg in segments.iter() {
     for key in seg.terms_with_prefix(&prefix_key) {
       if expanded >= max_expansions {
-        break;
+        break 'segments;
       }
       if key.len() <= field_prefix_len {
         continue;
@@ -442,11 +442,11 @@ fn expand_wildcard(
   let mut qualified = Vec::new();
   let mut keys = Vec::new();
   let mut seen = HashSet::new();
-  for seg in segments.iter() {
-    let mut expanded = 0usize;
+  let mut expanded = 0usize;
+  'segments: for seg in segments.iter() {
     for key in seg.terms_with_prefix(&prefix_key) {
       if expanded >= max_expansions {
-        break;
+        break 'segments;
       }
       if key.len() <= field_prefix_len {
         continue;
@@ -796,11 +796,11 @@ fn expand_regex(
   let mut qualified = Vec::new();
   let mut keys = Vec::new();
   let mut seen = HashSet::new();
-  for seg in segments.iter() {
-    let mut expanded = 0usize;
+  let mut expanded = 0usize;
+  'segments: for seg in segments.iter() {
     for key in seg.terms_with_prefix(&prefix_key) {
       if expanded >= max_expansions {
-        break;
+        break 'segments;
       }
       if key.len() <= field_prefix_len {
         continue;
