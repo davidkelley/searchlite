@@ -574,17 +574,20 @@ fn wildcard_query_matches_non_ascii_uppercase_with_default_tokenizer() {
 /// The fix moves the counter outside the segment loop and uses a labeled
 /// break, matching the pattern already in `expand_term_fuzzy`. This test
 /// builds a 3-segment index where each segment contains unique
-/// prefix-matching terms, runs each of the three expansion paths with
-/// `max_expansions = 2`, and asserts the total distinct matched terms
-/// never exceeds the requested limit.
+/// prefix-matching terms and each seeded term maps 1:1 to a distinct
+/// document, runs each of the three expansion paths with
+/// `max_expansions = 2`, and asserts the returned hit count never
+/// exceeds the requested limit.
 #[test]
 fn term_expansion_max_expansions_is_global_across_segments() {
   let dir = tempdir().unwrap();
   let path = dir.path().to_path_buf();
   let idx = Index::create(&path, Schema::default_text_body(), opts(&path)).unwrap();
   // Three segments, each holding disjoint terms that all match the prefix
-  // `ap`, wildcard `ap*`, and regex `^ap.*`. Committing between batches
-  // flushes a new segment per batch.
+  // `ap`, wildcard `ap*`, and regex `ap.*` (regex queries are anchored
+  // internally by `anchored_regex`, so no leading `^` is needed; adding
+  // one would also empty the literal-prefix optimisation). Committing
+  // between batches flushes a new segment per batch.
   let segments: [&[(&str, &str)]; 3] = [
     &[("s0a", "app"), ("s0b", "apple")],
     &[("s1a", "apply"), ("s1b", "apt")],
@@ -601,8 +604,8 @@ fn term_expansion_max_expansions_is_global_across_segments() {
   }
   let reader = idx.reader().unwrap();
 
-  // Helper to count distinct matched terms via the document id → term
-  // mapping we seeded above.
+  // Each seeded term occurs in exactly one document, so the number of
+  // returned hits is a direct proxy for the number of expanded terms.
   let max_expansions = 2usize;
   let assert_global_cap = |hits: Vec<String>, label: &str| {
     assert!(
