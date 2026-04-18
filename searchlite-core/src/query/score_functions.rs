@@ -108,13 +108,19 @@ pub(crate) fn combine_function_scores(values: &[f32], mode: FunctionScoreMode) -
   if values.is_empty() {
     return None;
   }
-  match mode {
-    FunctionScoreMode::Sum => Some(values.iter().copied().sum()),
-    FunctionScoreMode::Multiply => Some(values.iter().copied().product()),
-    FunctionScoreMode::Max => Some(values.iter().copied().reduce(|a, b| a.max(b)).unwrap()),
-    FunctionScoreMode::Min => Some(values.iter().copied().reduce(|a, b| a.min(b)).unwrap()),
-    FunctionScoreMode::Avg => Some(values.iter().copied().sum::<f32>() / values.len() as f32),
-  }
+  let result = match mode {
+    FunctionScoreMode::Sum => values.iter().copied().sum(),
+    FunctionScoreMode::Multiply => values.iter().copied().product(),
+    FunctionScoreMode::Max => values.iter().copied().reduce(|a, b| a.max(b)).unwrap(),
+    FunctionScoreMode::Min => values.iter().copied().reduce(|a, b| a.min(b)).unwrap(),
+    FunctionScoreMode::Avg => values.iter().copied().sum::<f32>() / values.len() as f32,
+  };
+  // `None` means "no function values"; `Some(result)` is the combined value
+  // and may be non-finite when Sum/Multiply/Avg overflow past f32::MAX to
+  // infinity. Callers are responsible for rejecting non-finite results; we
+  // preserve the overflow here so `max_boost` can still cap infinity to a
+  // finite value (`f32::INFINITY.min(max) == max`) before rejection.
+  Some(result)
 }
 
 pub(crate) fn apply_boost_mode(base: f32, func_score: f32, mode: FunctionBoostMode) -> f32 {
