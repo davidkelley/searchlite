@@ -3708,11 +3708,12 @@ fn compare_sort_values(
     (BucketSortComparable::I128(va), BucketSortComparable::F64(vb)) => (*va as f64).total_cmp(vb),
     (BucketSortComparable::F64(va), BucketSortComparable::I128(vb)) => va.total_cmp(&(*vb as f64)),
     (BucketSortComparable::Str(sa), BucketSortComparable::Str(sb)) => sa.cmp(sb),
-    // Numeric < String, mirroring the original ordering.
+    // Numeric < String in the natural (Asc) ordering. Fall through to the
+    // order inversion below so Desc is the true inverse of Asc.
     (BucketSortComparable::I128(_), BucketSortComparable::Str(_))
-    | (BucketSortComparable::F64(_), BucketSortComparable::Str(_)) => return Ordering::Less,
+    | (BucketSortComparable::F64(_), BucketSortComparable::Str(_)) => Ordering::Less,
     (BucketSortComparable::Str(_), BucketSortComparable::I128(_))
-    | (BucketSortComparable::Str(_), BucketSortComparable::F64(_)) => return Ordering::Greater,
+    | (BucketSortComparable::Str(_), BucketSortComparable::F64(_)) => Ordering::Greater,
   };
   match order {
     SortOrder::Asc => ord,
@@ -4372,6 +4373,57 @@ mod tests {
       _ => panic!("expected Str comparables for string keys"),
     }
     assert_eq!(compare_sort_values(&a, &b, SortOrder::Asc), Ordering::Less);
+  }
+
+  #[test]
+  fn compare_sort_values_inverts_mixed_type_ordering_for_desc() {
+    // With `_key: desc`, descending should be the inverse of ascending across
+    // every variant pair — including numeric-vs-string (e.g. a terms
+    // aggregation with a `missing` numeric fallback mixing with keyword
+    // buckets). Otherwise `size` truncation could return the wrong top N.
+    let num = BucketSortComparable::I128(42);
+    let s = BucketSortComparable::Str("zzz".into());
+    assert_eq!(
+      compare_sort_values(&num, &s, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&num, &s, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&s, &num, SortOrder::Asc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&s, &num, SortOrder::Desc),
+      Ordering::Less
+    );
+    // And the same for F64-vs-Str.
+    let f = BucketSortComparable::F64(7.5);
+    assert_eq!(compare_sort_values(&f, &s, SortOrder::Asc), Ordering::Less);
+    assert_eq!(
+      compare_sort_values(&f, &s, SortOrder::Desc),
+      Ordering::Greater
+    );
+  }
+
+  #[test]
+  fn compare_sort_values_keeps_missing_last_regardless_of_order() {
+    // `Missing` preserves the pre-existing "nulls last" behavior under both
+    // asc and desc — matching Elasticsearch's default for missing values.
+    let m = BucketSortComparable::Missing;
+    let n = BucketSortComparable::I128(1);
+    assert_eq!(
+      compare_sort_values(&m, &n, SortOrder::Asc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&m, &n, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(compare_sort_values(&n, &m, SortOrder::Asc), Ordering::Less);
+    assert_eq!(compare_sort_values(&n, &m, SortOrder::Desc), Ordering::Less);
   }
 
   #[test]
