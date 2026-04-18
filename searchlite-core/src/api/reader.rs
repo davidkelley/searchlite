@@ -4623,6 +4623,240 @@ mod tests {
     );
   }
 
+  /// BUG-316 regression: `max_expansions` must bound the total number of
+  /// expanded terms across *all* segments, not per-segment. Before the fix
+  /// the `expanded` counter in `expand_prefix`/`expand_wildcard`/`expand_regex`
+  /// lived inside the segment loop and reset to 0 for each segment, letting
+  /// a 3-segment index return up to `3 * max_expansions` unique terms.
+  #[test]
+  fn prefix_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-prefix-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    // Three segments, each containing disjoint unique terms starting with "ap".
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(
+      reader.segments.len() >= 2,
+      "expected multiple segments, got {}",
+      reader.segments.len()
+    );
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Prefix {
+        field: "body".into(),
+        value: "ap".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "prefix expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
+  /// BUG-316 regression for the wildcard branch of `expand_wildcard`.
+  #[test]
+  fn wildcard_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-wildcard-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(reader.segments.len() >= 2);
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "ap*".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "wildcard expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
+  /// BUG-316 regression for the regex branch of `expand_regex`.
+  #[test]
+  fn regex_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(reader.segments.len() >= 2);
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "ap.*".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "regex expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
   #[test]
   fn completion_suggest_prefers_higher_doc_freq() {
     let dir = tempfile::tempdir().unwrap();
