@@ -418,8 +418,9 @@ fn script_score_evaluates_expression_with_score_and_field() {
 }
 
 // Regression: unary `+` in operand position was emitted as binary `Add`,
-// which underflowed the RPN stack and silently produced a zero score.
-// See BUG-309.
+// which underflowed the RPN stack. `CompiledScript::evaluate()` returned
+// `None`, so the script_score function contributed no score and the hit
+// was effectively dropped from the result set. See BUG-309.
 #[test]
 fn script_score_accepts_unary_plus_on_number_literal() {
   let reader = setup_reader();
