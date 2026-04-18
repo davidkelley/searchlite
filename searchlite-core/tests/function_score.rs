@@ -917,21 +917,15 @@ fn function_score_multiply_overflow_is_excluded() {
     boost: None,
   });
   let resp = reader.search(&req).unwrap();
-  // 1e20 * 1e20 = 1e40 overflows f32 → combine returns None → hits excluded.
+  // 1e20 * 1e20 = 1e40 overflows f32 to infinity; the combined score is
+  // non-finite after capping, so evaluate_compiled_score returns None and
+  // every hit is excluded from the result set.
   assert!(
     resp.hits.is_empty(),
     "expected no hits when combine overflows to infinity, got {} hits with scores {:?}",
     resp.hits.len(),
     resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
   );
-  // Sanity: no score leaks out as non-finite.
-  for hit in &resp.hits {
-    assert!(
-      hit.score.is_finite(),
-      "non-finite score leaked into result: {}",
-      hit.score
-    );
-  }
 }
 
 #[test]

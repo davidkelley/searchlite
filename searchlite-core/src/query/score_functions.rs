@@ -115,10 +115,11 @@ pub(crate) fn combine_function_scores(values: &[f32], mode: FunctionScoreMode) -
     FunctionScoreMode::Min => values.iter().copied().reduce(|a, b| a.min(b)).unwrap(),
     FunctionScoreMode::Avg => values.iter().copied().sum::<f32>() / values.len() as f32,
   };
-  // Non-finite values (Sum/Multiply/Avg overflow past f32::MAX to infinity)
-  // must not leak into the sort key. Callers that care about distinguishing
-  // "overflow" from "no function values" must check `values.is_empty()` or
-  // the finitude of individual values themselves.
+  // `None` means "no function values"; `Some(result)` is the combined value
+  // and may be non-finite when Sum/Multiply/Avg overflow past f32::MAX to
+  // infinity. Callers are responsible for rejecting non-finite results; we
+  // preserve the overflow here so `max_boost` can still cap infinity to a
+  // finite value (`f32::INFINITY.min(max) == max`) before rejection.
   Some(result)
 }
 
