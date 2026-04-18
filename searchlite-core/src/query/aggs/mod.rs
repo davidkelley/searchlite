@@ -3455,7 +3455,7 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
     let looks_numeric = ch.is_ascii_digit()
       || ch == '.'
       || (expect_unary
-        && ch == '-'
+        && (ch == '-' || ch == '+')
         && chars
           .clone()
           .nth(1)
@@ -3465,6 +3465,10 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
       let mut num = String::new();
       if ch == '-' {
         num.push('-');
+        chars.next();
+      } else if ch == '+' {
+        // Unary plus is a no-op; consume the `+` without adding it to the
+        // literal so the parser sees a plain positive number.
         chars.next();
       }
       while let Some(next) = chars.peek() {
@@ -3501,6 +3505,13 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
       '+' | '-' | '*' | '/' => {
         if ch == '-' && expect_unary {
           tokens.push(ScriptToken::Neg);
+          chars.next();
+          continue;
+        }
+        if ch == '+' && expect_unary {
+          // Unary plus before a non-numeric operand (variable or `(`) is a
+          // no-op. Consume the `+` and leave `expect_unary` true so the next
+          // token is still parsed as an operand.
           chars.next();
           continue;
         }
@@ -4609,6 +4620,58 @@ mod tests {
     vars.insert("b".to_string(), 2.0);
     let value = eval_bucket_script("a / -b", &vars).unwrap();
     assert!((value - (-5.0)).abs() < 1e-6);
+  }
+
+  // Regression: unary `+` in operand position was emitted as binary `Add`,
+  // which underflowed the RPN stack and caused `eval_bucket_script` to
+  // return `None` for valid expressions. See BUG-313.
+  #[test]
+  fn bucket_script_unary_plus_on_number_literal() {
+    let vars = BTreeMap::new();
+    let value = eval_bucket_script("+5 * 2", &vars).unwrap();
+    assert!((value - 10.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_plus_on_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 7.0);
+    let value = eval_bucket_script("+a", &vars).unwrap();
+    assert!((value - 7.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_binary_plus_followed_by_unary_plus() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 3.0);
+    vars.insert("b".to_string(), 4.0);
+    let value = eval_bucket_script("a + +b", &vars).unwrap();
+    assert!((value - 7.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_plus_multiplication_with_variable() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 2.0);
+    vars.insert("b".to_string(), 3.0);
+    let value = eval_bucket_script("a * +b", &vars).unwrap();
+    assert!((value - 6.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_plus_in_parens() {
+    let vars = BTreeMap::new();
+    let value = eval_bucket_script("(+3) * 2", &vars).unwrap();
+    assert!((value - 6.0).abs() < 1e-6);
+  }
+
+  #[test]
+  fn bucket_script_unary_plus_before_parenthesized_expression() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 4.0);
+    vars.insert("b".to_string(), 5.0);
+    let value = eval_bucket_script("+(a + b)", &vars).unwrap();
+    assert!((value - 9.0).abs() < 1e-6);
   }
 
   #[test]
