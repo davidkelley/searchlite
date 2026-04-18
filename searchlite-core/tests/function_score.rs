@@ -497,6 +497,64 @@ fn script_score_evaluates_expression_with_score_and_field() {
   assert!(scores[0] > scores[1] && scores[1] > scores[2]);
 }
 
+// Regression: unary `+` in operand position was emitted as binary `Add`,
+// which underflowed the RPN stack. `CompiledScript::evaluate()` returned
+// `None`, so the script_score function contributed no score and the hit
+// was effectively dropped from the result set. See BUG-309.
+#[test]
+fn script_score_accepts_unary_plus_on_number_literal() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "+1 + +popularity".into(),
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  // Expected: 1 + popularity → doc-1=11, doc-3=6, doc-2=2
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!((scores[0] - 11.0).abs() < 1e-6, "doc-1: {}", scores[0]);
+  assert!((scores[1] - 6.0).abs() < 1e-6, "doc-3: {}", scores[1]);
+  assert!((scores[2] - 2.0).abs() < 1e-6, "doc-2: {}", scores[2]);
+}
+
+#[test]
+fn script_score_accepts_unary_plus_in_parenthesized_group() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "(-popularity) + (+popularity) + 100".into(),
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  // (-pop) + (+pop) + 100 = 100 for every doc
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert_eq!(scores.len(), 3);
+  for s in &scores {
+    assert!((s - 100.0).abs() < 1e-6, "expected 100.0, got {s}");
+  }
+}
+
+#[test]
+fn script_score_accepts_binary_plus_after_unary_plus() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "1 + +2".into(),
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  // 1 + (+2) = 3 for every doc
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert_eq!(scores.len(), 3);
+  for s in &scores {
+    assert!((s - 3.0).abs() < 1e-6, "expected 3.0, got {s}");
+  }
+}
+
 #[test]
 fn rescore_multiply_zeros_non_matching_docs() {
   let reader = setup_reader();

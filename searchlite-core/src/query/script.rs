@@ -276,9 +276,26 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
         expect_operand = false;
       }
       '+' => {
-        tokens.push(Token::Op(Op::Add));
         chars.next();
-        expect_operand = true;
+        if expect_operand {
+          // Unary plus is a no-op. If followed by a digit or `.`, parse
+          // it as a positive number literal; otherwise skip the `+` and
+          // let the next iteration handle the operand. `expect_operand`
+          // stays true so the subsequent token is still parsed as an
+          // operand.
+          if let Some(next) = chars.peek() {
+            if next.is_ascii_digit() || *next == '.' {
+              let first = chars.next().unwrap();
+              let value = read_number_literal(first, &mut chars)?;
+              tokens.push(Token::Number(value));
+              expect_operand = false;
+              continue;
+            }
+          }
+        } else {
+          tokens.push(Token::Op(Op::Add));
+          expect_operand = true;
+        }
       }
       '-' => {
         chars.next();
