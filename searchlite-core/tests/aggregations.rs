@@ -3106,17 +3106,18 @@ fn cardinality_and_percentiles_metrics() {
   if let searchlite_core::api::types::AggregationResponse::Percentiles(p) =
     resp.aggregations.get("pct").unwrap()
   {
-    assert_eq!(p.values.get("50").copied().unwrap() as i64, 25);
+    let p50 = p.values.get("50").copied().flatten().unwrap();
+    assert_eq!(p50 as i64, 25);
   } else {
     panic!("expected percentiles agg");
   }
   if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
     resp.aggregations.get("pct_ranks").unwrap()
   {
-    let v20 = p.values.get("20").unwrap();
-    let v35 = p.values.get("35").unwrap();
-    assert!(*v20 > 0.0);
-    assert!(*v35 > *v20);
+    let v20 = p.values.get("20").copied().flatten().unwrap();
+    let v35 = p.values.get("35").copied().flatten().unwrap();
+    assert!(v20 > 0.0);
+    assert!(v35 > v20);
   } else {
     panic!("expected percentile ranks agg");
   }
@@ -3222,7 +3223,7 @@ fn percentile_ranks_tdigest_path_includes_observed_minimum() {
   if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
     resp.aggregations.get("pct_ranks").unwrap()
   {
-    let rank = *p.values.get("0").unwrap();
+    let rank = p.values.get("0").copied().flatten().unwrap();
     // The regression being guarded against is that the TDigest path
     // short-circuits to 0.0 when the target equals the observed minimum. A
     // strict `> 0.0` check is enough to catch that without being brittle to
@@ -3329,7 +3330,7 @@ fn percentile_ranks_tdigest_path_all_values_equal_target() {
   if let searchlite_core::api::types::AggregationResponse::PercentileRanks(p) =
     resp.aggregations.get("pct_ranks").unwrap()
   {
-    let rank = *p.values.get("42").unwrap();
+    let rank = p.values.get("42").copied().flatten().unwrap();
     assert!(
       (rank - 100.0).abs() < f64::EPSILON,
       "percentile_rank(target) where every value equals target must be 100.0, got {rank}"
