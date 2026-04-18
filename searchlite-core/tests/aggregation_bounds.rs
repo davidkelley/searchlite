@@ -1746,6 +1746,76 @@ mod bug_030 {
     }
   }
 
+  /// Regression test for BUG-295 — `parse_interval_seconds` previously
+  /// rejected any spec with a leading `-`, so negative `offset` values
+  /// (used to shift bucket boundaries backward for e.g. timezone
+  /// alignment) returned HTTP 400 `offset is invalid` instead of being
+  /// honored. With the parser accepting a leading sign, a negative offset
+  /// must now shift the daily bucket boundaries back by six hours.
+  ///
+  /// With `interval = 1d` and `offset = -6h`, bucket boundaries fall at
+  /// `..., -6h, 18h, 42h, ...`. A timestamp of `DAY_MS` (midnight day 2)
+  /// belongs in the `[18h, 42h)` bucket whose key is `18h`.
+  #[test]
+  fn fixed_interval_accepts_negative_offset() {
+    const HOUR_MS: i64 = 3_600_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, ts) in [
+        // 06:00 day 1 -> bucket key -6h (offset -6h places boundary at
+        // -6h, 18h, 42h, ...; 6h lives in the [-6h, 18h) bucket).
+        ("morning-d1", 6 * HOUR_MS),
+        // 23:59 day 1 -> bucket key 18h (inside [18h, 42h)).
+        ("late-d1", DAY_MS - 60_000),
+        // 00:01 day 2 -> bucket key 18h (still inside [18h, 42h)).
+        ("early-d2", DAY_MS + 60_000),
+      ] {
+        writer
+          .add_document(&doc(id, vec![("body", json!("rust")), ("ts", json!(ts))]))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1d".into()),
+        offset: Some("-6h".into()),
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(
+        observed,
+        vec![
+          (json!(-6 * HOUR_MS), 1),
+          (json!(18 * HOUR_MS), 2),
+        ],
+        "offset=-6h must shift daily boundaries backward by six hours"
+      );
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
   /// `extended_bounds` drives empty-bucket fill via `bucket_start`. With the
   /// previous `.ceil()` implementation, the bounds themselves were rounded
   /// up, so fills spilled into the bucket *beyond* `max`. With `.floor()`
