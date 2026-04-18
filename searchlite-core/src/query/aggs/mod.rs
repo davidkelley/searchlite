@@ -3682,25 +3682,38 @@ fn bucket_sort_cmp(a: &BucketResponse, b: &BucketResponse, specs: &[BucketSortSp
       return ord;
     }
   }
-  bucket_key_string(&a.key).cmp(&bucket_key_string(&b.key))
+  // Residual tiebreaker — a hidden `_key` sort applied when every explicit
+  // spec ties (or when `specs` is empty for pagination-only use cases). Reuse
+  // the same numeric-aware comparator as the `_key` spec so numeric bucket
+  // keys (histogram/date_histogram) are not collapsed to lexicographic order
+  // (BUG-320).
+  compare_sort_values(
+    &bucket_key_comparable(&a.key),
+    &bucket_key_comparable(&b.key),
+    SortOrder::Asc,
+  )
+}
+
+// Shared by the `_key` sort spec and the residual tiebreaker in
+// `bucket_sort_cmp`. Preserve exact integer precision before falling back to
+// f64, so i64/u64 keys above 2^53 (e.g. nanosecond timestamps) compare
+// correctly.
+fn bucket_key_comparable(key: &serde_json::Value) -> BucketSortComparable {
+  if let Some(n) = key.as_i64() {
+    BucketSortComparable::I128(n as i128)
+  } else if let Some(n) = key.as_u64() {
+    BucketSortComparable::I128(n as i128)
+  } else if let Some(n) = key.as_f64() {
+    BucketSortComparable::F64(n)
+  } else {
+    BucketSortComparable::Str(bucket_key_string(key))
+  }
 }
 
 fn bucket_sort_value(bucket: &BucketResponse, spec: &BucketSortSpec) -> BucketSortComparable {
   match spec.field.as_str() {
     "_count" => BucketSortComparable::F64(bucket.doc_count as f64),
-    "key" | "_key" => {
-      // Preserve exact integer precision before falling back to f64, so
-      // i64/u64 keys above 2^53 (e.g. nanosecond timestamps) compare correctly.
-      if let Some(n) = bucket.key.as_i64() {
-        BucketSortComparable::I128(n as i128)
-      } else if let Some(n) = bucket.key.as_u64() {
-        BucketSortComparable::I128(n as i128)
-      } else if let Some(n) = bucket.key.as_f64() {
-        BucketSortComparable::F64(n)
-      } else {
-        BucketSortComparable::Str(bucket_key_string(&bucket.key))
-      }
-    }
+    "key" | "_key" => bucket_key_comparable(&bucket.key),
     path => bucket_metric_value(bucket, path)
       .map(BucketSortComparable::F64)
       .unwrap_or(BucketSortComparable::Missing),
@@ -4458,6 +4471,104 @@ mod tests {
     );
     assert_eq!(compare_sort_values(&n, &m, SortOrder::Asc), Ordering::Less);
     assert_eq!(compare_sort_values(&n, &m, SortOrder::Desc), Ordering::Less);
+  }
+
+  // Regression tests for BUG-320: the residual tiebreaker in `bucket_sort_cmp`
+  // (reached when every explicit sort spec ties, or when `specs` is empty)
+  // must compare numeric bucket keys numerically — not via lexicographic
+  // string comparison. This is the same fix BUG-296 applied to the `_key`
+  // sort spec, extended to the hidden tiebreaker.
+
+  fn make_bucket_with_count(key: serde_json::Value, doc_count: u64) -> BucketResponse {
+    BucketResponse {
+      key,
+      doc_count,
+      aggregations: BTreeMap::new(),
+    }
+  }
+
+  #[test]
+  fn bucket_sort_cmp_tiebreaker_orders_negative_numeric_keys_numerically() {
+    // All buckets tie on `_count`, so the only discriminator is the
+    // tiebreaker. Keys span negative values where lexicographic order
+    // ("-10" < "-20" < "-30" < "0" < "10" < "20" < "30") diverges from
+    // numeric order (-30 < -20 < -10 < 0 < 10 < 20 < 30).
+    let mut buckets: Vec<BucketResponse> = [-10i64, 30, -30, 0, 20, -20, 10]
+      .iter()
+      .map(|k| make_bucket_with_count(serde_json::json!(*k), 5))
+      .collect();
+    let specs = vec![BucketSortSpec {
+      field: "_count".into(),
+      order: SortOrder::Asc,
+    }];
+    buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &specs));
+    let ordered: Vec<i64> = buckets.iter().map(|b| b.key.as_i64().unwrap()).collect();
+    assert_eq!(ordered, vec![-30, -20, -10, 0, 10, 20, 30]);
+  }
+
+  #[test]
+  fn bucket_sort_cmp_empty_specs_orders_numeric_keys_numerically() {
+    // Pagination-only use case: `bucket_sort` with an empty `sort` list
+    // should preserve the parent histogram's natural numeric order via the
+    // tiebreaker, not reorder buckets lexicographically.
+    let mut buckets: Vec<BucketResponse> = [10.0, 100.0, 20.0, 5.0]
+      .iter()
+      .map(|k| make_bucket_with_count(serde_json::json!(*k), 1))
+      .collect();
+    let specs: Vec<BucketSortSpec> = vec![];
+    buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &specs));
+    let ordered: Vec<f64> = buckets.iter().map(|b| b.key.as_f64().unwrap()).collect();
+    assert_eq!(ordered, vec![5.0, 10.0, 20.0, 100.0]);
+  }
+
+  #[test]
+  fn bucket_sort_cmp_tiebreaker_preserves_i64_precision_above_2_pow_53() {
+    // Nanosecond-precision date_histogram keys above 2^53 collapse under
+    // f64 comparison. The tiebreaker's integer path must keep them
+    // distinct and correctly ordered.
+    let mut buckets: Vec<BucketResponse> = [
+      72_057_594_037_927_941i64, // 2^56 + 5
+      72_057_594_037_927_937,    // 2^56 + 1
+      72_057_594_037_927_939,    // 2^56 + 3
+    ]
+    .iter()
+    .map(|k| make_bucket_with_count(serde_json::json!(*k), 7))
+    .collect();
+    let specs = vec![BucketSortSpec {
+      field: "_count".into(),
+      order: SortOrder::Asc,
+    }];
+    buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &specs));
+    let ordered: Vec<i64> = buckets.iter().map(|b| b.key.as_i64().unwrap()).collect();
+    assert_eq!(
+      ordered,
+      vec![
+        72_057_594_037_927_937,
+        72_057_594_037_927_939,
+        72_057_594_037_927_941,
+      ]
+    );
+  }
+
+  #[test]
+  fn bucket_sort_cmp_tiebreaker_preserves_string_key_ordering() {
+    // For string-typed keys (terms aggregation), the tiebreaker must keep
+    // lexicographic ordering — the numeric-aware path is only a
+    // refinement for numeric keys.
+    let mut buckets: Vec<BucketResponse> = ["cherry", "apple", "banana"]
+      .iter()
+      .map(|k| make_bucket_with_count(serde_json::json!(*k), 3))
+      .collect();
+    let specs = vec![BucketSortSpec {
+      field: "_count".into(),
+      order: SortOrder::Asc,
+    }];
+    buckets.sort_by(|a, b| bucket_sort_cmp(a, b, &specs));
+    let ordered: Vec<String> = buckets
+      .iter()
+      .map(|b| b.key.as_str().unwrap().to_string())
+      .collect();
+    assert_eq!(ordered, vec!["apple", "banana", "cherry"]);
   }
 
   #[test]
