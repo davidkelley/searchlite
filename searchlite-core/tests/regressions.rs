@@ -561,3 +561,108 @@ fn wildcard_query_matches_non_ascii_uppercase_with_default_tokenizer() {
     .collect();
   assert_eq!(match_ids, vec!["resume_doc".to_string()]);
 }
+
+/// Regression test for davidkelley/searchlite#316.
+///
+/// `expand_prefix`, `expand_wildcard`, and `expand_regex` previously reset
+/// their `expanded` counter at the top of each segment loop, applying
+/// `max_expansions` per-segment rather than as a global cap. On a multi-
+/// segment index with disjoint terms per segment, the total number of
+/// expanded terms could grow to `num_segments * max_expansions` — up to
+/// `(num_segments - 1) * max_expansions` over the caller-requested limit.
+///
+/// The fix moves the counter outside the segment loop and uses a labeled
+/// break, matching the pattern already in `expand_term_fuzzy`. This test
+/// builds a 3-segment index where each segment contains unique
+/// prefix-matching terms, runs each of the three expansion paths with
+/// `max_expansions = 2`, and asserts the total distinct matched terms
+/// never exceeds the requested limit.
+#[test]
+fn term_expansion_max_expansions_is_global_across_segments() {
+  let dir = tempdir().unwrap();
+  let path = dir.path().to_path_buf();
+  let idx = Index::create(&path, Schema::default_text_body(), opts(&path)).unwrap();
+  // Three segments, each holding disjoint terms that all match the prefix
+  // `ap`, wildcard `ap*`, and regex `^ap.*`. Committing between batches
+  // flushes a new segment per batch.
+  let segments: [&[(&str, &str)]; 3] = [
+    &[("s0a", "app"), ("s0b", "apple")],
+    &[("s1a", "apply"), ("s1b", "apt")],
+    &[("s2a", "apricot"), ("s2b", "apogee")],
+  ];
+  for batch in segments.iter() {
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in batch.iter() {
+      writer
+        .add_document(&doc(id, vec![("body", json!(body))]))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+
+  // Helper to count distinct matched terms via the document id → term
+  // mapping we seeded above.
+  let max_expansions = 2usize;
+  let assert_global_cap = |hits: Vec<String>, label: &str| {
+    assert!(
+      hits.len() <= max_expansions,
+      "{label}: expected <= {max_expansions} matched docs (one per expanded term), got {} — {hits:?}",
+      hits.len()
+    );
+  };
+
+  let prefix_req = SearchRequest {
+    query: Query::Node(QueryNode::Prefix {
+      field: "body".into(),
+      value: "ap".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let prefix_hits: Vec<String> = reader
+    .search(&prefix_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(prefix_hits, "prefix");
+
+  let wildcard_req = SearchRequest {
+    query: Query::Node(QueryNode::Wildcard {
+      field: "body".into(),
+      value: "ap*".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let wildcard_hits: Vec<String> = reader
+    .search(&wildcard_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(wildcard_hits, "wildcard");
+
+  let regex_req = SearchRequest {
+    query: Query::Node(QueryNode::Regex {
+      field: "body".into(),
+      value: "ap.*".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let regex_hits: Vec<String> = reader
+    .search(&regex_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(regex_hits, "regex");
+}
