@@ -3669,7 +3669,13 @@ fn bucket_sort_cmp(a: &BucketResponse, b: &BucketResponse, specs: &[BucketSortSp
 fn bucket_sort_value(bucket: &BucketResponse, spec: &BucketSortSpec) -> BucketSortComparable {
   match spec.field.as_str() {
     "_count" => BucketSortComparable::F64(bucket.doc_count as f64),
-    "key" | "_key" => BucketSortComparable::Str(bucket_key_string(&bucket.key)),
+    "key" | "_key" => {
+      if let Some(n) = bucket.key.as_f64() {
+        BucketSortComparable::F64(n)
+      } else {
+        BucketSortComparable::Str(bucket_key_string(&bucket.key))
+      }
+    }
     path => bucket_metric_value(bucket, path)
       .map(BucketSortComparable::F64)
       .unwrap_or(BucketSortComparable::Missing),
