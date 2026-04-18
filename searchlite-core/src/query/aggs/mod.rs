@@ -3650,6 +3650,9 @@ fn bucket_sort_buckets(buckets: &mut Vec<BucketResponse>, cfg: &BucketSortAggreg
 #[derive(Clone)]
 enum BucketSortComparable {
   Missing,
+  // i128 fits both i64 and u64 without loss, so integer keys (including
+  // nanosecond timestamps and large IDs above 2^53) sort exactly.
+  I128(i128),
   F64(f64),
   Str(String),
 }
@@ -3669,7 +3672,19 @@ fn bucket_sort_cmp(a: &BucketResponse, b: &BucketResponse, specs: &[BucketSortSp
 fn bucket_sort_value(bucket: &BucketResponse, spec: &BucketSortSpec) -> BucketSortComparable {
   match spec.field.as_str() {
     "_count" => BucketSortComparable::F64(bucket.doc_count as f64),
-    "key" | "_key" => BucketSortComparable::Str(bucket_key_string(&bucket.key)),
+    "key" | "_key" => {
+      // Preserve exact integer precision before falling back to f64, so
+      // i64/u64 keys above 2^53 (e.g. nanosecond timestamps) compare correctly.
+      if let Some(n) = bucket.key.as_i64() {
+        BucketSortComparable::I128(n as i128)
+      } else if let Some(n) = bucket.key.as_u64() {
+        BucketSortComparable::I128(n as i128)
+      } else if let Some(n) = bucket.key.as_f64() {
+        BucketSortComparable::F64(n)
+      } else {
+        BucketSortComparable::Str(bucket_key_string(&bucket.key))
+      }
+    }
     path => bucket_metric_value(bucket, path)
       .map(BucketSortComparable::F64)
       .unwrap_or(BucketSortComparable::Missing),
@@ -3681,20 +3696,28 @@ fn compare_sort_values(
   b: &BucketSortComparable,
   order: SortOrder,
 ) -> Ordering {
-  match (a, b) {
+  let ord = match (a, b) {
     (BucketSortComparable::Missing, BucketSortComparable::Missing) => Ordering::Equal,
-    (BucketSortComparable::Missing, _) => Ordering::Greater,
-    (_, BucketSortComparable::Missing) => Ordering::Less,
-    (BucketSortComparable::F64(va), BucketSortComparable::F64(vb)) => match order {
-      SortOrder::Asc => va.total_cmp(vb),
-      SortOrder::Desc => vb.total_cmp(va),
-    },
-    (BucketSortComparable::Str(sa), BucketSortComparable::Str(sb)) => match order {
-      SortOrder::Asc => sa.cmp(sb),
-      SortOrder::Desc => sb.cmp(sa),
-    },
-    (BucketSortComparable::F64(_), BucketSortComparable::Str(_)) => Ordering::Less,
-    (BucketSortComparable::Str(_), BucketSortComparable::F64(_)) => Ordering::Greater,
+    (BucketSortComparable::Missing, _) => return Ordering::Greater,
+    (_, BucketSortComparable::Missing) => return Ordering::Less,
+    (BucketSortComparable::I128(va), BucketSortComparable::I128(vb)) => va.cmp(vb),
+    (BucketSortComparable::F64(va), BucketSortComparable::F64(vb)) => va.total_cmp(vb),
+    // Mixed integer/float: promote the integer to f64 for comparison. Cross-type
+    // mixing within a single _key sort is unusual, but we keep a consistent total
+    // order rather than bucketing by variant.
+    (BucketSortComparable::I128(va), BucketSortComparable::F64(vb)) => (*va as f64).total_cmp(vb),
+    (BucketSortComparable::F64(va), BucketSortComparable::I128(vb)) => va.total_cmp(&(*vb as f64)),
+    (BucketSortComparable::Str(sa), BucketSortComparable::Str(sb)) => sa.cmp(sb),
+    // Numeric < String in the natural (Asc) ordering. Fall through to the
+    // order inversion below so Desc is the true inverse of Asc.
+    (BucketSortComparable::I128(_), BucketSortComparable::Str(_))
+    | (BucketSortComparable::F64(_), BucketSortComparable::Str(_)) => Ordering::Less,
+    (BucketSortComparable::Str(_), BucketSortComparable::I128(_))
+    | (BucketSortComparable::Str(_), BucketSortComparable::F64(_)) => Ordering::Greater,
+  };
+  match order {
+    SortOrder::Asc => ord,
+    SortOrder::Desc => ord.reverse(),
   }
 }
 
@@ -4240,6 +4263,167 @@ mod tests {
   fn parse_interval_seconds_rejects_unknown_units() {
     assert_eq!(parse_interval_seconds("5x"), None);
     assert_eq!(parse_interval_seconds("10foo"), None);
+  }
+
+  // Regression tests for BUG-296: `bucket_sort` by `_key` must compare numeric
+  // keys numerically. Two code paths need coverage — `f64` keys (histogram) and
+  // `i64` keys above 2^53 (date_histogram, where f64 conversion would collapse
+  // distinct keys).
+
+  fn make_bucket(key: serde_json::Value) -> BucketResponse {
+    BucketResponse {
+      key,
+      doc_count: 0,
+      aggregations: BTreeMap::new(),
+    }
+  }
+
+  fn key_spec(order: SortOrder) -> BucketSortSpec {
+    BucketSortSpec {
+      field: "_key".into(),
+      order,
+    }
+  }
+
+  #[test]
+  fn bucket_sort_value_preserves_i64_precision_above_2_pow_53() {
+    // All three values round to the same f64 (2^56), so a lossy comparator
+    // would treat them as equal. The integer path must return distinct
+    // I128 values.
+    let a = make_bucket(serde_json::json!(72_057_594_037_927_937i64)); // 2^56 + 1
+    let b = make_bucket(serde_json::json!(72_057_594_037_927_939i64)); // 2^56 + 3
+    let c = make_bucket(serde_json::json!(72_057_594_037_927_941i64)); // 2^56 + 5
+    let spec = key_spec(SortOrder::Asc);
+    let va = bucket_sort_value(&a, &spec);
+    let vb = bucket_sort_value(&b, &spec);
+    let vc = bucket_sort_value(&c, &spec);
+    assert!(
+      matches!(
+        (&va, &vb, &vc),
+        (
+          BucketSortComparable::I128(_),
+          BucketSortComparable::I128(_),
+          BucketSortComparable::I128(_),
+        )
+      ),
+      "expected all I128 comparables"
+    );
+    // Ascending: a < b < c. A lossy comparator would return Equal, letting
+    // the tie-break decide and silently permuting the order.
+    assert_eq!(
+      compare_sort_values(&va, &vb, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&vb, &vc, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&vc, &va, SortOrder::Asc),
+      Ordering::Greater
+    );
+    // Descending inverts.
+    assert_eq!(
+      compare_sort_values(&va, &vb, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&vc, &va, SortOrder::Desc),
+      Ordering::Less
+    );
+  }
+
+  #[test]
+  fn bucket_sort_value_orders_f64_keys_numerically() {
+    // Histogram emits f64 keys; "100.0" must not sort between "10.0" and "20.0".
+    let ten = make_bucket(serde_json::json!(10.0));
+    let twenty = make_bucket(serde_json::json!(20.0));
+    let hundred = make_bucket(serde_json::json!(100.0));
+    let spec = key_spec(SortOrder::Asc);
+    let a = bucket_sort_value(&ten, &spec);
+    let b = bucket_sort_value(&twenty, &spec);
+    let c = bucket_sort_value(&hundred, &spec);
+    assert_eq!(compare_sort_values(&a, &b, SortOrder::Asc), Ordering::Less);
+    assert_eq!(compare_sort_values(&b, &c, SortOrder::Asc), Ordering::Less);
+  }
+
+  #[test]
+  fn bucket_sort_value_orders_negative_numeric_keys_numerically() {
+    // Lexicographic would order "-3" < "-30" < "-5"; numeric must be -30 < -5 < -3.
+    let neg_three = make_bucket(serde_json::json!(-3i64));
+    let neg_five = make_bucket(serde_json::json!(-5i64));
+    let neg_thirty = make_bucket(serde_json::json!(-30i64));
+    let spec = key_spec(SortOrder::Asc);
+    let a = bucket_sort_value(&neg_three, &spec);
+    let b = bucket_sort_value(&neg_five, &spec);
+    let c = bucket_sort_value(&neg_thirty, &spec);
+    assert_eq!(compare_sort_values(&c, &b, SortOrder::Asc), Ordering::Less); // -30 < -5
+    assert_eq!(compare_sort_values(&b, &a, SortOrder::Asc), Ordering::Less); // -5 < -3
+  }
+
+  #[test]
+  fn bucket_sort_value_falls_back_to_string_for_non_numeric_keys() {
+    let hello = make_bucket(serde_json::json!("hello"));
+    let world = make_bucket(serde_json::json!("world"));
+    let spec = key_spec(SortOrder::Asc);
+    let a = bucket_sort_value(&hello, &spec);
+    let b = bucket_sort_value(&world, &spec);
+    match (&a, &b) {
+      (BucketSortComparable::Str(_), BucketSortComparable::Str(_)) => {}
+      _ => panic!("expected Str comparables for string keys"),
+    }
+    assert_eq!(compare_sort_values(&a, &b, SortOrder::Asc), Ordering::Less);
+  }
+
+  #[test]
+  fn compare_sort_values_inverts_mixed_type_ordering_for_desc() {
+    // With `_key: desc`, descending should be the inverse of ascending across
+    // every variant pair — including numeric-vs-string (e.g. a terms
+    // aggregation with a `missing` numeric fallback mixing with keyword
+    // buckets). Otherwise `size` truncation could return the wrong top N.
+    let num = BucketSortComparable::I128(42);
+    let s = BucketSortComparable::Str("zzz".into());
+    assert_eq!(
+      compare_sort_values(&num, &s, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&num, &s, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&s, &num, SortOrder::Asc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&s, &num, SortOrder::Desc),
+      Ordering::Less
+    );
+    // And the same for F64-vs-Str.
+    let f = BucketSortComparable::F64(7.5);
+    assert_eq!(compare_sort_values(&f, &s, SortOrder::Asc), Ordering::Less);
+    assert_eq!(
+      compare_sort_values(&f, &s, SortOrder::Desc),
+      Ordering::Greater
+    );
+  }
+
+  #[test]
+  fn compare_sort_values_keeps_missing_last_regardless_of_order() {
+    // `Missing` preserves the pre-existing "nulls last" behavior under both
+    // asc and desc — matching Elasticsearch's default for missing values.
+    let m = BucketSortComparable::Missing;
+    let n = BucketSortComparable::I128(1);
+    assert_eq!(
+      compare_sort_values(&m, &n, SortOrder::Asc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&m, &n, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(compare_sort_values(&n, &m, SortOrder::Asc), Ordering::Less);
+    assert_eq!(compare_sort_values(&n, &m, SortOrder::Desc), Ordering::Less);
   }
 
   #[test]
