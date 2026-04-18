@@ -3216,14 +3216,17 @@ fn apply_pipeline_aggs(
       }
       Aggregation::SumBucket(cfg) => {
         let mut sum = 0.0_f64;
+        let mut count = 0usize;
         for bucket in buckets.iter() {
           if let Some(val) = bucket_metric_value(bucket, &cfg.buckets_path) {
             sum += val;
+            count += 1;
           }
         }
+        let value = if count > 0 { Some(sum) } else { None };
         responses.insert(
           name.to_string(),
-          AggregationResponse::SumBucket(OptionalBucketMetricResponse { value: Some(sum) }),
+          AggregationResponse::SumBucket(OptionalBucketMetricResponse { value }),
         );
       }
       Aggregation::Derivative(cfg) => {
@@ -6138,28 +6141,138 @@ mod tests {
   }
 
   #[test]
-  fn sum_bucket_returns_some_zero_when_no_buckets_contribute() {
+  fn sum_bucket_returns_none_when_all_buckets_missing_metric() {
     use crate::api::types::BucketMetricAggregation;
 
-    // sum_bucket follows the additive identity convention: the sum of an
-    // empty set is 0, and the value is wrapped in Some so it round-trips
-    // through the (now optional) response shape.
-    let mut buckets = vec![BucketResponse {
-      key: serde_json::json!("a"),
-      doc_count: 1,
-      aggregations: BTreeMap::new(),
-    }];
+    // Mirrors avg_bucket (BUG-283) and Elasticsearch semantics: when no parent
+    // bucket carries a value for the referenced metric, sum_bucket must return
+    // None so consumers can distinguish "no data" from "data that sums to 0".
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::new(),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 2,
+        aggregations: BTreeMap::new(),
+      },
+    ];
 
     let mut pipeline = BTreeMap::new();
     pipeline.insert(
-      "sum_price".to_string(),
+      "total_price".to_string(),
       Aggregation::SumBucket(BucketMetricAggregation {
         buckets_path: "price_stats.sum".to_string(),
       }),
     );
 
     let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
-    match responses.get("sum_price") {
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must return None when no bucket contributes a metric value"
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_returns_none_serializes_without_value_field() {
+    let resp = AggregationResponse::SumBucket(OptionalBucketMetricResponse { value: None });
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(
+      json.get("value").is_none(),
+      "expected `value` to be absent when None, got: {json}"
+    );
+  }
+
+  #[test]
+  fn sum_bucket_returns_some_sum_when_buckets_have_metric() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 20.0,
+            max: 20.0,
+            sum: 20.0,
+            avg: 20.0,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(val.value, Some(30.0));
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_returns_some_zero_when_any_bucket_contributes_zero() {
+    use crate::api::types::BucketMetricAggregation;
+
+    // A bucket that contributes an explicit 0.0 is "data that sums to 0" —
+    // distinct from the empty-input case which returns None.
+    let mut buckets = vec![BucketResponse {
+      key: serde_json::json!("a"),
+      doc_count: 1,
+      aggregations: BTreeMap::from([(
+        "price_stats".to_string(),
+        AggregationResponse::Stats(StatsResponse {
+          count: 1,
+          min: 0.0,
+          max: 0.0,
+          sum: 0.0,
+          avg: 0.0,
+        }),
+      )]),
+    }];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
       Some(AggregationResponse::SumBucket(val)) => {
         assert_eq!(val.value, Some(0.0));
       }
