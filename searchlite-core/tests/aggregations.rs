@@ -4541,3 +4541,496 @@ fn bucket_sort_runs_after_derivative_pipeline() {
     panic!("expected histogram agg");
   }
 }
+
+#[test]
+fn bucket_sort_by_key_uses_numeric_ordering_for_histogram() {
+  // Regression test for BUG-296: bucket_sort by `_key` on histogram buckets
+  // must sort numerically, not lexicographically. With lexicographic ordering,
+  // "100.0" would sort between "10.0" and "20.0".
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "val".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for (i, v) in [5.0_f64, 15.0, 25.0, 100.0].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("h-{i}"),
+          vec![("body", json!("rust")), ("val", json!(v))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut sub_aggs = BTreeMap::new();
+  sub_aggs.insert(
+    "sort_by_key".into(),
+    Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+      sort: vec![searchlite_core::api::types::BucketSortSpec {
+        field: "_key".into(),
+        order: searchlite_core::api::types::SortOrder::Asc,
+      }],
+      from: None,
+      size: None,
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "by_val".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "val".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(1),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: sub_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } =
+    resp.aggregations.get("by_val").unwrap()
+  {
+    let keys: Vec<f64> = buckets
+      .iter()
+      .map(|b| b.key.as_f64().expect("numeric key"))
+      .collect();
+    assert_eq!(
+      keys,
+      vec![0.0, 10.0, 20.0, 100.0],
+      "bucket_sort by _key should order histogram keys numerically, not lexicographically"
+    );
+  } else {
+    panic!("expected histogram agg");
+  }
+}
+
+#[test]
+fn bucket_sort_by_key_desc_uses_numeric_ordering_for_histogram() {
+  // Regression test for BUG-296: descending sort must also be numeric.
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "val".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    for (i, v) in [5.0_f64, 15.0, 25.0, 100.0].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("hd-{i}"),
+          vec![("body", json!("rust")), ("val", json!(v))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut sub_aggs = BTreeMap::new();
+  sub_aggs.insert(
+    "sort_by_key".into(),
+    Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+      sort: vec![searchlite_core::api::types::BucketSortSpec {
+        field: "_key".into(),
+        order: searchlite_core::api::types::SortOrder::Desc,
+      }],
+      from: None,
+      size: Some(2),
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "by_val".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "val".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(1),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: sub_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } =
+    resp.aggregations.get("by_val").unwrap()
+  {
+    let keys: Vec<f64> = buckets
+      .iter()
+      .map(|b| b.key.as_f64().expect("numeric key"))
+      .collect();
+    assert_eq!(
+      keys,
+      vec![100.0, 20.0],
+      "bucket_sort by _key desc should take top numerically-largest keys"
+    );
+  } else {
+    panic!("expected histogram agg");
+  }
+}
+
+#[test]
+fn bucket_sort_by_key_orders_negative_histogram_keys_numerically() {
+  // Regression test for BUG-296: negative numeric keys must be ordered
+  // numerically, not lexicographically. Lex order would produce
+  // "-3" < "-30" < "-5" which is wrong.
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "val".into(),
+    i64: false,
+    fast: true,
+    stored: false,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // Seed values spanning negative and positive so histogram produces
+    // negative keys. With interval=10, values -35, -15, -2, 12, 100
+    // yield buckets -40, -20, -10, 10, 100.
+    for (i, v) in [-35.0_f64, -15.0, -2.0, 12.0, 100.0].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("hn-{i}"),
+          vec![("body", json!("rust")), ("val", json!(v))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut sub_aggs = BTreeMap::new();
+  sub_aggs.insert(
+    "sort_by_key".into(),
+    Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+      sort: vec![searchlite_core::api::types::BucketSortSpec {
+        field: "_key".into(),
+        order: searchlite_core::api::types::SortOrder::Asc,
+      }],
+      from: None,
+      size: None,
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "by_val".into(),
+    Aggregation::Histogram(Box::new(HistogramAggregation {
+      field: "val".into(),
+      interval: 10.0,
+      offset: None,
+      min_doc_count: Some(1),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: sub_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } =
+    resp.aggregations.get("by_val").unwrap()
+  {
+    let keys: Vec<f64> = buckets
+      .iter()
+      .map(|b| b.key.as_f64().expect("numeric key"))
+      .collect();
+    assert_eq!(
+      keys,
+      vec![-40.0, -20.0, -10.0, 10.0, 100.0],
+      "bucket_sort by _key should order negative keys numerically"
+    );
+  } else {
+    panic!("expected histogram agg");
+  }
+}
+
+#[test]
+fn bucket_sort_by_key_uses_numeric_ordering_for_date_histogram() {
+  // Regression test for BUG-296: date_histogram keys are integer millisecond
+  // timestamps. Lexicographic ordering would sort "100" between "10" and "20"
+  // for string-compared keys; it must sort numerically.
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    // Timestamps covering three orders of magnitude so lex and numeric
+    // orderings disagree: with fixed_interval=1s (1000ms) and values in ms:
+    //   5     -> bucket 0
+    //   1_500 -> bucket 1000
+    //   25_000-> bucket 25000
+    //   100_000-> bucket 100000
+    for (i, ts) in [5_i64, 1_500, 25_000, 100_000].iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("dh-{i}"),
+          vec![("body", json!("rust")), ("ts", json!(ts))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let mut sub_aggs = BTreeMap::new();
+  sub_aggs.insert(
+    "sort_by_key".into(),
+    Aggregation::BucketSort(searchlite_core::api::types::BucketSortAggregation {
+      sort: vec![searchlite_core::api::types::BucketSortSpec {
+        field: "_key".into(),
+        order: searchlite_core::api::types::SortOrder::Asc,
+      }],
+      from: None,
+      size: None,
+    }),
+  );
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "by_ts".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: None,
+      fixed_interval: Some("1s".into()),
+      offset: None,
+      format: None,
+      min_doc_count: Some(1),
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: sub_aggs,
+    })),
+  );
+  let resp = idx
+    .reader()
+    .unwrap()
+    .search(&SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    })
+    .unwrap();
+  if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } =
+    resp.aggregations.get("by_ts").unwrap()
+  {
+    let keys: Vec<f64> = buckets
+      .iter()
+      .map(|b| b.key.as_f64().expect("numeric key"))
+      .collect();
+    assert_eq!(
+      keys,
+      vec![0.0, 1_000.0, 25_000.0, 100_000.0],
+      "bucket_sort by _key should order date_histogram keys numerically"
+    );
+  } else {
+    panic!("expected date histogram agg");
+  }
+}
