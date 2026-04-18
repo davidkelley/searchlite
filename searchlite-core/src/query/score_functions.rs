@@ -198,21 +198,21 @@ fn apply_modifier(value: f64, modifier: &FieldValueModifier) -> f64 {
       if value <= 0.0 {
         0.0
       } else {
-        value.ln()
+        value.log10()
       }
     }
     FieldValueModifier::Log1p => {
       if value <= -1.0 {
         0.0
       } else {
-        value.ln_1p()
+        (1.0 + value).log10()
       }
     }
     FieldValueModifier::Log2p => {
       if value <= -2.0 {
         0.0
       } else {
-        (value + 2.0).ln()
+        (value + 2.0).log10()
       }
     }
     FieldValueModifier::Sqrt => {
