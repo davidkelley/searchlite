@@ -5884,6 +5884,20 @@ mod tests {
   }
 
   #[test]
+  fn percentile_ranks_response_serializes_null_for_empty_buckets() {
+    // BUG-303: sibling coverage for PercentileRanks — the widened
+    // `Option<f64>` map must also serialize `None` entries as JSON `null`.
+    let mut values = BTreeMap::new();
+    values.insert("42".to_string(), None);
+    values.insert("100".to_string(), Some(87.5));
+    let resp = AggregationResponse::PercentileRanks(PercentileRanksResponse { values });
+    let json = serde_json::to_value(&resp).unwrap();
+    let map = json.get("values").and_then(|v| v.as_object()).unwrap();
+    assert!(map.get("42").unwrap().is_null());
+    assert_eq!(map.get("100").unwrap().as_f64().unwrap(), 87.5);
+  }
+
+  #[test]
   fn bucket_metric_value_stats_subfield_still_works() {
     let mut aggs = BTreeMap::new();
     aggs.insert(
