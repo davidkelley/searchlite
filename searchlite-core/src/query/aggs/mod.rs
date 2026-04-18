@@ -4227,14 +4227,20 @@ pub(crate) fn parse_date(value: &str) -> Option<f64> {
 }
 
 pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
-  // Accept an optional leading `-` so negative durations such as "-6h"
-  // parse correctly. Callers that only permit positive durations
+  // Accept an optional leading sign so negative durations such as "-6h"
+  // and explicitly-positive durations such as "+6h" parse correctly.
+  // Elasticsearch time-unit parsing accepts both `+` and `-` prefixes,
+  // so users migrating from Elasticsearch or following its documentation
+  // expect both. Callers that only permit positive durations
   // (e.g. `fixed_interval`) are responsible for rejecting negatives
   // via their own `secs > 0.0` guard; callers that accept negatives
   // (date_histogram `offset`) rely on this path.
-  let (negative, rest) = match spec.strip_prefix('-') {
-    Some(tail) => (true, tail),
-    None => (false, spec),
+  let (negative, rest) = if let Some(tail) = spec.strip_prefix('-') {
+    (true, tail)
+  } else if let Some(tail) = spec.strip_prefix('+') {
+    (false, tail)
+  } else {
+    (false, spec)
   };
   let mut idx = 0usize;
   for ch in rest.chars() {
@@ -4462,6 +4468,31 @@ mod tests {
     assert_eq!(parse_interval_seconds("--5h"), None);
     assert_eq!(parse_interval_seconds("-5x"), None);
     assert_eq!(parse_interval_seconds("-foo"), None);
+  }
+
+  #[test]
+  fn parse_interval_seconds_accepts_explicit_positive_sign() {
+    // Elasticsearch time-unit parsing accepts a leading `+` as a
+    // synonym for an unsigned positive duration. date_histogram
+    // `offset: "+6h"` must parse identically to `"6h"`.
+    assert_eq!(parse_interval_seconds("+6h"), Some(21_600.0));
+    assert_eq!(parse_interval_seconds("+30m"), Some(1_800.0));
+    assert_eq!(parse_interval_seconds("+1500ms"), Some(1.5));
+    assert_eq!(parse_interval_seconds("+2.5m"), Some(150.0));
+    assert_eq!(parse_interval_seconds("+1"), Some(1.0));
+    assert_eq!(parse_interval_seconds("+1s"), Some(1.0));
+  }
+
+  #[test]
+  fn parse_interval_seconds_rejects_malformed_positives() {
+    // A lone `+`, stacked signs, or a sign followed by an unknown
+    // unit must still fail — mirroring the negative malformed cases.
+    assert_eq!(parse_interval_seconds("+"), None);
+    assert_eq!(parse_interval_seconds("++5h"), None);
+    assert_eq!(parse_interval_seconds("+-5h"), None);
+    assert_eq!(parse_interval_seconds("-+5h"), None);
+    assert_eq!(parse_interval_seconds("+5x"), None);
+    assert_eq!(parse_interval_seconds("+foo"), None);
   }
 
   #[test]
