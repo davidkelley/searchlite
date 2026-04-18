@@ -3740,7 +3740,11 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) 
   match resp {
     AggregationResponse::Stats(stats) => {
       let field = path.unwrap_or("avg");
+      // When count == 0, min/max/avg have no meaningful value — return None so
+      // pipeline aggregations treat the bucket as missing (matching Elasticsearch,
+      // which serializes these fields as null).
       match field {
+        "avg" | "min" | "max" if stats.count == 0 => None,
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
         "max" => Some(stats.max),
@@ -3751,7 +3755,10 @@ fn extract_metric_from_response(resp: &AggregationResponse, path: Option<&str>) 
     }
     AggregationResponse::ExtendedStats(stats) => {
       let field = path.unwrap_or("avg");
+      // Same treatment as Stats — plus variance / std_deviation are also undefined
+      // for an empty sample.
       match field {
+        "avg" | "min" | "max" | "variance" | "std_deviation" if stats.count == 0 => None,
         "avg" => Some(stats.avg),
         "min" => Some(stats.min),
         "max" => Some(stats.max),
@@ -5766,6 +5773,204 @@ mod tests {
 
     // Without a subpath, Stats defaults to "avg"
     assert_eq!(bucket_metric_value(&bucket, "my_stats"), Some(5.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_stats_empty_count_returns_none_for_avg_min_max() {
+    // BUG-301: When a stats sub-agg has count == 0 (e.g. no docs have the field),
+    // avg / min / max are undefined and must be reported as None so pipeline aggs
+    // skip the bucket rather than treating the default 0.0 as a real value.
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_stats".to_string(),
+      AggregationResponse::Stats(StatsResponse {
+        count: 0,
+        min: 0.0,
+        max: 0.0,
+        avg: 0.0,
+        sum: 0.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 3,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.avg"), None);
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.min"), None);
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.max"), None);
+    // Default (no subpath) resolves to "avg" and must also be None.
+    assert_eq!(bucket_metric_value(&bucket, "my_stats"), None);
+    // sum and count are conventionally defined for the empty set.
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.sum"), Some(0.0));
+    assert_eq!(bucket_metric_value(&bucket, "my_stats.count"), Some(0.0));
+  }
+
+  #[test]
+  fn bucket_metric_value_extended_stats_empty_count_returns_none_for_nullable_fields() {
+    // BUG-301: Same rule for extended_stats, additionally including variance
+    // and std_deviation which are undefined for an empty sample.
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "my_ext_stats".to_string(),
+      AggregationResponse::ExtendedStats(crate::api::types::ExtendedStatsResponse {
+        count: 0,
+        min: 0.0,
+        max: 0.0,
+        avg: 0.0,
+        sum: 0.0,
+        variance: 0.0,
+        std_deviation: 0.0,
+      }),
+    );
+    let bucket = BucketResponse {
+      key: serde_json::json!(0),
+      doc_count: 3,
+      aggregations: aggs,
+    };
+
+    assert_eq!(bucket_metric_value(&bucket, "my_ext_stats.avg"), None);
+    assert_eq!(bucket_metric_value(&bucket, "my_ext_stats.min"), None);
+    assert_eq!(bucket_metric_value(&bucket, "my_ext_stats.max"), None);
+    assert_eq!(bucket_metric_value(&bucket, "my_ext_stats.variance"), None);
+    assert_eq!(
+      bucket_metric_value(&bucket, "my_ext_stats.std_deviation"),
+      None
+    );
+    assert_eq!(bucket_metric_value(&bucket, "my_ext_stats.sum"), Some(0.0));
+    assert_eq!(
+      bucket_metric_value(&bucket, "my_ext_stats.count"),
+      Some(0.0)
+    );
+  }
+
+  #[test]
+  fn avg_bucket_skips_buckets_with_empty_stats_count() {
+    use crate::api::types::BucketMetricAggregation;
+    // BUG-301 end-to-end: an avg_bucket pipeline agg over a `terms` agg with a
+    // `stats` sub-agg must skip buckets whose stats have count == 0, rather than
+    // averaging a spurious 0.0 into the result.
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("active"),
+        doc_count: 10,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 10,
+            min: 50.0,
+            max: 50.0,
+            avg: 50.0,
+            sum: 500.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("pending"),
+        doc_count: 5,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 0,
+            min: 0.0,
+            max: 0.0,
+            avg: 0.0,
+            sum: 0.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("archived"),
+        doc_count: 3,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 3,
+            min: 30.0,
+            max: 30.0,
+            avg: 30.0,
+            sum: 90.0,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "overall_avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let out = apply_pipeline_aggs(&pipeline, &mut buckets);
+    let result = out
+      .get("overall_avg_price")
+      .expect("overall_avg_price missing");
+    match result {
+      AggregationResponse::AvgBucket(val) => {
+        // Skipping the empty "pending" bucket: (50 + 30) / 2 = 40.
+        assert_eq!(val.value, Some(40.0));
+      }
+      other => panic!("expected AvgBucket, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sum_bucket_returns_none_when_all_stats_buckets_have_empty_count() {
+    use crate::api::types::BucketMetricAggregation;
+    // BUG-301: when every referenced stats bucket has count == 0, every
+    // contribution to sum_bucket is None, so the result must be None (matching
+    // the existing "all buckets missing metric" semantics in sum_bucket). Before
+    // the fix this returned Some(0.0).
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("pending"),
+        doc_count: 5,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 0,
+            min: 0.0,
+            max: 0.0,
+            avg: 0.0,
+            sum: 0.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("archived"),
+        doc_count: 3,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 0,
+            min: 0.0,
+            max: 0.0,
+            avg: 0.0,
+            sum: 0.0,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_of_avgs".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.avg".to_string(),
+      }),
+    );
+
+    let out = apply_pipeline_aggs(&pipeline, &mut buckets);
+    let result = out.get("total_of_avgs").expect("total_of_avgs missing");
+    match result {
+      AggregationResponse::SumBucket(val) => {
+        assert_eq!(val.value, None);
+      }
+      other => panic!("expected SumBucket, got {other:?}"),
+    }
   }
 
   #[test]
