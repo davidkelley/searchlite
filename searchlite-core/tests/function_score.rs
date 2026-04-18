@@ -363,7 +363,7 @@ fn rank_feature_uses_numeric_fast_field() {
 }
 
 #[test]
-fn log2p_modifier_uses_natural_log_of_value_plus_two() {
+fn log2p_modifier_uses_log10_of_value_plus_two() {
   let reader = setup_reader();
   let req = base_request(QueryNode::FunctionScore {
     query: Box::new(QueryNode::MatchAll { boost: None }),
@@ -382,21 +382,101 @@ fn log2p_modifier_uses_natural_log_of_value_plus_two() {
   });
   let resp = reader.search(&req).unwrap();
   // popularity: doc-1=10, doc-3=5, doc-2=1
-  // Log2p = ln(value + 2): ln(12) ≈ 2.485, ln(7) ≈ 1.946, ln(3) ≈ 1.099
+  // Log2p = log10(value + 2): log10(12) ≈ 1.079, log10(7) ≈ 0.845, log10(3) ≈ 0.477
   assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
   let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
   assert!(
-    (scores[0] - 12_f32.ln()).abs() < 1e-6,
+    (scores[0] - 12_f32.log10()).abs() < 1e-6,
     "doc-1: {}",
     scores[0]
   );
   assert!(
-    (scores[1] - 7_f32.ln()).abs() < 1e-6,
+    (scores[1] - 7_f32.log10()).abs() < 1e-6,
     "doc-3: {}",
     scores[1]
   );
   assert!(
-    (scores[2] - 3_f32.ln()).abs() < 1e-6,
+    (scores[2] - 3_f32.log10()).abs() < 1e-6,
+    "doc-2: {}",
+    scores[2]
+  );
+}
+
+#[test]
+fn log_modifier_uses_log10_of_value() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::Log),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-1=10, doc-3=5, doc-2=1
+  // Log = log10(value): log10(10) = 1.0, log10(5) ≈ 0.699, log10(1) = 0.0
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(
+    (scores[0] - 10_f32.log10()).abs() < 1e-6,
+    "doc-1: {}",
+    scores[0]
+  );
+  assert!(
+    (scores[1] - 5_f32.log10()).abs() < 1e-6,
+    "doc-3: {}",
+    scores[1]
+  );
+  assert!(
+    (scores[2] - 1_f32.log10()).abs() < 1e-6,
+    "doc-2: {}",
+    scores[2]
+  );
+}
+
+#[test]
+fn log1p_modifier_uses_log10_of_one_plus_value() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::Log1p),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // popularity: doc-1=10, doc-3=5, doc-2=1
+  // Log1p = log10(1 + value): log10(11) ≈ 1.041, log10(6) ≈ 0.778, log10(2) ≈ 0.301
+  assert_eq!(ids(&resp), vec!["doc-1", "doc-3", "doc-2"]);
+  let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
+  assert!(
+    (scores[0] - 11_f32.log10()).abs() < 1e-6,
+    "doc-1: {}",
+    scores[0]
+  );
+  assert!(
+    (scores[1] - 6_f32.log10()).abs() < 1e-6,
+    "doc-3: {}",
+    scores[1]
+  );
+  assert!(
+    (scores[2] - 2_f32.log10()).abs() < 1e-6,
     "doc-2: {}",
     scores[2]
   );
