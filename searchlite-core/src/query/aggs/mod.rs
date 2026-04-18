@@ -5918,29 +5918,30 @@ mod tests {
   }
 
   #[test]
-  fn sum_bucket_skips_buckets_with_empty_stats_count() {
+  fn sum_bucket_returns_none_when_all_stats_buckets_have_empty_count() {
     use crate::api::types::BucketMetricAggregation;
-    // BUG-301: sum_bucket must also skip stats buckets with count == 0 rather
-    // than summing in a spurious 0.0 (which would not change the total but
-    // would still be "incorrect" semantically — included here as a guard).
+    // BUG-301: when every referenced stats bucket has count == 0, every
+    // contribution to sum_bucket is None, so the result must be None (matching
+    // the existing "all buckets missing metric" semantics in sum_bucket). Before
+    // the fix this returned Some(0.0).
     let mut buckets = vec![
       BucketResponse {
-        key: serde_json::json!("active"),
-        doc_count: 10,
+        key: serde_json::json!("pending"),
+        doc_count: 5,
         aggregations: BTreeMap::from([(
           "price_stats".to_string(),
           AggregationResponse::Stats(StatsResponse {
-            count: 10,
-            min: 50.0,
-            max: 50.0,
-            avg: 50.0,
-            sum: 500.0,
+            count: 0,
+            min: 0.0,
+            max: 0.0,
+            avg: 0.0,
+            sum: 0.0,
           }),
         )]),
       },
       BucketResponse {
-        key: serde_json::json!("pending"),
-        doc_count: 5,
+        key: serde_json::json!("archived"),
+        doc_count: 3,
         aggregations: BTreeMap::from([(
           "price_stats".to_string(),
           AggregationResponse::Stats(StatsResponse {
@@ -5966,8 +5967,7 @@ mod tests {
     let result = out.get("total_of_avgs").expect("total_of_avgs missing");
     match result {
       AggregationResponse::SumBucket(val) => {
-        // Only the "active" bucket contributes.
-        assert_eq!(val.value, Some(50.0));
+        assert_eq!(val.value, None);
       }
       other => panic!("expected SumBucket, got {other:?}"),
     }
