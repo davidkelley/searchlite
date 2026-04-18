@@ -4309,12 +4309,27 @@ mod tests {
     );
     // Ascending: a < b < c. A lossy comparator would return Equal, letting
     // the tie-break decide and silently permuting the order.
-    assert_eq!(compare_sort_values(&va, &vb, SortOrder::Asc), Ordering::Less);
-    assert_eq!(compare_sort_values(&vb, &vc, SortOrder::Asc), Ordering::Less);
-    assert_eq!(compare_sort_values(&vc, &va, SortOrder::Asc), Ordering::Greater);
+    assert_eq!(
+      compare_sort_values(&va, &vb, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&vb, &vc, SortOrder::Asc),
+      Ordering::Less
+    );
+    assert_eq!(
+      compare_sort_values(&vc, &va, SortOrder::Asc),
+      Ordering::Greater
+    );
     // Descending inverts.
-    assert_eq!(compare_sort_values(&va, &vb, SortOrder::Desc), Ordering::Greater);
-    assert_eq!(compare_sort_values(&vc, &va, SortOrder::Desc), Ordering::Less);
+    assert_eq!(
+      compare_sort_values(&va, &vb, SortOrder::Desc),
+      Ordering::Greater
+    );
+    assert_eq!(
+      compare_sort_values(&vc, &va, SortOrder::Desc),
+      Ordering::Less
+    );
   }
 
   #[test]

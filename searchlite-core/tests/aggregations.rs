@@ -5034,4 +5034,3 @@ fn bucket_sort_by_key_uses_numeric_ordering_for_date_histogram() {
     panic!("expected date histogram agg");
   }
 }
-
