@@ -3285,8 +3285,19 @@ fn apply_derivative_pipeline(
       (None, GapPolicy::InsertZeros) => Some(0.0),
       (None, GapPolicy::Skip) => None,
     };
+    // Reject non-finite results (BUG-322). An upstream metric that overflows
+    // to +/-inf would otherwise propagate inf/-inf/NaN through the response and
+    // into downstream pipelines, bypassing their own finitude guards. Mirrors
+    // the policy used by eval_rpn (BUG-287) and combine_function_scores (BUG-315).
     let value = match (current, prev) {
-      (Some(cur), Some(prev_val)) => Some((cur - prev_val) / unit),
+      (Some(cur), Some(prev_val)) => {
+        let v = (cur - prev_val) / unit;
+        if v.is_finite() {
+          Some(v)
+        } else {
+          None
+        }
+      }
       _ => None,
     };
     if let Some(cur) = current {
@@ -3332,10 +3343,20 @@ fn apply_moving_avg_pipeline(
     // Compute the average from preceding values only (look-back). The current
     // bucket's value must NOT be included — Elasticsearch's moving_avg emits
     // the mean of the *previous* window at each position.
+    //
+    // Reject non-finite results (BUG-322). An upstream metric that overflows
+    // to +/-inf would otherwise contaminate every subsequent bucket's average
+    // (and any downstream pipeline) with inf or NaN. Mirrors eval_rpn (BUG-287)
+    // and combine_function_scores (BUG-315).
     let avg = if window_values.is_empty() {
       None
     } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+      let v = window_values.iter().copied().sum::<f64>() / window_values.len() as f64;
+      if v.is_finite() {
+        Some(v)
+      } else {
+        None
+      }
     };
     if let Some(val) = current {
       if window_values.len() == window {
@@ -3360,7 +3381,14 @@ fn apply_moving_avg_pipeline(
     let seed = if window_values.is_empty() {
       None
     } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+      let v = window_values.iter().copied().sum::<f64>() / window_values.len() as f64;
+      // Reject non-finite seed (BUG-322); otherwise vec![seed_val; predict] would
+      // replicate inf/NaN across every prediction slot.
+      if v.is_finite() {
+        Some(v)
+      } else {
+        None
+      }
     };
     if let Some(seed_val) = seed {
       // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
@@ -5260,6 +5288,119 @@ mod tests {
     assert!(responses.contains_key("diff"));
   }
 
+  /// Regression for BUG-322: derivative must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak NaN/Infinity into the
+  /// response or downstream pipelines that consume the derivative output.
+  /// Mirrors eval_rpn (BUG-287) and combine_function_scores (BUG-315).
+  #[test]
+  fn derivative_pipeline_rejects_non_finite_values() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "metric".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(0, 100.0),
+      stats_bucket(1, f64::INFINITY),
+      stats_bucket(2, f64::NEG_INFINITY),
+      stats_bucket(3, 50.0),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_derivative_pipeline(
+      "diff",
+      &DerivativeAggregation {
+        buckets_path: "metric.sum".to_string(),
+        gap_policy: Some(GapPolicy::Skip),
+        unit: Some(1.0),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // Bucket 0: no prev → None.
+    let v0 = match buckets[0].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 0"),
+    };
+    assert_eq!(v0, None);
+
+    // Bucket 1: INF - 100.0 = INF → rejected.
+    let v1 = match buckets[1].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 1"),
+    };
+    assert_eq!(v1, None, "derivative must reject infinite result");
+
+    // Bucket 2: -INF - INF = -INF → rejected.
+    let v2 = match buckets[2].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 2"),
+    };
+    assert_eq!(v2, None, "derivative must reject infinite result");
+
+    // Bucket 3: 50.0 - (-INF) = INF → rejected.
+    let v3 = match buckets[3].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 3"),
+    };
+    assert_eq!(v3, None, "derivative must reject infinite result");
+  }
+
+  /// Regression for BUG-322: the NaN case (inf - inf) must also be rejected.
+  #[test]
+  fn derivative_pipeline_rejects_nan_from_inf_minus_inf() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "metric".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(0, f64::INFINITY),
+      stats_bucket(1, f64::INFINITY),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_derivative_pipeline(
+      "diff",
+      &DerivativeAggregation {
+        buckets_path: "metric.sum".to_string(),
+        gap_policy: Some(GapPolicy::Skip),
+        unit: Some(1.0),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    let v1 = match buckets[1].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 1"),
+    };
+    assert_eq!(v1, None, "derivative must reject NaN result (inf - inf)");
+  }
+
   /// Regression for #251: add_calendar must preserve the sub-day time
   /// component so that bucket keys stay aligned with the offset applied by
   /// bucket_start. Previously `and_hms_opt(0, 0, 0)` discarded the time,
@@ -6493,6 +6634,130 @@ mod tests {
     } else {
       panic!("missing moving_avg pipeline response");
     }
+  }
+
+  /// Regression for BUG-322: moving_avg must reject non-finite per-bucket
+  /// averages so an upstream metric that overflows to +/-inf cannot leak
+  /// NaN/Infinity into the response or downstream pipelines that consume the
+  /// moving_avg output. Mirrors eval_rpn (BUG-287) and combine_function_scores
+  /// (BUG-315).
+  #[test]
+  fn moving_avg_pipeline_rejects_non_finite_window_average() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    // Window 2. Bucket 1 holds INF in its metric, which slides into the window
+    // for buckets 2 and 3, contaminating those windowed averages until INF
+    // falls out of the window again.
+    let mut buckets = vec![
+      stats_bucket(0, 100.0),
+      stats_bucket(1, f64::INFINITY),
+      stats_bucket(2, 50.0),
+      stats_bucket(3, 25.0),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m.sum".to_string(),
+        window: 2,
+        predict: None,
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // Bucket 0: empty window → None.
+    let v0 = match buckets[0].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 0"),
+    };
+    assert_eq!(v0, None);
+
+    // Bucket 1: window [100.0] → 100.0 (finite, not yet contaminated).
+    let v1 = match buckets[1].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 1"),
+    };
+    assert_eq!(v1, Some(100.0));
+
+    // Bucket 2: window [100.0, INF] → INF → rejected.
+    let v2 = match buckets[2].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 2"),
+    };
+    assert_eq!(v2, None, "moving_avg must reject infinite window mean");
+
+    // Bucket 3: window [INF, 50.0] → INF → rejected.
+    let v3 = match buckets[3].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 3"),
+    };
+    assert_eq!(v3, None, "moving_avg must reject infinite window mean");
+  }
+
+  /// Regression for BUG-322: a non-finite seed for the prediction window must
+  /// suppress all predictions rather than replicate Infinity/NaN across every
+  /// prediction slot.
+  #[test]
+  fn moving_avg_pipeline_rejects_non_finite_prediction_seed() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    // Final window includes INF, so the seed average is INF and predictions
+    // must come back empty.
+    let mut buckets = vec![stats_bucket(0, 10.0), stats_bucket(1, f64::INFINITY)];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m.sum".to_string(),
+        window: 2,
+        predict: Some(3),
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    let resp = match responses.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r,
+      _ => panic!("missing moving_avg pipeline response"),
+    };
+    assert!(
+      resp.predictions.is_empty(),
+      "non-finite prediction seed must suppress predictions, got {:?}",
+      resp.predictions
+    );
   }
 
   #[test]
