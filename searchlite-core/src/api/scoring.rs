@@ -354,20 +354,36 @@ pub(crate) fn evaluate_compiled_score(
       }
       let mut combined =
         if let Some(func_score) = combine_function_scores(&function_values, *score_mode) {
+          // `func_score` can be non-finite if the combine step (Sum,
+          // Multiply, or Avg) overflowed past f32::MAX to infinity, even
+          // when every individual function value was finite. `max_boost`,
+          // when set, caps infinity to a finite value because
+          // `f32::INFINITY.min(finite) == finite`; when absent, we must
+          // reject the doc rather than let infinity leak into the sort
+          // key. Mirrors the RankFeature guards below and script.rs/aggs.
           let capped = match max_boost {
             Some(max) => func_score.min(*max),
             None => func_score,
           };
+          if !capped.is_finite() {
+            return None;
+          }
           apply_boost_mode(effective_base, capped, *boost_mode)
         } else {
           effective_base
         };
+      if !combined.is_finite() {
+        return None;
+      }
       if let Some(min) = min_score {
         if combined < *min {
           return None;
         }
       }
       combined *= *boost;
+      if !combined.is_finite() {
+        return None;
+      }
       if collect_functions {
         out_functions.extend(fn_expls);
       }

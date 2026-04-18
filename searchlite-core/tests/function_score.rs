@@ -887,6 +887,153 @@ fn max_boost_caps_function_score_before_boost_mode_multiply() {
   }
 }
 
+// Regression: `combine_function_scores` and the `FunctionScore` branch of
+// `evaluate_compiled_score` previously lacked finitude guards. When
+// individually finite function values overflow `f32` during combine (e.g.
+// Multiply of two 1e20 weights → 1e40 > f32::MAX), the result leaked out
+// as `Some(f32::INFINITY)` and corrupted sort ordering. The fix is to
+// reject non-finite combined scores (return `None`) so overflowing hits
+// are excluded from the result set, mirroring the RankFeature guard. See
+// BUG-315.
+#[test]
+fn function_score_multiply_overflow_is_excluded() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![
+      FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      },
+      FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      },
+    ],
+    score_mode: Some(FunctionScoreMode::Multiply),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  // 1e20 * 1e20 = 1e40 overflows f32 → combine returns None → hits excluded.
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when combine overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+  // Sanity: no score leaks out as non-finite.
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "non-finite score leaked into result: {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_sum_overflow_is_excluded() {
+  let reader = setup_reader();
+  // Two Weight functions whose Sum overflows f32::MAX (≈ 3.4e38).
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![
+      FunctionSpec::Weight {
+        weight: f32::MAX,
+        filter: None,
+      },
+      FunctionSpec::Weight {
+        weight: f32::MAX,
+        filter: None,
+      },
+    ],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when Sum combine overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn function_score_boost_multiplier_overflow_is_excluded() {
+  let reader = setup_reader();
+  // A single function value that is finite, but the final `combined *= boost`
+  // step overflows. The second finitude guard (after boost) must catch it.
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 1.0e30,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: Some(1.0e30),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when final boost multiply overflows, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn function_score_max_boost_caps_combine_overflow_to_finite() {
+  let reader = setup_reader();
+  // When `max_boost` is set, it must cap the combined function score even
+  // if the combine step overflowed to `f32::INFINITY`. This works because
+  // `f32::INFINITY.min(finite) == finite`, so the doc survives with a
+  // finite, capped score. This test documents that `max_boost` protects
+  // against combine overflow, which was the existing workaround noted in
+  // BUG-315 for users who were aware of the issue.
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![
+      FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      },
+      FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      },
+    ],
+    score_mode: Some(FunctionScoreMode::Multiply),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: Some(100.0),
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "expected finite score after max_boost capping, got {}",
+      hit.score
+    );
+    assert!(
+      (hit.score - 100.0).abs() < 1e-6,
+      "expected score to be capped at max_boost=100.0, got {}",
+      hit.score
+    );
+  }
+}
+
 #[test]
 fn rescore_sort_window_excludes_non_rescored_after_removal() {
   // Regression test for BUG-291: when rescore drops hits from within the
