@@ -190,7 +190,7 @@ fn compute_hybrid_score(
   bm25_score: f32,
   plan: &VectorPlan,
   vector_scores: &[HashMap<(u32, DocId), f32>],
-) -> (f32, Option<f32>, bool) {
+) -> Option<(f32, Option<f32>, bool)> {
   let mut blended_sum = 0.0_f32;
   let mut vector_sum = 0.0_f32;
   let mut has_vector = false;
@@ -212,7 +212,20 @@ fn compute_hybrid_score(
   }
   let denom = plan.clauses.len().max(1) as f32;
   let final_score = blended_sum / denom;
-  (final_score, has_vector.then_some(vector_sum), has_vector)
+  // `blended_sum` accumulates per-clause contributions that are individually
+  // bounded but can still overflow f32 past `±f32::MAX` to `±INF` once summed
+  // across multiple clauses — notably when a doc is missing its vector in
+  // multiple L2 clauses, since `missing_vector_score(L2) = f32::MIN` is
+  // already at the edge of representable f32. A non-finite `final_score`
+  // would leak into `hit.score`, the explanation payload, and the sort key
+  // (breaking strict ordering under `NaN` and pinning the doc to a sort
+  // extreme under `±INF`). Drop the candidate instead, matching the policy
+  // enforced by `evaluate_compiled_score` (BUG-315) and the rescore
+  // combination branch (BUG-326).
+  if !final_score.is_finite() {
+    return None;
+  }
+  Some((final_score, has_vector.then_some(vector_sum), has_vector))
 }
 
 use super::scoring::{
@@ -652,7 +665,10 @@ impl IndexReader {
       for doc_id in seg_docs.into_iter() {
         let key_tuple = (segment_ord as u32, doc_id);
         let (final_score, vector_score, _) =
-          compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores);
+          match compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores) {
+            Some(t) => t,
+            None => continue,
+          };
         let key = if req.return_hits {
           let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
           if let Some(cur) = &cursor_key {
@@ -982,7 +998,10 @@ impl IndexReader {
         explanation = existing.explanation;
       }
       let (final_score, vector_score, has_vector) =
-        compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores);
+        match compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores) {
+          Some(t) => t,
+          None => continue,
+        };
       if all_vector_only && !has_vector {
         continue;
       }
@@ -5112,6 +5131,99 @@ mod tests {
       source.get("body").and_then(|v| v.as_str()),
       Some("second version"),
       "mget should return the most recent version"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_drops_candidate_on_negative_infinity() {
+    // Regression test for BUG-328. Two L2 clauses where the candidate doc is
+    // absent from both vector postings: `missing_vector_score(L2)` is
+    // `f32::MIN ≈ -3.4e38`, so `f32::MIN + f32::MIN` saturates to
+    // `f32::NEG_INFINITY` when accumulated, and the division by the clause
+    // count preserves that infinity. Before the fix the non-finite
+    // `final_score` leaked into `hit.score`, the sort key, and the
+    // `expl.final_score` payload.
+    let plan = VectorPlan {
+      clauses: vec![
+        VectorClausePlan {
+          field: "vec_a".into(),
+          vector: vec![0.1, 0.2],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+        VectorClausePlan {
+          field: "vec_b".into(),
+          vector: vec![0.3, 0.4],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+      ],
+      candidate_size: 32,
+      vector_only: true,
+    };
+    let vector_scores: Vec<HashMap<(u32, DocId), f32>> = vec![HashMap::new(), HashMap::new()];
+    let result = compute_hybrid_score((0, 1), 0.0, &plan, &vector_scores);
+    assert!(
+      result.is_none(),
+      "candidate with saturating blended_sum must be dropped rather than leaking non-finite score"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_keeps_candidate_when_finite() {
+    // Same plan shape, but both clauses have a vector score for the doc, so
+    // `blended_sum` stays bounded and a finite score flows through.
+    let plan = VectorPlan {
+      clauses: vec![
+        VectorClausePlan {
+          field: "vec_a".into(),
+          vector: vec![0.1, 0.2],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+        VectorClausePlan {
+          field: "vec_b".into(),
+          vector: vec![0.3, 0.4],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+      ],
+      candidate_size: 32,
+      vector_only: true,
+    };
+    let mut scores_a: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores_a.insert((0, 1), -0.5);
+    let mut scores_b: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores_b.insert((0, 1), -0.25);
+    let vector_scores = vec![scores_a, scores_b];
+    let result =
+      compute_hybrid_score((0, 1), 0.0, &plan, &vector_scores).expect("finite result expected");
+    assert!(
+      result.0.is_finite(),
+      "finite inputs should yield a finite final_score, got {}",
+      result.0
+    );
+    assert!(
+      result.2,
+      "has_vector should be true when both clauses contribute"
     );
   }
 }
