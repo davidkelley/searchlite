@@ -3682,7 +3682,11 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
           '-' => a - b,
           '*' => a * b,
           '/' => {
-            if b.abs() < 1e-12 {
+            // Only reject exact zero divisors. Small-but-valid non-zero divisors
+            // (e.g. `1e-13`) produce legitimate finite quotients and must be
+            // preserved. Overflow to infinity is handled by the post-operation
+            // `!result.is_finite()` guard below. Mirrors script.rs (BUG-346).
+            if b == 0.0 {
               return None;
             }
             a / b
@@ -4785,10 +4789,47 @@ mod tests {
   }
 
   #[test]
-  fn bucket_script_rejects_near_zero_division() {
+  fn bucket_script_rejects_exact_zero_division() {
     let mut vars = BTreeMap::new();
     vars.insert("a".to_string(), 1.0);
-    vars.insert("b".to_string(), 1e-14);
+    vars.insert("b".to_string(), 0.0);
+    assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_negative_zero_division() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    vars.insert("b".to_string(), -0.0);
+    assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  // BUG-346: previously the epsilon guard `b.abs() < 1e-12` silently rejected
+  // valid small divisors. Division by a small but non-zero finite divisor must
+  // produce the correct finite quotient.
+  #[test]
+  fn bucket_script_accepts_small_non_zero_divisor() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    vars.insert("b".to_string(), 1e-13);
+    let value = eval_bucket_script("a / b", &vars).unwrap();
+    assert!((value - 1e13).abs() < 1.0);
+  }
+
+  #[test]
+  fn bucket_script_accepts_tiny_numerator_and_denominator() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1e-20);
+    vars.insert("b".to_string(), 1e-13);
+    let value = eval_bucket_script("a / b", &vars).unwrap();
+    assert!((value - 1e-7).abs() < 1e-15);
+  }
+
+  #[test]
+  fn bucket_script_rejects_overflow_to_infinity() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::MAX);
+    vars.insert("b".to_string(), f64::MIN_POSITIVE);
     assert!(eval_bucket_script("a / b", &vars).is_none());
   }
 
