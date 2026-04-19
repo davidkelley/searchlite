@@ -1111,9 +1111,11 @@ fn rescore_sort_window_excludes_non_rescored_after_removal() {
 // sibling `str::parse::<f64>` fixes.
 
 fn overflow_literal(extra_zeros: usize) -> String {
-  // A plain digit string long enough to exceed f64::MAX (~1.8e308). 309
-  // digits is the minimum; pad further so we are well above the boundary
-  // and still well under `MAX_SCRIPT_LENGTH = 512`.
+  // Construct `1` followed by `extra_zeros` zeros (i.e. `10^extra_zeros`).
+  // For this specific pattern overflow to f64::INFINITY starts at
+  // `extra_zeros >= 309` (310 digits total, since `10^309 > f64::MAX`);
+  // pad further so we are well above the boundary and still well under
+  // `MAX_SCRIPT_LENGTH = 512`.
   let mut s = String::with_capacity(1 + extra_zeros);
   s.push('1');
   s.extend(std::iter::repeat_n('0', extra_zeros));
