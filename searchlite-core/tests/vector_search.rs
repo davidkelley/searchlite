@@ -691,3 +691,90 @@ fn rejects_global_cap_below_clause_count() {
     "expected validation error, got {err}"
   );
 }
+
+// BUG-330: `collect_vector_value` previously cast each JSON `f64` component
+// to `f32` via `num as f32` without validating the resulting `f32`. A finite
+// `f64` whose magnitude exceeds `f32::MAX` (~3.4e38) saturates to
+// `±f32::INFINITY` under Rust's `as` cast and was persisted into the segment,
+// then propagated through `metric_similarity` (and through `normalize_in_place`
+// on cosine, which produces an all-`NaN` vector). The fix bails when the
+// pending document is flushed to a segment, surfacing the bad input to the
+// writer instead of corrupting reads forever after.
+#[test]
+fn commit_rejects_vector_component_overflowing_f32_to_positive_inf() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  let mut writer = idx.writer().expect("writer");
+  // 1e40 is a valid JSON number; it parses to a finite f64 ≈ 1e40 but
+  // `1e40_f64 as f32` saturates to f32::INFINITY.
+  let doc = Document {
+    fields: [
+      ("_id".into(), serde_json::json!("inf-pos")),
+      ("body".into(), serde_json::json!("body")),
+      ("embedding".into(), serde_json::json!([1.0e40, 0.0])),
+    ]
+    .into_iter()
+    .collect(),
+  };
+  writer.add_document(&doc).expect("staging accepts the doc");
+  let err = writer.commit().unwrap_err().to_string();
+  assert!(
+    err.contains("non-finite"),
+    "expected non-finite component error, got {err}"
+  );
+}
+
+#[test]
+fn commit_rejects_vector_component_overflowing_f32_to_negative_inf() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  let mut writer = idx.writer().expect("writer");
+  let doc = Document {
+    fields: [
+      ("_id".into(), serde_json::json!("inf-neg")),
+      ("body".into(), serde_json::json!("body")),
+      ("embedding".into(), serde_json::json!([-1.0e40, 1.0])),
+    ]
+    .into_iter()
+    .collect(),
+  };
+  writer.add_document(&doc).expect("staging accepts the doc");
+  let err = writer.commit().unwrap_err().to_string();
+  assert!(
+    err.contains("non-finite"),
+    "expected non-finite component error, got {err}"
+  );
+}
+
+#[test]
+fn commit_accepts_vector_component_at_f32_max() {
+  // The boundary case: a value that fits in f32 (exactly f32::MAX cast to
+  // f64) must still be accepted to avoid over-rejecting legitimate inputs.
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  let mut writer = idx.writer().expect("writer");
+  let doc = Document {
+    fields: [
+      ("_id".into(), serde_json::json!("at-max")),
+      ("body".into(), serde_json::json!("body")),
+      (
+        "embedding".into(),
+        serde_json::json!([f32::MAX as f64, 0.0]),
+      ),
+    ]
+    .into_iter()
+    .collect(),
+  };
+  writer
+    .add_document(&doc)
+    .expect("finite component at f32::MAX must be accepted");
+  writer
+    .commit()
+    .expect("finite component at f32::MAX must commit");
+}
