@@ -486,9 +486,12 @@ mod tests {
   }
 
   /// Build a raw hex cursor whose score bits are set to `score_bits`.
-  /// All other fields are zero, which is enough to exercise the decode
-  /// validation path (the finitude check fires before generation/advance
-  /// checks that depend on caller-supplied state).
+  /// All other fields are zero, which is enough to exercise the decode-time
+  /// score validation path. Other cursor validity checks depend on
+  /// caller-supplied state and are enforced separately — the advance limit
+  /// (`returned <= MAX_CURSOR_ADVANCE`) runs inside `decode` before this
+  /// guard but is unaffected by zeroed bytes, and `generation` is checked
+  /// by `decode_cursor` rather than `PaginationCursor::decode`.
   fn cursor_hex_with_score_bits(score_bits: u32) -> String {
     let mut buf = [0u8; CURSOR_BYTES];
     buf[0] = CURSOR_VERSION;
