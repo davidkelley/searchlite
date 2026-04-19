@@ -1097,3 +1097,209 @@ fn rescore_sort_window_excludes_non_rescored_after_removal() {
     doc2.score
   );
 }
+
+// BUG-336: the f64 -> f32 narrowing cast in `FieldValueFactor::evaluate`,
+// `RankFeature` evaluation, and `CompiledScript::evaluate` saturates any
+// finite f64 whose magnitude exceeds `f32::MAX` (~3.4e38) to
+// `±f32::INFINITY`. Downstream non-finite guards in
+// `evaluate_compiled_score` then reject the hit, silently dropping it from
+// the result set. The fix clamps the f64 to the f32 representable range
+// before the cast so the document survives with the closest representable
+// score (`f32::MAX` / `f32::MIN`), matching the `finite_or_zero` policy used
+// in aggregations.
+
+fn weight_doc(id: &str, body: &str, weight: f64) -> Document {
+  Document {
+    fields: [
+      ("_id".to_string(), serde_json::json!(id)),
+      ("body".to_string(), serde_json::json!(body)),
+      ("weight".to_string(), serde_json::json!(weight)),
+    ]
+    .into_iter()
+    .collect(),
+  }
+}
+
+fn setup_reader_with_weight_field(weights: &[(&str, f64)]) -> searchlite_core::api::IndexReader {
+  let path = tempfile::tempdir().unwrap().path().join("idx");
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "weight".into(),
+    i64: false,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  let mut writer = idx.writer().unwrap();
+  for (id, weight) in weights {
+    writer
+      .add_document(&weight_doc(id, "rust", *weight))
+      .unwrap();
+  }
+  writer.commit().unwrap();
+  idx.reader().unwrap()
+}
+
+#[test]
+fn field_value_factor_reciprocal_overflow_preserves_document_with_f32_max() {
+  // weight = 1e-40 is a finite f64 well within the f64 range. Taking its
+  // reciprocal yields 1e40, which is finite as f64 but exceeds f32::MAX
+  // (~3.4e38). Before the fix, `modified as f32` saturated to
+  // f32::INFINITY, which the downstream non-finite guards rejected,
+  // dropping the hit from the result set. After the fix, the value is
+  // clamped to f32::MAX and the hit survives.
+  let reader = setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "weight".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::Reciprocal),
+      missing: None,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  let hit_ids = ids(&resp);
+  assert!(
+    hit_ids.contains(&"doc-small".to_string()),
+    "doc-small must survive the f64->f32 narrowing cast, got hits {hit_ids:?}"
+  );
+  let doc_small = resp
+    .hits
+    .iter()
+    .find(|h| h.doc_id == "doc-small")
+    .expect("doc-small present");
+  assert!(
+    doc_small.score.is_finite(),
+    "doc-small score must be finite after clamp, got {}",
+    doc_small.score
+  );
+  assert_eq!(
+    doc_small.score,
+    f32::MAX,
+    "doc-small score must be clamped to f32::MAX, got {}",
+    doc_small.score
+  );
+}
+
+#[test]
+fn rank_feature_reciprocal_overflow_preserves_document_with_f32_max() {
+  // Same overflow trigger as above but routed through the RankFeature
+  // score node, which performs the `modified as f32` cast independently of
+  // the FunctionScore path.
+  let reader = setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
+  let req = base_request(QueryNode::RankFeature {
+    field: "weight".into(),
+    boost: Some(1.0),
+    modifier: Some(RankFeatureModifier::Reciprocal),
+    missing: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  let hit_ids = ids(&resp);
+  assert!(
+    hit_ids.contains(&"doc-small".to_string()),
+    "doc-small must survive the f64->f32 narrowing cast, got hits {hit_ids:?}"
+  );
+  let doc_small = resp
+    .hits
+    .iter()
+    .find(|h| h.doc_id == "doc-small")
+    .expect("doc-small present");
+  assert!(
+    doc_small.score.is_finite(),
+    "doc-small score must be finite after clamp, got {}",
+    doc_small.score
+  );
+  assert_eq!(
+    doc_small.score,
+    f32::MAX,
+    "doc-small score must be clamped to f32::MAX, got {}",
+    doc_small.score
+  );
+}
+
+#[test]
+fn script_score_large_literal_overflow_preserves_document_with_f32_max() {
+  // The script tokenizer accepts params (validated finite at compile time)
+  // but a finite `f64` param larger than `f32::MAX` saturates to
+  // `f32::INFINITY` on the final `value as f32` cast at the end of
+  // `CompiledScript::evaluate`. Before the fix the hit was dropped; after
+  // the fix the score is clamped to `f32::MAX`.
+  let reader = setup_reader();
+  let mut params = BTreeMap::new();
+  params.insert("big".to_string(), 1.0e40_f64);
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "big".into(),
+    params: Some(params),
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite after clamp, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert_eq!(
+      hit.score,
+      f32::MAX,
+      "{} score must be clamped to f32::MAX, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn script_score_large_negative_literal_overflow_clamps_to_f32_min() {
+  // Symmetric negative overflow: a finite f64 below `f32::MIN` saturates
+  // to `f32::NEG_INFINITY` on the narrowing cast. The clamp should floor
+  // the result at `f32::MIN` so the hit survives with the closest
+  // representable negative score.
+  let reader = setup_reader();
+  let mut params = BTreeMap::new();
+  params.insert("big".to_string(), -1.0e40_f64);
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: "big".into(),
+    params: Some(params),
+    boost: Some(1.0),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite after clamp, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert_eq!(
+      hit.score,
+      f32::MIN,
+      "{} score must be clamped to f32::MIN, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}

@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::manifest::Schema;
-use crate::query::util::ensure_numeric_fast;
+use crate::query::util::{ensure_numeric_fast, f64_to_finite_f32};
 use crate::DocId;
 
 const MAX_SCRIPT_LENGTH: usize = 512;
@@ -142,7 +142,7 @@ impl CompiledScript {
     if !value.is_finite() {
       return None;
     }
-    Some(value as f32)
+    Some(f64_to_finite_f32(value))
   }
 }
 
