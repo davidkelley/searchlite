@@ -3007,8 +3007,8 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
       };
       AggregationResponse::Stats(StatsResponse {
         count: stats.count,
-        min: stats.min,
-        max: stats.max,
+        min: finite_or_zero(stats.min),
+        max: finite_or_zero(stats.max),
         sum: finite_or_zero(stats.sum),
         avg: finite_or_zero(avg),
       })
@@ -3027,8 +3027,8 @@ fn finalize_response(intermediate: AggregationIntermediate) -> AggregationRespon
       let std_deviation = variance.sqrt();
       AggregationResponse::ExtendedStats(crate::api::types::ExtendedStatsResponse {
         count: stats.count,
-        min: stats.min,
-        max: stats.max,
+        min: finite_or_zero(stats.min),
+        max: finite_or_zero(stats.max),
         sum: finite_or_zero(stats.sum),
         avg: finite_or_zero(avg),
         variance: finite_or_zero(variance),
@@ -4849,11 +4849,14 @@ mod tests {
   }
 
   // Regression tests for BUG-332: `Stats` and `ExtendedStats` finalization
-  // must collapse non-finite `sum`, `avg`, `variance`, and `std_deviation`
-  // values to `0.0`. `serde_json` cannot emit `NaN` / `Infinity` as JSON
-  // numbers, so leaking them fails response serialization. `merge_stats` must
-  // likewise not produce a `NaN` `m2` via an `INF - INF` delta when segments'
-  // averages sit at opposite `f64` extremes.
+  // must collapse non-finite `sum`, `avg`, `variance`, `std_deviation`,
+  // `min`, and `max` values to `0.0`. `serde_json` cannot emit `NaN` /
+  // `Infinity` as JSON numbers, so leaking them fails response
+  // serialization. `merge_stats` must likewise not produce a `NaN` `m2` via
+  // an `INF - INF` delta when segments' averages sit at opposite `f64`
+  // extremes. `min` / `max` are also guarded because a request-supplied
+  // `missing` value parsed via `str::parse::<f64>` accepts `"NaN"` /
+  // `"inf"` and would otherwise reach the response unchecked.
 
   #[test]
   fn stats_finalize_replaces_non_finite_sum_and_avg_with_zero() {
@@ -4901,6 +4904,52 @@ mod tests {
       }
       other => panic!("expected ExtendedStats, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn stats_finalize_replaces_non_finite_min_and_max_with_zero() {
+    // `missing: "NaN"` / `"inf"` strings are accepted by
+    // `f64::from_str` (see `StatsCollector::new`), producing a non-finite
+    // `StatsState.min` / `StatsState.max` that would otherwise fail
+    // `serde_json` serialization.
+    let stats = StatsState {
+      count: 5,
+      min: f64::NEG_INFINITY,
+      max: f64::INFINITY,
+      sum: 0.0,
+      m2: 0.0,
+    };
+    let response = finalize_response(AggregationIntermediate::Stats(stats));
+    match &response {
+      AggregationResponse::Stats(r) => {
+        assert_eq!(r.min, 0.0);
+        assert_eq!(r.max, 0.0);
+        assert!(r.min.is_finite());
+        assert!(r.max.is_finite());
+      }
+      other => panic!("expected Stats, got {other:?}"),
+    }
+    assert!(serde_json::to_string(&response).is_ok());
+  }
+
+  #[test]
+  fn extended_stats_finalize_replaces_nan_min_and_max_with_zero() {
+    let stats = StatsState {
+      count: 3,
+      min: f64::NAN,
+      max: f64::NAN,
+      sum: 0.0,
+      m2: 0.0,
+    };
+    let response = finalize_response(AggregationIntermediate::ExtendedStats(stats));
+    match &response {
+      AggregationResponse::ExtendedStats(r) => {
+        assert_eq!(r.min, 0.0);
+        assert_eq!(r.max, 0.0);
+      }
+      other => panic!("expected ExtendedStats, got {other:?}"),
+    }
+    assert!(serde_json::to_string(&response).is_ok());
   }
 
   #[test]
