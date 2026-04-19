@@ -1120,8 +1120,14 @@ fn weight_doc(id: &str, body: &str, weight: f64) -> Document {
   }
 }
 
-fn setup_reader_with_weight_field(weights: &[(&str, f64)]) -> searchlite_core::api::IndexReader {
-  let path = tempfile::tempdir().unwrap().path().join("idx");
+fn setup_reader_with_weight_field(
+  weights: &[(&str, f64)],
+) -> (tempfile::TempDir, searchlite_core::api::IndexReader) {
+  // Keep the `TempDir` alive for the reader's lifetime so the index
+  // directory survives for the duration of the test and is cleaned up
+  // when the caller drops the returned guard.
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().join("idx");
   let mut schema = Schema::default_text_body();
   schema.numeric_fields.push(NumericField {
     name: "weight".into(),
@@ -1148,7 +1154,7 @@ fn setup_reader_with_weight_field(weights: &[(&str, f64)]) -> searchlite_core::a
       .unwrap();
   }
   writer.commit().unwrap();
-  idx.reader().unwrap()
+  (tmp, idx.reader().unwrap())
 }
 
 #[test]
@@ -1159,7 +1165,8 @@ fn field_value_factor_reciprocal_overflow_preserves_document_with_f32_max() {
   // f32::INFINITY, which the downstream non-finite guards rejected,
   // dropping the hit from the result set. After the fix, the value is
   // clamped to f32::MAX and the hit survives.
-  let reader = setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
+  let (_tmp, reader) =
+    setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
   let req = base_request(QueryNode::FunctionScore {
     query: Box::new(QueryNode::MatchAll { boost: None }),
     functions: vec![FunctionSpec::FieldValueFactor {
@@ -1204,7 +1211,8 @@ fn rank_feature_reciprocal_overflow_preserves_document_with_f32_max() {
   // Same overflow trigger as above but routed through the RankFeature
   // score node, which performs the `modified as f32` cast independently of
   // the FunctionScore path.
-  let reader = setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
+  let (_tmp, reader) =
+    setup_reader_with_weight_field(&[("doc-small", 1.0e-40), ("doc-normal", 1.0)]);
   let req = base_request(QueryNode::RankFeature {
     field: "weight".into(),
     boost: Some(1.0),

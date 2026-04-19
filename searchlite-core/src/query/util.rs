@@ -19,9 +19,7 @@ pub(crate) fn ensure_numeric_fast(schema: &Schema, field: &str, ctx: &str) -> Re
   Ok(())
 }
 
-/// Narrow a finite `f64` to `f32`, clamping values outside the `f32`
-/// representable range to `f32::MIN` / `f32::MAX` instead of letting the
-/// narrowing cast saturate to `±f32::INFINITY`.
+/// Narrow an `f64` to a finite `f32`.
 ///
 /// Rust's `value as f32` cast saturates to `±f32::INFINITY` for any finite
 /// `f64` whose magnitude exceeds `f32::MAX` (~3.4e38). Downstream score
@@ -30,10 +28,21 @@ pub(crate) fn ensure_numeric_fast(schema: &Schema, field: &str, ctx: &str) -> Re
 /// Clamping mirrors the policy used by the `finite_or_zero` helper in
 /// `query/aggs/mod.rs` for aggregation finalization.
 ///
-/// `NaN` inputs propagate as-is (`clamp` is a no-op on `NaN`). Callers must
-/// validate finitude on the `f64` input first if they want to reject `NaN`.
+/// Behavior is finite for every input:
+/// - finite `f64` within the `f32` range → narrowed as-is,
+/// - finite `f64` outside the range → clamped to `f32::MIN` / `f32::MAX`,
+/// - `±f64::INFINITY` → clamped to `f32::MIN` / `f32::MAX`,
+/// - `f64::NAN` → `0.0`, matching the `finite_or_zero` fallback.
+///
+/// All scoring-pipeline callers validate `is_finite()` on the `f64` input
+/// before calling this helper, so the `NaN` and `±∞` branches are
+/// defensive; they keep the post-cast value finite regardless of the
+/// caller.
 #[inline]
 pub(crate) fn f64_to_finite_f32(value: f64) -> f32 {
+  if value.is_nan() {
+    return 0.0;
+  }
   value.clamp(f32::MIN as f64, f32::MAX as f64) as f32
 }
 
@@ -63,8 +72,10 @@ mod tests {
   }
 
   #[test]
-  fn f64_to_finite_f32_propagates_nan() {
-    assert!(f64_to_finite_f32(f64::NAN).is_nan());
+  fn f64_to_finite_f32_collapses_nan_to_zero() {
+    let out = f64_to_finite_f32(f64::NAN);
+    assert!(out.is_finite(), "expected finite output, got {out}");
+    assert_eq!(out, 0.0);
   }
 
   #[test]
