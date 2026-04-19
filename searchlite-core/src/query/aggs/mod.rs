@@ -4348,6 +4348,23 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
     return None;
   }
   let value: f64 = rest[..idx].parse().ok()?;
+  // Rust's `f64::from_str` returns `Ok(f64::INFINITY)` for numeric
+  // strings whose decimal magnitude exceeds the `f64` range (~1e308),
+  // rather than `Err`. The digit-and-dot prefix filter above prevents
+  // literal `"inf"`/`"NaN"` strings from reaching the parser, but a
+  // sufficiently long all-digit prefix (e.g. 310+ digits) still parses
+  // to infinity. Downstream call sites cast the result to `i64` via
+  // `as i64`, which saturates `f64::INFINITY` to `i64::MAX` — silently
+  // producing `DateInterval::Fixed(i64::MAX)` (all documents collapse
+  // into a single bucket) or an `i64::MAX` offset (every document is
+  // dropped from the aggregation), with no diagnostic for the caller.
+  // Reject non-finite parse results so overflowed intervals/offsets
+  // surface as a parse failure in the caller, mirroring the
+  // `.filter(|f| f.is_finite())` guard added to `parse_date` for
+  // BUG-338.
+  if !value.is_finite() {
+    return None;
+  }
   let suffix = &rest[idx..];
   let mult = match suffix {
     "" | "s" => 1.0,
@@ -4359,6 +4376,12 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
     _ => return None,
   };
   let magnitude = value * mult;
+  // Also reject non-finite scaled magnitudes: a finite `value` close to
+  // `f64::MAX` can still overflow to infinity after multiplication by
+  // the unit multiplier (e.g. `604_800.0` for weeks).
+  if !magnitude.is_finite() {
+    return None;
+  }
   Some(if negative { -magnitude } else { magnitude })
 }
 
@@ -4380,6 +4403,43 @@ mod tests {
   fn parse_interval_seconds_rejects_unknown_units() {
     assert_eq!(parse_interval_seconds("5x"), None);
     assert_eq!(parse_interval_seconds("10foo"), None);
+  }
+
+  // Regression tests for BUG-344: `parse_interval_seconds` must reject
+  // non-finite `f64` parse results. Rust's `f64::from_str` returns
+  // `Ok(f64::INFINITY)` for decimal strings whose magnitude exceeds the
+  // `f64` range (~1e308). Without a finitude guard, the infinity
+  // propagates through the unit-multiplier and the downstream
+  // `as i64` cast saturates to `i64::MAX`, silently producing a
+  // degenerate `date_histogram` aggregation (a single bucket at the
+  // offset, or all documents dropped via `i64::MAX` offset).
+  #[test]
+  fn parse_interval_seconds_rejects_overflowing_magnitude() {
+    // A 310-digit integer prefix overflows `f64::MAX` (~1.8e308) and
+    // `f64::from_str` returns `Ok(f64::INFINITY)` rather than `Err`.
+    let huge = "9".repeat(310);
+    assert_eq!(parse_interval_seconds(&huge), None);
+    assert_eq!(parse_interval_seconds(&format!("{huge}h")), None);
+    assert_eq!(parse_interval_seconds(&format!("{huge}ms")), None);
+    assert_eq!(parse_interval_seconds(&format!("-{huge}h")), None);
+    assert_eq!(parse_interval_seconds(&format!("+{huge}h")), None);
+  }
+
+  #[test]
+  fn parse_interval_seconds_rejects_overflow_after_multiplier() {
+    // A finite value close to `f64::MAX` can still overflow to
+    // infinity after scaling by a unit multiplier (weeks = 604_800.0).
+    // The digit-and-dot prefix filter forbids scientific notation, so
+    // we construct the value as `1` followed by 305 zeros (≈1e305),
+    // which is finite. Multiplying by `604_800.0` (weeks) yields
+    // ≈6.048e310, which exceeds `f64::MAX` (~1.7976e308) and rounds to
+    // `f64::INFINITY`.
+    let value = format!("1{}", "0".repeat(305));
+    assert_eq!(parse_interval_seconds(&format!("{value}w")), None);
+    assert_eq!(parse_interval_seconds(&format!("-{value}w")), None);
+    // Sanity check: the same value with a smaller multiplier (ms,
+    // which scales by 0.001) should still parse to a finite result.
+    assert!(parse_interval_seconds(&format!("{value}ms")).is_some_and(|f| f.is_finite()));
   }
 
   // Regression tests for BUG-296: `bucket_sort` by `_key` must compare numeric
