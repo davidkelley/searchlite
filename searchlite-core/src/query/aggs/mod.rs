@@ -1451,7 +1451,7 @@ impl<'a> DateHistogramCollector<'a> {
     let missing = agg
       .missing
       .as_ref()
-      .and_then(|s| parse_date(s).or_else(|| s.parse::<f64>().ok()))
+      .and_then(|s| parse_date(s))
       .map(|v| v as i64);
     Self {
       field: agg.field.clone(),
@@ -4275,10 +4275,21 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
 }
 
 pub(crate) fn parse_date(value: &str) -> Option<f64> {
+  // Rust's `f64::from_str` accepts `"NaN"`, `"inf"`, `"infinity"`,
+  // `"-inf"`, `"-infinity"` (case-insensitive) as valid float literals.
+  // None of these are meaningful timestamps, and letting them through
+  // the fallback lets NaN silently cast to epoch 0 and Infinity
+  // saturate to `i64::MAX` (~292 billion years) in downstream
+  // `parse_date(..) as i64` call sites — producing wrong
+  // date_histogram / date_range bounds and bypassing `min > max`
+  // guards (since `NaN > NaN` is `false`). Filter the numeric
+  // fallback to finite values so non-finite strings surface as a
+  // validation error ("not a valid date/number") at their caller.
+  // Mirrors the `parse_finite_missing_f64` guard added for BUG-334.
   chrono::DateTime::parse_from_rfc3339(value)
     .map(|dt| dt.timestamp_millis() as f64)
     .ok()
-    .or_else(|| value.parse::<f64>().ok())
+    .or_else(|| value.parse::<f64>().ok().filter(|f| f.is_finite()))
 }
 
 pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
@@ -5132,6 +5143,49 @@ mod tests {
     // collector delegates to.
     let parsed = parse_finite_missing_f64(&serde_json::json!("inf"));
     assert!(parsed.is_none());
+  }
+
+  // Regression tests for BUG-338: `parse_date` delegates to
+  // `str::parse::<f64>` when RFC 3339 parsing fails, which accepts
+  // `"NaN"` / `"inf"` / `"-inf"` / `"Infinity"` / `"-Infinity"` as
+  // valid floats. Non-finite values must not reach date_histogram
+  // `extended_bounds` / `hard_bounds` / `missing` or date_range
+  // `from` / `to`, where they would silently cast to epoch 0 or
+  // saturate to `i64::MAX` and bypass `min > max` comparison guards.
+  #[test]
+  fn parse_date_accepts_rfc3339_and_finite_epoch_millis() {
+    assert!(
+      parse_date("2026-04-19T00:00:00Z").is_some(),
+      "RFC 3339 must still parse"
+    );
+    assert_eq!(parse_date("0"), Some(0.0));
+    assert_eq!(parse_date("1234567890"), Some(1234567890.0));
+    assert_eq!(parse_date("-1234567890"), Some(-1234567890.0));
+    assert_eq!(parse_date("1.5e12"), Some(1.5e12));
+  }
+
+  #[test]
+  fn parse_date_rejects_nan_string() {
+    assert_eq!(parse_date("NaN"), None);
+    assert_eq!(parse_date("nan"), None);
+    assert_eq!(parse_date("NAN"), None);
+  }
+
+  #[test]
+  fn parse_date_rejects_infinity_strings() {
+    assert_eq!(parse_date("inf"), None);
+    assert_eq!(parse_date("Inf"), None);
+    assert_eq!(parse_date("infinity"), None);
+    assert_eq!(parse_date("Infinity"), None);
+    assert_eq!(parse_date("-inf"), None);
+    assert_eq!(parse_date("-Infinity"), None);
+    assert_eq!(parse_date("-infinity"), None);
+  }
+
+  #[test]
+  fn parse_date_rejects_non_numeric_non_rfc3339_strings() {
+    assert_eq!(parse_date(""), None);
+    assert_eq!(parse_date("not-a-date"), None);
   }
 
   #[test]

@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
-  HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation, Query, RescoreMode,
-  RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
+  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation,
+  DateRangeAggregation, Filter, HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation,
+  Query, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -2367,6 +2367,7 @@ fn validate_aggregations_in_scope(
       }
       Aggregation::DateRange(r) => {
         ensure_numeric_fast(schema, &r.field, name, scope_path)?;
+        validate_date_range_config(name, r)?;
         validate_sampling(name, &r.sampling)?;
         validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
@@ -3083,6 +3084,42 @@ fn validate_histogram_bounds(name: &str, which: &str, min: f64, max: f64) -> Res
       }
       .into(),
     );
+  }
+  Ok(())
+}
+
+fn validate_date_range_config(name: &str, agg: &DateRangeAggregation) -> Result<()> {
+  // `DateRangeCollector::new` builds each range via
+  // `from.as_deref().and_then(parse_date)` / `to.as_deref().and_then(parse_date)`
+  // and `RangeCollector::collect` treats `None` as an unbounded side. If a
+  // caller supplies a non-finite string (`"NaN"` / `"inf"` / `"-infinity"`),
+  // `parse_date` now correctly returns `None` (BUG-338), but the collector
+  // would then silently widen the bound to "unbounded" and match far more
+  // documents than intended. Surface those inputs — and any other
+  // unparseable date string — as an `InvalidConfig` error at planning time
+  // instead of letting them corrupt bucket membership. An `Option::None`
+  // (field omitted) is still legal and keeps the side open.
+  for range in &agg.ranges {
+    if let Some(from) = range.from.as_deref() {
+      if parse_date(from).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `from` `{from}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
+    if let Some(to) = range.to.as_deref() {
+      if parse_date(to).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `to` `{to}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
   }
   Ok(())
 }
