@@ -815,6 +815,164 @@ fn date_histogram_rejects_non_finite_bound_strings() {
   }
 }
 
+// Regression test for BUG-344: `parse_interval_seconds` previously
+// returned `Some(f64::INFINITY)` for duration strings whose numeric
+// prefix overflowed `f64` (~1e308). The callers cast the result to
+// `i64` via `as i64`, which saturates `f64::INFINITY` to `i64::MAX`,
+// silently producing `DateInterval::Fixed(i64::MAX)` (a single bucket
+// at the offset) or an `i64::MAX` offset (every document dropped). The
+// planner-side validator in `validate_date_histogram_config` already
+// rejects `fixed_interval` whose `parse_interval_seconds` result is
+// non-finite, but for `offset` it only checks `parse_interval_seconds
+// .is_none()` — so without the in-function finitude guard, an overflow
+// returned `Some(INFINITY)` and bypassed the check. After the fix,
+// overflow strings parse to `None` and both call sites surface the
+// expected `InvalidConfig` error.
+#[test]
+fn date_histogram_rejects_overflowing_interval_strings() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+  let reader = idx.reader().unwrap();
+
+  // A 310-digit integer prefix overflows `f64::MAX` and `f64::from_str`
+  // returns `Ok(f64::INFINITY)` rather than `Err`.
+  let overflow_digits: String = "9".repeat(310);
+  let overflow_hours = format!("{overflow_digits}h");
+
+  fn base_request(aggs: BTreeMap<String, Aggregation>) -> SearchRequest {
+    SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  // fixed_interval overflow → "must be a positive duration of at least 1ms"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: None,
+      fixed_interval: Some(overflow_hours.clone()),
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "fixed_interval overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("fixed_interval") && msg.contains("positive duration"),
+    "fixed_interval overflow: expected message about positive duration, got `{msg}`",
+  );
+
+  // offset overflow → "offset `...` is invalid"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("day".into()),
+      fixed_interval: None,
+      offset: Some(overflow_hours.clone()),
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "offset overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("offset") && msg.contains("invalid"),
+    "offset overflow: expected message about invalid offset, got `{msg}`",
+  );
+
+  // Also exercise the post-multiplier overflow path: a finite `value`
+  // close to `f64::MAX` that overflows after being multiplied by a unit
+  // multiplier (`604_800.0` for weeks).
+  let post_mult_overflow = format!("1{}w", "0".repeat(305));
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("day".into()),
+      fixed_interval: None,
+      offset: Some(post_mult_overflow),
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "offset with post-multiplier overflow should surface InvalidConfig",
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("offset") && msg.contains("invalid"),
+    "post-mult offset overflow: expected message about invalid offset, got `{msg}`",
+  );
+}
+
 #[test]
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();
