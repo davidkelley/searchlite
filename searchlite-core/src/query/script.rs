@@ -251,9 +251,20 @@ fn read_number_literal(first: char, chars: &mut Peekable<Chars<'_>>) -> Result<f
   if digit_count == 0 {
     bail!("invalid number literal `{num}`");
   }
-  num
+  // `str::parse::<f64>` returns `Ok(f64::INFINITY)` for decimal strings whose
+  // magnitude exceeds `f64::MAX` (~1.8e308) instead of surfacing an error, so
+  // a 309+ digit literal would otherwise compile to `Instruction::PushConst(
+  // f64::INFINITY)` and silently drop the document at evaluate time. Reject
+  // the overflow here, matching the parse-time policy used by `params`
+  // validation below (`"script_score param must be finite"`) and by BUG-334 /
+  // BUG-338 / BUG-344 for sibling `str::parse::<f64>` sites.
+  let value: f64 = num
     .parse::<f64>()
-    .map_err(|_| anyhow!("invalid number literal `{num}`"))
+    .map_err(|_| anyhow!("invalid number literal `{num}`"))?;
+  if !value.is_finite() {
+    bail!("number literal `{num}` overflows to infinity");
+  }
+  Ok(value)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>> {

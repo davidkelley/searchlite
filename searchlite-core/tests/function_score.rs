@@ -1097,3 +1097,120 @@ fn rescore_sort_window_excludes_non_rescored_after_removal() {
     doc2.score
   );
 }
+
+// BUG-352: `read_number_literal` called `num.parse::<f64>()` without
+// validating that the parsed value was finite. Rust's `str::parse::<f64>`
+// returns `Ok(f64::INFINITY)` for decimal strings whose magnitude exceeds
+// `f64::MAX` (~1.8e308) instead of surfacing an error, so a 309+ digit
+// literal embedded in a script compiled to `Instruction::PushConst(
+// f64::INFINITY)`. The eval-time guards in `CompiledScript::evaluate` then
+// rejected the value and returned `None`, silently dropping every matching
+// document with no error surfaced to the caller. The fix rejects the
+// literal at compile time, matching the policy already used for
+// `script_score` `params` validation and the BUG-334/BUG-338/BUG-344
+// sibling `str::parse::<f64>` fixes.
+
+fn overflow_literal(extra_zeros: usize) -> String {
+  // A plain digit string long enough to exceed f64::MAX (~1.8e308). 309
+  // digits is the minimum; pad further so we are well above the boundary
+  // and still well under `MAX_SCRIPT_LENGTH = 512`.
+  let mut s = String::with_capacity(1 + extra_zeros);
+  s.push('1');
+  s.extend(std::iter::repeat_n('0', extra_zeros));
+  s
+}
+
+#[test]
+fn script_score_overflow_number_literal_is_rejected_at_compile_time() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: overflow_literal(310),
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader.search(&req).expect_err(
+    "script_score with an f64-overflow number literal must surface a clear error, not silently drop hits",
+  );
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+#[test]
+fn script_score_overflow_number_literal_in_expression_is_rejected_at_compile_time() {
+  // The overflow surfaces regardless of where the literal appears in the
+  // script: an operator-embedded literal would previously have compiled
+  // cleanly and been caught only by an eval-time op guard, silently
+  // dropping the hit.
+  let reader = setup_reader();
+  let script = format!("{} - popularity", overflow_literal(310));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader
+    .search(&req)
+    .expect_err("operator-embedded f64-overflow literal must also surface a compile-time error");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+#[test]
+fn script_score_negative_overflow_number_literal_is_rejected_at_compile_time() {
+  // Unary `-` consumes the digit string via `read_number_literal` before
+  // negating, so the finitude check in `read_number_literal` catches the
+  // overflow before the negation site ever sees the infinity.
+  let reader = setup_reader();
+  let script = format!("-{}", overflow_literal(310));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader
+    .search(&req)
+    .expect_err("negated f64-overflow literal must surface a compile-time error");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+#[test]
+fn script_score_large_but_finite_literal_is_accepted() {
+  // Boundary check: a large-but-finite literal within f64 range must still
+  // compile and execute. Guards against an over-eager finitude check that
+  // would reject legitimate scripts. The literal used here is ~1e50 which
+  // parses to a finite f64; multiplying by 0 collapses it before the f32
+  // narrowing cast, so the final score is `popularity` which fits in f32.
+  let reader = setup_reader();
+  let script = format!("{} * 0 + popularity", "1".to_string() + &"0".repeat(50));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader
+    .search(&req)
+    .expect("finite large literal must compile and execute cleanly");
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
