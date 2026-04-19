@@ -96,15 +96,20 @@ impl PaginationCursor {
     if returned as usize > MAX_CURSOR_ADVANCE {
       bail!("cursor requests {returned} hits, which exceeds max supported {MAX_CURSOR_ADVANCE}");
     }
+    // The score bytes are reconstructed directly from user-supplied hex, so a
+    // bit pattern like 0x7F800000 (+inf) or 0x7FC00000 (NaN) is indistinguishable
+    // from a legitimate encoded score. Left unchecked these non-finite values
+    // flow into `SortKey` and silently corrupt keyset pagination under
+    // `total_cmp` (where NaN/+inf sort beyond all finite scores). Mirrors the
+    // guard added for `search_after` _score in BUG-342.
+    let score = f32::from_bits(score_bits);
+    if !score.is_finite() {
+      bail!("cursor contains non-finite score bits 0x{score_bits:08X}");
+    }
     Ok(Self {
       version,
       generation,
-      key: score_sort_key(
-        f32::from_bits(score_bits),
-        segment_ord,
-        doc_id,
-        SortOrder::Desc,
-      ),
+      key: score_sort_key(score, segment_ord, doc_id, SortOrder::Desc),
       returned,
     })
   }
@@ -143,14 +148,28 @@ impl From<SortValue> for CursorValue {
   }
 }
 
-impl From<CursorValue> for SortValue {
-  fn from(value: CursorValue) -> Self {
+impl TryFrom<CursorValue> for SortValue {
+  type Error = anyhow::Error;
+
+  fn try_from(value: CursorValue) -> Result<Self> {
     match value {
-      CursorValue::Score(bits) => SortValue::Score(f32::from_bits(bits)),
-      CursorValue::I64(v) => SortValue::I64(v),
-      CursorValue::F64(v) => SortValue::F64(v),
-      CursorValue::Str(v) => SortValue::Str(v),
-      CursorValue::Missing => SortValue::Missing,
+      // JSON-encoded cursors carry the score as a `u32` bit pattern. `serde`
+      // happily accepts any u32, including 0x7F800000 (+inf) or 0x7FC00000
+      // (NaN), so we must reject non-finite reconstructions here; otherwise
+      // the poisoned value reaches `SortKey` and silently corrupts pagination
+      // under `total_cmp`. Mirrors the hex-cursor guard above and the
+      // `search_after` guard from BUG-342.
+      CursorValue::Score(bits) => {
+        let score = f32::from_bits(bits);
+        if !score.is_finite() {
+          bail!("cursor contains non-finite score bits 0x{bits:08X}");
+        }
+        Ok(SortValue::Score(score))
+      }
+      CursorValue::I64(v) => Ok(SortValue::I64(v)),
+      CursorValue::F64(v) => Ok(SortValue::F64(v)),
+      CursorValue::Str(v) => Ok(SortValue::Str(v)),
+      CursorValue::Missing => Ok(SortValue::Missing),
     }
   }
 }
@@ -350,7 +369,12 @@ pub(crate) fn decode_cursor(
       state.returned
     );
   }
-  let values: Vec<SortValue> = state.values.into_iter().map(SortValue::from).collect();
+  let values: Vec<SortValue> = state
+    .values
+    .into_iter()
+    .map(SortValue::try_from)
+    .collect::<Result<_>>()
+    .context("decoding cursor sort values")?;
   let key = sort_plan.key_from_values(&values, state.segment_ord, state.doc_id)?;
   Ok(CursorState {
     key,
@@ -459,5 +483,105 @@ mod tests {
     // Positive control: ensure the added ASCII guard doesn't break the happy path.
     let decoded = hex_decode("deadbeef").expect("valid ASCII hex decodes");
     assert_eq!(decoded, vec![0xde, 0xad, 0xbe, 0xef]);
+  }
+
+  /// Build a raw hex cursor whose score bits are set to `score_bits`.
+  /// All other fields are zero, which is enough to exercise the decode-time
+  /// score validation path. Other cursor validity checks depend on
+  /// caller-supplied state and are enforced separately — the advance limit
+  /// (`returned <= MAX_CURSOR_ADVANCE`) runs inside `decode` before this
+  /// guard but is unaffected by zeroed bytes, and `generation` is checked
+  /// by `decode_cursor` rather than `PaginationCursor::decode`.
+  fn cursor_hex_with_score_bits(score_bits: u32) -> String {
+    let mut buf = [0u8; CURSOR_BYTES];
+    buf[0] = CURSOR_VERSION;
+    buf[5..9].copy_from_slice(&score_bits.to_be_bytes());
+    hex_encode(&buf)
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_positive_infinity_score_bits() {
+    // 0x7F800000 is the IEEE-754 f32 positive infinity bit pattern. Any
+    // legitimate encode path produces only finite scores, so surfacing this
+    // as an error prevents a crafted cursor from silently corrupting
+    // keyset pagination under `total_cmp`.
+    let encoded = cursor_hex_with_score_bits(0x7F800000);
+    let err = PaginationCursor::decode(&encoded).expect_err("expected non-finite score rejection");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("non-finite score"),
+      "unexpected error message: {msg}"
+    );
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_negative_infinity_score_bits() {
+    let encoded = cursor_hex_with_score_bits(0xFF800000);
+    let err = PaginationCursor::decode(&encoded).expect_err("expected non-finite score rejection");
+    assert!(err.to_string().contains("non-finite score"));
+  }
+
+  #[test]
+  fn pagination_cursor_rejects_nan_score_bits() {
+    // 0x7FC00000 is an IEEE-754 f32 quiet NaN bit pattern.
+    let encoded = cursor_hex_with_score_bits(0x7FC00000);
+    let err = PaginationCursor::decode(&encoded).expect_err("expected non-finite score rejection");
+    assert!(err.to_string().contains("non-finite score"));
+  }
+
+  #[test]
+  fn pagination_cursor_accepts_finite_score_bits_at_boundary() {
+    // Positive control: f32::MAX is the largest finite score and must still
+    // decode successfully after the finitude guard.
+    let encoded = cursor_hex_with_score_bits(f32::MAX.to_bits());
+    let decoded = PaginationCursor::decode(&encoded).expect("finite score bits must decode");
+    assert!(decoded.key.score_bits().is_some());
+  }
+
+  #[test]
+  fn cursor_value_try_from_rejects_non_finite_score() {
+    // JSON cursors deserialize `CursorValue::Score(u32)` straight from
+    // serde, so the u32 can encode +inf/-inf/NaN. The TryFrom conversion
+    // must reject those before they reach the sort key.
+    for bits in [0x7F800000_u32, 0xFF800000, 0x7FC00000] {
+      let err = SortValue::try_from(CursorValue::Score(bits))
+        .expect_err("non-finite score bits must be rejected");
+      assert!(
+        err.to_string().contains("non-finite score"),
+        "bits {bits:#X}: unexpected error: {err}"
+      );
+    }
+  }
+
+  #[test]
+  fn cursor_value_try_from_accepts_finite_score() {
+    let v = SortValue::try_from(CursorValue::Score(1.5_f32.to_bits()))
+      .expect("finite score must convert");
+    match v {
+      SortValue::Score(s) => assert_eq!(s, 1.5_f32),
+      other => panic!("expected Score, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn cursor_value_try_from_passes_through_non_score_variants() {
+    // Non-score variants have no finitude guard and must continue to
+    // round-trip unchanged.
+    assert!(matches!(
+      SortValue::try_from(CursorValue::I64(-7)).unwrap(),
+      SortValue::I64(-7)
+    ));
+    assert!(matches!(
+      SortValue::try_from(CursorValue::F64(2.5)).unwrap(),
+      SortValue::F64(v) if v == 2.5
+    ));
+    assert!(matches!(
+      SortValue::try_from(CursorValue::Missing).unwrap(),
+      SortValue::Missing
+    ));
+    match SortValue::try_from(CursorValue::Str("k".into())).unwrap() {
+      SortValue::Str(s) => assert_eq!(s, "k"),
+      other => panic!("expected Str, got {other:?}"),
+    }
   }
 }
