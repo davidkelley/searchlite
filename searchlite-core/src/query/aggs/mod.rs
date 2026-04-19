@@ -5105,11 +5105,13 @@ mod tests {
   }
 
   #[test]
-  fn stats_collector_missing_nan_string_does_not_corrupt_response() {
-    // End-to-end guard: a `"NaN"` missing value must not reach the
-    // collector. With the fix, the collector treats the field as having
-    // no missing default — documents without the field are excluded —
-    // and the final response serializes cleanly.
+  fn parse_finite_missing_f64_rejects_nan_on_metric_aggregation_missing_field() {
+    // Guards the call site that every numeric-stats collector uses:
+    // `agg.missing.as_ref().and_then(parse_finite_missing_f64)`. If this
+    // returns `Some(NaN)`, the collector seeds itself with a non-finite
+    // default and downstream stats / quantile math is poisoned. This test
+    // exercises the parse helper through the `MetricAggregation` JSON
+    // value — it does not execute a full `StatsCollector` pipeline.
     use crate::api::types::MetricAggregation;
     let agg = MetricAggregation {
       field: "price".to_string(),
@@ -5120,11 +5122,14 @@ mod tests {
   }
 
   #[test]
-  fn range_collector_missing_infinity_string_is_rejected() {
-    // Range buckets use `val >= from && val < to`. An `INFINITY` missing
-    // default silently excludes documents from every finite bucket (since
-    // `INF < to` is `false`). The fix rejects the string before it can
-    // reach the collector.
+  fn parse_finite_missing_f64_rejects_infinity_for_range_missing_path() {
+    // Helper-level guard for the range-aggregation `missing` path: `"inf"`
+    // must be rejected before any collector logic sees it. Range buckets
+    // use `val >= from && val < to`, so an `INFINITY` default would
+    // silently exclude documents from every finite bucket. This test does
+    // not execute a `RangeCollector`; it only verifies the parser blocks
+    // the non-finite missing default at the single chokepoint every
+    // collector delegates to.
     let parsed = parse_finite_missing_f64(&serde_json::json!("inf"));
     assert!(parsed.is_none());
   }
