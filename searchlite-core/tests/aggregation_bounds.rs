@@ -709,6 +709,112 @@ fn date_histogram_rejects_invalid_config() {
   assert!(msg.contains("extended_bounds") || msg.contains("hard_bounds"));
 }
 
+// Regression test for BUG-338: `parse_date` previously accepted
+// non-finite strings ("NaN", "inf", "-inf", "infinity", "Infinity",
+// "-infinity") via its `f64::from_str` fallback. Those values flowed
+// into `extended_bounds` / `hard_bounds` validation as `Some(NaN)` /
+// `Some(±INF)`, bypassing the `min > max` guard (`NaN > NaN` is
+// `false`) and ultimately saturating through `as i64` casts to
+// epoch 0 or `i64::MAX`. After the fix, non-finite bound strings
+// must surface as the same "not a valid date/number" InvalidConfig
+// error raised for any other unparseable value.
+#[test]
+fn date_histogram_rejects_non_finite_bound_strings() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let reader = idx.reader().unwrap();
+
+  fn request_with_extended(
+    min: &str,
+    max: &str,
+    aggs_entry: &str,
+  ) -> (BTreeMap<String, Aggregation>, SearchRequest) {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      aggs_entry.into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("day".into()),
+        fixed_interval: None,
+        offset: None,
+        format: None,
+        min_doc_count: None,
+        extended_bounds: Some(DateHistogramBounds {
+          min: min.into(),
+          max: max.into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let req = SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: aggs.clone(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    (aggs, req)
+  }
+
+  for (label, min, max) in [
+    ("nan-min", "NaN", "2024-01-02T00:00:00Z"),
+    ("nan-max", "2024-01-01T00:00:00Z", "NaN"),
+    ("nan-pair", "NaN", "NaN"),
+    ("inf-max", "2024-01-01T00:00:00Z", "inf"),
+    ("neg-inf-min", "-Infinity", "2024-01-02T00:00:00Z"),
+    ("infinity-pair", "-infinity", "infinity"),
+  ] {
+    let (_aggs, req) = request_with_extended(min, max, label);
+    let resp = reader.search(&req);
+    assert!(
+      resp.is_err(),
+      "{label}: expected InvalidConfig for non-finite bound ({min:?}, {max:?})",
+    );
+    let msg = resp.err().unwrap().to_string();
+    assert!(
+      msg.contains("not a valid date/number"),
+      "{label}: expected `not a valid date/number` in error, got `{msg}`",
+    );
+  }
+}
+
 #[test]
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();

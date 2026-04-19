@@ -691,3 +691,162 @@ fn rejects_global_cap_below_clause_count() {
     "expected validation error, got {err}"
   );
 }
+
+#[test]
+fn vector_query_with_positive_inf_component_is_rejected() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![f32::INFINITY, 0.0],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("non-finite component") && err.contains("embedding"),
+    "expected non-finite component error, got {err}"
+  );
+}
+
+#[test]
+fn vector_query_with_negative_inf_component_is_rejected_for_l2() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust vector")),
+        ("embedding".into(), serde_json::json!([0.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    vector_query: Some(VectorQuerySpec::Structured(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![f32::NEG_INFINITY, 0.0],
+      k: Some(3),
+      alpha: Some(0.5),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_filter: None,
+    ..base_request(Query::String("rust".into()), 3)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("non-finite component") && err.contains("embedding"),
+    "expected non-finite component error, got {err}"
+  );
+}
+
+#[test]
+fn vector_query_with_nan_component_is_rejected() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![0.0, f32::NAN],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("non-finite component") && err.contains("embedding"),
+    "expected non-finite component error, got {err}"
+  );
+}
+
+#[test]
+fn vector_query_with_finite_boundary_components_is_accepted() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust vector")),
+        ("embedding".into(), serde_json::json!([0.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  // f32::MAX and f32::MIN are finite boundary values; the validation guard
+  // must not reject them. The downstream L2 distance may saturate to INF
+  // inside `metric_similarity`, but that's a separate concern — this test
+  // only asserts that the request passes the finitude guard.
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![f32::MAX, f32::MIN],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let _ = reader.search(&req).expect("boundary f32 values are finite");
+}
