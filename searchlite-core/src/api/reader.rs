@@ -219,10 +219,16 @@ fn compute_hybrid_score(
   // already at the edge of representable f32. A non-finite `final_score`
   // would leak into `hit.score`, the explanation payload, and the sort key
   // (breaking strict ordering under `NaN` and pinning the doc to a sort
-  // extreme under `±INF`). Drop the candidate instead, matching the policy
-  // enforced by `evaluate_compiled_score` (BUG-315) and the rescore
-  // combination branch (BUG-326).
-  if !final_score.is_finite() {
+  // extreme under `±INF`). `vector_sum` accumulates the raw per-clause
+  // vector scores separately and flows into `hit.vector_score`; it can
+  // independently be non-finite because `collect_vector_value`
+  // (`index/segment.rs`) casts JSON `f64` components to `f32` without an
+  // `is_finite()` check, so a value past `f32::MAX` is persisted as `±INF`
+  // in the indexed vector and propagates through `metric_similarity`. Drop
+  // the candidate in either case, matching the policy enforced by
+  // `evaluate_compiled_score` (BUG-315) and the rescore combination branch
+  // (BUG-326).
+  if !final_score.is_finite() || (has_vector && !vector_sum.is_finite()) {
     return None;
   }
   Some((final_score, has_vector.then_some(vector_sum), has_vector))
@@ -5175,6 +5181,44 @@ mod tests {
     assert!(
       result.is_none(),
       "candidate with saturating blended_sum must be dropped rather than leaking non-finite score"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_drops_candidate_when_vector_sum_is_non_finite() {
+    // Regression guard for the symmetric leak path flagged during review of
+    // BUG-328: `collect_vector_value` casts JSON `f64` components to `f32`
+    // without an `is_finite()` check, so a doc indexed with a component
+    // past `f32::MAX` surfaces as `±INF` in the cached `vector_scores` map.
+    // `compute_hybrid_score` threads that raw per-clause value through
+    // `vector_sum`, which then flows into `hit.vector_score` — `Hit` serializes
+    // `vector_score` as a bare number when `Some`, so a non-finite value
+    // would break JSON serialization even when `final_score` is finite
+    // (e.g. `alpha >= 1.0` makes `final_score` equal to the finite
+    // `bm25_score`). The candidate must be dropped.
+    let plan = VectorPlan {
+      clauses: vec![VectorClausePlan {
+        field: "vec_a".into(),
+        vector: vec![0.1, 0.2],
+        k: 10,
+        alpha: 1.0,
+        ef_search: 16,
+        candidate_size: 16,
+        boost: 1.0,
+        metric: VectorMetric::Cosine,
+      }],
+      candidate_size: 16,
+      vector_only: false,
+    };
+    let mut scores: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores.insert((0, 1), f32::INFINITY);
+    let vector_scores = vec![scores];
+    let result = compute_hybrid_score((0, 1), 1.0, &plan, &vector_scores);
+    assert!(
+      result.is_none(),
+      "candidate whose raw vector_sum is non-finite must be dropped so \
+       hit.vector_score cannot leak ±INF into JSON serialization"
     );
   }
 
