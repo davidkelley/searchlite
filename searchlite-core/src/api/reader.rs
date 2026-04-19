@@ -487,6 +487,20 @@ impl IndexReader {
           vector_query.vector.len()
         );
       }
+      // Reject non-finite query vector components before they reach
+      // `normalize_in_place` (which yields NaN for cosine when any component
+      // overflows to ±INF) or `metric_similarity` (where L2 surfaces the raw
+      // ±INF into `hit.vector_score` and fails JSON serialization). Mirrors
+      // the write-side guard in `collect_vector_value` (BUG-330).
+      for (idx, value) in vector_query.vector.iter().enumerate() {
+        if !value.is_finite() {
+          bail!(
+            "vector query for field `{}` contains non-finite component at index {}",
+            vector_query.field,
+            idx
+          );
+        }
+      }
       let mut query_vec = vector_query.vector.clone();
       if matches!(
         schema_field.metric,
