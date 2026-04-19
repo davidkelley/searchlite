@@ -2112,11 +2112,12 @@ impl IndexReader {
         let combined = combine_rescore_scores(rescore.score_mode, orig_score, rescore_score);
         // Reject non-finite combined scores (BUG-326). Even though `rescore_score`
         // is guarded finite by `evaluate_compiled_score` (BUG-315) and `orig_score`
-        // is a finite f32, the combination itself can still overflow — a Sum or
-        // Multiply of two large finite values exceeds f32::MAX and yields +/-inf,
-        // and prior Multiply passes can seed inf * 0.0 = NaN on chained rescores.
-        // A non-finite value would otherwise leak into `hit.score`, `hit.key`, and
-        // the serialized JSON response; drop the doc instead, matching the
+        // is a finite f32, combining the two can still produce a non-finite value:
+        // a Sum/Total or Multiply of two large finite inputs can exceed `f32::MAX`
+        // and yield +/-inf, and a saturating Sum/Multiply that produces +inf against
+        // a finite operand of the opposite sign can then fall out as NaN. A
+        // non-finite value would otherwise leak into `hit.score`, `hit.key`, and the
+        // serialized JSON response; drop the doc instead, matching the
         // "evaluate_compiled_score returned None" branch above and the policy used
         // by `eval_rpn` (BUG-287), `combine_function_scores` (BUG-315), and the
         // pipeline-agg paths (BUG-322, BUG-324).
