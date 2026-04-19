@@ -1028,6 +1028,158 @@ fn function_score_max_boost_caps_combine_overflow_to_finite() {
   }
 }
 
+// Regression for BUG-326: the rescore `combine_rescore_scores` step had no
+// finitude guard on its output. Two individually-finite inputs (each within
+// `f32::MAX`) can still overflow when combined under `Multiply` or `Sum`, and
+// the resulting `±INF` / `NaN` would flow into `hit.score`, the sort key, and
+// the JSON response — bypassing the per-input guards that BUG-315 added to
+// `evaluate_compiled_score`. Mirrors the policy in `eval_rpn` (BUG-287),
+// `combine_function_scores` (BUG-315), and the pipeline-agg paths (BUG-322,
+// BUG-324): drop the doc when the combination is non-finite.
+#[test]
+fn rescore_multiply_overflow_excludes_hit() {
+  let reader = setup_reader();
+  // Base query: every doc scores 1.0e20 (finite f32). This survives the
+  // per-function-score finitude guard (BUG-315) because 1e20 < f32::MAX.
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 1.0e20,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore: every doc scores 1.0e20 (also finite). The combine step
+  // 1e20 * 1e20 = 1e40 overflows f32 to +INF, which must exclude the doc.
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::FunctionScore {
+      query: Box::new(QueryNode::MatchAll { boost: None }),
+      functions: vec![FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      }],
+      score_mode: Some(FunctionScoreMode::Sum),
+      boost_mode: Some(FunctionBoostMode::Replace),
+      max_boost: None,
+      min_score: None,
+      boost: None,
+    },
+    score_mode: RescoreMode::Multiply,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when rescore Multiply overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn rescore_sum_overflow_excludes_hit() {
+  let reader = setup_reader();
+  // Base query: every doc scores f32::MAX (finite, at the edge of f32).
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: f32::MAX,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Rescore: every doc scores f32::MAX. `RescoreMode::Total` aliases `Sum`
+  // (documented in the definition of `combine_rescore_scores`), so
+  // f32::MAX + f32::MAX = +INF. With the fix, the non-finite combined
+  // result drops every rescored hit.
+  req.rescore = Some(RescoreRequest {
+    window_size: 10,
+    query: QueryNode::FunctionScore {
+      query: Box::new(QueryNode::MatchAll { boost: None }),
+      functions: vec![FunctionSpec::Weight {
+        weight: f32::MAX,
+        filter: None,
+      }],
+      score_mode: Some(FunctionScoreMode::Sum),
+      boost_mode: Some(FunctionBoostMode::Replace),
+      max_boost: None,
+      min_score: None,
+      boost: None,
+    },
+    score_mode: RescoreMode::Total,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when rescore Sum overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+// A non-rescored doc (outside `window_size`) must keep its original finite
+// score even when the rescored docs in the window are dropped because their
+// combined score overflowed. Documents the interaction with the sort-window
+// shrink behaviour from BUG-291.
+#[test]
+fn rescore_multiply_overflow_preserves_non_rescored_hits() {
+  let reader = setup_reader();
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 1.0e20,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // Window only covers the first two hits; the third doc is untouched by
+  // rescore and must keep its finite original score.
+  req.rescore = Some(RescoreRequest {
+    window_size: 2,
+    query: QueryNode::FunctionScore {
+      query: Box::new(QueryNode::MatchAll { boost: None }),
+      functions: vec![FunctionSpec::Weight {
+        weight: 1.0e20,
+        filter: None,
+      }],
+      score_mode: Some(FunctionScoreMode::Sum),
+      boost_mode: Some(FunctionBoostMode::Replace),
+      max_boost: None,
+      min_score: None,
+      boost: None,
+    },
+    score_mode: RescoreMode::Multiply,
+  });
+  let resp = reader.search(&req).unwrap();
+  // The two rescored hits overflow and are dropped; the one outside-window
+  // hit survives at its original finite score.
+  assert_eq!(resp.hits.len(), 1);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "outside-window hit must keep a finite score, got {}",
+      hit.score
+    );
+    assert!(
+      (hit.score - 1.0e20).abs() < 1.0e14,
+      "outside-window hit should keep its original 1e20 score, got {}",
+      hit.score
+    );
+  }
+}
+
 #[test]
 fn rescore_sort_window_excludes_non_rescored_after_removal() {
   // Regression test for BUG-291: when rescore drops hits from within the
