@@ -14,7 +14,7 @@ use crate::query::score_functions::{
 };
 use crate::query::script::{compile_script, CompiledScript};
 use crate::query::sort::{SortKey, SortKeyPart, SortValue};
-use crate::query::util::ensure_numeric_fast as ensure_numeric_fast_field;
+use crate::query::util::{ensure_numeric_fast as ensure_numeric_fast_field, f64_to_finite_f32};
 use crate::DocId;
 
 pub(crate) fn score_sort_key(
@@ -271,6 +271,15 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       if has_score || children.is_empty() {
+        // Individual child scores are guarded for finitude by their
+        // respective nodes, but their sum can still overflow f32::MAX to
+        // infinity when many finite children accumulate. Reject non-finite
+        // sums so they do not leak into the sort key heap. Mirrors the
+        // FunctionScore, RankFeature, ScriptScore, rescore, and hybrid
+        // guards.
+        if !sum.is_finite() {
+          return None;
+        }
         Some(sum)
       } else {
         None
@@ -302,7 +311,25 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       if has_score {
-        Some(max + *tie_breaker * (sum - max))
+        // `sum` can overflow to infinity across many finite children and,
+        // when `max` is also infinite, `sum - max` is NaN so the whole
+        // expression becomes NaN. Reject non-finite results so they do not
+        // leak into the sort key heap; matches the other scoring guards.
+        //
+        // Short-circuit when `tie_breaker == 0`: `0 * ∞` is `NaN` under
+        // IEEE-754, so the naïve formula would drop the hit even though
+        // zero-tie-breaker DisMax semantics is simply `max`. `max` is
+        // always finite here because at least one child produced a finite
+        // score (child scores are guarded by their respective nodes).
+        let result = if *tie_breaker == 0.0 {
+          max
+        } else {
+          max + *tie_breaker * (sum - max)
+        };
+        if !result.is_finite() {
+          return None;
+        }
+        Some(result)
       } else {
         None
       }
@@ -347,9 +374,19 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       let mut effective_base = base_score;
-      if effective_base.abs() <= f32::EPSILON && !function_values.is_empty() {
-        // Preserve function contributions even when the base query scored 0.0,
-        // so multiplicative boost modes do not erase function-only scoring.
+      if effective_base.abs() <= f32::EPSILON
+        && !function_values.is_empty()
+        && *boost_mode == FunctionBoostMode::Multiply
+      {
+        // Preserve function contributions when the base query scored 0.0 and
+        // the boost_mode is Multiply — otherwise `0 * func = 0` would erase
+        // the function-only scoring. All other boost modes (Sum, Max, Min,
+        // Replace) already preserve the function contribution without a
+        // rewrite, so leaving `effective_base` at 0.0 gives the correct
+        // result: Sum -> `0 + func = func`, Max -> `max(0, func)`, Min ->
+        // `min(0, func)`, Replace ignores the base. Gating the rewrite on
+        // Multiply prevents an artificial +1.0 bias in Sum, a 1.0 clamp in
+        // Max when `func < 1.0`, and a 1.0 floor in Min when `func >= 1.0`.
         effective_base = 1.0;
       }
       let mut combined =
@@ -404,7 +441,7 @@ pub(crate) fn evaluate_compiled_score(
       if !modified.is_finite() {
         return None;
       }
-      let score = (modified as f32) * *boost;
+      let score = f64_to_finite_f32(modified) * *boost;
       if !score.is_finite() {
         return None;
       }

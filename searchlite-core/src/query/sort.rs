@@ -261,7 +261,16 @@ impl SortPlan {
           let f = n
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
-          SortValue::Score(f as f32)
+          // Narrow from f64 to f32 explicitly so a finite JSON number larger
+          // than f32::MAX (which Rust's `as` cast saturates to ±f32::INFINITY)
+          // is rejected here rather than poisoning the sort key and silently
+          // corrupting pagination via `total_cmp`. Mirrors the write-side
+          // guards in BUG-330 (collect_vector_value) and BUG-336 (scoring).
+          let score = f as f32;
+          if !score.is_finite() {
+            bail!("search_after _score value must fit in a finite f32 (received {f})");
+          }
+          SortValue::Score(score)
         }
         (SortField::Keyword(_), Value::String(s)) => SortValue::Str(s.clone()),
         (SortField::I64(_), Value::Number(n)) => {
@@ -487,6 +496,76 @@ mod tests {
     };
     assert!(higher_asc > key_asc);
     assert!(higher_desc < key_desc);
+  }
+
+  fn score_sort_plan() -> SortPlan {
+    let schema = Schema {
+      doc_id_field: crate::index::manifest::default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    SortPlan::from_request(&schema, &[]).unwrap()
+  }
+
+  #[test]
+  fn values_from_json_rejects_score_overflow_to_positive_inf() {
+    // `1e40` is a valid finite JSON number (well within f64::MAX) but larger
+    // than f32::MAX, so `f as f32` saturates to `f32::INFINITY`. Feeding that
+    // poisoned value into the sort key via `search_after` silently corrupts
+    // pagination comparisons under `total_cmp`; the decode must bail.
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(1.0e40_f64)];
+    let err = plan.values_from_json(&raw).unwrap_err();
+    assert!(
+      err.to_string().contains("finite f32"),
+      "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn values_from_json_rejects_score_overflow_to_negative_inf() {
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(-1.0e40_f64)];
+    let err = plan.values_from_json(&raw).unwrap_err();
+    assert!(
+      err.to_string().contains("finite f32"),
+      "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn values_from_json_accepts_score_at_f32_max() {
+    // Boundary: `f32::MAX as f64` round-trips through the cast unchanged and
+    // must continue to be accepted so legitimate large-but-finite scores are
+    // not over-rejected.
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(f32::MAX as f64)];
+    let values = plan.values_from_json(&raw).unwrap();
+    assert_eq!(values.len(), 1);
+    match &values[0] {
+      SortValue::Score(v) => {
+        assert!(v.is_finite());
+        assert_eq!(*v, f32::MAX);
+      }
+      other => panic!("expected SortValue::Score, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn values_from_json_accepts_small_finite_score() {
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(0.5_f64)];
+    let values = plan.values_from_json(&raw).unwrap();
+    assert_eq!(values.len(), 1);
+    match &values[0] {
+      SortValue::Score(v) => assert_eq!(*v, 0.5_f32),
+      other => panic!("expected SortValue::Score, got {other:?}"),
+    }
   }
 
   #[test]

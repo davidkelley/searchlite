@@ -7,7 +7,7 @@ use crate::api::types::{
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::manifest::Schema;
 use crate::query::filters::passes_filter;
-use crate::query::util::ensure_numeric_fast;
+use crate::query::util::{ensure_numeric_fast, f64_to_finite_f32};
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -161,7 +161,7 @@ impl CompiledFunction {
         if !modified.is_finite() {
           return None;
         }
-        Some(modified as f32)
+        Some(f64_to_finite_f32(modified))
       }
       CompiledFunction::Decay {
         field,
@@ -180,7 +180,7 @@ impl CompiledFunction {
         let norm = (distance.max(0.0)) / *scale;
         let score = decay_value(*decay, norm, function);
         if score.is_finite() {
-          Some(score as f32)
+          Some(f64_to_finite_f32(score))
         } else {
           None
         }
