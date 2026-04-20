@@ -315,7 +315,17 @@ pub(crate) fn evaluate_compiled_score(
         // when `max` is also infinite, `sum - max` is NaN so the whole
         // expression becomes NaN. Reject non-finite results so they do not
         // leak into the sort key heap; matches the other scoring guards.
-        let result = max + *tie_breaker * (sum - max);
+        //
+        // Short-circuit when `tie_breaker == 0`: `0 * ∞` is `NaN` under
+        // IEEE-754, so the naïve formula would drop the hit even though
+        // zero-tie-breaker DisMax semantics is simply `max`. `max` is
+        // always finite here because at least one child produced a finite
+        // score (child scores are guarded by their respective nodes).
+        let result = if *tie_breaker == 0.0 {
+          max
+        } else {
+          max + *tie_breaker * (sum - max)
+        };
         if !result.is_finite() {
           return None;
         }

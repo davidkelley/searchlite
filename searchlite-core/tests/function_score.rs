@@ -1444,6 +1444,62 @@ fn dismax_node_rejects_document_when_accumulated_sum_overflows() {
 }
 
 #[test]
+fn dismax_node_preserves_max_when_tie_breaker_is_zero_and_sum_overflows() {
+  let reader = setup_reader();
+  // With `tie_breaker == 0` the DisMax formula reduces to `max` by
+  // definition. Naïve evaluation of `max + 0 * (sum - max)` becomes
+  // `max + 0 * ∞ = max + NaN = NaN` when `sum` overflows — even though
+  // semantically the hit should be preserved with score `max`. The
+  // short-circuit must return `max` directly so the hit survives.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.0),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert!(
+      (hit.score - f32::MAX).abs() < f32::EPSILON * f32::MAX,
+      "{} score must equal max=f32::MAX, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
 fn sum_node_keeps_document_when_children_sum_stays_finite() {
   let reader = setup_reader();
   // Boundary check: children whose Sum fits within f32 must still produce
