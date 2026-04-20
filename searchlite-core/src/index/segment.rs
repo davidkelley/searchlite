@@ -511,7 +511,11 @@ fn collect_vector_value(
     let Some(num) = v.as_f64() else {
       bail!("vector field {field} must contain numbers");
     };
-    vecvals.push(num as f32);
+    let num_f32 = num as f32;
+    if !num_f32.is_finite() {
+      bail!("vector field {field} contains non-finite component");
+    }
+    vecvals.push(num_f32);
   }
   if vecvals.len() != vf.dim {
     bail!(
