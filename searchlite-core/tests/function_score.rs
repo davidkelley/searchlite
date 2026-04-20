@@ -2053,6 +2053,135 @@ fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
   );
 }
 
+// Regression test for BUG-376: when `score_fast_path` is active (sort by
+// `_score` desc, no `track_total_hits`, no aggs) and a score hook
+// (function_score/script_score/rank_feature) amplifies scores above BM25
+// upper bounds, WAND's dynamic threshold pruning terminates early because
+// the heap threshold — now an adjusted-score minimum — exceeds the sum of
+// remaining BM25 term upper bounds. Documents that would have ranked in the
+// top-k after adjustment are silently dropped.
+#[test]
+fn wand_does_not_prune_against_amplified_scores_on_fast_path() {
+  let path = tempfile::tempdir().unwrap().path().join("idx");
+  let mut schema = Schema::default_text_body();
+  schema.keyword_fields.push(KeywordField {
+    name: "boosted".into(),
+    stored: true,
+    indexed: true,
+    fast: true,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  let mut writer = idx.writer().unwrap();
+  // All documents match the boost filter (boosted = "yes") and contain
+  // "common". Term frequency increases with doc_id so doc-2 has the highest
+  // BM25, indexed last. With weight=100 multiplicative boost, the early
+  // docs' adjusted scores fill the heap with a threshold far above any
+  // term's BM25 upper bound. The buggy WAND terminates before reaching the
+  // latest doc (doc-2), returning doc-1 instead of doc-2 as the top hit.
+  for d in [
+    Document {
+      fields: [
+        ("_id".to_string(), serde_json::json!("doc-0")),
+        ("body".to_string(), serde_json::json!("common")),
+        ("boosted".to_string(), serde_json::json!("yes")),
+      ]
+      .into_iter()
+      .collect(),
+    },
+    Document {
+      fields: [
+        ("_id".to_string(), serde_json::json!("doc-1")),
+        ("body".to_string(), serde_json::json!("common common")),
+        ("boosted".to_string(), serde_json::json!("yes")),
+      ]
+      .into_iter()
+      .collect(),
+    },
+    Document {
+      fields: [
+        ("_id".to_string(), serde_json::json!("doc-2")),
+        (
+          "body".to_string(),
+          serde_json::json!("common common common common"),
+        ),
+        ("boosted".to_string(), serde_json::json!("yes")),
+      ]
+      .into_iter()
+      .collect(),
+    },
+  ] {
+    writer.add_document(&d).unwrap();
+  }
+  writer.commit().unwrap();
+  let reader = idx.reader().unwrap();
+
+  let mut req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::Term {
+      field: "body".into(),
+      value: "common".into(),
+      boost: None,
+    }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 100.0,
+      filter: Some(Filter::KeywordEq {
+        field: "boosted".into(),
+        value: "yes".into(),
+      }),
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Multiply),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  // size=1 (top_k=2 internally) is the minimal setting that forces the
+  // heap to fill before the last document is examined. Once the heap
+  // holds two adjusted-score hits, the heap threshold climbs well above
+  // any BM25 upper bound. `track_total_hits = false` (the default) is
+  // what activates `score_fast_path` — the code path with the bug.
+  req.limit = 1;
+
+  let resp = reader.search(&req).unwrap();
+  let ids: Vec<String> = resp.hits.iter().map(|h| h.doc_id.clone()).collect();
+
+  assert_eq!(
+    ids,
+    vec!["doc-2".to_string()],
+    "top-1 must be doc-2 (highest BM25 * 100); got {:?}",
+    ids
+  );
+  let top = &resp.hits[0];
+  assert!(
+    top.score.is_finite(),
+    "score must be finite, got {}",
+    top.score
+  );
+
+  // Compare against the `track_total_hits = true` path, which disables
+  // `score_fast_path` entirely and therefore has never been affected by
+  // the WAND pruning bug. The two paths must agree on the top hit.
+  let mut req_total = req.clone();
+  req_total.track_total_hits = Some(true);
+  let resp_total = reader.search(&req_total).unwrap();
+  let ids_total: Vec<String> = resp_total.hits.iter().map(|h| h.doc_id.clone()).collect();
+  assert_eq!(
+    ids, ids_total,
+    "fast-path top-k must match the track_total_hits=true path (which doesn't trigger WAND pruning); fast={:?} full={:?}",
+    ids, ids_total
+  );
+}
+
 #[test]
 fn constant_score_keeps_document_when_boost_product_stays_finite() {
   let reader = setup_reader();
