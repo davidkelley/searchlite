@@ -1277,8 +1277,27 @@ impl<'a> HistogramCollector<'a> {
     }
   }
 
-  fn bucket_key(&self, val: f64) -> i64 {
-    ((val - self.offset) / self.interval).floor() as i64
+  /// Map a document value to its bucket id, returning `None` when the quotient
+  /// cannot be represented as an `i64` without loss.
+  ///
+  /// `interval` is validated finite and positive in `validate_histogram_config`
+  /// and `offset` is validated finite, but the document value `val` comes
+  /// unvalidated from the fast-field store. Two independent overflow modes
+  /// must be rejected here so neither silently coalesces documents into a
+  /// saturated bucket id with a wrong reconstructed key (BUG-358):
+  ///
+  /// 1. `(val - offset) / interval` itself overflows f64 to `±Infinity` (for
+  ///    example `f64::MAX / 0.5`). `.floor() as i64` then saturates to
+  ///    `i64::MAX` / `i64::MIN`.
+  /// 2. The quotient stays a finite f64 but exceeds the `i64` representable
+  ///    range (for example `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`). The
+  ///    `as i64` saturating cast again silently coalesces to `i64::MAX`.
+  ///
+  /// Both shapes previously produced a bucket key orders of magnitude away
+  /// from the document value and coalesced unrelated documents. Matches the
+  /// composite-histogram finitude guard added in BUG-356.
+  fn bucket_key(&self, val: f64) -> Option<i64> {
+    finite_bucket_id(val, self.offset, self.interval)
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
@@ -1291,7 +1310,9 @@ impl<'a> HistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
-      let bucket_id = self.bucket_key(val);
+      let Some(bucket_id) = self.bucket_key(val) else {
+        continue;
+      };
       if let Some((min, max)) = self.hard_bounds {
         let bucket_val = bucket_id as f64 * self.interval + self.offset;
         if bucket_val < min || bucket_val >= max {
@@ -1329,7 +1350,7 @@ impl<'a> HistogramCollector<'a> {
     let extended_bounds = self.extended_bounds;
     let hard_bounds = self.hard_bounds;
     let mut buckets = self.buckets;
-    let bucket_key = |val: f64| ((val - offset) / interval).floor() as i64;
+    let bucket_key = |val: f64| finite_bucket_id(val, offset, interval);
     let bucket_value = |bucket_id: i64| bucket_id as f64 * interval + offset;
     // Defense-in-depth: the request validator rejects non-finite / non-positive
     // intervals (see `validate_histogram_config`). Skip bounds materialization
@@ -1346,29 +1367,37 @@ impl<'a> HistogramCollector<'a> {
     // violate the hard cap even if that validation is ever weakened or bypassed.
     let fill_range = intersect_fill_range_f64(extended_bounds, hard_bounds);
     if bounds_materializable {
+      // Mirror the collector-side BUG-358 guard: both fill-range endpoints must
+      // map to a representable `i64` bucket id. The request validator rejects
+      // non-finite `extended_bounds` / `hard_bounds` values and caps the span
+      // at `MAX_BUCKETS`, so in practice both endpoints are finite; this guard
+      // is belt-and-braces so a degenerate combination (e.g. a bounds value
+      // whose quotient saturates `as i64`) cannot materialize a bucket at a
+      // wrong reconstructed key.
       if let Some((min, max)) = fill_range {
-        let mut bucket_id = bucket_key(min);
-        let end = bucket_key(max);
-        let mut materialized: usize = 0;
-        while bucket_id <= end {
-          buckets.entry(bucket_id).or_insert_with(|| BucketState {
-            key: serde_json::Value::Number(
-              serde_json::Number::from_f64(bucket_value(bucket_id))
-                .unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-            doc_count: 0,
-            aggs: BTreeMap::new(),
-          });
-          // Guard against saturating-cast + wrapping addition producing an
-          // infinite loop if somehow `end == i64::MAX` (belt-and-braces: the
-          // validator caps the span well below this).
-          let Some(next) = bucket_id.checked_add(1) else {
-            break;
-          };
-          bucket_id = next;
-          materialized = materialized.saturating_add(1);
-          if materialized >= MAX_BUCKETS {
-            break;
+        if let (Some(start), Some(end)) = (bucket_key(min), bucket_key(max)) {
+          let mut bucket_id = start;
+          let mut materialized: usize = 0;
+          while bucket_id <= end {
+            buckets.entry(bucket_id).or_insert_with(|| BucketState {
+              key: serde_json::Value::Number(
+                serde_json::Number::from_f64(bucket_value(bucket_id))
+                  .unwrap_or_else(|| serde_json::Number::from(0)),
+              ),
+              doc_count: 0,
+              aggs: BTreeMap::new(),
+            });
+            // Guard against saturating-cast + wrapping addition producing an
+            // infinite loop if somehow `end == i64::MAX` (belt-and-braces: the
+            // validator caps the span well below this).
+            let Some(next) = bucket_id.checked_add(1) else {
+              break;
+            };
+            bucket_id = next;
+            materialized = materialized.saturating_add(1);
+            if materialized >= MAX_BUCKETS {
+              break;
+            }
           }
         }
       }
@@ -3256,8 +3285,20 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
+        // Reject non-finite results (BUG-324). An upstream metric that
+        // overflows to +/-inf (or produces NaN via inf - inf) would otherwise
+        // propagate the bad value into the response and into any downstream
+        // pipeline that consumes it, bypassing those pipelines' own input-side
+        // guards. Mirrors the policy used by eval_rpn (BUG-287),
+        // combine_function_scores (BUG-315), and derivative/moving_avg
+        // (BUG-322).
         let value = if count > 0 {
-          Some(sum / count as f64)
+          let avg = sum / count as f64;
+          if avg.is_finite() {
+            Some(avg)
+          } else {
+            None
+          }
         } else {
           None
         };
@@ -3275,7 +3316,14 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
-        let value = if count > 0 { Some(sum) } else { None };
+        // Reject non-finite results (BUG-324); see AvgBucket above for the
+        // rationale. sum_bucket is a direct pass-through of the accumulator so
+        // a single +/-inf upstream input would otherwise leak unchanged.
+        let value = if count > 0 && sum.is_finite() {
+          Some(sum)
+        } else {
+          None
+        };
         responses.insert(
           name.to_string(),
           AggregationResponse::SumBucket(OptionalBucketMetricResponse { value }),
@@ -4054,6 +4102,34 @@ fn hash_cardinality<T: Hash>(value: &T) -> u64 {
 
 fn default_percentiles_list() -> Vec<f64> {
   vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+}
+
+/// Map `(val - offset) / interval` to a bucket id, returning `None` when the
+/// quotient cannot be represented as an `i64` without loss (BUG-358).
+///
+/// Two overflow modes must be rejected for histogram arithmetic so that
+/// documents whose bucket id would saturate the `as i64` cast are dropped
+/// rather than silently coalesced into a shared `i64::MAX` / `i64::MIN` bucket
+/// with a wrong reconstructed key:
+///
+/// 1. The quotient itself overflows f64 to `±Infinity` (for example
+///    `f64::MAX / 0.5`); `is_finite()` rejects this shape.
+/// 2. The quotient stays a finite f64 but exceeds the `i64` representable
+///    range (for example `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`); the
+///    magnitude comparison against `i64::MAX as f64 = 2^63` rejects this
+///    shape.
+///
+/// Note: `i64::MAX as f64` rounds up to `2^63` because `2^63 - 1` is not
+/// representable in f64, so the upper bound uses `>=` to keep every `q` whose
+/// saturating cast would exceed `i64::MAX`. The lower bound uses the exactly
+/// representable `i64::MIN as f64 = -2^63`; a `q` equal to that bound is
+/// still a valid id because `(-2^63) as i64 == i64::MIN`.
+fn finite_bucket_id(val: f64, offset: f64, interval: f64) -> Option<i64> {
+  let q = ((val - offset) / interval).floor();
+  if !q.is_finite() || q >= (i64::MAX as f64) || q < (i64::MIN as f64) {
+    return None;
+  }
+  Some(q as i64)
 }
 
 /// Compute the effective fill range for `HistogramCollector::finish`.
@@ -5439,6 +5515,57 @@ mod tests {
     let a = sampler.sample_value(0, 42);
     let b = sampler.sample_value(1, 42);
     assert_ne!(a, b);
+  }
+
+  /// BUG-358: `finite_bucket_id` must reject quotients that overflow f64 to
+  /// `±Infinity` and finite quotients that exceed the `i64` representable
+  /// range. Both shapes would otherwise saturate via `as i64` and coalesce
+  /// documents into a wrong bucket.
+  #[test]
+  fn finite_bucket_id_rejects_quotient_overflow_to_infinity() {
+    // f64::MAX / 0.5 saturates the division to f64::INFINITY.
+    assert_eq!(finite_bucket_id(f64::MAX, 0.0, 0.5), None);
+    assert_eq!(finite_bucket_id(-f64::MAX, 0.0, 0.5), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_rejects_finite_quotient_above_i64_max() {
+    // 1e16 / 0.001 = 1e19 — finite f64 but above i64::MAX ≈ 9.22e18.
+    assert_eq!(finite_bucket_id(1e16, 0.0, 0.001), None);
+    assert_eq!(finite_bucket_id(-1e16, 0.0, 0.001), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_rejects_non_finite_inputs() {
+    // Non-finite `val` propagates to a non-finite quotient.
+    assert_eq!(finite_bucket_id(f64::INFINITY, 0.0, 1.0), None);
+    assert_eq!(finite_bucket_id(f64::NEG_INFINITY, 0.0, 1.0), None);
+    assert_eq!(finite_bucket_id(f64::NAN, 0.0, 1.0), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_accepts_values_inside_i64_range() {
+    // Simple in-range cases round-trip as expected.
+    assert_eq!(finite_bucket_id(5.0, 0.0, 1.0), Some(5));
+    assert_eq!(finite_bucket_id(25.0, 0.0, 10.0), Some(2));
+    assert_eq!(finite_bucket_id(-0.5, 0.0, 1.0), Some(-1));
+    // Offsets are applied before the division.
+    assert_eq!(finite_bucket_id(25.0, 5.0, 10.0), Some(2));
+    // Large-but-safe quotient (well below i64::MAX ≈ 9.22e18).
+    assert_eq!(finite_bucket_id(1e10, 0.0, 1.0), Some(1e10 as i64));
+  }
+
+  #[test]
+  fn finite_bucket_id_boundary_is_rejected() {
+    // `i64::MAX as f64` == `2^63` (rounded up because `2^63 - 1` is not
+    // representable in f64). A `q` exactly at this boundary would saturate
+    // to `i64::MAX` under `as i64`, so the guard must reject it via `>=`.
+    let boundary = i64::MAX as f64;
+    assert_eq!(finite_bucket_id(boundary, 0.0, 1.0), None);
+    // `i64::MIN as f64` == `-2^63`, which is exactly representable and
+    // casts back to `i64::MIN` — legitimate, so the guard accepts it.
+    let neg_boundary = i64::MIN as f64;
+    assert_eq!(finite_bucket_id(neg_boundary, 0.0, 1.0), Some(i64::MIN));
   }
 
   #[test]
@@ -7681,6 +7808,242 @@ mod tests {
         assert_eq!(val.value, Some(0.0));
       }
       other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume sum_bucket's output.
+  /// Mirrors eval_rpn (BUG-287), combine_function_scores (BUG-315), and
+  /// derivative/moving_avg (BUG-322).
+  #[test]
+  fn sum_bucket_rejects_non_finite_accumulated_sum() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject non-finite accumulated sum, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject NaN produced by summing
+  /// +inf and -inf across buckets.
+  #[test]
+  fn sum_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject NaN (inf + -inf), got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume avg_bucket's output.
+  #[test]
+  fn avg_bucket_rejects_non_finite_accumulated_average() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject non-finite average, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject NaN produced when a
+  /// +inf and -inf combine in the running sum before the division.
+  #[test]
+  fn avg_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject NaN (inf + -inf)/n, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
     }
   }
 }

@@ -1340,6 +1340,264 @@ fn script_score_negative_overflow_number_literal_is_rejected_at_compile_time() {
   );
 }
 
+// Regression: the `Sum` and `DisMax` arms of `evaluate_compiled_score`
+// previously accumulated child scores without a finitude guard. Every other
+// scoring path (FunctionScore, RankFeature, ScriptScore, rescore, hybrid)
+// rejects non-finite accumulated scores, but the top-level aggregation
+// nodes did not. When individually-finite children summed past f32::MAX,
+// the accumulator overflowed to ±INFINITY (or NaN, in the DisMax path
+// where `sum - max` is `∞ - ∞`) and leaked into the sort key heap,
+// silently corrupting ordering. See BUG-364.
+#[test]
+fn sum_node_rejects_document_when_children_overflow_to_infinity() {
+  let reader = setup_reader();
+  // Two FunctionScore children in a Bool `must`. Each child returns a
+  // finite `f32::MAX` via Replace of a weight function, but their Sum
+  // overflows to +INFINITY. The outer Sum must now return None and the
+  // document must be excluded.
+  let req = base_request(QueryNode::Bool {
+    must: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when Sum of children overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn dismax_node_rejects_document_when_accumulated_sum_overflows() {
+  let reader = setup_reader();
+  // Two FunctionScore children under a DisMax with tie_breaker > 0. Each
+  // child returns a finite `f32::MAX`. `max` is finite but `sum`
+  // overflows to +INFINITY, so `max + tie_breaker * (sum - max)` is
+  // +INFINITY. The outer DisMax must now reject the document.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.5),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when DisMax accumulated sum overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn dismax_node_preserves_max_when_tie_breaker_is_zero_and_sum_overflows() {
+  let reader = setup_reader();
+  // With `tie_breaker == 0` the DisMax formula reduces to `max` by
+  // definition. Naïve evaluation of `max + 0 * (sum - max)` becomes
+  // `max + 0 * ∞ = max + NaN = NaN` when `sum` overflows — even though
+  // semantically the hit should be preserved with score `max`. The
+  // short-circuit must return `max` directly so the hit survives.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.0),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert!(
+      (hit.score - f32::MAX).abs() < f32::EPSILON * f32::MAX,
+      "{} score must equal max=f32::MAX, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn sum_node_keeps_document_when_children_sum_stays_finite() {
+  let reader = setup_reader();
+  // Boundary check: children whose Sum fits within f32 must still produce
+  // hits. Guards against an over-eager finitude check that would reject
+  // legitimate scores. Two children at `f32::MAX / 4.0` sum to
+  // ~`f32::MAX / 2.0`, comfortably finite.
+  let req = base_request(QueryNode::Bool {
+    must: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn dismax_node_keeps_document_when_accumulated_sum_stays_finite() {
+  let reader = setup_reader();
+  // Boundary check for DisMax: two finite children whose `sum` stays
+  // below f32::MAX must still produce hits and finite scores.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.5),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
 #[test]
 fn script_score_large_but_finite_literal_is_accepted() {
   // Boundary check: a large-but-finite literal within f64 range must still

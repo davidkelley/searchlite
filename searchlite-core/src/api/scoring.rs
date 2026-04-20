@@ -271,6 +271,15 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       if has_score || children.is_empty() {
+        // Individual child scores are guarded for finitude by their
+        // respective nodes, but their sum can still overflow f32::MAX to
+        // infinity when many finite children accumulate. Reject non-finite
+        // sums so they do not leak into the sort key heap. Mirrors the
+        // FunctionScore, RankFeature, ScriptScore, rescore, and hybrid
+        // guards.
+        if !sum.is_finite() {
+          return None;
+        }
         Some(sum)
       } else {
         None
@@ -302,7 +311,25 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       if has_score {
-        Some(max + *tie_breaker * (sum - max))
+        // `sum` can overflow to infinity across many finite children and,
+        // when `max` is also infinite, `sum - max` is NaN so the whole
+        // expression becomes NaN. Reject non-finite results so they do not
+        // leak into the sort key heap; matches the other scoring guards.
+        //
+        // Short-circuit when `tie_breaker == 0`: `0 * ∞` is `NaN` under
+        // IEEE-754, so the naïve formula would drop the hit even though
+        // zero-tie-breaker DisMax semantics is simply `max`. `max` is
+        // always finite here because at least one child produced a finite
+        // score (child scores are guarded by their respective nodes).
+        let result = if *tie_breaker == 0.0 {
+          max
+        } else {
+          max + *tie_breaker * (sum - max)
+        };
+        if !result.is_finite() {
+          return None;
+        }
+        Some(result)
       } else {
         None
       }
