@@ -398,9 +398,11 @@ fn expand_synonyms(tokens: Vec<Token>, rules: &[SynonymRule]) -> Vec<Token> {
         .zip(tokens[i..].iter())
         .all(|(from, tok)| from == &tok.text)
       {
-        for offset in 0..rule.from.len() {
-          out.push(tokens[i + offset].clone());
-        }
+        // Emit the first matched token, then the synonyms sharing its
+        // position, then the remaining matched tokens. Placing the synonyms
+        // immediately after the first match keeps the position sequence
+        // monotonic so `resequence_positions` coalesces them correctly.
+        out.push(tokens[i].clone());
         if !rule.to.is_empty() {
           let pos = tokens[i].position;
           for to in rule.to.iter() {
@@ -409,6 +411,9 @@ fn expand_synonyms(tokens: Vec<Token>, rules: &[SynonymRule]) -> Vec<Token> {
               position: pos,
             });
           }
+        }
+        for offset in 1..rule.from.len() {
+          out.push(tokens[i + offset].clone());
         }
         i += rule.from.len();
         matched = true;
@@ -556,6 +561,93 @@ mod tests {
         ("new".into(), 0),
         ("york".into(), 0),
         ("subway".into(), 1)
+      ]
+    );
+  }
+
+  #[test]
+  fn synonyms_multi_token_from_shares_first_match_position() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::Synonyms(vec![SynonymRule {
+        from: vec!["new".into(), "york".into()],
+        to: vec!["nyc".into()],
+      }])],
+      "hello new york subway",
+    );
+    let texts: Vec<(String, u32)> = tokens.into_iter().map(|t| (t.text, t.position)).collect();
+    assert_eq!(
+      texts,
+      vec![
+        ("hello".into(), 0),
+        ("new".into(), 1),
+        ("nyc".into(), 1),
+        ("york".into(), 2),
+        ("subway".into(), 3),
+      ]
+    );
+  }
+
+  #[test]
+  fn synonyms_multi_token_from_multi_token_to_shares_first_match_position() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::Synonyms(vec![SynonymRule {
+        from: vec!["new".into(), "york".into()],
+        to: vec!["big".into(), "apple".into()],
+      }])],
+      "hello new york subway",
+    );
+    let texts: Vec<(String, u32)> = tokens.into_iter().map(|t| (t.text, t.position)).collect();
+    assert_eq!(
+      texts,
+      vec![
+        ("hello".into(), 0),
+        ("new".into(), 1),
+        ("big".into(), 1),
+        ("apple".into(), 1),
+        ("york".into(), 2),
+        ("subway".into(), 3),
+      ]
+    );
+  }
+
+  #[test]
+  fn synonyms_multi_token_from_at_input_start() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::Synonyms(vec![SynonymRule {
+        from: vec!["new".into(), "york".into()],
+        to: vec!["nyc".into()],
+      }])],
+      "new york city",
+    );
+    let texts: Vec<(String, u32)> = tokens.into_iter().map(|t| (t.text, t.position)).collect();
+    assert_eq!(
+      texts,
+      vec![
+        ("new".into(), 0),
+        ("nyc".into(), 0),
+        ("york".into(), 1),
+        ("city".into(), 2),
+      ]
+    );
+  }
+
+  #[test]
+  fn synonyms_multi_token_from_empty_to_drops_nothing() {
+    let tokens = analyze_with(
+      vec![TokenFilterDef::Synonyms(vec![SynonymRule {
+        from: vec!["new".into(), "york".into()],
+        to: vec![],
+      }])],
+      "hello new york subway",
+    );
+    let texts: Vec<(String, u32)> = tokens.into_iter().map(|t| (t.text, t.position)).collect();
+    assert_eq!(
+      texts,
+      vec![
+        ("hello".into(), 0),
+        ("new".into(), 1),
+        ("york".into(), 2),
+        ("subway".into(), 3),
       ]
     );
   }
