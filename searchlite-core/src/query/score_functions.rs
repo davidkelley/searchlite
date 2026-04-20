@@ -94,6 +94,9 @@ pub(crate) fn compile_functions(
           bail!("decay scale must be > 0");
         }
         let decay = decay.unwrap_or(0.5);
+        if !decay.is_finite() {
+          bail!("decay factor must be finite");
+        }
         if decay <= 0.0 || decay > 1.0 {
           bail!("decay factor must be in the range (0, 1]");
         }
