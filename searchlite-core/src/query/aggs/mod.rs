@@ -3541,7 +3541,21 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
       if num == "-" || num == "." || num == "-." {
         return None;
       }
+      // `str::parse::<f64>` returns `Ok(f64::INFINITY)` for decimal
+      // strings whose magnitude exceeds `f64::MAX` (~1.8e308) rather
+      // than surfacing an error. `eval_rpn` has a defensive finitude
+      // guard on every `ScriptToken::Number` push (BUG-287), but that
+      // guard masks the parse-time intent: a non-finite token should
+      // never have been produced in the first place. Reject the
+      // overflow here so the rejection is anchored at the script
+      // source, matching the parse-time policy used by
+      // `read_number_literal` in `script_score` (BUG-352) and the
+      // `is_finite` gates already applied to sibling
+      // `str::parse::<f64>` sites (BUG-334 / BUG-338 / BUG-344).
       let value: f64 = num.parse().ok()?;
+      if !value.is_finite() {
+        return None;
+      }
       tokens.push(ScriptToken::Number(value));
       expect_unary = false;
       continue;
@@ -4831,6 +4845,55 @@ mod tests {
     vars.insert("a".to_string(), f64::MAX);
     vars.insert("b".to_string(), f64::MIN_POSITIVE);
     assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  // Regression tests for the `tokenize_script` literal-overflow fix: a
+  // 310+ digit decimal literal (the tokenizer accepts only digits and
+  // `.` for numeric literals — no scientific `e` notation) parses via
+  // `str::parse::<f64>` as `Ok(f64::INFINITY)` rather than surfacing an
+  // error. The tokenizer must reject the overflow at parse time so the
+  // rejection is anchored at the script source, matching BUG-352's
+  // parse-time rejection in `read_number_literal` (`script_score`) and
+  // the `is_finite` gates already applied to sibling
+  // `str::parse::<f64>` sites (BUG-334 / BUG-338 / BUG-344). The
+  // standalone-literal case is covered by
+  // `bucket_script_rejects_infinity_literal` above; these tests
+  // exercise the tokenizer paths that embed the overflowing literal
+  // inside a larger expression (binary operator, unary minus) — paths
+  // where a non-finite `Number` token would otherwise flow through
+  // `to_rpn` before `eval_rpn` caught it.
+  #[test]
+  fn bucket_script_rejects_number_literal_overflow_in_binary_op() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("1{}", "0".repeat(309));
+    let script = format!("{literal} * a");
+    assert!(eval_bucket_script(&script, &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_number_literal_overflow_with_unary_minus() {
+    // Symmetric negative case routed through the tokenizer's
+    // unary-minus fast path at the start of a numeric token.
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("-1{}", "0".repeat(309));
+    let script = format!("{literal} * a");
+    assert!(eval_bucket_script(&script, &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_accepts_large_but_finite_literal() {
+    // Boundary: 1 followed by 300 zeros = 10^300, which is well below
+    // `f64::MAX` (~1.8e308) and parses to a finite f64. The tokenizer
+    // must continue to accept it so legitimate large-but-finite
+    // literals are not over-rejected by the new `is_finite` guard.
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("1{}", "0".repeat(300));
+    let script = format!("{literal} * a");
+    let value = eval_bucket_script(&script, &vars).unwrap();
+    assert!((value - 1e300).abs() <= 1e284);
   }
 
   #[test]
