@@ -2037,10 +2037,14 @@ impl<'a> CompositeCollector<'a> {
             // state as `INFINITY.to_bits()`. That non-finite key later
             // serializes to `null` via `Number::from_f64` and participates
             // in `total_cmp` ordering, corrupting composite responses and
-            // `after`-cursor pagination. Drop the document from the
-            // composite key set when its bucket arithmetic is non-finite,
-            // matching the parse-time / commit-time finitude policy used
-            // at adjacent numeric sites (BUG-342/344/345/346/354).
+            // `after`-cursor pagination. Drop non-finite bucket values
+            // from this source's value list; on a multi-valued numeric
+            // field the document still contributes via its remaining
+            // finite values, and only when every value for this source
+            // is non-finite does the `values.is_empty()` check below
+            // skip the document entirely. Matches the parse-time /
+            // commit-time finitude policy used at adjacent numeric
+            // sites (BUG-342/344/345/346/354).
             let bucket = (v / interval).floor() * interval;
             bucket
               .is_finite()

@@ -1841,7 +1841,11 @@ mod bug_027 {
 /// unvalidated from the fast-field store. A large `v` (near `f64::MAX`)
 /// combined with a small `interval` overflows the division to infinity,
 /// producing a non-finite bucket key that serialized as `null` via
-/// `Number::from_f64` and corrupted `after`-cursor ordering.
+/// `Number::from_f64` and corrupted `after`-cursor ordering. The fix
+/// filters out non-finite histogram values from the source's value
+/// list; a multi-valued field still contributes via its remaining
+/// finite values, and the document is only skipped for that source
+/// when every value is non-finite.
 mod bug_356 {
   use super::*;
 
