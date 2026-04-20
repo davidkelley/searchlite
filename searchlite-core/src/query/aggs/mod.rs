@@ -3285,8 +3285,20 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
+        // Reject non-finite results (BUG-324). An upstream metric that
+        // overflows to +/-inf (or produces NaN via inf - inf) would otherwise
+        // propagate the bad value into the response and into any downstream
+        // pipeline that consumes it, bypassing those pipelines' own input-side
+        // guards. Mirrors the policy used by eval_rpn (BUG-287),
+        // combine_function_scores (BUG-315), and derivative/moving_avg
+        // (BUG-322).
         let value = if count > 0 {
-          Some(sum / count as f64)
+          let avg = sum / count as f64;
+          if avg.is_finite() {
+            Some(avg)
+          } else {
+            None
+          }
         } else {
           None
         };
@@ -3304,7 +3316,14 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
-        let value = if count > 0 { Some(sum) } else { None };
+        // Reject non-finite results (BUG-324); see AvgBucket above for the
+        // rationale. sum_bucket is a direct pass-through of the accumulator so
+        // a single +/-inf upstream input would otherwise leak unchanged.
+        let value = if count > 0 && sum.is_finite() {
+          Some(sum)
+        } else {
+          None
+        };
         responses.insert(
           name.to_string(),
           AggregationResponse::SumBucket(OptionalBucketMetricResponse { value }),
@@ -7789,6 +7808,242 @@ mod tests {
         assert_eq!(val.value, Some(0.0));
       }
       other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume sum_bucket's output.
+  /// Mirrors eval_rpn (BUG-287), combine_function_scores (BUG-315), and
+  /// derivative/moving_avg (BUG-322).
+  #[test]
+  fn sum_bucket_rejects_non_finite_accumulated_sum() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject non-finite accumulated sum, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject NaN produced by summing
+  /// +inf and -inf across buckets.
+  #[test]
+  fn sum_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject NaN (inf + -inf), got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume avg_bucket's output.
+  #[test]
+  fn avg_bucket_rejects_non_finite_accumulated_average() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject non-finite average, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject NaN produced when a
+  /// +inf and -inf combine in the running sum before the division.
+  #[test]
+  fn avg_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject NaN (inf + -inf)/n, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
     }
   }
 }

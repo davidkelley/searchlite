@@ -1726,7 +1726,9 @@ impl IndexReader {
     }
     let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
 
-    let docs = seg.live_docs() as f32;
+    // BM25 N must use total doc_count (including deleted documents) so it matches
+    // the df basis (postings.len() includes deleted documents). See BUG-360.
+    let docs = seg.meta.doc_count as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf, group_fields)) in term_weights.iter() {
       if let Some(mut postings) = seg.postings(key) {
@@ -2058,7 +2060,9 @@ impl IndexReader {
             .or_insert((term.field.clone(), 0.0, term.leaf));
         entry.1 += term.weight;
       }
-      let docs_count = seg.live_docs() as f32;
+      // BM25 N must use total doc_count (including deleted documents) so it matches
+      // the df basis (postings.len() includes deleted documents). See BUG-360.
+      let docs_count = seg.meta.doc_count as f32;
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
         if let Some(mut postings) = seg.postings(&key) {
@@ -5334,6 +5338,122 @@ mod tests {
     assert!(
       result.2,
       "has_vector should be true when both clauses contribute"
+    );
+  }
+
+  // BUG-360: BM25 N (total docs) must use seg.meta.doc_count rather than
+  // seg.live_docs(), so N remains consistent with df = postings.len() after
+  // deletions. Deleting documents that do not share a term's posting list
+  // should not alter the BM25 score of documents still matching the term.
+  #[test]
+  fn bm25_score_is_stable_across_deletions_of_unrelated_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    // 3 documents containing the target term "foo".
+    for i in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("foo-{i}"))),
+            ("body".into(), json!("foo filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    // 7 documents NOT containing "foo" so that deleting them shrinks
+    // live_docs without changing the "foo" posting list (df stays at 3).
+    for i in 0..7 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("bar-{i}"))),
+            ("body".into(), json!("bar filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+
+    let search_request = || SearchRequest {
+      query: Query::String("foo".into()),
+      fields: None,
+      filter: None,
+      limit: 10,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+
+    let reader = idx.reader().unwrap();
+    let before = reader.search(&search_request()).unwrap();
+    assert_eq!(before.hits.len(), 3);
+    let before_score = before
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present before deletion")
+      .score;
+
+    // Delete all bar-* documents. This shrinks live_docs but leaves the
+    // "foo" posting list (and df) unchanged.
+    let mut writer = idx.writer().unwrap();
+    let to_delete: Vec<String> = (0..7).map(|i| format!("bar-{i}")).collect();
+    writer.delete_documents(&to_delete).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let after = reader.search(&search_request()).unwrap();
+    assert_eq!(after.hits.len(), 3);
+    let after_score = after
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present after deletion")
+      .score;
+
+    // With live_docs as N, deletion of unrelated documents drops IDF to the
+    // clamped floor of 1.0; with doc_count as N, the score is unchanged.
+    assert!(
+      (before_score - after_score).abs() < 1e-6,
+      "BM25 score changed after unrelated deletions: before={before_score} after={after_score}"
     );
   }
 }
