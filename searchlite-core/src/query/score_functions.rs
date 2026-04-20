@@ -78,8 +78,16 @@ pub(crate) fn compile_functions(
         function,
         filter,
       } => {
+        if !origin.is_finite() {
+          bail!("decay origin must be finite");
+        }
         if !scale.is_finite() {
           bail!("decay scale must be finite");
+        }
+        if let Some(off) = offset {
+          if !off.is_finite() {
+            bail!("decay offset must be finite");
+          }
         }
         ensure_numeric_fast(schema, field, "function_score")?;
         if *scale <= 0.0 {
