@@ -14,7 +14,7 @@ use crate::query::score_functions::{
 };
 use crate::query::script::{compile_script, CompiledScript};
 use crate::query::sort::{SortKey, SortKeyPart, SortValue};
-use crate::query::util::ensure_numeric_fast as ensure_numeric_fast_field;
+use crate::query::util::{ensure_numeric_fast as ensure_numeric_fast_field, f64_to_finite_f32};
 use crate::DocId;
 
 pub(crate) fn score_sort_key(
@@ -441,7 +441,7 @@ pub(crate) fn evaluate_compiled_score(
       if !modified.is_finite() {
         return None;
       }
-      let score = (modified as f32) * *boost;
+      let score = f64_to_finite_f32(modified) * *boost;
       if !score.is_finite() {
         return None;
       }
