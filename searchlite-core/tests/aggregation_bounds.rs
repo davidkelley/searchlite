@@ -1833,6 +1833,189 @@ mod bug_027 {
   }
 }
 
+/// Regression tests for BUG-356 — `CompositeCollector::collect` for a
+/// `CompositeSource::Histogram` stored `(v / interval).floor() * interval`
+/// as a `CompositeKeyPart::F64` bit pattern without checking finitude.
+/// `interval` is validated finite/positive in
+/// `validate_aggregations_in_scope`, but the document value `v` comes
+/// unvalidated from the fast-field store. A large `v` (near `f64::MAX`)
+/// combined with a small `interval` overflows the division to infinity,
+/// producing a non-finite bucket key that serialized as `null` via
+/// `Number::from_f64` and corrupted `after`-cursor ordering.
+mod bug_356 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn run_composite(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "c".into(),
+      Aggregation::Composite(Box::new(CompositeAggregation {
+        sources: vec![CompositeSource::Histogram {
+          name: "score_buckets".into(),
+          field: "score".into(),
+          interval,
+        }],
+        size: 100,
+        after: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("c").cloned().expect("composite agg")
+  }
+
+  fn index_docs(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn extract_composite(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Composite { buckets, .. } => buckets,
+      _ => panic!("expected composite aggregation response"),
+    }
+  }
+
+  /// A document whose `score` is large enough that `(v / interval).floor() *
+  /// interval` overflows to `+Infinity` must not produce a bucket. Prior to
+  /// the fix the bucket was committed with `f64::INFINITY.to_bits()` and
+  /// serialized as a `null` key via `Number::from_f64`'s non-finite
+  /// fallback.
+  #[test]
+  fn composite_histogram_drops_document_whose_bucket_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e308 / 0.0001 = 1e312, which saturates to f64::INFINITY. `floor` and
+    // the subsequent multiply preserve the non-finite value.
+    index_docs(&idx, &[1e308]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with non-finite bucket arithmetic must be dropped, got {buckets:?}"
+    );
+    for bucket in buckets {
+      let key = bucket
+        .key
+        .as_object()
+        .and_then(|m| m.get("score_buckets"))
+        .expect("score_buckets key present");
+      assert!(
+        !key.is_null(),
+        "composite bucket key must never be null (got {key:?})"
+      );
+    }
+  }
+
+  /// Regression lock: a document whose field value is large but whose bucket
+  /// arithmetic stays finite must still be emitted. Guards against the new
+  /// finitude filter over-rejecting legitimate large-but-finite values.
+  #[test]
+  fn composite_histogram_keeps_document_with_large_finite_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e10 / 1.0 = 1e10 (finite), floor * 1.0 = 1e10 (finite).
+    index_docs(&idx, &[1e10]);
+
+    let resp = run_composite(&idx, 1.0);
+    let buckets = extract_composite(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected exactly one finite-bucket composite entry, got {buckets:?}"
+    );
+    let key = buckets[0]
+      .key
+      .as_object()
+      .and_then(|m| m.get("score_buckets"))
+      .expect("score_buckets key present");
+    assert!(
+      key.is_number(),
+      "composite bucket key for a finite-valued document must be a number (got {key:?})"
+    );
+    assert_eq!(buckets[0].doc_count, 1);
+  }
+
+  /// Mixed input: overflow docs are skipped, finite docs are emitted with
+  /// number-valued keys. Verifies the finitude gate is applied per-document
+  /// rather than per-segment.
+  #[test]
+  fn composite_histogram_mixed_overflow_and_finite_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // `1e308` overflows with interval `0.0001`; `0.5` and `1.5` stay finite
+    // and land in distinct buckets.
+    index_docs(&idx, &[1e308, 0.5, 1.5]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected two finite-bucket entries (overflow doc dropped), got {buckets:?}"
+    );
+    for bucket in buckets {
+      let key = bucket
+        .key
+        .as_object()
+        .and_then(|m| m.get("score_buckets"))
+        .expect("score_buckets key present");
+      assert!(
+        key.is_number(),
+        "every emitted composite bucket must have a numeric key (got {key:?})"
+      );
+      assert_eq!(bucket.doc_count, 1);
+    }
+  }
+
+  /// Negative-overflow sibling: `-1e308 / 0.0001` saturates to
+  /// `-Infinity`, so the negative-large document must be dropped for the
+  /// same reason as the positive case. Exercises both ends of the
+  /// overflow range in a single test.
+  #[test]
+  fn composite_histogram_drops_document_whose_bucket_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_docs(&idx, &[-1e308]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with negative overflow bucket must be dropped, got {buckets:?}"
+    );
+  }
+}
+
 /// Regression tests for BUG-030 (#186) — `bucket_start` for
 /// `DateInterval::Fixed` used `.ceil()` instead of `.floor()`, causing every
 /// timestamp that did not fall exactly on a bucket boundary to be mis-assigned

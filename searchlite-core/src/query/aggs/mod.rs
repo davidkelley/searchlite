@@ -2027,9 +2027,24 @@ impl<'a> CompositeCollector<'a> {
           .fast_fields
           .f64_values(field, doc_id)
           .into_iter()
-          .map(|v| {
+          .filter_map(|v| {
+            // BUG-356: `interval` is validated finite and positive in
+            // `validate_aggregations_in_scope`, but the document value `v`
+            // comes unvalidated from the fast-field store. A large `v`
+            // combined with a small `interval` overflows the division to
+            // `±Infinity`, after which `.floor() * interval` stays
+            // non-finite and the bucket key is committed to composite
+            // state as `INFINITY.to_bits()`. That non-finite key later
+            // serializes to `null` via `Number::from_f64` and participates
+            // in `total_cmp` ordering, corrupting composite responses and
+            // `after`-cursor pagination. Drop the document from the
+            // composite key set when its bucket arithmetic is non-finite,
+            // matching the parse-time / commit-time finitude policy used
+            // at adjacent numeric sites (BUG-342/344/345/346/354).
             let bucket = (v / interval).floor() * interval;
-            CompositeKeyPart::F64(bucket.to_bits())
+            bucket
+              .is_finite()
+              .then(|| CompositeKeyPart::F64(bucket.to_bits()))
           })
           .collect::<Vec<_>>(),
       };
