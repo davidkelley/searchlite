@@ -282,6 +282,175 @@ fn decay_function_orders_by_distance() {
   assert!(resp.hits[1].score > resp.hits[2].score);
 }
 
+// BUG-373: `serde_wasm_bindgen` (unlike `serde_json`) passes JS `NaN`/`Infinity`
+// straight into `f64`, so a decay `origin`/`offset` arriving via the WASM
+// binding could poison the scoring formula. `(value - NaN).abs() = NaN`,
+// then `NaN.max(0.0) = 0.0` (IEEE-754 maxNum picks the non-NaN), which
+// collapses every document to `decay^0 = 1.0` — a silently wrong result.
+// `compile_functions` must reject non-finite `origin` and `offset` at the
+// boundary, matching the existing `scale` guard.
+#[test]
+fn decay_rejects_non_finite_origin_nan() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: f64::NAN,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay origin must be finite"),
+    "expected origin-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_origin_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: f64::INFINITY,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay origin must be finite"),
+    "expected origin-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_offset_nan() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(f64::NAN),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay offset must be finite"),
+    "expected offset-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_origin_negative_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: f64::NEG_INFINITY,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay origin must be finite"),
+    "expected origin-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_offset_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(f64::INFINITY),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay offset must be finite"),
+    "expected offset-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_offset_negative_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(f64::NEG_INFINITY),
+      decay: Some(0.5),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay offset must be finite"),
+    "expected offset-finitude error, got {err}"
+  );
+}
+
 #[test]
 fn min_score_branch_does_not_drop_other_clauses() {
   let reader = setup_reader();
