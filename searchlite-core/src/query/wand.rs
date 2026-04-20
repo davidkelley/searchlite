@@ -760,12 +760,19 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         term.upper_bound()
       };
 
-      if bound.is_finite() {
-        acc += bound;
-        if acc >= pivot_threshold {
-          pivot_idx = Some(i);
-          break;
-        }
+      // Skip NaN bounds only: NaN arithmetic poisons the accumulator and
+      // `NaN >= threshold` is always false, so the term could never trigger
+      // the pivot. Positive infinity, on the other hand, is a valid (if
+      // loose) upper bound — it should immediately satisfy any finite
+      // threshold and set the pivot, otherwise the WAND loop can terminate
+      // early and silently drop documents whose global ub overflowed.
+      if bound.is_nan() {
+        continue;
+      }
+      acc += bound;
+      if acc >= pivot_threshold {
+        pivot_idx = Some(i);
+        break;
       }
     }
 
@@ -1354,6 +1361,85 @@ mod tests {
 
     // Verify the block at idx=4 has doc_id=4
     assert_eq!(state.doc_id(), 4);
+  }
+
+  #[test]
+  fn wand_does_not_skip_term_with_infinite_upper_bound() {
+    // BUG-366: when a term's global upper bound overflows to +inf (e.g.
+    // because its weight is huge), the pivot-finding loop must not silently
+    // skip it. A +inf bound is a valid (if loose) upper bound — skipping it
+    // can prevent the accumulator from reaching the heap threshold, causing
+    // WAND to exit early and drop the term's documents.
+    //
+    // Setup: one "anchor" term with normal BM25 scores that seeds the heap
+    // with finite scores, and one "overflow" term whose single posting lies
+    // past the anchor's doc_ids and whose ub overflows f32.
+    let anchor = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 3,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ]);
+
+    let overflow_postings = PostingsReader::from_entries_for_test(
+      vec![PostingEntry {
+        doc_id: 100,
+        term_freq: u32::MAX,
+        positions: smallvec![],
+      }],
+      DEFAULT_BLOCK_SIZE,
+    );
+    let overflow = ScoredTerm {
+      postings: overflow_postings,
+      weight: f32::MAX,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 101])),
+      min_doc_len: Some(10.0),
+    };
+
+    // Precondition: the overflow term's global ub really is +inf. If bm25
+    // math ever changes such that this no longer overflows, the test stops
+    // exercising the bug and we need to pick new inputs.
+    let overflow_state = TermState::new(overflow.clone(), DEFAULT_BLOCK_SIZE);
+    assert!(
+      overflow_state.upper_bound().is_infinite() && overflow_state.upper_bound().is_sign_positive(),
+      "overflow term global ub should be +inf; got {}",
+      overflow_state.upper_bound(),
+    );
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      2,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+
+    // doc 100's score is dominated by the overflowing weight, so it must be
+    // ranked into the top-k. Before the fix, the `is_finite()` pivot guard
+    // skipped the overflow term and doc 100 was silently dropped.
+    assert!(
+      results.iter().any(|r| r.doc_id == 100),
+      "doc 100 (overflow term) was dropped from top-k: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
   }
 
   #[test]
