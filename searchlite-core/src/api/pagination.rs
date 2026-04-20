@@ -167,7 +167,19 @@ impl TryFrom<CursorValue> for SortValue {
         Ok(SortValue::Score(score))
       }
       CursorValue::I64(v) => Ok(SortValue::I64(v)),
-      CursorValue::F64(v) => Ok(SortValue::F64(v)),
+      // Same story as the Score variant above: a crafted JSON cursor can
+      // deliver any `f64` bit pattern, including +/-inf or NaN, either
+      // directly in the cursor or via a JSON literal that overflows to
+      // `f64::INFINITY` during deserialization. Let those reach `SortKey`
+      // and `total_cmp`-based pagination silently skips or duplicates
+      // pages. Mirrors the `search_after` F64 guard (BUG-369) and the
+      // Score guards from BUG-342 / BUG-345.
+      CursorValue::F64(v) => {
+        if !v.is_finite() {
+          bail!("cursor contains non-finite F64 sort value ({v})");
+        }
+        Ok(SortValue::F64(v))
+      }
       CursorValue::Str(v) => Ok(SortValue::Str(v)),
       CursorValue::Missing => Ok(SortValue::Missing),
     }
@@ -565,8 +577,10 @@ mod tests {
 
   #[test]
   fn cursor_value_try_from_passes_through_non_score_variants() {
-    // Non-score variants have no finitude guard and must continue to
-    // round-trip unchanged.
+    // I64, Str, and Missing have no finitude guard and must continue to
+    // round-trip unchanged. F64 is covered separately below because the
+    // finite values still pass through, but non-finite values are
+    // rejected (BUG-369).
     assert!(matches!(
       SortValue::try_from(CursorValue::I64(-7)).unwrap(),
       SortValue::I64(-7)
@@ -582,6 +596,42 @@ mod tests {
     match SortValue::try_from(CursorValue::Str("k".into())).unwrap() {
       SortValue::Str(s) => assert_eq!(s, "k"),
       other => panic!("expected Str, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn cursor_value_try_from_rejects_non_finite_f64() {
+    // A crafted JSON cursor can deliver any f64, including +/-inf or NaN,
+    // either by embedding the bit pattern directly or by supplying a JSON
+    // literal that overflows to f64::INFINITY during deserialization.
+    // Those values must be rejected before they reach the sort key;
+    // otherwise `total_cmp`-based keyset pagination silently skips or
+    // duplicates pages.
+    for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+      let err = SortValue::try_from(CursorValue::F64(value))
+        .expect_err("non-finite F64 cursor value must be rejected");
+      assert!(
+        err.to_string().contains("non-finite F64 sort value"),
+        "value {value}: unexpected error: {err}"
+      );
+    }
+  }
+
+  #[test]
+  fn cursor_value_try_from_accepts_finite_f64_at_boundary() {
+    // Positive control: finite boundary values (including signed zero)
+    // must still round-trip after the guard so legitimate cursors are
+    // not over-rejected. Bit-pattern equality keeps +0.0 and -0.0
+    // distinguishable across the conversion.
+    for value in [f64::MAX, f64::MIN, 0.0_f64, -0.0_f64] {
+      let v = SortValue::try_from(CursorValue::F64(value)).expect("finite F64 must convert");
+      match v {
+        SortValue::F64(out) => {
+          assert!(out.is_finite());
+          assert_eq!(out.to_bits(), value.to_bits());
+        }
+        other => panic!("expected F64, got {other:?}"),
+      }
     }
   }
 }
