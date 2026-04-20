@@ -2062,7 +2062,11 @@ fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
 // top-k after adjustment are silently dropped.
 #[test]
 fn wand_does_not_prune_against_amplified_scores_on_fast_path() {
-  let path = tempfile::tempdir().unwrap().path().join("idx");
+  // Bind `TempDir` to a local so the directory survives the whole test and
+  // is cleaned up on drop; calling `.path()` on a temporary would delete the
+  // directory before the index could be created.
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().join("idx");
   let mut schema = Schema::default_text_body();
   schema.keyword_fields.push(KeywordField {
     name: "boosted".into(),
