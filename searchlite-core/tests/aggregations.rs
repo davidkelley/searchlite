@@ -2297,6 +2297,119 @@ fn date_range_missing_and_keyed() {
   }
 }
 
+// Regression test for BUG-338: non-finite date_range bound strings
+// (`"NaN"` / `"inf"` / `"-infinity"`) must surface as `InvalidConfig`
+// rather than being silently downgraded to an unbounded side by
+// `parse_date` returning `None` and `RangeCollector::collect`
+// treating `None` as open-ended. Without this validation the
+// parse_date finite-only fallback would turn "matches no documents"
+// into "matches every document".
+#[test]
+fn date_range_rejects_non_finite_bound_strings() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = Index::create(
+    &path,
+    schema,
+    IndexOptions {
+      path: path.clone(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    },
+  )
+  .unwrap();
+
+  let reader = idx.reader().unwrap();
+
+  fn req_with_range(
+    from: Option<&str>,
+    to: Option<&str>,
+  ) -> searchlite_core::api::types::SearchRequest {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "ranges".into(),
+      Aggregation::DateRange(Box::new(
+        searchlite_core::api::types::DateRangeAggregation {
+          field: "ts".into(),
+          keyed: false,
+          format: None,
+          ranges: vec![searchlite_core::api::types::DateRangeBound {
+            key: None,
+            from: from.map(|s| s.to_string()),
+            to: to.map(|s| s.to_string()),
+          }],
+          missing: None,
+          sampling: None,
+          aggs: BTreeMap::new(),
+        },
+      )),
+    );
+    searchlite_core::api::types::SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  for (label, from, to) in [
+    ("nan-from", Some("NaN"), Some("1970-01-01T00:00:01Z")),
+    ("nan-to", Some("1970-01-01T00:00:00Z"), Some("NaN")),
+    ("inf-from", Some("inf"), None),
+    ("neg-inf-to", None, Some("-Infinity")),
+    ("infinity-pair", Some("-infinity"), Some("infinity")),
+  ] {
+    let resp = reader.search(&req_with_range(from, to));
+    assert!(
+      resp.is_err(),
+      "{label}: expected InvalidConfig for non-finite bound ({from:?}, {to:?})",
+    );
+    let msg = resp.err().unwrap().to_string();
+    assert!(
+      msg.contains("not a valid date/number"),
+      "{label}: expected `not a valid date/number` in error, got `{msg}`",
+    );
+  }
+}
+
 #[test]
 fn extended_stats_and_value_count_include_missing() {
   let tmp = tempfile::tempdir().unwrap();
