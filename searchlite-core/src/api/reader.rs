@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
-  HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation, Query, RescoreMode,
-  RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
+  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation,
+  DateRangeAggregation, Filter, HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation,
+  Query, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -486,6 +486,20 @@ impl IndexReader {
           schema_field.dim,
           vector_query.vector.len()
         );
+      }
+      // Reject non-finite query vector components before they reach
+      // `normalize_in_place` (which yields NaN for cosine when any component
+      // overflows to ±INF) or `metric_similarity` (where L2 surfaces the raw
+      // ±INF into `hit.vector_score` and fails JSON serialization). Mirrors
+      // the write-side guard in `collect_vector_value` (BUG-330).
+      for (idx, value) in vector_query.vector.iter().enumerate() {
+        if !value.is_finite() {
+          bail!(
+            "vector query for field `{}` contains non-finite component at index {}",
+            vector_query.field,
+            idx
+          );
+        }
       }
       let mut query_vec = vector_query.vector.clone();
       if matches!(
@@ -1712,7 +1726,9 @@ impl IndexReader {
     }
     let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
 
-    let docs = seg.live_docs() as f32;
+    // BM25 N must use total doc_count (including deleted documents) so it matches
+    // the df basis (postings.len() includes deleted documents). See BUG-360.
+    let docs = seg.meta.doc_count as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf, group_fields)) in term_weights.iter() {
       if let Some(mut postings) = seg.postings(key) {
@@ -2044,7 +2060,9 @@ impl IndexReader {
             .or_insert((term.field.clone(), 0.0, term.leaf));
         entry.1 += term.weight;
       }
-      let docs_count = seg.live_docs() as f32;
+      // BM25 N must use total doc_count (including deleted documents) so it matches
+      // the df basis (postings.len() includes deleted documents). See BUG-360.
+      let docs_count = seg.meta.doc_count as f32;
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
         if let Some(mut postings) = seg.postings(&key) {
@@ -2135,6 +2153,21 @@ impl IndexReader {
         let hit = hits.get_mut(hit_idx).unwrap();
         let orig_score = hit.score;
         let combined = combine_rescore_scores(rescore.score_mode, orig_score, rescore_score);
+        // Reject non-finite combined scores (BUG-326). Even though `rescore_score`
+        // is guarded finite by `evaluate_compiled_score` (BUG-315) and `orig_score`
+        // is a finite f32, combining the two can still produce a non-finite value:
+        // a Sum/Total or Multiply of two large finite inputs can exceed `f32::MAX`
+        // and yield +/-inf, and a saturating Sum/Multiply that produces +inf against
+        // a finite operand of the opposite sign can then fall out as NaN. A
+        // non-finite value would otherwise leak into `hit.score`, `hit.key`, and the
+        // serialized JSON response; drop the doc instead, matching the
+        // "evaluate_compiled_score returned None" branch above and the policy used
+        // by `eval_rpn` (BUG-287), `combine_function_scores` (BUG-315), and the
+        // pipeline-agg paths (BUG-322, BUG-324).
+        if !combined.is_finite() {
+          to_remove.push(hit_idx);
+          continue;
+        }
         hit.score = combined;
         hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
         if req.explain {
@@ -2367,6 +2400,7 @@ fn validate_aggregations_in_scope(
       }
       Aggregation::DateRange(r) => {
         ensure_numeric_fast(schema, &r.field, name, scope_path)?;
+        validate_date_range_config(name, r)?;
         validate_sampling(name, &r.sampling)?;
         validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
@@ -3083,6 +3117,42 @@ fn validate_histogram_bounds(name: &str, which: &str, min: f64, max: f64) -> Res
       }
       .into(),
     );
+  }
+  Ok(())
+}
+
+fn validate_date_range_config(name: &str, agg: &DateRangeAggregation) -> Result<()> {
+  // `DateRangeCollector::new` builds each range via
+  // `from.as_deref().and_then(parse_date)` / `to.as_deref().and_then(parse_date)`
+  // and `RangeCollector::collect` treats `None` as an unbounded side. If a
+  // caller supplies a non-finite string (`"NaN"` / `"inf"` / `"-infinity"`),
+  // `parse_date` now correctly returns `None` (BUG-338), but the collector
+  // would then silently widen the bound to "unbounded" and match far more
+  // documents than intended. Surface those inputs — and any other
+  // unparseable date string — as an `InvalidConfig` error at planning time
+  // instead of letting them corrupt bucket membership. An `Option::None`
+  // (field omitted) is still legal and keeps the side open.
+  for range in &agg.ranges {
+    if let Some(from) = range.from.as_deref() {
+      if parse_date(from).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `from` `{from}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
+    if let Some(to) = range.to.as_deref() {
+      if parse_date(to).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `to` `{to}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
   }
   Ok(())
 }
@@ -5268,6 +5338,122 @@ mod tests {
     assert!(
       result.2,
       "has_vector should be true when both clauses contribute"
+    );
+  }
+
+  // BUG-360: BM25 N (total docs) must use seg.meta.doc_count rather than
+  // seg.live_docs(), so N remains consistent with df = postings.len() after
+  // deletions. Deleting documents that do not share a term's posting list
+  // should not alter the BM25 score of documents still matching the term.
+  #[test]
+  fn bm25_score_is_stable_across_deletions_of_unrelated_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    // 3 documents containing the target term "foo".
+    for i in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("foo-{i}"))),
+            ("body".into(), json!("foo filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    // 7 documents NOT containing "foo" so that deleting them shrinks
+    // live_docs without changing the "foo" posting list (df stays at 3).
+    for i in 0..7 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("bar-{i}"))),
+            ("body".into(), json!("bar filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+
+    let search_request = || SearchRequest {
+      query: Query::String("foo".into()),
+      fields: None,
+      filter: None,
+      limit: 10,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+
+    let reader = idx.reader().unwrap();
+    let before = reader.search(&search_request()).unwrap();
+    assert_eq!(before.hits.len(), 3);
+    let before_score = before
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present before deletion")
+      .score;
+
+    // Delete all bar-* documents. This shrinks live_docs but leaves the
+    // "foo" posting list (and df) unchanged.
+    let mut writer = idx.writer().unwrap();
+    let to_delete: Vec<String> = (0..7).map(|i| format!("bar-{i}")).collect();
+    writer.delete_documents(&to_delete).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let after = reader.search(&search_request()).unwrap();
+    assert_eq!(after.hits.len(), 3);
+    let after_score = after
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present after deletion")
+      .score;
+
+    // With live_docs as N, deletion of unrelated documents drops IDF to the
+    // clamped floor of 1.0; with doc_count as N, the score is unchanged.
+    assert!(
+      (before_score - after_score).abs() < 1e-6,
+      "BM25 score changed after unrelated deletions: before={before_score} after={after_score}"
     );
   }
 }

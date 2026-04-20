@@ -1098,6 +1098,539 @@ fn rescore_sort_window_excludes_non_rescored_after_removal() {
   );
 }
 
+// BUG-352: `read_number_literal` called `num.parse::<f64>()` without
+// validating that the parsed value was finite. Rust's `str::parse::<f64>`
+// returns `Ok(f64::INFINITY)` for decimal strings whose magnitude exceeds
+// `f64::MAX` (~1.8e308) instead of surfacing an error, so a 309+ digit
+// literal embedded in a script compiled to `Instruction::PushConst(
+// f64::INFINITY)`. The eval-time guards in `CompiledScript::evaluate` then
+// rejected the value and returned `None`, silently dropping every matching
+// document with no error surfaced to the caller. The fix rejects the
+// literal at compile time, matching the policy already used for
+// `script_score` `params` validation and the BUG-334/BUG-338/BUG-344
+// sibling `str::parse::<f64>` fixes.
+
+fn overflow_literal(extra_zeros: usize) -> String {
+  // Construct `1` followed by `extra_zeros` zeros (i.e. `10^extra_zeros`).
+  // For this specific pattern overflow to f64::INFINITY starts at
+  // `extra_zeros >= 309` (310 digits total, since `10^309 > f64::MAX`);
+  // pad further so we are well above the boundary and still well under
+  // `MAX_SCRIPT_LENGTH = 512`.
+  let mut s = String::with_capacity(1 + extra_zeros);
+  s.push('1');
+  s.extend(std::iter::repeat_n('0', extra_zeros));
+  s
+}
+
+#[test]
+fn script_score_overflow_number_literal_is_rejected_at_compile_time() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script: overflow_literal(310),
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader.search(&req).expect_err(
+    "script_score with an f64-overflow number literal must surface a clear error, not silently drop hits",
+  );
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+#[test]
+fn script_score_overflow_number_literal_in_expression_is_rejected_at_compile_time() {
+  // The overflow surfaces regardless of where the literal appears in the
+  // script: an operator-embedded literal would previously have compiled
+  // cleanly and been caught only by an eval-time op guard, silently
+  // dropping the hit.
+  let reader = setup_reader();
+  let script = format!("{} - popularity", overflow_literal(310));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader
+    .search(&req)
+    .expect_err("operator-embedded f64-overflow literal must also surface a compile-time error");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+#[test]
+fn script_score_negative_overflow_number_literal_is_rejected_at_compile_time() {
+  // Unary `-` consumes the digit string via `read_number_literal` before
+  // negating, so the finitude check in `read_number_literal` catches the
+  // overflow before the negation site ever sees the infinity.
+  let reader = setup_reader();
+  let script = format!("-{}", overflow_literal(310));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let err = reader
+    .search(&req)
+    .expect_err("negated f64-overflow literal must surface a compile-time error");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("overflows to infinity"),
+    "error should mention overflow to infinity, got: {msg}"
+  );
+}
+
+// Regression: the `Sum` and `DisMax` arms of `evaluate_compiled_score`
+// previously accumulated child scores without a finitude guard. Every other
+// scoring path (FunctionScore, RankFeature, ScriptScore, rescore, hybrid)
+// rejects non-finite accumulated scores, but the top-level aggregation
+// nodes did not. When individually-finite children summed past f32::MAX,
+// the accumulator overflowed to ±INFINITY (or NaN, in the DisMax path
+// where `sum - max` is `∞ - ∞`) and leaked into the sort key heap,
+// silently corrupting ordering. See BUG-364.
+#[test]
+fn sum_node_rejects_document_when_children_overflow_to_infinity() {
+  let reader = setup_reader();
+  // Two FunctionScore children in a Bool `must`. Each child returns a
+  // finite `f32::MAX` via Replace of a weight function, but their Sum
+  // overflows to +INFINITY. The outer Sum must now return None and the
+  // document must be excluded.
+  let req = base_request(QueryNode::Bool {
+    must: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when Sum of children overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn dismax_node_rejects_document_when_accumulated_sum_overflows() {
+  let reader = setup_reader();
+  // Two FunctionScore children under a DisMax with tie_breaker > 0. Each
+  // child returns a finite `f32::MAX`. `max` is finite but `sum`
+  // overflows to +INFINITY, so `max + tie_breaker * (sum - max)` is
+  // +INFINITY. The outer DisMax must now reject the document.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.5),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when DisMax accumulated sum overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn dismax_node_preserves_max_when_tie_breaker_is_zero_and_sum_overflows() {
+  let reader = setup_reader();
+  // With `tie_breaker == 0` the DisMax formula reduces to `max` by
+  // definition. Naïve evaluation of `max + 0 * (sum - max)` becomes
+  // `max + 0 * ∞ = max + NaN = NaN` when `sum` overflows — even though
+  // semantically the hit should be preserved with score `max`. The
+  // short-circuit must return `max` directly so the hit survives.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.0),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert!(
+      (hit.score - f32::MAX).abs() < f32::EPSILON * f32::MAX,
+      "{} score must equal max=f32::MAX, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn sum_node_keeps_document_when_children_sum_stays_finite() {
+  let reader = setup_reader();
+  // Boundary check: children whose Sum fits within f32 must still produce
+  // hits. Guards against an over-eager finitude check that would reject
+  // legitimate scores. Two children at `f32::MAX / 4.0` sum to
+  // ~`f32::MAX / 2.0`, comfortably finite.
+  let req = base_request(QueryNode::Bool {
+    must: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn dismax_node_keeps_document_when_accumulated_sum_stays_finite() {
+  let reader = setup_reader();
+  // Boundary check for DisMax: two finite children whose `sum` stays
+  // below f32::MAX must still produce hits and finite scores.
+  let req = base_request(QueryNode::DisMax {
+    queries: vec![
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+      QueryNode::FunctionScore {
+        query: Box::new(QueryNode::MatchAll { boost: None }),
+        functions: vec![FunctionSpec::Weight {
+          weight: f32::MAX / 4.0,
+          filter: None,
+        }],
+        score_mode: Some(FunctionScoreMode::Sum),
+        boost_mode: Some(FunctionBoostMode::Replace),
+        max_boost: None,
+        min_score: None,
+        boost: None,
+      },
+    ],
+    tie_breaker: Some(0.5),
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn script_score_large_but_finite_literal_is_accepted() {
+  // Boundary check: a large-but-finite literal within f64 range must still
+  // compile and execute. Guards against an over-eager finitude check that
+  // would reject legitimate scripts. The literal used here is ~1e50 which
+  // parses to a finite f64; multiplying by 0 collapses it before the f32
+  // narrowing cast, so the final score is `popularity` which fits in f32.
+  let reader = setup_reader();
+  let script = format!("{} * 0 + popularity", "1".to_string() + &"0".repeat(50));
+  let req = base_request(QueryNode::ScriptScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    script,
+    params: None,
+    boost: Some(1.0),
+  });
+  let resp = reader
+    .search(&req)
+    .expect("finite large literal must compile and execute cleanly");
+  assert_eq!(resp.hits.len(), 3);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}
+
+// BUG-362: `evaluate_compiled_score` unconditionally rewrote a near-zero
+// base query score to `1.0` whenever function values were present, but the
+// rewrite is only correct for `boost_mode: multiply` (where `0 * func = 0`
+// would erase the function contribution). For Sum, Max, and Min boost
+// modes, rewriting the base from `0.0` to `1.0` adds an artificial bias:
+// Sum becomes `1 + func` instead of `0 + func`, Max clamps at `1.0` when
+// `func < 1.0`, and Min produces a `1.0` floor when `func >= 1.0`. The fix
+// gates the rewrite on `FunctionBoostMode::Multiply`, leaving other modes
+// to preserve the base naturally.
+
+fn zero_base_function_score(func_weight: f32, boost_mode: FunctionBoostMode) -> QueryNode {
+  QueryNode::FunctionScore {
+    query: Box::new(QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(0.0),
+    }),
+    functions: vec![FunctionSpec::Weight {
+      weight: func_weight,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(boost_mode),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  }
+}
+
+#[test]
+fn function_score_sum_boost_mode_preserves_zero_base() {
+  // Sum: `0 + 5 = 5`. The pre-fix implementation rewrote the base to 1.0,
+  // producing `1 + 5 = 6` — a +1.0 bias on every doc whose base query
+  // legitimately scored zero.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Sum));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (0.0 + 5.0), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_max_boost_mode_preserves_zero_base() {
+  // Max: `max(0, 0.5) = 0.5`. The pre-fix implementation rewrote the base
+  // to 1.0, producing `max(1, 0.5) = 1.0` — clamping the function value
+  // whenever it was below 1.0.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(0.5, FunctionBoostMode::Max));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 0.5).abs() < 1e-6,
+      "expected 0.5 (max(0.0, 0.5)), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_min_boost_mode_preserves_zero_base() {
+  // Min: `min(0, 5) = 0`. The pre-fix implementation rewrote the base to
+  // 1.0, producing `min(1, 5) = 1.0` — a 1.0 floor whenever the function
+  // value was ≥ 1.0.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Min));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.abs() < 1e-6,
+      "expected 0.0 (min(0.0, 5.0)), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_multiply_boost_mode_still_rewrites_zero_base() {
+  // Regression lock: Multiply still needs the `0 -> 1` rewrite because
+  // `0 * func = 0` would erase the function contribution entirely. After
+  // the fix, Multiply must continue to produce `1 * 5 = 5`.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Multiply));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (rewritten 1.0 * 5.0), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_replace_boost_mode_preserves_function_value_over_zero_base() {
+  // Replace: ignores the base entirely. Behaviour is identical before and
+  // after the fix; included as a regression lock so the base rewrite gate
+  // cannot accidentally alter Replace semantics.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Replace));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (Replace drops base), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_sum_boost_mode_with_nonzero_base_unchanged() {
+  // Regression lock: when the base is not near zero, the rewrite gate does
+  // not fire regardless of boost_mode, and Sum still combines the real
+  // base score with the function value.
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(2.0),
+    }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Sum),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 7.0).abs() < 1e-6,
+      "expected 7.0 (2.0 + 5.0), got {}",
+      hit.score
+    );
+  }
+}
+
 // BUG-336: the f64 -> f32 narrowing cast in `FieldValueFactor::evaluate`,
 // `RankFeature` evaluation, and `CompiledScript::evaluate` saturates any
 // finite f64 whose magnitude exceeds `f32::MAX` (~3.4e38) to

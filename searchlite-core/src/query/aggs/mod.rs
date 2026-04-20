@@ -1277,8 +1277,27 @@ impl<'a> HistogramCollector<'a> {
     }
   }
 
-  fn bucket_key(&self, val: f64) -> i64 {
-    ((val - self.offset) / self.interval).floor() as i64
+  /// Map a document value to its bucket id, returning `None` when the quotient
+  /// cannot be represented as an `i64` without loss.
+  ///
+  /// `interval` is validated finite and positive in `validate_histogram_config`
+  /// and `offset` is validated finite, but the document value `val` comes
+  /// unvalidated from the fast-field store. Two independent overflow modes
+  /// must be rejected here so neither silently coalesces documents into a
+  /// saturated bucket id with a wrong reconstructed key (BUG-358):
+  ///
+  /// 1. `(val - offset) / interval` itself overflows f64 to `±Infinity` (for
+  ///    example `f64::MAX / 0.5`). `.floor() as i64` then saturates to
+  ///    `i64::MAX` / `i64::MIN`.
+  /// 2. The quotient stays a finite f64 but exceeds the `i64` representable
+  ///    range (for example `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`). The
+  ///    `as i64` saturating cast again silently coalesces to `i64::MAX`.
+  ///
+  /// Both shapes previously produced a bucket key orders of magnitude away
+  /// from the document value and coalesced unrelated documents. Matches the
+  /// composite-histogram finitude guard added in BUG-356.
+  fn bucket_key(&self, val: f64) -> Option<i64> {
+    finite_bucket_id(val, self.offset, self.interval)
   }
 
   fn collect(&mut self, doc_id: DocId, score: f32) {
@@ -1291,7 +1310,9 @@ impl<'a> HistogramCollector<'a> {
     }
     let mut seen = HashSet::new();
     for val in values {
-      let bucket_id = self.bucket_key(val);
+      let Some(bucket_id) = self.bucket_key(val) else {
+        continue;
+      };
       if let Some((min, max)) = self.hard_bounds {
         let bucket_val = bucket_id as f64 * self.interval + self.offset;
         if bucket_val < min || bucket_val >= max {
@@ -1329,7 +1350,7 @@ impl<'a> HistogramCollector<'a> {
     let extended_bounds = self.extended_bounds;
     let hard_bounds = self.hard_bounds;
     let mut buckets = self.buckets;
-    let bucket_key = |val: f64| ((val - offset) / interval).floor() as i64;
+    let bucket_key = |val: f64| finite_bucket_id(val, offset, interval);
     let bucket_value = |bucket_id: i64| bucket_id as f64 * interval + offset;
     // Defense-in-depth: the request validator rejects non-finite / non-positive
     // intervals (see `validate_histogram_config`). Skip bounds materialization
@@ -1346,29 +1367,37 @@ impl<'a> HistogramCollector<'a> {
     // violate the hard cap even if that validation is ever weakened or bypassed.
     let fill_range = intersect_fill_range_f64(extended_bounds, hard_bounds);
     if bounds_materializable {
+      // Mirror the collector-side BUG-358 guard: both fill-range endpoints must
+      // map to a representable `i64` bucket id. The request validator rejects
+      // non-finite `extended_bounds` / `hard_bounds` values and caps the span
+      // at `MAX_BUCKETS`, so in practice both endpoints are finite; this guard
+      // is belt-and-braces so a degenerate combination (e.g. a bounds value
+      // whose quotient saturates `as i64`) cannot materialize a bucket at a
+      // wrong reconstructed key.
       if let Some((min, max)) = fill_range {
-        let mut bucket_id = bucket_key(min);
-        let end = bucket_key(max);
-        let mut materialized: usize = 0;
-        while bucket_id <= end {
-          buckets.entry(bucket_id).or_insert_with(|| BucketState {
-            key: serde_json::Value::Number(
-              serde_json::Number::from_f64(bucket_value(bucket_id))
-                .unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-            doc_count: 0,
-            aggs: BTreeMap::new(),
-          });
-          // Guard against saturating-cast + wrapping addition producing an
-          // infinite loop if somehow `end == i64::MAX` (belt-and-braces: the
-          // validator caps the span well below this).
-          let Some(next) = bucket_id.checked_add(1) else {
-            break;
-          };
-          bucket_id = next;
-          materialized = materialized.saturating_add(1);
-          if materialized >= MAX_BUCKETS {
-            break;
+        if let (Some(start), Some(end)) = (bucket_key(min), bucket_key(max)) {
+          let mut bucket_id = start;
+          let mut materialized: usize = 0;
+          while bucket_id <= end {
+            buckets.entry(bucket_id).or_insert_with(|| BucketState {
+              key: serde_json::Value::Number(
+                serde_json::Number::from_f64(bucket_value(bucket_id))
+                  .unwrap_or_else(|| serde_json::Number::from(0)),
+              ),
+              doc_count: 0,
+              aggs: BTreeMap::new(),
+            });
+            // Guard against saturating-cast + wrapping addition producing an
+            // infinite loop if somehow `end == i64::MAX` (belt-and-braces: the
+            // validator caps the span well below this).
+            let Some(next) = bucket_id.checked_add(1) else {
+              break;
+            };
+            bucket_id = next;
+            materialized = materialized.saturating_add(1);
+            if materialized >= MAX_BUCKETS {
+              break;
+            }
           }
         }
       }
@@ -1451,7 +1480,7 @@ impl<'a> DateHistogramCollector<'a> {
     let missing = agg
       .missing
       .as_ref()
-      .and_then(|s| parse_date(s).or_else(|| s.parse::<f64>().ok()))
+      .and_then(|s| parse_date(s))
       .map(|v| v as i64);
     Self {
       field: agg.field.clone(),
@@ -2027,9 +2056,28 @@ impl<'a> CompositeCollector<'a> {
           .fast_fields
           .f64_values(field, doc_id)
           .into_iter()
-          .map(|v| {
+          .filter_map(|v| {
+            // BUG-356: `interval` is validated finite and positive in
+            // `validate_aggregations_in_scope`, but the document value `v`
+            // comes unvalidated from the fast-field store. A large `v`
+            // combined with a small `interval` overflows the division to
+            // `±Infinity`, after which `.floor() * interval` stays
+            // non-finite and the bucket key is committed to composite
+            // state as `INFINITY.to_bits()`. That non-finite key later
+            // serializes to `null` via `Number::from_f64` and participates
+            // in `total_cmp` ordering, corrupting composite responses and
+            // `after`-cursor pagination. Drop non-finite bucket values
+            // from this source's value list; on a multi-valued numeric
+            // field the document still contributes via its remaining
+            // finite values, and only when every value for this source
+            // is non-finite does the `values.is_empty()` check below
+            // skip the document entirely. Matches the parse-time /
+            // commit-time finitude policy used at adjacent numeric
+            // sites (BUG-342/344/345/346/354).
             let bucket = (v / interval).floor() * interval;
-            CompositeKeyPart::F64(bucket.to_bits())
+            bucket
+              .is_finite()
+              .then(|| CompositeKeyPart::F64(bucket.to_bits()))
           })
           .collect::<Vec<_>>(),
       };
@@ -3237,8 +3285,20 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
+        // Reject non-finite results (BUG-324). An upstream metric that
+        // overflows to +/-inf (or produces NaN via inf - inf) would otherwise
+        // propagate the bad value into the response and into any downstream
+        // pipeline that consumes it, bypassing those pipelines' own input-side
+        // guards. Mirrors the policy used by eval_rpn (BUG-287),
+        // combine_function_scores (BUG-315), and derivative/moving_avg
+        // (BUG-322).
         let value = if count > 0 {
-          Some(sum / count as f64)
+          let avg = sum / count as f64;
+          if avg.is_finite() {
+            Some(avg)
+          } else {
+            None
+          }
         } else {
           None
         };
@@ -3256,7 +3316,14 @@ fn apply_pipeline_aggs(
             count += 1;
           }
         }
-        let value = if count > 0 { Some(sum) } else { None };
+        // Reject non-finite results (BUG-324); see AvgBucket above for the
+        // rationale. sum_bucket is a direct pass-through of the accumulator so
+        // a single +/-inf upstream input would otherwise leak unchanged.
+        let value = if count > 0 && sum.is_finite() {
+          Some(sum)
+        } else {
+          None
+        };
         responses.insert(
           name.to_string(),
           AggregationResponse::SumBucket(OptionalBucketMetricResponse { value }),
@@ -3316,8 +3383,19 @@ fn apply_derivative_pipeline(
       (None, GapPolicy::InsertZeros) => Some(0.0),
       (None, GapPolicy::Skip) => None,
     };
+    // Reject non-finite results (BUG-322). An upstream metric that overflows
+    // to +/-inf would otherwise propagate inf/-inf/NaN through the response and
+    // into downstream pipelines, bypassing their own finitude guards. Mirrors
+    // the policy used by eval_rpn (BUG-287) and combine_function_scores (BUG-315).
     let value = match (current, prev) {
-      (Some(cur), Some(prev_val)) => Some((cur - prev_val) / unit),
+      (Some(cur), Some(prev_val)) => {
+        let v = (cur - prev_val) / unit;
+        if v.is_finite() {
+          Some(v)
+        } else {
+          None
+        }
+      }
       _ => None,
     };
     if let Some(cur) = current {
@@ -3363,10 +3441,20 @@ fn apply_moving_avg_pipeline(
     // Compute the average from preceding values only (look-back). The current
     // bucket's value must NOT be included — Elasticsearch's moving_avg emits
     // the mean of the *previous* window at each position.
+    //
+    // Reject non-finite results (BUG-322). An upstream metric that overflows
+    // to +/-inf would otherwise contaminate every subsequent bucket's average
+    // (and any downstream pipeline) with inf or NaN. Mirrors eval_rpn (BUG-287)
+    // and combine_function_scores (BUG-315).
     let avg = if window_values.is_empty() {
       None
     } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+      let v = window_values.iter().copied().sum::<f64>() / window_values.len() as f64;
+      if v.is_finite() {
+        Some(v)
+      } else {
+        None
+      }
     };
     if let Some(val) = current {
       if window_values.len() == window {
@@ -3391,7 +3479,14 @@ fn apply_moving_avg_pipeline(
     let seed = if window_values.is_empty() {
       None
     } else {
-      Some(window_values.iter().copied().sum::<f64>() / window_values.len() as f64)
+      let v = window_values.iter().copied().sum::<f64>() / window_values.len() as f64;
+      // Reject non-finite seed (BUG-322); otherwise vec![seed_val; predict] would
+      // replicate inf/NaN across every prediction slot.
+      if v.is_finite() {
+        Some(v)
+      } else {
+        None
+      }
     };
     if let Some(seed_val) = seed {
       // Defense-in-depth: clamp `predict` to `MAX_PREDICTIONS` so an internal caller
@@ -3513,7 +3608,21 @@ fn tokenize_script(script: &str) -> Option<Vec<ScriptToken>> {
       if num == "-" || num == "." || num == "-." {
         return None;
       }
+      // `str::parse::<f64>` returns `Ok(f64::INFINITY)` for decimal
+      // strings whose magnitude exceeds `f64::MAX` (~1.8e308) rather
+      // than surfacing an error. `eval_rpn` has a defensive finitude
+      // guard on every `ScriptToken::Number` push (BUG-287), but that
+      // guard masks the parse-time intent: a non-finite token should
+      // never have been produced in the first place. Reject the
+      // overflow here so the rejection is anchored at the script
+      // source, matching the parse-time policy used by
+      // `read_number_literal` in `script_score` (BUG-352) and the
+      // `is_finite` gates already applied to sibling
+      // `str::parse::<f64>` sites (BUG-334 / BUG-338 / BUG-344).
       let value: f64 = num.parse().ok()?;
+      if !value.is_finite() {
+        return None;
+      }
       tokens.push(ScriptToken::Number(value));
       expect_unary = false;
       continue;
@@ -3654,7 +3763,11 @@ fn eval_rpn(tokens: Vec<ScriptToken>, vars: &BTreeMap<String, f64>) -> Option<f6
           '-' => a - b,
           '*' => a * b,
           '/' => {
-            if b.abs() < 1e-12 {
+            // Only reject exact zero divisors. Small-but-valid non-zero divisors
+            // (e.g. `1e-13`) produce legitimate finite quotients and must be
+            // preserved. Overflow to infinity is handled by the post-operation
+            // `!result.is_finite()` guard below. Mirrors script.rs (BUG-346).
+            if b == 0.0 {
               return None;
             }
             a / b
@@ -3991,6 +4104,34 @@ fn default_percentiles_list() -> Vec<f64> {
   vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
 }
 
+/// Map `(val - offset) / interval` to a bucket id, returning `None` when the
+/// quotient cannot be represented as an `i64` without loss (BUG-358).
+///
+/// Two overflow modes must be rejected for histogram arithmetic so that
+/// documents whose bucket id would saturate the `as i64` cast are dropped
+/// rather than silently coalesced into a shared `i64::MAX` / `i64::MIN` bucket
+/// with a wrong reconstructed key:
+///
+/// 1. The quotient itself overflows f64 to `±Infinity` (for example
+///    `f64::MAX / 0.5`); `is_finite()` rejects this shape.
+/// 2. The quotient stays a finite f64 but exceeds the `i64` representable
+///    range (for example `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`); the
+///    magnitude comparison against `i64::MAX as f64 = 2^63` rejects this
+///    shape.
+///
+/// Note: `i64::MAX as f64` rounds up to `2^63` because `2^63 - 1` is not
+/// representable in f64, so the upper bound uses `>=` to keep every `q` whose
+/// saturating cast would exceed `i64::MAX`. The lower bound uses the exactly
+/// representable `i64::MIN as f64 = -2^63`; a `q` equal to that bound is
+/// still a valid id because `(-2^63) as i64 == i64::MIN`.
+fn finite_bucket_id(val: f64, offset: f64, interval: f64) -> Option<i64> {
+  let q = ((val - offset) / interval).floor();
+  if !q.is_finite() || q >= (i64::MAX as f64) || q < (i64::MIN as f64) {
+    return None;
+  }
+  Some(q as i64)
+}
+
 /// Compute the effective fill range for `HistogramCollector::finish`.
 ///
 /// When both `extended_bounds` and `hard_bounds` are set, the empty-bucket fill
@@ -4275,10 +4416,21 @@ fn add_calendar(value: i64, unit: CalendarUnit) -> Option<i64> {
 }
 
 pub(crate) fn parse_date(value: &str) -> Option<f64> {
+  // Rust's `f64::from_str` accepts `"NaN"`, `"inf"`, `"infinity"`,
+  // `"-inf"`, `"-infinity"` (case-insensitive) as valid float literals.
+  // None of these are meaningful timestamps, and letting them through
+  // the fallback lets NaN silently cast to epoch 0 and Infinity
+  // saturate to `i64::MAX` (~292 billion years) in downstream
+  // `parse_date(..) as i64` call sites — producing wrong
+  // date_histogram / date_range bounds and bypassing `min > max`
+  // guards (since `NaN > NaN` is `false`). Filter the numeric
+  // fallback to finite values so non-finite strings surface as a
+  // validation error ("not a valid date/number") at their caller.
+  // Mirrors the `parse_finite_missing_f64` guard added for BUG-334.
   chrono::DateTime::parse_from_rfc3339(value)
     .map(|dt| dt.timestamp_millis() as f64)
     .ok()
-    .or_else(|| value.parse::<f64>().ok())
+    .or_else(|| value.parse::<f64>().ok().filter(|f| f.is_finite()))
 }
 
 pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
@@ -4309,6 +4461,23 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
     return None;
   }
   let value: f64 = rest[..idx].parse().ok()?;
+  // Rust's `f64::from_str` returns `Ok(f64::INFINITY)` for numeric
+  // strings whose decimal magnitude exceeds the `f64` range (~1e308),
+  // rather than `Err`. The digit-and-dot prefix filter above prevents
+  // literal `"inf"`/`"NaN"` strings from reaching the parser, but a
+  // sufficiently long all-digit prefix (e.g. 310+ digits) still parses
+  // to infinity. Downstream call sites cast the result to `i64` via
+  // `as i64`, which saturates `f64::INFINITY` to `i64::MAX` — silently
+  // producing `DateInterval::Fixed(i64::MAX)` (all documents collapse
+  // into a single bucket) or an `i64::MAX` offset (every document is
+  // dropped from the aggregation), with no diagnostic for the caller.
+  // Reject non-finite parse results so overflowed intervals/offsets
+  // surface as a parse failure in the caller, mirroring the
+  // `.filter(|f| f.is_finite())` guard added to `parse_date` for
+  // BUG-338.
+  if !value.is_finite() {
+    return None;
+  }
   let suffix = &rest[idx..];
   let mult = match suffix {
     "" | "s" => 1.0,
@@ -4320,6 +4489,12 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
     _ => return None,
   };
   let magnitude = value * mult;
+  // Also reject non-finite scaled magnitudes: a finite `value` close to
+  // `f64::MAX` can still overflow to infinity after multiplication by
+  // the unit multiplier (e.g. `604_800.0` for weeks).
+  if !magnitude.is_finite() {
+    return None;
+  }
   Some(if negative { -magnitude } else { magnitude })
 }
 
@@ -4341,6 +4516,43 @@ mod tests {
   fn parse_interval_seconds_rejects_unknown_units() {
     assert_eq!(parse_interval_seconds("5x"), None);
     assert_eq!(parse_interval_seconds("10foo"), None);
+  }
+
+  // Regression tests for BUG-344: `parse_interval_seconds` must reject
+  // non-finite `f64` parse results. Rust's `f64::from_str` returns
+  // `Ok(f64::INFINITY)` for decimal strings whose magnitude exceeds the
+  // `f64` range (~1e308). Without a finitude guard, the infinity
+  // propagates through the unit-multiplier and the downstream
+  // `as i64` cast saturates to `i64::MAX`, silently producing a
+  // degenerate `date_histogram` aggregation (a single bucket at the
+  // offset, or all documents dropped via `i64::MAX` offset).
+  #[test]
+  fn parse_interval_seconds_rejects_overflowing_magnitude() {
+    // A 310-digit integer prefix overflows `f64::MAX` (~1.8e308) and
+    // `f64::from_str` returns `Ok(f64::INFINITY)` rather than `Err`.
+    let huge = "9".repeat(310);
+    assert_eq!(parse_interval_seconds(&huge), None);
+    assert_eq!(parse_interval_seconds(&format!("{huge}h")), None);
+    assert_eq!(parse_interval_seconds(&format!("{huge}ms")), None);
+    assert_eq!(parse_interval_seconds(&format!("-{huge}h")), None);
+    assert_eq!(parse_interval_seconds(&format!("+{huge}h")), None);
+  }
+
+  #[test]
+  fn parse_interval_seconds_rejects_overflow_after_multiplier() {
+    // A finite value close to `f64::MAX` can still overflow to
+    // infinity after scaling by a unit multiplier (weeks = 604_800.0).
+    // The digit-and-dot prefix filter forbids scientific notation, so
+    // we construct the value as `1` followed by 305 zeros (≈1e305),
+    // which is finite. Multiplying by `604_800.0` (weeks) yields
+    // ≈6.048e310, which exceeds `f64::MAX` (~1.7976e308) and rounds to
+    // `f64::INFINITY`.
+    let value = format!("1{}", "0".repeat(305));
+    assert_eq!(parse_interval_seconds(&format!("{value}w")), None);
+    assert_eq!(parse_interval_seconds(&format!("-{value}w")), None);
+    // Sanity check: the same value with a smaller multiplier (ms,
+    // which scales by 0.001) should still parse to a finite result.
+    assert!(parse_interval_seconds(&format!("{value}ms")).is_some_and(|f| f.is_finite()));
   }
 
   // Regression tests for BUG-296: `bucket_sort` by `_key` must compare numeric
@@ -4686,11 +4898,97 @@ mod tests {
   }
 
   #[test]
-  fn bucket_script_rejects_near_zero_division() {
+  fn bucket_script_rejects_exact_zero_division() {
     let mut vars = BTreeMap::new();
     vars.insert("a".to_string(), 1.0);
-    vars.insert("b".to_string(), 1e-14);
+    vars.insert("b".to_string(), 0.0);
     assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_negative_zero_division() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    vars.insert("b".to_string(), -0.0);
+    assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  // BUG-346: previously the epsilon guard `b.abs() < 1e-12` silently rejected
+  // valid small divisors. Division by a small but non-zero finite divisor must
+  // produce the correct finite quotient.
+  #[test]
+  fn bucket_script_accepts_small_non_zero_divisor() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    vars.insert("b".to_string(), 1e-13);
+    let value = eval_bucket_script("a / b", &vars).unwrap();
+    assert!((value - 1e13).abs() < 1.0);
+  }
+
+  #[test]
+  fn bucket_script_accepts_tiny_numerator_and_denominator() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1e-20);
+    vars.insert("b".to_string(), 1e-13);
+    let value = eval_bucket_script("a / b", &vars).unwrap();
+    assert!((value - 1e-7).abs() < 1e-15);
+  }
+
+  #[test]
+  fn bucket_script_rejects_overflow_to_infinity() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), f64::MAX);
+    vars.insert("b".to_string(), f64::MIN_POSITIVE);
+    assert!(eval_bucket_script("a / b", &vars).is_none());
+  }
+
+  // Regression tests for the `tokenize_script` literal-overflow fix: a
+  // 310+ digit decimal literal (the tokenizer accepts only digits and
+  // `.` for numeric literals — no scientific `e` notation) parses via
+  // `str::parse::<f64>` as `Ok(f64::INFINITY)` rather than surfacing an
+  // error. The tokenizer must reject the overflow at parse time so the
+  // rejection is anchored at the script source, matching BUG-352's
+  // parse-time rejection in `read_number_literal` (`script_score`) and
+  // the `is_finite` gates already applied to sibling
+  // `str::parse::<f64>` sites (BUG-334 / BUG-338 / BUG-344). The
+  // standalone-literal case is covered by
+  // `bucket_script_rejects_infinity_literal` above; these tests
+  // exercise the tokenizer paths that embed the overflowing literal
+  // inside a larger expression (binary operator, unary minus) — paths
+  // where a non-finite `Number` token would otherwise flow through
+  // `to_rpn` before `eval_rpn` caught it.
+  #[test]
+  fn bucket_script_rejects_number_literal_overflow_in_binary_op() {
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("1{}", "0".repeat(309));
+    let script = format!("{literal} * a");
+    assert!(eval_bucket_script(&script, &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_rejects_number_literal_overflow_with_unary_minus() {
+    // Symmetric negative case routed through the tokenizer's
+    // unary-minus fast path at the start of a numeric token.
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("-1{}", "0".repeat(309));
+    let script = format!("{literal} * a");
+    assert!(eval_bucket_script(&script, &vars).is_none());
+  }
+
+  #[test]
+  fn bucket_script_accepts_large_but_finite_literal() {
+    // Boundary: 1 followed by 300 zeros = 10^300, which is well below
+    // `f64::MAX` (~1.8e308) and parses to a finite f64. The tokenizer
+    // must continue to accept it so legitimate large-but-finite
+    // literals are not over-rejected by the new `is_finite` guard.
+    let mut vars = BTreeMap::new();
+    vars.insert("a".to_string(), 1.0);
+    let literal = format!("1{}", "0".repeat(300));
+    let script = format!("{literal} * a");
+    let value = eval_bucket_script(&script, &vars).unwrap();
+    assert!((value - 1e300).abs() <= 1e284);
   }
 
   #[test]
@@ -5134,6 +5432,49 @@ mod tests {
     assert!(parsed.is_none());
   }
 
+  // Regression tests for BUG-338: `parse_date` delegates to
+  // `str::parse::<f64>` when RFC 3339 parsing fails, which accepts
+  // `"NaN"` / `"inf"` / `"-inf"` / `"Infinity"` / `"-Infinity"` as
+  // valid floats. Non-finite values must not reach date_histogram
+  // `extended_bounds` / `hard_bounds` / `missing` or date_range
+  // `from` / `to`, where they would silently cast to epoch 0 or
+  // saturate to `i64::MAX` and bypass `min > max` comparison guards.
+  #[test]
+  fn parse_date_accepts_rfc3339_and_finite_epoch_millis() {
+    assert!(
+      parse_date("2026-04-19T00:00:00Z").is_some(),
+      "RFC 3339 must still parse"
+    );
+    assert_eq!(parse_date("0"), Some(0.0));
+    assert_eq!(parse_date("1234567890"), Some(1234567890.0));
+    assert_eq!(parse_date("-1234567890"), Some(-1234567890.0));
+    assert_eq!(parse_date("1.5e12"), Some(1.5e12));
+  }
+
+  #[test]
+  fn parse_date_rejects_nan_string() {
+    assert_eq!(parse_date("NaN"), None);
+    assert_eq!(parse_date("nan"), None);
+    assert_eq!(parse_date("NAN"), None);
+  }
+
+  #[test]
+  fn parse_date_rejects_infinity_strings() {
+    assert_eq!(parse_date("inf"), None);
+    assert_eq!(parse_date("Inf"), None);
+    assert_eq!(parse_date("infinity"), None);
+    assert_eq!(parse_date("Infinity"), None);
+    assert_eq!(parse_date("-inf"), None);
+    assert_eq!(parse_date("-Infinity"), None);
+    assert_eq!(parse_date("-infinity"), None);
+  }
+
+  #[test]
+  fn parse_date_rejects_non_numeric_non_rfc3339_strings() {
+    assert_eq!(parse_date(""), None);
+    assert_eq!(parse_date("not-a-date"), None);
+  }
+
   #[test]
   fn bucket_script_rejects_non_finite_variable() {
     let mut vars = BTreeMap::new();
@@ -5174,6 +5515,57 @@ mod tests {
     let a = sampler.sample_value(0, 42);
     let b = sampler.sample_value(1, 42);
     assert_ne!(a, b);
+  }
+
+  /// BUG-358: `finite_bucket_id` must reject quotients that overflow f64 to
+  /// `±Infinity` and finite quotients that exceed the `i64` representable
+  /// range. Both shapes would otherwise saturate via `as i64` and coalesce
+  /// documents into a wrong bucket.
+  #[test]
+  fn finite_bucket_id_rejects_quotient_overflow_to_infinity() {
+    // f64::MAX / 0.5 saturates the division to f64::INFINITY.
+    assert_eq!(finite_bucket_id(f64::MAX, 0.0, 0.5), None);
+    assert_eq!(finite_bucket_id(-f64::MAX, 0.0, 0.5), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_rejects_finite_quotient_above_i64_max() {
+    // 1e16 / 0.001 = 1e19 — finite f64 but above i64::MAX ≈ 9.22e18.
+    assert_eq!(finite_bucket_id(1e16, 0.0, 0.001), None);
+    assert_eq!(finite_bucket_id(-1e16, 0.0, 0.001), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_rejects_non_finite_inputs() {
+    // Non-finite `val` propagates to a non-finite quotient.
+    assert_eq!(finite_bucket_id(f64::INFINITY, 0.0, 1.0), None);
+    assert_eq!(finite_bucket_id(f64::NEG_INFINITY, 0.0, 1.0), None);
+    assert_eq!(finite_bucket_id(f64::NAN, 0.0, 1.0), None);
+  }
+
+  #[test]
+  fn finite_bucket_id_accepts_values_inside_i64_range() {
+    // Simple in-range cases round-trip as expected.
+    assert_eq!(finite_bucket_id(5.0, 0.0, 1.0), Some(5));
+    assert_eq!(finite_bucket_id(25.0, 0.0, 10.0), Some(2));
+    assert_eq!(finite_bucket_id(-0.5, 0.0, 1.0), Some(-1));
+    // Offsets are applied before the division.
+    assert_eq!(finite_bucket_id(25.0, 5.0, 10.0), Some(2));
+    // Large-but-safe quotient (well below i64::MAX ≈ 9.22e18).
+    assert_eq!(finite_bucket_id(1e10, 0.0, 1.0), Some(1e10 as i64));
+  }
+
+  #[test]
+  fn finite_bucket_id_boundary_is_rejected() {
+    // `i64::MAX as f64` == `2^63` (rounded up because `2^63 - 1` is not
+    // representable in f64). A `q` exactly at this boundary would saturate
+    // to `i64::MAX` under `as i64`, so the guard must reject it via `>=`.
+    let boundary = i64::MAX as f64;
+    assert_eq!(finite_bucket_id(boundary, 0.0, 1.0), None);
+    // `i64::MIN as f64` == `-2^63`, which is exactly representable and
+    // casts back to `i64::MIN` — legitimate, so the guard accepts it.
+    let neg_boundary = i64::MIN as f64;
+    assert_eq!(finite_bucket_id(neg_boundary, 0.0, 1.0), Some(i64::MIN));
   }
 
   #[test]
@@ -5573,6 +5965,119 @@ mod tests {
       panic!("missing derivative on bucket");
     }
     assert!(responses.contains_key("diff"));
+  }
+
+  /// Regression for BUG-322: derivative must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak NaN/Infinity into the
+  /// response or downstream pipelines that consume the derivative output.
+  /// Mirrors eval_rpn (BUG-287) and combine_function_scores (BUG-315).
+  #[test]
+  fn derivative_pipeline_rejects_non_finite_values() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "metric".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(0, 100.0),
+      stats_bucket(1, f64::INFINITY),
+      stats_bucket(2, f64::NEG_INFINITY),
+      stats_bucket(3, 50.0),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_derivative_pipeline(
+      "diff",
+      &DerivativeAggregation {
+        buckets_path: "metric.sum".to_string(),
+        gap_policy: Some(GapPolicy::Skip),
+        unit: Some(1.0),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // Bucket 0: no prev → None.
+    let v0 = match buckets[0].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 0"),
+    };
+    assert_eq!(v0, None);
+
+    // Bucket 1: INF - 100.0 = INF → rejected.
+    let v1 = match buckets[1].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 1"),
+    };
+    assert_eq!(v1, None, "derivative must reject infinite result");
+
+    // Bucket 2: -INF - INF = -INF → rejected.
+    let v2 = match buckets[2].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 2"),
+    };
+    assert_eq!(v2, None, "derivative must reject infinite result");
+
+    // Bucket 3: 50.0 - (-INF) = INF → rejected.
+    let v3 = match buckets[3].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 3"),
+    };
+    assert_eq!(v3, None, "derivative must reject infinite result");
+  }
+
+  /// Regression for BUG-322: the NaN case (inf - inf) must also be rejected.
+  #[test]
+  fn derivative_pipeline_rejects_nan_from_inf_minus_inf() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "metric".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    let mut buckets = vec![
+      stats_bucket(0, f64::INFINITY),
+      stats_bucket(1, f64::INFINITY),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_derivative_pipeline(
+      "diff",
+      &DerivativeAggregation {
+        buckets_path: "metric.sum".to_string(),
+        gap_policy: Some(GapPolicy::Skip),
+        unit: Some(1.0),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    let v1 = match buckets[1].aggregations.get("diff") {
+      Some(AggregationResponse::Derivative(r)) => r.value,
+      _ => panic!("missing derivative on bucket 1"),
+    };
+    assert_eq!(v1, None, "derivative must reject NaN result (inf - inf)");
   }
 
   /// Regression for #251: add_calendar must preserve the sub-day time
@@ -6810,6 +7315,130 @@ mod tests {
     }
   }
 
+  /// Regression for BUG-322: moving_avg must reject non-finite per-bucket
+  /// averages so an upstream metric that overflows to +/-inf cannot leak
+  /// NaN/Infinity into the response or downstream pipelines that consume the
+  /// moving_avg output. Mirrors eval_rpn (BUG-287) and combine_function_scores
+  /// (BUG-315).
+  #[test]
+  fn moving_avg_pipeline_rejects_non_finite_window_average() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    // Window 2. Bucket 1 holds INF in its metric, which slides into the window
+    // for buckets 2 and 3, contaminating those windowed averages until INF
+    // falls out of the window again.
+    let mut buckets = vec![
+      stats_bucket(0, 100.0),
+      stats_bucket(1, f64::INFINITY),
+      stats_bucket(2, 50.0),
+      stats_bucket(3, 25.0),
+    ];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m.sum".to_string(),
+        window: 2,
+        predict: None,
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    // Bucket 0: empty window → None.
+    let v0 = match buckets[0].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 0"),
+    };
+    assert_eq!(v0, None);
+
+    // Bucket 1: window [100.0] → 100.0 (finite, not yet contaminated).
+    let v1 = match buckets[1].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 1"),
+    };
+    assert_eq!(v1, Some(100.0));
+
+    // Bucket 2: window [100.0, INF] → INF → rejected.
+    let v2 = match buckets[2].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 2"),
+    };
+    assert_eq!(v2, None, "moving_avg must reject infinite window mean");
+
+    // Bucket 3: window [INF, 50.0] → INF → rejected.
+    let v3 = match buckets[3].aggregations.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r.value,
+      _ => panic!("missing moving_avg on bucket 3"),
+    };
+    assert_eq!(v3, None, "moving_avg must reject infinite window mean");
+  }
+
+  /// Regression for BUG-322: a non-finite seed for the prediction window must
+  /// suppress all predictions rather than replicate Infinity/NaN across every
+  /// prediction slot.
+  #[test]
+  fn moving_avg_pipeline_rejects_non_finite_prediction_seed() {
+    fn stats_bucket(key: i64, sum: f64) -> BucketResponse {
+      BucketResponse {
+        key: serde_json::json!(key),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "m".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: sum,
+            max: sum,
+            sum,
+            avg: sum,
+          }),
+        )]),
+      }
+    }
+
+    // Final window includes INF, so the seed average is INF and predictions
+    // must come back empty.
+    let mut buckets = vec![stats_bucket(0, 10.0), stats_bucket(1, f64::INFINITY)];
+    let mut responses = BTreeMap::new();
+    apply_moving_avg_pipeline(
+      "smooth",
+      &MovingAvgAggregation {
+        buckets_path: "m.sum".to_string(),
+        window: 2,
+        predict: Some(3),
+        gap_policy: Some(GapPolicy::Skip),
+      },
+      &mut buckets,
+      &mut responses,
+    );
+
+    let resp = match responses.get("smooth") {
+      Some(AggregationResponse::MovingAvg(r)) => r,
+      _ => panic!("missing moving_avg pipeline response"),
+    };
+    assert!(
+      resp.predictions.is_empty(),
+      "non-finite prediction seed must suppress predictions, got {:?}",
+      resp.predictions
+    );
+  }
+
   #[test]
   fn pipeline_aggs_respect_dependency_order_not_alphabetical() {
     use crate::api::types::{BucketScriptAggregation, DerivativeAggregation};
@@ -7179,6 +7808,242 @@ mod tests {
         assert_eq!(val.value, Some(0.0));
       }
       other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume sum_bucket's output.
+  /// Mirrors eval_rpn (BUG-287), combine_function_scores (BUG-315), and
+  /// derivative/moving_avg (BUG-322).
+  #[test]
+  fn sum_bucket_rejects_non_finite_accumulated_sum() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject non-finite accumulated sum, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: sum_bucket must reject NaN produced by summing
+  /// +inf and -inf across buckets.
+  #[test]
+  fn sum_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "total_price".to_string(),
+      Aggregation::SumBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("total_price") {
+      Some(AggregationResponse::SumBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "sum_bucket must reject NaN (inf + -inf), got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected SumBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject non-finite results so an
+  /// upstream metric that overflows to +/-inf cannot leak Infinity into the
+  /// response or downstream pipelines that consume avg_bucket's output.
+  #[test]
+  fn avg_bucket_rejects_non_finite_accumulated_average() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: 10.0,
+            max: 10.0,
+            sum: 10.0,
+            avg: 10.0,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject non-finite average, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
+    }
+  }
+
+  /// Regression for BUG-324: avg_bucket must reject NaN produced when a
+  /// +inf and -inf combine in the running sum before the division.
+  #[test]
+  fn avg_bucket_rejects_nan_from_inf_plus_neg_inf() {
+    use crate::api::types::BucketMetricAggregation;
+
+    let mut buckets = vec![
+      BucketResponse {
+        key: serde_json::json!("a"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::INFINITY,
+            max: f64::INFINITY,
+            sum: f64::INFINITY,
+            avg: f64::INFINITY,
+          }),
+        )]),
+      },
+      BucketResponse {
+        key: serde_json::json!("b"),
+        doc_count: 1,
+        aggregations: BTreeMap::from([(
+          "price_stats".to_string(),
+          AggregationResponse::Stats(StatsResponse {
+            count: 1,
+            min: f64::NEG_INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: f64::NEG_INFINITY,
+            avg: f64::NEG_INFINITY,
+          }),
+        )]),
+      },
+    ];
+
+    let mut pipeline = BTreeMap::new();
+    pipeline.insert(
+      "avg_price".to_string(),
+      Aggregation::AvgBucket(BucketMetricAggregation {
+        buckets_path: "price_stats.sum".to_string(),
+      }),
+    );
+
+    let responses = apply_pipeline_aggs(&pipeline, &mut buckets);
+    match responses.get("avg_price") {
+      Some(AggregationResponse::AvgBucket(val)) => {
+        assert_eq!(
+          val.value, None,
+          "avg_bucket must reject NaN (inf + -inf)/n, got {:?}",
+          val.value
+        );
+      }
+      other => panic!("expected AvgBucket response, got {other:?}"),
     }
   }
 }
