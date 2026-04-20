@@ -451,6 +451,96 @@ fn decay_rejects_non_finite_offset_negative_infinity() {
   );
 }
 
+// BUG-379: the existing `decay <= 0.0 || decay > 1.0` range check uses
+// ordered comparisons that are always `false` for NaN under IEEE-754, so a
+// NaN `decay` factor arriving via the WASM binding (where
+// `serde_wasm_bindgen` passes JS `NaN` straight into `f64`) slipped past
+// the guard. For `Linear`, `NaN.max(0.0) = 0.0` collapses every document to
+// score 0.0; for `Exp`/`Gauss`, `NaN.powf(norm)` is NaN and documents are
+// silently dropped by the `is_finite()` evaluation guard. Both outcomes
+// are silently wrong — `compile_functions` must reject non-finite `decay`
+// at the boundary, matching the origin/scale/offset guards.
+#[test]
+fn decay_rejects_non_finite_decay_factor_nan() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(f64::NAN),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay factor must be finite"),
+    "expected decay-factor-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_decay_factor_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(f64::INFINITY),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay factor must be finite"),
+    "expected decay-factor-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn decay_rejects_non_finite_decay_factor_negative_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::Decay {
+      field: "popularity".into(),
+      origin: 0.0,
+      scale: 10.0,
+      offset: Some(0.0),
+      decay: Some(f64::NEG_INFINITY),
+      function: Some(DecayFunction::Linear),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("decay factor must be finite"),
+    "expected decay-factor-finitude error, got {err}"
+  );
+}
+
 #[test]
 fn min_score_branch_does_not_drop_other_clauses() {
   let reader = setup_reader();
