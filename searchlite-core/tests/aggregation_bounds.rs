@@ -3587,3 +3587,211 @@ mod bug_251 {
     assert_eq!(total, 2, "total doc_count must equal indexed docs");
   }
 }
+
+/// Regression tests for BUG-358 — `HistogramCollector::bucket_key` computed
+/// `((val - offset) / interval).floor() as i64` without guarding the
+/// intermediate float against overflow to `±Infinity` or against a finite
+/// quotient above `i64::MAX`. Under either shape the saturating `as i64` cast
+/// silently coalesced documents into an `i64::MAX` / `i64::MIN` bucket with
+/// a reconstructed key orders of magnitude away from the document value.
+///
+/// Two independent overflow modes are exercised:
+///
+/// 1. Quotient overflows f64 to `±Infinity` (`f64::MAX / 0.5`).
+/// 2. Quotient stays finite f64 but exceeds `i64::MAX`
+///    (`1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`).
+///
+/// The fix drops affected documents from the histogram, matching the
+/// composite-histogram finitude filter added in BUG-356 and the
+/// finitude / range policy used across adjacent numeric sites.
+mod bug_358 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn index_scores(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn run_histogram(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("hist").cloned().expect("histogram")
+  }
+
+  fn extract_histogram(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } => buckets,
+      _ => panic!("expected histogram aggregation response"),
+    }
+  }
+
+  /// Scenario 2 from the bug report: `f64::MAX / 0.5` saturates the quotient
+  /// to `f64::INFINITY`. Before the fix the `.floor() as i64` cast clamped
+  /// the bucket id to `i64::MAX`, then the reconstructed key
+  /// `i64::MAX as f64 * 0.5 ≈ 4.61e18` landed nearly 290 orders of magnitude
+  /// away from the document's actual value.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[f64::MAX]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose bucket arithmetic overflows to infinity must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Scenario 1 from the bug report: quotient stays a finite f64 but exceeds
+  /// `i64::MAX`. `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`. Before the fix
+  /// the `as i64` cast saturated to `i64::MAX`, reconstructing a key at
+  /// `~9.22e15` — wrong by roughly 8% and liable to coalesce with every
+  /// other over-`i64::MAX` document in the same bucket.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_i64_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // Quotient = 1e19 (finite f64) > i64::MAX ≈ 9.22e18.
+    index_scores(&idx, &[1e16]);
+
+    let resp = run_histogram(&idx, 0.001);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose quotient exceeds i64::MAX must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Symmetric negative overflow: `-f64::MAX / 0.5 = -Infinity`. The same
+  /// finitude guard must reject this shape or the saturating `as i64` would
+  /// land the document in an `i64::MIN` bucket.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[-f64::MAX]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with negative-overflow quotient must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Coalescing regression: two documents whose quotients both saturate to
+  /// `i64::MAX` previously ended up in the same `i64::MAX` bucket despite
+  /// having different source values. After the fix they are both dropped
+  /// rather than silently merged.
+  #[test]
+  fn histogram_does_not_coalesce_multiple_overflow_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e16 / 0.001 = 1e19 (saturates) and 2e16 / 0.001 = 2e19 (saturates) —
+    // both would collapse to the same i64::MAX bucket under the old code.
+    index_scores(&idx, &[1e16, 2e16]);
+
+    let resp = run_histogram(&idx, 0.001);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "distinct overflow documents must not coalesce into a saturated bucket, got {buckets:?}"
+    );
+  }
+
+  /// Mixed input: overflow docs are dropped, finite-quotient docs land in
+  /// their expected buckets. Locks in per-document (rather than per-segment)
+  /// application of the finitude gate.
+  #[test]
+  fn histogram_mixed_overflow_and_finite_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // `f64::MAX` overflows with interval `0.5`; `0.25` and `1.25` stay
+    // finite and land in distinct buckets at keys 0.0 and 1.0.
+    index_scores(&idx, &[f64::MAX, 0.25, 1.25]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected two finite-bucket entries (overflow doc dropped), got {buckets:?}"
+    );
+    for bucket in buckets {
+      assert!(
+        bucket.key.is_number(),
+        "every emitted histogram bucket must have a numeric key (got {:?})",
+        bucket.key
+      );
+      assert_eq!(bucket.doc_count, 1);
+    }
+  }
+
+  /// Regression lock: a document whose raw value is large but whose quotient
+  /// stays well within `i64` range must still be emitted. Guards against
+  /// the finitude filter over-rejecting legitimate large-but-finite values.
+  #[test]
+  fn histogram_keeps_document_with_large_finite_quotient() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e10 / 1.0 = 1e10 (finite f64 well below i64::MAX ≈ 9.22e18).
+    index_scores(&idx, &[1e10]);
+
+    let resp = run_histogram(&idx, 1.0);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected exactly one finite-bucket entry, got {buckets:?}"
+    );
+    assert!(
+      buckets[0].key.is_number(),
+      "finite-quotient document must produce a numeric bucket key (got {:?})",
+      buckets[0].key
+    );
+    assert_eq!(buckets[0].doc_count, 1);
+  }
+}
