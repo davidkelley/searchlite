@@ -1269,8 +1269,17 @@ impl IndexReader {
         let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
+        // When any custom scoring node is active — constant_score,
+        // function_score, script_score, or rank_feature (see
+        // `has_custom_scoring`) — WAND's per-term BM25 upper bounds no
+        // longer bound the candidate score. Pass a collector so
+        // `pivot_threshold` drops to NEG_INFINITY and pruning is disabled.
+        // See BUG-376.
         if agg_ref.is_none()
-          && (page_limit == 0 || !req.return_hits || (!score_fast_path && page_limit > 0))
+          && (page_limit == 0
+            || !req.return_hits
+            || (!score_fast_path && page_limit > 0)
+            || needs_score_hook)
         {
           agg_ref = Some(&mut noop_collector);
         }
