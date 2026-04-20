@@ -1844,3 +1844,81 @@ fn script_score_large_negative_literal_overflow_clamps_to_f32_min() {
     );
   }
 }
+
+// Regression: the `Constant` arm of `evaluate_compiled_score` previously
+// returned `Some(*score)` unconditionally. Every other variant (Sum, DisMax,
+// FunctionScore, RankFeature, ScriptScore) rejects non-finite results, but
+// Constant did not. When `boost * node_boost` accumulated across nested
+// scopes overflowed `f32::MAX` to `+INFINITY`, the non-finite score leaked
+// into the WAND heap (corrupting ordering) and into `Hit.score`, where
+// `serde_json` rejects it as invalid JSON and the HTTP endpoint returns 500.
+// See BUG-370.
+#[test]
+fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
+  let reader = setup_reader();
+  // `Bool` with `boost = 1e38` containing a single `ConstantScore` with
+  // `boost = 1e38`. Both factors are individually finite and pass
+  // `validate_boost`, but their product `1e38 * 1e38 = 1e76` overflows
+  // `f32::MAX ≈ 3.4e38` and saturates to `+INFINITY`. With the guard in
+  // place, the Constant evaluator returns `None` and the hit is dropped.
+  let req = base_request(QueryNode::Bool {
+    must: vec![QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(1e38),
+    }],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: Some(1e38),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert!(
+    resp.hits.is_empty(),
+    "expected no hits when Constant score overflows to infinity, got {} hits with scores {:?}",
+    resp.hits.len(),
+    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn constant_score_keeps_document_when_boost_product_stays_finite() {
+  let reader = setup_reader();
+  // Boundary check: the new finitude guard must not over-reject legitimate
+  // large-but-finite scores. `1e10 * 1e10 = 1e20` is comfortably within
+  // `f32::MAX`, so the Constant evaluator must return the product as the
+  // document's score.
+  let req = base_request(QueryNode::Bool {
+    must: vec![QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(1e10),
+    }],
+    should: Vec::new(),
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: Some(1e10),
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.is_finite(),
+      "{} score must be finite, got {}",
+      hit.doc_id,
+      hit.score
+    );
+    assert!(
+      (hit.score - 1e20).abs() < 1e20 * 1e-5,
+      "{} score must equal 1e20, got {}",
+      hit.doc_id,
+      hit.score
+    );
+  }
+}

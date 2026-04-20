@@ -336,6 +336,16 @@ pub(crate) fn evaluate_compiled_score(
     }
     CompiledScoreNode::Constant { score, matcher } => {
       if evaluator.matches_subquery(matcher, doc_id) {
+        // The stored score is `boost * node_boost` accumulated from every
+        // enclosing scope during planning. Each factor is validated to be
+        // finite, but the product can still overflow `f32::MAX` to
+        // `+INFINITY`. Every other variant of this match rejects non-finite
+        // outputs; Constant must too so the non-finite score does not leak
+        // into the WAND heap (where it corrupts ordering) or into `Hit.score`
+        // (where `serde_json` rejects it as invalid JSON, returning 500).
+        if !score.is_finite() {
+          return None;
+        }
         Some(*score)
       } else {
         Some(0.0)
