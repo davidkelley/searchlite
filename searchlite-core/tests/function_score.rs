@@ -1368,3 +1368,159 @@ fn script_score_large_but_finite_literal_is_accepted() {
     );
   }
 }
+
+// BUG-362: `evaluate_compiled_score` unconditionally rewrote a near-zero
+// base query score to `1.0` whenever function values were present, but the
+// rewrite is only correct for `boost_mode: multiply` (where `0 * func = 0`
+// would erase the function contribution). For Sum, Max, and Min boost
+// modes, rewriting the base from `0.0` to `1.0` adds an artificial bias:
+// Sum becomes `1 + func` instead of `0 + func`, Max clamps at `1.0` when
+// `func < 1.0`, and Min produces a `1.0` floor when `func >= 1.0`. The fix
+// gates the rewrite on `FunctionBoostMode::Multiply`, leaving other modes
+// to preserve the base naturally.
+
+fn zero_base_function_score(func_weight: f32, boost_mode: FunctionBoostMode) -> QueryNode {
+  QueryNode::FunctionScore {
+    query: Box::new(QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(0.0),
+    }),
+    functions: vec![FunctionSpec::Weight {
+      weight: func_weight,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(boost_mode),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  }
+}
+
+#[test]
+fn function_score_sum_boost_mode_preserves_zero_base() {
+  // Sum: `0 + 5 = 5`. The pre-fix implementation rewrote the base to 1.0,
+  // producing `1 + 5 = 6` — a +1.0 bias on every doc whose base query
+  // legitimately scored zero.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Sum));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (0.0 + 5.0), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_max_boost_mode_preserves_zero_base() {
+  // Max: `max(0, 0.5) = 0.5`. The pre-fix implementation rewrote the base
+  // to 1.0, producing `max(1, 0.5) = 1.0` — clamping the function value
+  // whenever it was below 1.0.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(0.5, FunctionBoostMode::Max));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 0.5).abs() < 1e-6,
+      "expected 0.5 (max(0.0, 0.5)), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_min_boost_mode_preserves_zero_base() {
+  // Min: `min(0, 5) = 0`. The pre-fix implementation rewrote the base to
+  // 1.0, producing `min(1, 5) = 1.0` — a 1.0 floor whenever the function
+  // value was ≥ 1.0.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Min));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      hit.score.abs() < 1e-6,
+      "expected 0.0 (min(0.0, 5.0)), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_multiply_boost_mode_still_rewrites_zero_base() {
+  // Regression lock: Multiply still needs the `0 -> 1` rewrite because
+  // `0 * func = 0` would erase the function contribution entirely. After
+  // the fix, Multiply must continue to produce `1 * 5 = 5`.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Multiply));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (rewritten 1.0 * 5.0), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_replace_boost_mode_preserves_function_value_over_zero_base() {
+  // Replace: ignores the base entirely. Behaviour is identical before and
+  // after the fix; included as a regression lock so the base rewrite gate
+  // cannot accidentally alter Replace semantics.
+  let reader = setup_reader();
+  let req = base_request(zero_base_function_score(5.0, FunctionBoostMode::Replace));
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 5.0).abs() < 1e-6,
+      "expected 5.0 (Replace drops base), got {}",
+      hit.score
+    );
+  }
+}
+
+#[test]
+fn function_score_sum_boost_mode_with_nonzero_base_unchanged() {
+  // Regression lock: when the base is not near zero, the rewrite gate does
+  // not fire regardless of boost_mode, and Sum still combines the real
+  // base score with the function value.
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::ConstantScore {
+      filter: Filter::KeywordEq {
+        field: "lang".into(),
+        value: "en".into(),
+      },
+      boost: Some(2.0),
+    }),
+    functions: vec![FunctionSpec::Weight {
+      weight: 5.0,
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Sum),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 2);
+  for hit in &resp.hits {
+    assert!(
+      (hit.score - 7.0).abs() < 1e-6,
+      "expected 7.0 (2.0 + 5.0), got {}",
+      hit.score
+    );
+  }
+}

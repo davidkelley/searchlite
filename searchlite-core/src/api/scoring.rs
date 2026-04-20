@@ -347,9 +347,19 @@ pub(crate) fn evaluate_compiled_score(
         }
       }
       let mut effective_base = base_score;
-      if effective_base.abs() <= f32::EPSILON && !function_values.is_empty() {
-        // Preserve function contributions even when the base query scored 0.0,
-        // so multiplicative boost modes do not erase function-only scoring.
+      if effective_base.abs() <= f32::EPSILON
+        && !function_values.is_empty()
+        && *boost_mode == FunctionBoostMode::Multiply
+      {
+        // Preserve function contributions when the base query scored 0.0 and
+        // the boost_mode is Multiply — otherwise `0 * func = 0` would erase
+        // the function-only scoring. All other boost modes (Sum, Max, Min,
+        // Replace) already preserve the function contribution without a
+        // rewrite, so leaving `effective_base` at 0.0 gives the correct
+        // result: Sum -> `0 + func = func`, Max -> `max(0, func)`, Min ->
+        // `min(0, func)`, Replace ignores the base. Gating the rewrite on
+        // Multiply prevents an artificial +1.0 bias in Sum, a 1.0 clamp in
+        // Max when `func < 1.0`, and a 1.0 floor in Min when `func >= 1.0`.
         effective_base = 1.0;
       }
       let mut combined =
