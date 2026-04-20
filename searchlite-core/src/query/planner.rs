@@ -155,13 +155,40 @@ impl ScoreExpr {
   pub(crate) fn evaluate(&self, leaves: &[f32]) -> f32 {
     match self {
       ScoreExpr::Leaf(idx) => leaves.get(*idx).copied().unwrap_or(0.0),
-      ScoreExpr::Sum(children) => children.iter().map(|c| c.evaluate(leaves)).sum(),
+      ScoreExpr::Sum(children) => {
+        // Individual leaf scores are expected to be finite, but summing many
+        // finite values can overflow `f32::MAX` to `±∞`, and any NaN input
+        // poisons the sum. Clamp non-finite accumulators to `0.0` so they do
+        // not leak into the sort-key heap via the pure-BM25 fast path (which
+        // has no `score_adjust` hook to filter them). Mirrors the guard
+        // applied to `CompiledScoreNode::Sum` in BUG-364.
+        let sum: f32 = children.iter().map(|c| c.evaluate(leaves)).sum();
+        if sum.is_finite() {
+          sum
+        } else {
+          0.0
+        }
+      }
       ScoreExpr::DisMax {
         children,
         tie_breaker,
       } => {
         if children.is_empty() {
           return 0.0;
+        }
+        // Short-circuit the zero-tie-breaker case up-front. `0.0 * ∞ = NaN`
+        // under IEEE-754, so the naïve `max + tie_breaker * (sum - max)`
+        // formula would leak NaN into the heap when `sum` overflows even
+        // though zero-tie-breaker DisMax semantics is simply `max`. Skipping
+        // the `sum` accumulator here also avoids unnecessary work on the
+        // per-candidate WAND hot path. Mirrors the guard applied to
+        // `CompiledScoreNode::DisMax` in BUG-364.
+        if *tie_breaker == 0.0 {
+          let mut max = f32::NEG_INFINITY;
+          for child in children.iter() {
+            max = max.max(child.evaluate(leaves));
+          }
+          return if max.is_finite() { max } else { 0.0 };
         }
         let mut max = f32::NEG_INFINITY;
         let mut sum = 0.0_f32;
@@ -170,7 +197,16 @@ impl ScoreExpr {
           max = max.max(score);
           sum += score;
         }
-        max + *tie_breaker * (sum - max)
+        // Clamp non-finite DisMax results to `0.0`: `sum` can still overflow
+        // across many finite children, and `max + tie_breaker * (sum - max)`
+        // may evaluate to `±∞`/`NaN` under IEEE-754 even with a non-zero
+        // tie-breaker.
+        let result = max + *tie_breaker * (sum - max);
+        if result.is_finite() {
+          result
+        } else {
+          0.0
+        }
       }
     }
   }
@@ -1412,5 +1448,92 @@ mod tests {
         MAX_REGEX_EXPANSIONS_HARD
       );
     }
+  }
+
+  // Regression tests for BUG-374. The BM25 fast-path `ScoreExpr::DisMax` and
+  // `ScoreExpr::Sum` evaluators must not leak `NaN` or `±∞` into the sort-key
+  // heap. Mirrors the `CompiledScoreNode` guards added in BUG-364.
+
+  #[test]
+  fn dis_max_zero_tie_breaker_short_circuits_when_sum_overflows() {
+    // Target test for BUG-374: choose finite children whose `sum` overflows
+    // to `+∞` while `max` stays finite. Without the `tie_breaker == 0`
+    // short-circuit, the naïve formula evaluates to `f32::MAX + 0.0 * (∞ -
+    // f32::MAX) = f32::MAX + 0.0 * ∞ = NaN`, which the final clamp would
+    // mask by returning `0.0`. The short-circuit must instead return the
+    // finite `max` directly.
+    let expr = ScoreExpr::DisMax {
+      children: vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)],
+      tie_breaker: 0.0,
+    };
+    let leaves = [f32::MAX, f32::MAX];
+    let score = expr.evaluate(&leaves);
+    assert_eq!(
+      score,
+      f32::MAX,
+      "DisMax with tie_breaker==0 must short-circuit to max when sum overflows"
+    );
+  }
+
+  #[test]
+  fn dis_max_nonzero_tie_breaker_guards_nonfinite_result() {
+    // With `tie_breaker != 0`, `max + tie_breaker * (sum - max)` can still
+    // produce a non-finite value when `sum` overflows. The final guard must
+    // clamp to a finite fallback so pure-BM25 queries (no `score_adjust`)
+    // never push `NaN`/`±∞` into the heap.
+    let expr = ScoreExpr::DisMax {
+      children: vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)],
+      tie_breaker: 0.3,
+    };
+    let leaves = [f32::INFINITY, f32::INFINITY];
+    let score = expr.evaluate(&leaves);
+    assert!(
+      score.is_finite(),
+      "DisMax must guard non-finite results: got {score}"
+    );
+  }
+
+  #[test]
+  fn dis_max_zero_tie_breaker_preserves_finite_max() {
+    // Sanity check: the zero-tie-breaker short-circuit must return the actual
+    // `max` for finite inputs rather than collapsing to `0.0`.
+    let expr = ScoreExpr::DisMax {
+      children: vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)],
+      tie_breaker: 0.0,
+    };
+    let leaves = [1.5_f32, 2.5_f32];
+    assert_eq!(expr.evaluate(&leaves), 2.5);
+  }
+
+  #[test]
+  fn dis_max_nonzero_tie_breaker_preserves_finite_formula() {
+    // Sanity check for the finite path: `max + tb * (sum - max)` with
+    // `max = 2.0`, `sum = 3.0`, `tie_breaker = 0.5` → `2.0 + 0.5 * 1.0 = 2.5`.
+    let expr = ScoreExpr::DisMax {
+      children: vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)],
+      tie_breaker: 0.5,
+    };
+    let leaves = [1.0_f32, 2.0_f32];
+    assert!((expr.evaluate(&leaves) - 2.5).abs() < 1e-6);
+  }
+
+  #[test]
+  fn sum_guards_nonfinite_accumulator() {
+    // `ScoreExpr::Sum` must reject non-finite sums so that overflow or NaN
+    // propagation from leaf scores never leaks into the heap via the pure
+    // BM25 path.
+    let expr = ScoreExpr::Sum(vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)]);
+    let leaves = [f32::INFINITY, f32::INFINITY];
+    assert_eq!(expr.evaluate(&leaves), 0.0);
+
+    let nan_leaves = [f32::NAN, 1.0];
+    assert_eq!(expr.evaluate(&nan_leaves), 0.0);
+  }
+
+  #[test]
+  fn sum_preserves_finite_accumulator() {
+    let expr = ScoreExpr::Sum(vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)]);
+    let leaves = [1.25_f32, 2.75_f32];
+    assert_eq!(expr.evaluate(&leaves), 4.0);
   }
 }
