@@ -365,7 +365,7 @@ impl<'a> QueryPlanBuilder<'a> {
             fields,
             term.term.clone(),
             TermExpansion::Exact,
-            boost * node_boost,
+            combine_boost(boost, node_boost)?,
             score,
             TermGroupMode::PerField,
             None,
@@ -390,7 +390,7 @@ impl<'a> QueryPlanBuilder<'a> {
             fields,
             term.term.clone(),
             TermExpansion::Exact,
-            boost * node_boost,
+            combine_boost(boost, node_boost)?,
             false,
             TermGroupMode::PerField,
             None,
@@ -485,7 +485,7 @@ impl<'a> QueryPlanBuilder<'a> {
             field_specs.clone(),
             term.term.clone(),
             TermExpansion::Exact,
-            boost * node_boost,
+            combine_boost(boost, node_boost)?,
             score,
             mode.clone(),
             fuzziness.clone(),
@@ -499,7 +499,7 @@ impl<'a> QueryPlanBuilder<'a> {
             field_specs.clone(),
             term.term.clone(),
             TermExpansion::Exact,
-            boost * node_boost,
+            combine_boost(boost, node_boost)?,
             false,
             mode.clone(),
             fuzziness.clone(),
@@ -535,8 +535,9 @@ impl<'a> QueryPlanBuilder<'a> {
         let mut matchers = Vec::with_capacity(queries.len());
         let mut scorers = Vec::new();
         let mut score_nodes = Vec::new();
+        let combined = combine_boost(boost, node_boost)?;
         for child in queries.iter() {
-          let (matcher, scorer, score_node) = self.build_node(child, score, boost * node_boost)?;
+          let (matcher, scorer, score_node) = self.build_node(child, score, combined)?;
           matchers.push(matcher);
           if let Some(expr) = scorer {
             scorers.push(expr);
@@ -583,7 +584,7 @@ impl<'a> QueryPlanBuilder<'a> {
           }],
           value.clone(),
           TermExpansion::Exact,
-          boost * node_boost,
+          combine_boost(boost, node_boost)?,
           score,
           TermGroupMode::PerField,
           None,
@@ -619,7 +620,7 @@ impl<'a> QueryPlanBuilder<'a> {
               "prefix",
             )?,
           },
-          boost * node_boost,
+          combine_boost(boost, node_boost)?,
           score,
           TermGroupMode::PerField,
           None,
@@ -655,7 +656,7 @@ impl<'a> QueryPlanBuilder<'a> {
               "wildcard",
             )?,
           },
-          boost * node_boost,
+          combine_boost(boost, node_boost)?,
           score,
           TermGroupMode::PerField,
           None,
@@ -692,7 +693,7 @@ impl<'a> QueryPlanBuilder<'a> {
               "regex",
             )?,
           },
-          boost * node_boost,
+          combine_boost(boost, node_boost)?,
           score,
           TermGroupMode::PerField,
           None,
@@ -733,7 +734,7 @@ impl<'a> QueryPlanBuilder<'a> {
         boost: node_boost,
       } => {
         let node_boost = validate_boost(node_boost)?;
-        let child_boost = boost * node_boost;
+        let child_boost = combine_boost(boost, node_boost)?;
         let mut must_matchers = Vec::with_capacity(must.len());
         let mut scorer_parts = Vec::new();
         let mut score_nodes = Vec::new();
@@ -808,7 +809,7 @@ impl<'a> QueryPlanBuilder<'a> {
           minimum_should_match: None,
         };
         let score_node = ScoreNode::Constant {
-          score: boost * node_boost,
+          score: combine_boost(boost, node_boost)?,
           matcher: matcher.clone(),
         };
         Ok((matcher, None, score_node))
@@ -842,7 +843,7 @@ impl<'a> QueryPlanBuilder<'a> {
           boost_mode: (*boost_mode).unwrap_or(FunctionBoostMode::Multiply),
           max_boost: *max_boost,
           min_score: *min_score,
-          boost: boost * node_boost,
+          boost: combine_boost(boost, node_boost)?,
         };
         Ok((matcher, scorer, score_node))
       }
@@ -859,7 +860,7 @@ impl<'a> QueryPlanBuilder<'a> {
           field: field.clone(),
           modifier: *modifier,
           missing: *missing,
-          boost: boost * node_boost,
+          boost: combine_boost(boost, node_boost)?,
         };
         Ok((matcher, None, score_node))
       }
@@ -876,7 +877,7 @@ impl<'a> QueryPlanBuilder<'a> {
           base: Box::new(base_score_node),
           script: script.clone(),
           params: params.clone(),
-          boost: boost * node_boost,
+          boost: combine_boost(boost, node_boost)?,
         };
         Ok((matcher, scorer, score_node))
       }
@@ -937,6 +938,26 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
     bail!("query boost must be finite and non-negative (>= 0)");
   }
   Ok(value)
+}
+
+/// Combine a parent boost with a node-local boost, rejecting overflow.
+///
+/// `validate_boost` confirms each individual boost is finite, but the
+/// product of two finite f32 values can still overflow `f32::MAX` to
+/// `+inf` (e.g. `1e38 * 1e38`). Before the guard, that `+inf` flowed
+/// through term weights into BM25 scores and into `ScoreExpr::Constant`
+/// payloads, breaking serialisation and surfacing as HTTP 500 or as
+/// silently dropped documents further down the pipeline (BUG-381).
+/// Rejecting the overflow at plan-time turns that into a deterministic,
+/// actionable validation error instead.
+fn combine_boost(boost: f32, node_boost: f32) -> Result<f32> {
+  let combined = boost * node_boost;
+  if !combined.is_finite() {
+    bail!(
+      "combined query boost overflows to non-finite ({boost} * {node_boost}); reduce nested boosts"
+    );
+  }
+  Ok(combined)
 }
 
 /// Resolve a caller-supplied `max_expansions` against the per-kind default and
@@ -1535,5 +1556,100 @@ mod tests {
     let expr = ScoreExpr::Sum(vec![ScoreExpr::Leaf(0), ScoreExpr::Leaf(1)]);
     let leaves = [1.25_f32, 2.75_f32];
     assert_eq!(expr.evaluate(&leaves), 4.0);
+  }
+
+  #[test]
+  fn combine_boost_rejects_overflow_product() {
+    // Each factor on its own passes `validate_boost` (finite, non-negative),
+    // but their product overflows `f32::MAX` to `+inf`. Before the guard,
+    // that `+inf` would flow into `ScoredTerm.weight`, producing non-finite
+    // BM25 scores and HTTP 500 on serialisation (BUG-381).
+    let err = combine_boost(1e38, 1e38).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow message, got: {err}",
+    );
+  }
+
+  #[test]
+  fn combine_boost_accepts_finite_product() {
+    assert_eq!(combine_boost(2.0, 3.5).unwrap(), 7.0);
+    assert_eq!(combine_boost(1.0, 1.0).unwrap(), 1.0);
+    assert_eq!(combine_boost(0.0, 1e38).unwrap(), 0.0);
+  }
+
+  #[test]
+  fn build_query_plan_rejects_nested_boost_overflow_via_bool_match() {
+    // Mirrors the exact reproduction from BUG-381: a Bool with boost = 1e38
+    // wrapping a Match with boost = 1e38. Each factor is individually
+    // finite, but their product overflows `f32::MAX`. The planner now
+    // rejects this at build time with a clear error instead of letting
+    // `+inf` flow into term weights.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![QueryNode::QueryString {
+        query: "hello".into(),
+        fields: None,
+        boost: Some(1e38),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_boost_overflow_on_constant_score() {
+    // Before the guard, a `ConstantScore` wrapped in a boost-heavy Bool
+    // produced `ScoreNode::Constant { score: +inf }` (BUG-370 addressed
+    // the evaluation side, but the planner still silently built the
+    // overflowed payload).
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![QueryNode::ConstantScore {
+        filter: Filter::KeywordEq {
+          field: "tag".into(),
+          value: "rust".into(),
+        },
+        boost: Some(1e38),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_accepts_boost_product_within_range() {
+    // Control case: a moderately large nested boost that stays finite
+    // after multiplication must plan without error, so the guard does not
+    // regress legitimate queries.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1e9),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e9),
+    });
+    let plan = build_query_plan(&query, &["body".to_string()])
+      .expect("finite nested boost product must plan cleanly");
+    assert!(plan.scorer.is_some());
   }
 }

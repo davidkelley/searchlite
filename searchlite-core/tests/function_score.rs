@@ -2112,14 +2112,21 @@ fn script_score_large_negative_literal_overflow_clamps_to_f32_min() {
 // into the WAND heap (corrupting ordering) and into `Hit.score`, where
 // `serde_json` rejects it as invalid JSON and the HTTP endpoint returns 500.
 // See BUG-370.
+//
+// The planner now catches this class of overflow at build time (the
+// `combine_boost` helper bails when `boost * node_boost` is non-finite),
+// so the request is rejected with an actionable error before it reaches
+// the WAND loop. The evaluator guard remains as defense-in-depth for any
+// non-finite score that might be produced by later arithmetic.
 #[test]
 fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
   let reader = setup_reader();
   // `Bool` with `boost = 1e38` containing a single `ConstantScore` with
   // `boost = 1e38`. Both factors are individually finite and pass
   // `validate_boost`, but their product `1e38 * 1e38 = 1e76` overflows
-  // `f32::MAX ≈ 3.4e38` and saturates to `+INFINITY`. With the guard in
-  // place, the Constant evaluator returns `None` and the hit is dropped.
+  // `f32::MAX ≈ 3.4e38` and saturates to `+INFINITY`. With the planner
+  // guard in place, `search` surfaces the overflow as a validation error
+  // rather than silently dropping the document.
   let req = base_request(QueryNode::Bool {
     must: vec![QueryNode::ConstantScore {
       filter: Filter::KeywordEq {
@@ -2134,12 +2141,12 @@ fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
     minimum_should_match: None,
     boost: Some(1e38),
   });
-  let resp = reader.search(&req).unwrap();
+  let err = reader
+    .search(&req)
+    .expect_err("overflowing boost product must be rejected at plan time");
   assert!(
-    resp.hits.is_empty(),
-    "expected no hits when Constant score overflows to infinity, got {} hits with scores {:?}",
-    resp.hits.len(),
-    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+    err.to_string().contains("overflows"),
+    "expected overflow validation error, got: {err}",
   );
 }
 
