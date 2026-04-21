@@ -506,6 +506,23 @@ impl IndexReader {
         schema_field.metric,
         crate::index::manifest::VectorMetric::Cosine
       ) {
+        // BUG-384: reject cosine query vectors whose squared magnitudes sum
+        // past `f32::MAX` (e.g. `[3e19, 3e19]`). Each component passes the
+        // per-value finitude guard above, but their sum-of-squares is `+inf`,
+        // so `normalize_in_place` would skip scaling and leave the vector
+        // un-normalized, producing meaningless or wildly large cosine dot
+        // products that violate the unit-length assumption cosine scoring
+        // relies on. (Historically, the unguarded division by `+inf` inside
+        // `normalize_in_place` also silently zeroed every component, hiding
+        // the query entirely; either failure mode is unactionable for the
+        // caller, so surface it as a plain error here.)
+        let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
+        if !sum_sq.is_finite() {
+          bail!(
+            "vector query for field `{}` cannot be normalized: sum-of-squares overflows f32",
+            vector_query.field
+          );
+        }
         normalize_in_place(&mut query_vec);
       }
       let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);

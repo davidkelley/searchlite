@@ -937,3 +937,134 @@ fn vector_query_with_finite_boundary_components_is_accepted() {
   };
   let _ = reader.search(&req).expect("boundary f32 values are finite");
 }
+
+// BUG-384: cosine query vectors with individually-finite components whose
+// squared magnitudes sum past `f32::MAX` used to reach `normalize_in_place`,
+// where division by `+inf` silently turned them into an all-zero vector — so
+// downstream cosine dot products returned 0 for every hit and the query
+// matched nothing even though the caller supplied a well-formed vector. The
+// defensive `is_finite()` guard now skips normalization instead of zeroing
+// it, but an un-normalized cosine vector still violates the unit-length
+// assumption and produces garbage scores. Reject the input at the same layer
+// as BUG-340 so callers get an actionable error either way.
+#[test]
+fn cosine_query_vector_with_overflowing_sum_of_squares_is_rejected() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  // Each component is finite (`3e19 < f32::MAX ≈ 3.4e38`) and passes the
+  // BUG-340 per-component guard, but `(3e19)^2 + (3e19)^2 = 1.8e39` overflows
+  // `f32::MAX` to `+inf`.
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![3.0e19_f32, 3.0e19_f32],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("cannot be normalized")
+      && err.contains("sum-of-squares")
+      && err.contains("embedding"),
+    "expected sum-of-squares overflow error, got {err}"
+  );
+}
+
+// BUG-384: cosine-indexed documents whose squared magnitudes sum past
+// `f32::MAX` used to be silently written as an all-zero normalized vector.
+// Commit must refuse the document so the segment does not capture a corrupt
+// vector that is invisible to every subsequent query.
+#[test]
+fn commit_rejects_cosine_vector_with_overflowing_sum_of_squares() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  let mut writer = idx.writer().expect("writer");
+  // Each component is finite but their squared magnitudes sum to `+inf`.
+  let doc = Document {
+    fields: [
+      ("_id".into(), serde_json::json!("overflow-norm")),
+      ("body".into(), serde_json::json!("body")),
+      (
+        "embedding".into(),
+        serde_json::json!([3.0e19_f64, 3.0e19_f64]),
+      ),
+    ]
+    .into_iter()
+    .collect(),
+  };
+  writer.add_document(&doc).expect("staging accepts the doc");
+  let err = writer.commit().unwrap_err().to_string();
+  assert!(
+    err.contains("cannot be normalized") && err.contains("sum-of-squares"),
+    "expected sum-of-squares overflow error, got {err}"
+  );
+}
+
+// Companion: a cosine-indexed document and query where the sum-of-squares is
+// finite but close to the boundary still round-trip successfully — the new
+// guard must not reject legitimate inputs.
+#[test]
+fn cosine_vector_with_finite_sum_of_squares_round_trips() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  // `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`, so the sum-of-squares stays finite.
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("finite-norm")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0e19_f64, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0e19_f32, 0.0],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let hits = reader
+    .search(&req)
+    .expect("finite sum-of-squares must be accepted")
+    .hits;
+  assert!(!hits.is_empty(), "expected the single doc to match");
+  assert_eq!(hits[0].doc_id.as_str(), "finite-norm");
+}
