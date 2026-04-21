@@ -751,13 +751,17 @@ fn commit_rejects_vector_component_overflowing_f32_to_negative_inf() {
 }
 
 #[test]
-fn commit_accepts_vector_component_at_f32_max_representable_sum_of_squares() {
-  // The boundary case for BUG-330: an individually-finite component that also
-  // keeps the BUG-386 sum-of-squares inside `f32::MAX` must still be accepted
-  // to avoid over-rejecting legitimate inputs. `(1e19)^2 = 1e38 < f32::MAX ≈
-  // 3.4e38`, so this vector passes both guards. A vector with `f32::MAX`
-  // itself as a component is covered by the dedicated BUG-386 overflow tests
-  // below, since `(f32::MAX)^2` overflows.
+fn commit_accepts_vector_component_with_finite_squared_magnitude() {
+  // The boundary case for BUG-330 / BUG-386: an individually-finite component
+  // whose squared magnitude also stays inside `f32::MAX` must still be
+  // accepted so the new sum-of-squares guard does not over-reject legitimate
+  // inputs. `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`, so this vector passes
+  // both guards. A literal `f32::MAX` component is not accepted because
+  // `(f32::MAX)^2` itself overflows to `+inf`; the per-component boundary
+  // from pre-BUG-386 is therefore no longer the effective acceptance bound —
+  // the sum-of-squares boundary is. No dedicated test exercises a literal
+  // `f32::MAX` component because such a vector is now (correctly) rejected by
+  // the BUG-386 guard at both commit and query time.
   let dir = tempdir().unwrap();
   let schema = schema_l2();
   IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
@@ -919,11 +923,10 @@ fn vector_query_with_finite_boundary_components_is_accepted() {
   );
   let reader = idx.reader().unwrap();
   // Use a large-but-finite component that keeps the sum-of-squares within
-  // `f32::MAX` (post-BUG-386): `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`. The
-  // BUG-340 per-component guard allows the full f32 range, and the BUG-386
-  // sum-of-squares guard allows any vector whose squared magnitudes fit in
-  // `f32::MAX`. Values where `sum-of-squares` itself overflows are exercised
-  // by the dedicated `*_overflowing_sum_of_squares_*` tests below.
+  // `f32::MAX` (post-BUG-386): `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`. This
+  // test exercises the sum-of-squares acceptance boundary for finite values.
+  // Cases where `sum-of-squares` itself overflows are covered by the
+  // dedicated `*_overflowing_sum_of_squares_*` tests below.
   let req = SearchRequest {
     query: Query::Node(QueryNode::Vector(VectorQuery {
       field: "embedding".into(),
@@ -989,7 +992,7 @@ fn cosine_query_vector_with_overflowing_sum_of_squares_is_rejected() {
   let err = reader.search(&req).unwrap_err().to_string();
   // BUG-386 unified cosine + L2 under the same guard and error shape.
   assert!(
-    err.contains("squared magnitudes overflow") && err.contains("embedding"),
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }
@@ -1022,7 +1025,7 @@ fn commit_rejects_cosine_vector_with_overflowing_sum_of_squares() {
   let err = writer.commit().unwrap_err().to_string();
   // BUG-386 unified cosine + L2 under the same guard and error shape.
   assert!(
-    err.contains("squared magnitudes overflow"),
+    err.contains("sum-of-squares overflows"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }
@@ -1104,7 +1107,7 @@ fn commit_rejects_l2_vector_with_overflowing_sum_of_squares() {
   writer.add_document(&doc).expect("staging accepts the doc");
   let err = writer.commit().unwrap_err().to_string();
   assert!(
-    err.contains("squared magnitudes overflow") && err.contains("embedding"),
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }
@@ -1149,7 +1152,7 @@ fn l2_query_vector_with_overflowing_sum_of_squares_is_rejected() {
   };
   let err = reader.search(&req).unwrap_err().to_string();
   assert!(
-    err.contains("squared magnitudes overflow") && err.contains("embedding"),
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }

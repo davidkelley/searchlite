@@ -518,7 +518,7 @@ impl IndexReader {
       let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
       if !sum_sq.is_finite() {
         bail!(
-          "vector query for field `{}` has components whose squared magnitudes overflow f32",
+          "vector query for field `{}` has components whose sum-of-squares overflows f32; reduce component magnitudes",
           vector_query.field
         );
       }

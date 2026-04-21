@@ -539,7 +539,7 @@ fn collect_vector_value(
   let sum_sq = vecvals.iter().map(|v| v * v).sum::<f32>();
   if !sum_sq.is_finite() {
     bail!(
-      "vector field {field} has components whose squared magnitudes overflow f32; reduce component magnitudes"
+      "vector field {field} has components whose sum-of-squares overflows f32; reduce component magnitudes"
     );
   }
   if matches!(vf.metric, VectorMetric::Cosine) {
