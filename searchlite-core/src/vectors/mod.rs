@@ -73,7 +73,13 @@ impl VectorStore {
 
 pub fn normalize_in_place(vec: &mut [f32]) {
   let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-  if norm > 0.0 {
+  // BUG-384: the sum-of-squares of individually-finite components can still
+  // overflow `f32::MAX` to `+inf` (e.g. `[3e19, 3e19]`). Under `norm = +inf`,
+  // `v / norm` silently collapses every component to `0.0`, poisoning any
+  // downstream cosine similarity. Leave the vector un-normalized in that case
+  // so the caller's overflow guard surfaces an actionable error rather than a
+  // segment with all-zero cosine vectors that are invisible to every query.
+  if norm > 0.0 && norm.is_finite() {
     for v in vec.iter_mut() {
       *v /= norm;
     }
@@ -126,4 +132,46 @@ pub fn blend_scores(bm25: f32, vector_score: f32, alpha: f32, higher_is_better: 
     -vector_score
   };
   alpha * bm25 + (1.0 - alpha) * vec_component
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn normalize_in_place_scales_finite_vector_to_unit_length() {
+    let mut v = vec![3.0_f32, 4.0_f32];
+    normalize_in_place(&mut v);
+    assert!((v[0] - 0.6).abs() < 1e-6, "expected 0.6, got {}", v[0]);
+    assert!((v[1] - 0.8).abs() < 1e-6, "expected 0.8, got {}", v[1]);
+    let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+    assert!((norm_sq - 1.0).abs() < 1e-6);
+  }
+
+  // BUG-384: `[3e19, 3e19]` has finite components but `(3e19)^2 = 9e38` alone
+  // already exceeds `f32::MAX`, so the sum-of-squares saturates to `+inf`. The
+  // pre-fix code computed `norm = sqrt(inf) = inf`, passed the `norm > 0.0`
+  // check, and then divided every component by `inf` — silently zeroing the
+  // vector and poisoning every downstream cosine score to exactly `0`.
+  #[test]
+  fn normalize_in_place_leaves_vector_untouched_when_sum_of_squares_overflows() {
+    let input: Vec<f32> = vec![3.0e19_f32, 3.0e19_f32];
+    let mut v = input.clone();
+    normalize_in_place(&mut v);
+    assert_eq!(
+      v, input,
+      "non-finite norm must leave the vector un-normalized, not zero it"
+    );
+    assert!(
+      v.iter().all(|x| *x == 3.0e19_f32),
+      "no component should be silently collapsed to zero"
+    );
+  }
+
+  #[test]
+  fn normalize_in_place_leaves_zero_vector_untouched() {
+    let mut v = vec![0.0_f32, 0.0_f32];
+    normalize_in_place(&mut v);
+    assert_eq!(v, vec![0.0, 0.0]);
+  }
 }
