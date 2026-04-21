@@ -2119,7 +2119,7 @@ fn script_score_large_negative_literal_overflow_clamps_to_f32_min() {
 // the WAND loop. The evaluator guard remains as defense-in-depth for any
 // non-finite score that might be produced by later arithmetic.
 #[test]
-fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
+fn constant_score_rejects_request_when_boost_product_overflows_to_infinity() {
   let reader = setup_reader();
   // `Bool` with `boost = 1e38` containing a single `ConstantScore` with
   // `boost = 1e38`. Both factors are individually finite and pass

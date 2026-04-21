@@ -945,7 +945,7 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
 /// `validate_boost` confirms each individual boost is finite, but the
 /// product of two finite f32 values can still overflow `f32::MAX` to
 /// `+inf` (e.g. `1e38 * 1e38`). Before the guard, that `+inf` flowed
-/// through term weights into BM25 scores and into `ScoreExpr::Constant`
+/// through term weights into BM25 scores and into `ScoreNode::Constant`
 /// payloads, breaking serialisation and surfacing as HTTP 500 or as
 /// silently dropped documents further down the pipeline (BUG-381).
 /// Rejecting the overflow at plan-time turns that into a deterministic,
@@ -1579,9 +1579,9 @@ mod tests {
   }
 
   #[test]
-  fn build_query_plan_rejects_nested_boost_overflow_via_bool_match() {
+  fn build_query_plan_rejects_nested_boost_overflow_via_bool_query_string() {
     // Mirrors the exact reproduction from BUG-381: a Bool with boost = 1e38
-    // wrapping a Match with boost = 1e38. Each factor is individually
+    // wrapping a QueryString with boost = 1e38. Each factor is individually
     // finite, but their product overflows `f32::MAX`. The planner now
     // rejects this at build time with a clear error instead of letting
     // `+inf` flow into term weights.
