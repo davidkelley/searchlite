@@ -1068,3 +1068,87 @@ fn cosine_vector_with_finite_sum_of_squares_round_trips() {
   assert!(!hits.is_empty(), "expected the single doc to match");
   assert_eq!(hits[0].doc_id.as_str(), "finite-norm");
 }
+
+// BUG-388: the BUG-384 / BUG-386 sum-of-squares guards bound every indexed
+// and queried vector to `sum(v_i^2) <= f32::MAX`, which constrains
+// `|v_i| <= sqrt(f32::MAX) ≈ 1.84e19` per component. But pairwise
+// `|a_i - b_i|` can still reach `3.68e19`, so a single dimension's squared
+// difference can overflow `f32::MAX`. Before the `l2_distance` saturation
+// guard, `sum` saturated to `+inf`, `metric_similarity(L2) = -inf`, and the
+// BUG-328 hybrid-score guard silently dropped the far doc from the result
+// set with no error. After the guard, `l2_distance` returns a finite
+// sentinel (`f32::MAX`) so the doc is returned (ranked last) instead of
+// silently disappearing.
+#[test]
+fn l2_search_returns_far_doc_when_pairwise_squared_diff_overflows() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  // Both vectors pass the per-vector sum-of-squares bound: `(1.5e19)^2 =
+  // 2.25e38 < f32::MAX ≈ 3.4e38`. But their pairwise `d[0] = 3.0e19` and
+  // `d[0]^2 = 9e38 > f32::MAX` overflows the `l2_distance` accumulator in a
+  // single step.
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("near")),
+          ("body".into(), serde_json::json!("rust vector")),
+          ("embedding".into(), serde_json::json!([1.5e19_f64, 0.0_f64])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("far")),
+          ("body".into(), serde_json::json!("rust search")),
+          (
+            "embedding".into(),
+            serde_json::json!([-1.5e19_f64, 0.0_f64]),
+          ),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.5e19_f32, 0.0_f32],
+      k: Some(10),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(10),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 10)
+  };
+  let hits = reader
+    .search(&req)
+    .expect("pairwise-overflow distance must not fail the query")
+    .hits;
+  let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str().to_string()).collect();
+  assert!(
+    ids.contains(&"far".to_string()),
+    "`far` doc with overflowing pairwise distance must be returned, not silently dropped; got ids={ids:?}",
+  );
+  assert!(
+    ids.contains(&"near".to_string()),
+    "`near` doc must remain in results alongside `far`; got ids={ids:?}",
+  );
+  for hit in hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "every hit score must be finite; doc {} had score {}",
+      hit.doc_id,
+      hit.score,
+    );
+  }
+}
