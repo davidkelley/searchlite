@@ -526,11 +526,14 @@ fn collect_vector_value(
   }
   if matches!(vf.metric, VectorMetric::Cosine) {
     // BUG-384: reject cosine-indexed vectors whose squared magnitudes sum past
-    // `f32::MAX` before `normalize_in_place` silently skips the division.
-    // Each component passes the per-value finitude check above, but their
-    // sum-of-squares can still overflow (e.g. `[3e19, 3e19]`), and an
-    // un-normalized (or silently zeroed) cosine vector is invisible to every
-    // subsequent query for the lifetime of the segment.
+    // `f32::MAX` before `normalize_in_place` skips the division. Each
+    // component passes the per-value finitude check above, but their sum-of-
+    // squares can still overflow (e.g. `[3e19, 3e19]`). Cosine scoring
+    // assumes unit-length vectors, so persisting one that cannot be
+    // normalized would feed the query path a vector that either distorts
+    // downstream scores (post-fix: left un-scaled when the norm is non-
+    // finite) or silently collapses to all-zero (pre-fix: division by
+    // `+inf`). Refuse at commit time so the segment never captures it.
     let sum_sq = vecvals.iter().map(|v| v * v).sum::<f32>();
     if !sum_sq.is_finite() {
       bail!("vector field {field} cannot be normalized: sum-of-squares overflows f32");

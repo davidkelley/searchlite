@@ -509,9 +509,13 @@ impl IndexReader {
         // BUG-384: reject cosine query vectors whose squared magnitudes sum
         // past `f32::MAX` (e.g. `[3e19, 3e19]`). Each component passes the
         // per-value finitude guard above, but their sum-of-squares is `+inf`,
-        // and `normalize_in_place` would otherwise leave the vector un-scaled
-        // or silently zero it — returning uniformly zero cosine scores for
-        // every hit.
+        // so `normalize_in_place` would skip scaling and leave the vector
+        // un-normalized, producing meaningless or wildly large cosine dot
+        // products that violate the unit-length assumption cosine scoring
+        // relies on. (Historically, the unguarded division by `+inf` inside
+        // `normalize_in_place` also silently zeroed every component, hiding
+        // the query entirely; either failure mode is unactionable for the
+        // caller, so surface it as a plain error here.)
         let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
         if !sum_sq.is_finite() {
           bail!(

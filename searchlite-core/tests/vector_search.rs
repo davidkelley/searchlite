@@ -938,13 +938,15 @@ fn vector_query_with_finite_boundary_components_is_accepted() {
   let _ = reader.search(&req).expect("boundary f32 values are finite");
 }
 
-// BUG-384: cosine cosine-cast query vectors with individually-finite components
-// whose squared magnitudes sum past `f32::MAX` used to reach
-// `normalize_in_place`, which silently turned them into an all-zero vector.
-// Downstream cosine dot products against any document vector then returned 0
-// for every hit, so the query silently matched nothing even though the caller
-// supplied a well-formed vector. Reject it at the same layer as BUG-340 so
-// callers get an actionable error.
+// BUG-384: cosine query vectors with individually-finite components whose
+// squared magnitudes sum past `f32::MAX` used to reach `normalize_in_place`,
+// where division by `+inf` silently turned them into an all-zero vector — so
+// downstream cosine dot products returned 0 for every hit and the query
+// matched nothing even though the caller supplied a well-formed vector. The
+// defensive `is_finite()` guard now skips normalization instead of zeroing
+// it, but an un-normalized cosine vector still violates the unit-length
+// assumption and produces garbage scores. Reject the input at the same layer
+// as BUG-340 so callers get an actionable error either way.
 #[test]
 fn cosine_query_vector_with_overflowing_sum_of_squares_is_rejected() {
   let dir = tempdir().unwrap();
