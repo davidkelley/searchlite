@@ -504,27 +504,30 @@ impl IndexReader {
         }
       }
       let mut query_vec = vector_query.vector.clone();
+      // BUG-386: reject any query vector whose squared magnitudes sum past
+      // `f32::MAX` regardless of metric. Each component passes the BUG-340
+      // per-value guard above, but their pairwise combination can still
+      // overflow (e.g. `[3e19, 3e19]` gives `1.8e39`).
+      //
+      // For cosine this was originally called out in BUG-384 because
+      // `normalize_in_place` would divide by `+inf` and silently produce
+      // garbage / zeroed query vectors. For L2 the same overflow manifests a
+      // step later: `l2_distance(q, doc)` accumulates `(q_i - doc_i)^2` into
+      // `+inf`, `metric_similarity(L2) = -inf`, and `compute_hybrid_score`
+      // drops every candidate via the BUG-328 guard — the caller silently
+      // sees an empty hit set with no actionable diagnostic. Guarding both
+      // metrics uniformly turns that into a plain validation error.
+      let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
+      if !sum_sq.is_finite() {
+        bail!(
+          "vector query for field `{}` has components whose sum-of-squares overflows f32; reduce component magnitudes",
+          vector_query.field
+        );
+      }
       if matches!(
         schema_field.metric,
         crate::index::manifest::VectorMetric::Cosine
       ) {
-        // BUG-384: reject cosine query vectors whose squared magnitudes sum
-        // past `f32::MAX` (e.g. `[3e19, 3e19]`). Each component passes the
-        // per-value finitude guard above, but their sum-of-squares is `+inf`,
-        // so `normalize_in_place` would skip scaling and leave the vector
-        // un-normalized, producing meaningless or wildly large cosine dot
-        // products that violate the unit-length assumption cosine scoring
-        // relies on. (Historically, the unguarded division by `+inf` inside
-        // `normalize_in_place` also silently zeroed every component, hiding
-        // the query entirely; either failure mode is unactionable for the
-        // caller, so surface it as a plain error here.)
-        let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
-        if !sum_sq.is_finite() {
-          bail!(
-            "vector query for field `{}` cannot be normalized: sum-of-squares overflows f32",
-            vector_query.field
-          );
-        }
         normalize_in_place(&mut query_vec);
       }
       let alpha = vector_query.alpha.unwrap_or(DEFAULT_VECTOR_ALPHA);
