@@ -537,24 +537,27 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
     for (doc_id, leaves) in scores.into_iter() {
       let mut score = plan.evaluate(&leaves);
-      // BUG-381: the plan-time guard (combine_boost) rejects overflow of
-      // `boost * node_boost`, but the per-doc `bm25 * weight` in score_tf
-      // can still overflow to ±INF when a validated-finite `weight` is
-      // combined with a typical BM25 contribution, and `plan.evaluate`
-      // sums those leaf values. score_adjust is only installed when custom
-      // scoring is active, so for plain BM25 a non-finite value would leak
-      // straight into the heap → `Hit.score` → HTTP 500 (serde_json rejects
-      // ±INF / NaN). Drop the candidate to match the policy enforced by
-      // every `evaluate_compiled_score` variant (BUG-315) and the rescore
-      // combine path (BUG-326).
-      if !score.is_finite() {
-        continue;
-      }
       if let Some(adj) = score_adjust.as_deref_mut() {
         let Some(adjusted) = adj(doc_id, score, &leaves) else {
           continue;
         };
         score = adjusted;
+      }
+      // BUG-381: the plan-time guard (combine_boost) rejects overflow of
+      // `boost * node_boost`, but the per-doc `bm25 * weight` inside
+      // `plan.evaluate` can still overflow to ±INF when a validated-finite
+      // `weight` is combined with a typical BM25 contribution. For plain
+      // BM25 queries `score_adjust` is `None`, so a non-finite score
+      // flows straight into the heap → `Hit.score` → HTTP 500 (serde_json
+      // rejects ±INF / NaN). For custom scoring, `evaluate_compiled_score`
+      // already drops non-finite outputs (BUG-315/326), but we check again
+      // here as belt-and-suspenders for modes like FunctionScore with
+      // `boost_mode=Replace` that can legitimately salvage a non-finite
+      // base into a finite final score — the check is post-adjust so
+      // custom scoring hooks get to run first. Matches the defensive
+      // pattern used by the rescore combine path (BUG-326).
+      if !score.is_finite() {
+        continue;
       }
       if !accept(doc_id, score) {
         continue;
@@ -593,18 +596,17 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   });
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
   for (doc_id, mut score) in scores.into_iter() {
-    // BUG-381: see the plan-driven branch above for rationale. The
-    // accumulated `score_tf = bm25 * weight` can overflow to ±INF for a
-    // validated-finite `weight`, and no downstream step in the plain-BM25
-    // path rejects non-finite scores before the heap.
-    if !score.is_finite() {
-      continue;
-    }
     if let Some(adj) = score_adjust.as_deref_mut() {
       let Some(adjusted) = adj(doc_id, score, &[]) else {
         continue;
       };
       score = adjusted;
+    }
+    // BUG-381: see the plan-driven branch above for rationale — run the
+    // check post-adjust so custom scoring (e.g. FunctionScore with
+    // `boost_mode=Replace`) gets to salvage a non-finite BM25 base first.
+    if !score.is_finite() {
+      continue;
     }
     if !accept(doc_id, score) {
       continue;
@@ -858,18 +860,7 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       }
 
       let leaves_slice = leaf_scores.as_deref().unwrap_or(&[]);
-      // BUG-381: `score_sum` accumulates `score_tf = bm25 * weight` across
-      // matching terms. Each `weight` is validated finite at plan time by
-      // `combine_boost`, but `bm25 * weight` for a single term can still
-      // overflow to +INF when `weight` is near `f32::MAX / bm25`. For plain
-      // BM25 queries `score_adjust` is `None`, so `score_opt = Some(score)`
-      // carries the overflow straight into the heap → `Hit.score` and the
-      // HTTP response, where `serde_json` rejects ±INF and NaN. Drop the
-      // candidate up front so custom-scoring hooks and `accept` never see
-      // a non-finite input.
-      let score_opt = if !score.is_finite() {
-        None
-      } else if let Some(adj) = score_adjust.as_deref_mut() {
+      let score_opt = if let Some(adj) = score_adjust.as_deref_mut() {
         adj(doc_id, score, leaves_slice)
       } else {
         Some(score)
@@ -883,6 +874,20 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       }
 
       if let Some(final_score) = score_opt {
+        // BUG-381: `score_sum` accumulates `score_tf = bm25 * weight` across
+        // matching terms. Each `weight` is validated finite at plan time by
+        // `combine_boost`, but `bm25 * weight` for a single term can still
+        // overflow to +INF when `weight` is near `f32::MAX / bm25`. For plain
+        // BM25 queries `score_adjust` is `None`, so the overflow would flow
+        // straight into the heap → `Hit.score` and the HTTP response, where
+        // `serde_json` rejects ±INF and NaN. Check finiteness post-adjust so
+        // custom scoring (e.g. FunctionScore with `boost_mode=Replace`) gets
+        // to salvage a non-finite BM25 base into a finite final score first
+        // — matching the defensive pattern used by the rescore combine path
+        // (BUG-326).
+        if !final_score.is_finite() {
+          continue;
+        }
         if accept(doc_id, final_score) {
           if let Some(collector) = collector.as_deref_mut() {
             collector.collect(doc_id, final_score);
@@ -1707,5 +1712,131 @@ mod tests {
     let skipped = state.skip_blocks_below_bound(-1.0);
     assert_eq!(skipped, 0);
     assert_eq!(state.idx, 0);
+  }
+
+  // BUG-381: the heap-level finitude guard must run *after* `score_adjust`
+  // so custom scoring (notably `FunctionScore { boost_mode: Replace }`)
+  // gets a chance to turn a non-finite raw BM25 score into a finite final
+  // score. This regression asserts that an adjuster which unconditionally
+  // returns a finite value keeps the overflow doc in the top-k — matching
+  // the behavior `evaluate_compiled_score` (BUG-315) and the rescore
+  // combine path (BUG-326) rely on.
+  #[test]
+  fn wand_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "wand salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    assert!(
+      results.iter().any(|r| r.doc_id == 5),
+      "wand dropped overflow doc 5 even though score_adjust returned a finite value: {:?}",
+      results,
+    );
+    assert!(
+      results
+        .iter()
+        .find(|r| r.doc_id == 5)
+        .map(|r| r.score == 42.0)
+        .unwrap_or(false),
+      "wand kept overflow doc 5 but did not take the adjusted score: {:?}",
+      results,
+    );
+  }
+
+  #[test]
+  fn bmw_score_adjust_can_salvage_non_finite_raw_score() {
+    // Same invariant, BMW strategy.
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "bmw salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    assert!(
+      results.iter().any(|r| r.doc_id == 5),
+      "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {:?}",
+      results,
+    );
+  }
+
+  #[test]
+  fn brute_force_score_adjust_can_salvage_non_finite_raw_score() {
+    // Same invariant, brute-force plain-BM25 branch (no ScorePlan).
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "brute_force salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    assert!(
+      results.iter().any(|r| r.doc_id == 5),
+      "brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {:?}",
+      results,
+    );
   }
 }
