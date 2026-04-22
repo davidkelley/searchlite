@@ -1096,8 +1096,10 @@ fn resolve_minimum_should_match(
         bail!("minimum_should_match percentage must be between 0 and 100");
       }
       let raw = (percent / 100.0) * term_count as f32;
-      // 0% explicitly allows zero required matches; callers opt into this.
-      raw.ceil() as usize
+      // BUG-403: round down to match Elasticsearch `minimum_should_match`
+      // percentage semantics (e.g. 75% of 3 terms = 2, not 3). `floor(0.0)`
+      // also preserves the 0%-allows-zero-matches behaviour.
+      raw.floor() as usize
     }
   };
   Ok(Some(required.min(term_count)))
@@ -1639,6 +1641,48 @@ mod tests {
       err.to_string().contains("overflows"),
       "expected overflow error, got: {err}",
     );
+  }
+
+  // -------- BUG-403 regression tests --------
+  //
+  // `resolve_minimum_should_match` must round percentage-based specs
+  // *down* to match Elasticsearch's documented semantics: "The number
+  // computed from the percentage is rounded down and used as the
+  // minimum." Before the fix it used `ceil()`, which silently demanded
+  // one more matching term than the user requested for any non-integer
+  // product (e.g. `75%` of 3 terms became 3 instead of 2).
+  #[test]
+  fn resolve_minimum_should_match_percentage_rounds_down() {
+    let cases: &[(&str, usize, usize)] = &[
+      // (percentage, term_count, expected_required)
+      ("75%", 3, 2),  // floor(2.25) = 2, not ceil -> 3
+      ("50%", 3, 1),  // floor(1.5)  = 1, not ceil -> 2
+      ("34%", 3, 1),  // floor(1.02) = 1, not ceil -> 2
+      ("25%", 3, 0),  // floor(0.75) = 0, not ceil -> 1
+      ("60%", 5, 3),  // floor(3.0)  = 3 (integer product, unchanged)
+      ("100%", 4, 4), // full match: integer product, unchanged
+      ("0%", 3, 0),   // explicit zero-required: preserved
+      ("10%", 1, 0),  // floor(0.1)  = 0, not ceil -> 1
+    ];
+    for (pct, term_count, expected) in cases {
+      let spec = Some(MinimumShouldMatch::Percentage((*pct).to_string()));
+      let got = resolve_minimum_should_match(&spec, *term_count, MatchOperator::Or)
+        .unwrap_or_else(|e| panic!("{pct} of {term_count} failed: {e}"));
+      assert_eq!(
+        got,
+        Some(*expected),
+        "{pct} of {term_count} terms: expected {expected}, got {got:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn resolve_minimum_should_match_percentage_caps_at_term_count() {
+    // Values above 100% are rejected by the range check, but the final
+    // `.min(term_count)` still guards against any future drift.
+    let spec = Some(MinimumShouldMatch::Percentage("100%".to_string()));
+    let got = resolve_minimum_should_match(&spec, 4, MatchOperator::Or).unwrap();
+    assert_eq!(got, Some(4));
   }
 
   #[test]
