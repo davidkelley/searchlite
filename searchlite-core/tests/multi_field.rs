@@ -649,6 +649,21 @@ fn multi_match_accepts_group_times_field_boost_within_range() {
   let result = reader
     .search(&request(finite))
     .expect("finite group × field boost product must search cleanly");
+  // Guard against vacuous pass: the corpus in `setup_reader` seeds
+  // several docs whose `body`/`title` contain "rust", so this query must
+  // return hits. A zero-hit result would skip the finitude loop below
+  // and silently mask a guard that rejected every legitimate doc.
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-396 control case: legitimate in-range boosts must still return hits — the \
+     new guard cannot accidentally reject every candidate",
+  );
+  let matching_ids = ids(&result);
+  assert!(
+    matching_ids.contains("doc-2") || matching_ids.contains("doc-4"),
+    "BUG-396 control case: at least one known-\"rust\"-bearing doc must be returned, got {:?}",
+    matching_ids,
+  );
   for hit in result.hits.iter() {
     assert!(
       hit.score.is_finite(),
