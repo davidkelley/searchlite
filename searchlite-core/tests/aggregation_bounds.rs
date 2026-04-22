@@ -3922,3 +3922,144 @@ mod bug_358 {
     assert_eq!(buckets[0].doc_count, 1);
   }
 }
+
+/// Regression tests for BUG-410 — `HistogramCollector` reconstructs each
+/// bucket's display key via `bucket_id as f64 * interval + offset`. The
+/// BUG-358 guard protects the forward quotient against overflow and
+/// `i64`-range saturation, but does not guard the inverse reconstruction.
+/// `i64 → f64` rounding (values above `2^53` are not all exactly representable
+/// in f64) can nudge the product past `f64::MAX` and evaluate to `±Infinity`
+/// even when the original quotient was finite and within i64 range.
+///
+/// At that point `serde_json::Number::from_f64(±Infinity)` returns `None` and
+/// the `unwrap_or_else(|| Number::from(0))` fallback at each call site
+/// silently re-keys the bucket at `0`, potentially colliding with a
+/// legitimate bucket. The fix extends `finite_bucket_id` to also reject
+/// quotients whose reconstruction is non-finite, so the affected documents
+/// are dropped (matching the composite-histogram policy from BUG-356 and the
+/// forward-quotient policy from BUG-358) rather than keyed at `0`.
+mod bug_410 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn index_scores(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn run_histogram(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("hist").cloned().expect("histogram")
+  }
+
+  fn extract_histogram(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } => buckets,
+      _ => panic!("expected histogram aggregation response"),
+    }
+  }
+
+  /// Primary regression: `val = f64::MAX, interval = 3e289`. The quotient
+  /// `val / interval ≈ 5.99e18` is within the i64 range (BUG-358 guard
+  /// passes), but the reconstruction `id as f64 * 3e289` overflows to
+  /// `+Infinity`. Before the fix the bucket was silently keyed at `0` via
+  /// `serde_json::Number::from_f64(inf).unwrap_or_else(|| Number::from(0))`.
+  #[test]
+  fn histogram_drops_document_when_reconstruction_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose reconstruction overflows must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Symmetric negative overflow: `-f64::MAX` with `interval = 3e289`
+  /// reconstructs to `-Infinity`. Same fallback would key at `0`.
+  #[test]
+  fn histogram_drops_document_when_reconstruction_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[-f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose negative reconstruction overflows must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Key-collision regression: an overflow document must not coalesce with a
+  /// legitimate document whose bucket key really is `0`. Before the fix the
+  /// overflow document's key was silently replaced with `0` via the
+  /// `unwrap_or_else(|| Number::from(0))` fallback, merging its count into
+  /// the `0` bucket.
+  #[test]
+  fn histogram_reconstruction_overflow_does_not_collide_with_zero_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // A legitimate doc at key 0 (value lands in bucket [0, interval)) plus
+    // an overflow doc. The overflow doc must NOT land in the same bucket.
+    index_scores(&idx, &[0.0, f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected one bucket (zero), overflow doc dropped; got {buckets:?}"
+    );
+    let bucket = &buckets[0];
+    assert!(bucket.key.is_number());
+    assert_eq!(
+      bucket.doc_count, 1,
+      "overflow doc must not be coalesced into the zero bucket"
+    );
+  }
+}
