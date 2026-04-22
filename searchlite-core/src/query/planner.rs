@@ -1089,15 +1089,28 @@ fn resolve_minimum_should_match(
         bail!("minimum_should_match percentage must be a number with % suffix");
       }
       let without_percent_suffix = &pct[..pct.len() - 1];
-      let percent: f32 = without_percent_suffix.parse().map_err(|_| {
+      let percent: f64 = without_percent_suffix.parse().map_err(|_| {
         anyhow::anyhow!("minimum_should_match percentage must be a number with % suffix")
       })?;
       if !(0.0..=100.0).contains(&percent) {
         bail!("minimum_should_match percentage must be between 0 and 100");
       }
-      let raw = (percent / 100.0) * term_count as f32;
-      // 0% explicitly allows zero required matches; callers opt into this.
-      raw.ceil() as usize
+      // BUG-403: round *down* to match Elasticsearch `minimum_should_match`
+      // percentage semantics (e.g. 75% of 3 terms = 2, not 3). `floor(0.0)`
+      // also preserves the 0%-allows-zero-matches behaviour.
+      //
+      // For whole-number percentages, compute in integer arithmetic so that
+      // mathematically exact products (e.g. 13% of 900 = 117) aren't
+      // undercounted by f32/f64 rounding of the intermediate `percent/100`.
+      // For fractional percentages, multiply before dividing in f64 so the
+      // intermediate stays precise for realistic clause counts.
+      if percent.fract() == 0.0 {
+        let whole = percent as usize; // range-checked: 0..=100
+        whole.saturating_mul(term_count) / 100
+      } else {
+        let raw = percent * term_count as f64 / 100.0;
+        raw.floor() as usize
+      }
     }
   };
   Ok(Some(required.min(term_count)))
@@ -1639,6 +1652,62 @@ mod tests {
       err.to_string().contains("overflows"),
       "expected overflow error, got: {err}",
     );
+  }
+
+  // -------- BUG-403 regression tests --------
+  //
+  // `resolve_minimum_should_match` must round percentage-based specs
+  // *down* to match Elasticsearch's documented semantics: "The number
+  // computed from the percentage is rounded down and used as the
+  // minimum." Before the fix it used `ceil()`, which silently demanded
+  // one more matching term than the user requested for any non-integer
+  // product (e.g. `75%` of 3 terms became 3 instead of 2).
+  #[test]
+  fn resolve_minimum_should_match_percentage_rounds_down() {
+    let cases: &[(&str, usize, usize)] = &[
+      // (percentage, term_count, expected_required)
+      ("75%", 3, 2),  // floor(2.25)   = 2, not ceil -> 3
+      ("50%", 3, 1),  // floor(1.5)    = 1, not ceil -> 2
+      ("34%", 3, 1),  // floor(1.02)   = 1, not ceil -> 2
+      ("25%", 3, 0),  // floor(0.75)   = 0, not ceil -> 1
+      ("60%", 5, 3),  // floor(3.0)    = 3 (integer product, unchanged)
+      ("100%", 4, 4), // full match: integer product, unchanged
+      ("0%", 3, 0),   // explicit zero-required: preserved
+      ("10%", 1, 0),  // floor(0.1)    = 0, not ceil -> 1
+      // Integer-product cases that would undercount if the intermediate
+      // `percent/100` is stored as an inexact binary fraction and the
+      // result is computed as `(percent / 100) * term_count` in f32/f64.
+      // The fix must compute `(percent * term_count) / 100` (or, better,
+      // use integer arithmetic for whole-number percents) so these land
+      // on the exact integer rather than a hair below it.
+      ("13%", 900, 117), // (13/100) * 900 in f32 is 116.9999…; must be 117
+      ("70%", 10, 7),    // (70/100) * 10  can underflow to 6.9999…; must be 7
+      ("7%", 1000, 70),  // (7/100)  * 1000 ≈ 69.9999… in f32; must be 70
+      // Fractional percentages still exercise the float path.
+      ("12.5%", 8, 1), // floor(1.0) = 1 (0.125 * 8 = 1.0 exactly in f64)
+      ("33.3%", 3, 0), // floor(0.999) = 0
+    ];
+    for (pct, term_count, expected) in cases {
+      let spec = Some(MinimumShouldMatch::Percentage((*pct).to_string()));
+      let got = resolve_minimum_should_match(&spec, *term_count, MatchOperator::Or)
+        .unwrap_or_else(|e| panic!("{pct} of {term_count} failed: {e}"));
+      assert_eq!(
+        got,
+        Some(*expected),
+        "{pct} of {term_count} terms: expected {expected}, got {got:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn resolve_minimum_should_match_value_caps_at_term_count() {
+    // A raw `Value(v)` can exceed the number of terms, so this directly
+    // exercises the final `.min(term_count)` cap. (Percentages can't
+    // exceed it under the 0..=100 range check, so they don't reach the
+    // cap — cover the path that actually does.)
+    let spec = Some(MinimumShouldMatch::Value(10));
+    let got = resolve_minimum_should_match(&spec, 4, MatchOperator::Or).unwrap();
+    assert_eq!(got, Some(4));
   }
 
   #[test]
