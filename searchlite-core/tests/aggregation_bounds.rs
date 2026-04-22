@@ -973,6 +973,133 @@ fn date_histogram_rejects_overflowing_interval_strings() {
   );
 }
 
+// Regression test for BUG-408: `parse_interval_seconds` returns a finite
+// `f64` magnitude, but every caller converts the returned seconds value
+// to milliseconds via `secs * 1_000.0` before casting to `i64`. A finite
+// seconds magnitude slightly above `f64::MAX / 1_000.0` (~1.8e305) is
+// below the `magnitude.is_finite()` threshold (BUG-344) yet overflows
+// to `f64::INFINITY` after the millisecond conversion, and Rust's
+// `as i64` cast saturates infinity to `i64::MAX` — silently producing a
+// degenerate `DateInterval::Fixed(i64::MAX)` (all documents collapse
+// into a single bucket) or an `i64::MAX` offset (every document is
+// dropped). After the fix, `parse_interval_seconds` rejects such
+// magnitudes centrally and both call sites surface the expected
+// `InvalidConfig` error.
+#[test]
+fn date_histogram_rejects_finite_seconds_that_overflow_millis_conversion() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+  let reader = idx.reader().unwrap();
+
+  // `1` followed by 306 zeros is ≈1e306: finite in f64 (~1.8e308) but
+  // above `f64::MAX / 1_000.0` (~1.8e305), so `secs * 1_000.0` overflows
+  // to infinity and `as i64` saturates to `i64::MAX` without the guard.
+  let overflow_seconds = format!("1{}s", "0".repeat(306));
+
+  fn base_request(aggs: BTreeMap<String, Aggregation>) -> SearchRequest {
+    SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  // fixed_interval post-millis overflow → "must be a positive duration of at least 1ms"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: None,
+      fixed_interval: Some(overflow_seconds.clone()),
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "fixed_interval post-millis overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("fixed_interval") && msg.contains("positive duration"),
+    "fixed_interval post-millis overflow: expected message about positive duration, got `{msg}`",
+  );
+
+  // offset post-millis overflow (positive and negative) → "offset `...` is invalid"
+  for signed in [overflow_seconds.clone(), format!("-{overflow_seconds}")] {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("day".into()),
+        fixed_interval: None,
+        offset: Some(signed.clone()),
+        format: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let resp = reader.search(&base_request(aggs));
+    assert!(
+      resp.is_err(),
+      "offset post-millis overflow ({signed}) should surface InvalidConfig"
+    );
+    let msg = resp.err().unwrap().to_string();
+    assert!(
+      msg.contains("offset") && msg.contains("invalid"),
+      "offset post-millis overflow ({signed}): expected message about invalid offset, got `{msg}`",
+    );
+  }
+}
+
 #[test]
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();
