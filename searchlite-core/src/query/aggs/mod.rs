@@ -4496,16 +4496,21 @@ pub(crate) fn parse_interval_seconds(spec: &str) -> Option<f64> {
     return None;
   }
   // Every caller converts the returned seconds value to milliseconds via
-  // `secs * 1_000.0` before casting to `i64`. A finite magnitude above
-  // `f64::MAX / 1_000.0` overflows to `f64::INFINITY` after that
-  // multiplication, and Rust's `as i64` cast saturates infinity to
-  // `i64::MAX` — silently producing `DateInterval::Fixed(i64::MAX)`
-  // (all documents collapse into a single bucket) or an `i64::MAX`
-  // offset that drops every document. Reject such magnitudes centrally
+  // `secs * 1_000.0` before casting to `i64`. Rust's `as i64` cast
+  // saturates both `f64::INFINITY` AND any finite value above
+  // `i64::MAX` to `i64::MAX` (and symmetrically to `i64::MIN` on the
+  // negative side), silently producing `DateInterval::Fixed(i64::MAX)`
+  // (all documents collapse into a single bucket) or a saturated
+  // offset that drops every document. Reject magnitudes whose
+  // millisecond value would fall outside a conservative `i64` window
   // so the overflow surfaces as a parse failure at every call site,
   // rather than patching each `* 1_000.0` multiplication individually.
-  // Guards BUG-408.
-  if magnitude.abs() > f64::MAX / 1_000.0 {
+  // The cap is `i64::MAX / 2` (~4.6e18 ms ≈ 146 million years), which
+  // is already astronomically larger than any realistic interval and
+  // leaves headroom for downstream arithmetic. Guards BUG-408.
+  const MAX_SAFE_MILLIS: f64 = (i64::MAX / 2) as f64;
+  let millis = magnitude * 1_000.0;
+  if !millis.is_finite() || millis.abs() > MAX_SAFE_MILLIS {
     return None;
   }
   Some(if negative { -magnitude } else { magnitude })
@@ -4563,43 +4568,56 @@ mod tests {
     let value = format!("1{}", "0".repeat(305));
     assert_eq!(parse_interval_seconds(&format!("{value}w")), None);
     assert_eq!(parse_interval_seconds(&format!("-{value}w")), None);
-    // Sanity check: the same value with a smaller multiplier (ms,
-    // which scales by 0.001) should still parse to a finite result.
-    assert!(parse_interval_seconds(&format!("{value}ms")).is_some_and(|f| f.is_finite()));
+    // Sanity check: a well-sized value with a smaller multiplier (ms,
+    // which scales by 0.001) should still parse to a finite result
+    // whose millisecond conversion fits comfortably in the `i64` range.
+    // Using `1e10` → `1e7 s` → `1e10 ms`, far below `i64::MAX`.
+    let small = format!("1{}", "0".repeat(10));
+    assert!(parse_interval_seconds(&format!("{small}ms")).is_some_and(|f| f.is_finite()));
   }
 
   // Regression test for BUG-408: `parse_interval_seconds` must reject
-  // finite seconds magnitudes that overflow to `f64::INFINITY` when the
-  // caller converts them to milliseconds via `secs * 1_000.0`. Without
-  // the `magnitude.abs() > f64::MAX / 1_000.0` guard, such a value would
-  // parse successfully, the downstream `* 1_000.0` would overflow, and
-  // Rust's `as i64` cast would saturate `f64::INFINITY` to `i64::MAX` —
-  // silently producing `DateInterval::Fixed(i64::MAX)` or an `i64::MAX`
-  // offset that collapses all documents into a single bucket or drops
-  // them entirely.
+  // finite seconds magnitudes whose millisecond value would saturate
+  // the `as i64` cast at the call sites. Without the guard, such
+  // values produce `DateInterval::Fixed(i64::MAX)` (all documents
+  // collapse into a single bucket) or a saturated offset (every
+  // document dropped), with no error returned. This covers two
+  // saturation paths: (a) `secs * 1_000.0 = f64::INFINITY` (the bug
+  // report's 306-digit prefix), and (b) `secs * 1_000.0` remains
+  // finite but exceeds `i64::MAX` (~9.22e18), where `as i64` still
+  // saturates silently.
   #[test]
   fn parse_interval_seconds_rejects_seconds_that_overflow_millis_conversion() {
-    // `1` followed by 306 zeros (≈1e306) parses to a finite f64 — it
-    // is well below `f64::MAX` (~1.8e308) — but exceeds
-    // `f64::MAX / 1_000.0` (~1.8e305), so multiplying by 1_000.0 in
-    // downstream code would overflow to infinity.
-    let value = format!("1{}", "0".repeat(306));
-    // Bare seconds, the unit used for `fixed_interval` and `offset`
-    // that triggers the bug report.
-    assert_eq!(parse_interval_seconds(&value), None);
-    assert_eq!(parse_interval_seconds(&format!("{value}s")), None);
-    // Negative sign path (the `offset` caller accepts negatives).
-    assert_eq!(parse_interval_seconds(&format!("-{value}s")), None);
-    assert_eq!(parse_interval_seconds(&format!("+{value}s")), None);
+    // Path (a) — `secs * 1_000.0` overflows to infinity.
+    // `1` followed by 306 zeros (≈1e306) is finite in f64 (~1.8e308)
+    // but multiplied by 1_000.0 overflows to `f64::INFINITY`.
+    let inf_after_mul = format!("1{}", "0".repeat(306));
+    assert_eq!(parse_interval_seconds(&inf_after_mul), None);
+    assert_eq!(parse_interval_seconds(&format!("{inf_after_mul}s")), None);
+    assert_eq!(parse_interval_seconds(&format!("-{inf_after_mul}s")), None);
+    assert_eq!(parse_interval_seconds(&format!("+{inf_after_mul}s")), None);
 
-    // Boundary check: the largest finite magnitude that survives the
-    // downstream `* 1_000.0` conversion should still parse. We pick
-    // `1e305`, which is comfortably below `f64::MAX / 1_000.0`
-    // (~1.7976e305) and yields a finite millisecond value.
-    let safe = format!("1{}", "0".repeat(305));
-    let parsed = parse_interval_seconds(&safe).expect("1e305s must parse");
+    // Path (b) — `secs * 1_000.0` is finite but above the `i64` range.
+    // `1` followed by 20 zeros (1e20) seconds → 1e23 millis, which is
+    // finite but far above `i64::MAX` (~9.22e18) and would saturate
+    // silently without the tightened guard.
+    let finite_but_saturates = format!("1{}", "0".repeat(20));
+    assert_eq!(parse_interval_seconds(&finite_but_saturates), None);
+    assert_eq!(parse_interval_seconds(&format!("{finite_but_saturates}s")), None);
+    assert_eq!(
+      parse_interval_seconds(&format!("-{finite_but_saturates}s")),
+      None
+    );
+
+    // Boundary sanity: a large-but-realistic magnitude (1e10 seconds
+    // ≈ 317 years) yields 1e13 millis, well inside the i64 range, and
+    // must still parse.
+    let safe = format!("1{}", "0".repeat(10));
+    let parsed = parse_interval_seconds(&safe).expect("1e10 bare seconds must parse");
     assert!(parsed.is_finite());
-    assert!((parsed * 1_000.0).is_finite());
+    let millis = parsed * 1_000.0;
+    assert!(millis.is_finite());
+    assert!(millis.abs() < i64::MAX as f64);
   }
 
   // Regression tests for BUG-296: `bucket_sort` by `_key` must compare numeric
