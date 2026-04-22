@@ -754,3 +754,92 @@ fn multi_match_ignores_overflow_boost_on_numeric_field_kind() {
     );
   }
 }
+
+#[test]
+fn bool_rejects_accumulated_term_weight_overflow() {
+  // BUG-401: `term_weights` in `IndexReader::search` sums per-term weights
+  // with `entry.1 += term.weight` when multiple query clauses resolve to the
+  // same `field:term` key. Each individual boost is validated finite by
+  // `combine_boost` at plan/expansion time (BUG-381 / BUG-396), but the sum
+  // of N finite f32 values can still overflow `f32::MAX` (~3.4e38) to `+Inf`.
+  // Before the guard, that `Inf` propagated into `ScoredTerm.weight` and
+  // through BM25 `score_tf` into the WAND/brute-force heap, corrupting
+  // ranking (WAND+Sum silently clamped to 0.0 per BUG-364) or producing an
+  // `Inf` in the serialised response (HTTP 500 on `serde_json::to_vec`).
+  // The guard must fire at accumulation time and mirror the
+  // `combine_boost` error shape.
+  let (_tmp, reader) = setup_reader();
+  // Two `should` clauses, each matching `body:rust` with a boost that is
+  // individually finite (f32::MAX ≈ 3.4e38). Their accumulated sum
+  // (3.6e38) exceeds f32::MAX and overflows to +Inf.
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1.8e38),
+      },
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1.8e38),
+      },
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let err = reader.search(&request(query)).unwrap_err();
+  let msg = err.to_string();
+  assert!(
+    msg.contains("overflows"),
+    "expected overflow error from the term_weights accumulation guard, got: {msg}",
+  );
+  assert!(
+    msg.contains("body:rust"),
+    "error should name the field:term key that overflowed, got: {msg}",
+  );
+}
+
+#[test]
+fn bool_accepts_accumulated_term_weight_within_range() {
+  // Control case for BUG-401: two clauses sharing a key whose summed weight
+  // stays finite must continue to search cleanly. Guards against a guard
+  // that rejects every legitimate multi-clause query.
+  let (_tmp, reader) = setup_reader();
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(2.0),
+      },
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(3.0),
+      },
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let result = reader
+    .search(&request(query))
+    .expect("finite summed weight must search cleanly");
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-401 control case: legitimate in-range boosts must still return hits",
+  );
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-401 control case: legitimate summed weights must yield finite scores (got {})",
+      hit.score,
+    );
+  }
+}
