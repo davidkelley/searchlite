@@ -672,3 +672,85 @@ fn multi_match_accepts_group_times_field_boost_within_range() {
     );
   }
 }
+
+#[test]
+fn multi_match_ignores_overflow_boost_on_numeric_field_kind() {
+  // BUG-396: the `combine_boost(group.boost, field.boost)?` guard must be
+  // scoped to Text/Keyword field kinds. `Numeric` and `Unknown` fields
+  // are no-ops inside `expand_term_groups` (nothing consumes `weight`),
+  // so an overflowing boost on one of those fields must not abort the
+  // whole query. Raising there would be a behavior regression for
+  // mixed / typoed field lists where Text fields still have legitimate
+  // finite boosts. Verifies Codex's P2 comment on the initial patch.
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("idx-bug-396-numeric-nop");
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "year".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".to_string(), serde_json::json!("doc-1")),
+        ("body".to_string(), serde_json::json!("rust systems")),
+        ("year".to_string(), serde_json::json!(2024)),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+  let reader = idx.reader().unwrap();
+  // `body` carries a sane 2.0 boost; `year` (numeric) carries an
+  // overflow-trigger 1e20 with a query-level 1e20 boost. The guard must
+  // not fire on the numeric field because its branch discards `weight`.
+  let query = QueryNode::MultiMatch {
+    query: "rust".into(),
+    fields: vec![
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(2.0),
+      },
+      FieldSpec {
+        field: "year".into(),
+        boost: Some(1e20),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(1e20),
+  };
+  let result = reader
+    .search(&request(query))
+    .expect("overflow boost on Numeric field must be a no-op, not a hard error");
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-396: mixed field list must still surface the Text-field match",
+  );
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-396: Text field's finite weight must still produce finite scores (got {})",
+      hit.score,
+    );
+  }
+}

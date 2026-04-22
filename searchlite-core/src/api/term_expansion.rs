@@ -142,18 +142,22 @@ pub(crate) fn expand_term_groups(
     let mut seen_keys = HashSet::new();
     for field in group.fields.iter() {
       let target_leaf = field.leaf.or(group.leaf);
-      // BUG-396: `group.boost` is the already-combined query boost (finite
-      // per BUG-381 / #383's `combine_boost` guard) and `field.boost` is
-      // the per-field multi_match boost (finite per `validate_boost`), but
-      // their f32 product can still overflow `f32::MAX` to `±INF` when
-      // both factors are large. Reject the overflow with the same plan-time
-      // diagnostic `combine_boost` raises for nested-query boosts, so the
-      // non-finite weight cannot leak into `ScoredTerm.weight` / BM25
-      // `score_tf` / the top-k heap.
-      let weight = combine_boost(group.boost, field.boost)?;
       match schema.field_kind(&field.field) {
         FieldKind::Text => {
           if let Some(analyzer) = analysis.search_analyzer(&field.field) {
+            // BUG-396: `group.boost` is the already-combined query boost
+            // (finite per BUG-381 / #383's `combine_boost` guard) and
+            // `field.boost` is the per-field multi_match boost (finite
+            // per `validate_boost`), but their f32 product can still
+            // overflow `f32::MAX` to `±INF` when both factors are large.
+            // Reject the overflow with the same diagnostic `combine_boost`
+            // raises for nested-query boosts so the non-finite weight
+            // cannot leak into `ScoredTerm.weight` / BM25 `score_tf` / the
+            // top-k heap. The check is scoped to Text/Keyword field kinds
+            // because only those consume `weight`; a huge boost on a
+            // Numeric / Unknown field is a no-op today and must stay one
+            // (raising on those would regress mixed / typoed field lists).
+            let weight = combine_boost(group.boost, field.boost)?;
             let mut seen_tokens = HashSet::new();
             let tokens: Vec<String> = match group.expansion {
               TermExpansion::Exact => analyzer
@@ -192,6 +196,9 @@ pub(crate) fn expand_term_groups(
           }
         }
         FieldKind::Keyword => {
+          // BUG-396: same overflow guard as the Text branch, scoped here
+          // so Numeric / Unknown fields (no-ops below) stay no-ops.
+          let weight = combine_boost(group.boost, field.boost)?;
           let term = fold_keyword(&group.term).into_owned();
           let term_fuzzy =
             resolve_multi_match_fuzzy_options(group.fuzziness.as_ref(), request_fuzzy, &term);
