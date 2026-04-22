@@ -541,6 +541,110 @@ fn decay_rejects_non_finite_decay_factor_negative_infinity() {
   );
 }
 
+// BUG-392: `compile_functions` validates `FieldValueFactor.factor` for
+// finiteness but not `FieldValueFactor.missing`. A non-finite `missing`
+// (NaN, ±Infinity) propagates through `raw * factor` for docs that omit the
+// numeric field; the downstream `scaled.is_finite()` guard then silently
+// drops the doc's function contribution. Mirrors the symmetric guard on
+// `rank_feature.missing` and the `decay` parameter guards: reject
+// non-finite `missing` at the plan boundary with an actionable error.
+#[test]
+fn field_value_factor_rejects_non_finite_missing_nan() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::NAN),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_rejects_non_finite_missing_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::INFINITY),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_rejects_non_finite_missing_negative_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::NEG_INFINITY),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_accepts_finite_missing() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(0.0),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+}
+
 #[test]
 fn min_score_branch_does_not_drop_other_clauses() {
   let reader = setup_reader();
