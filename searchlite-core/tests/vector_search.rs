@@ -1237,14 +1237,15 @@ fn l2_search_with_boost_gt_one_returns_far_doc_when_pairwise_squared_diff_overfl
       hit.doc_id,
       hit.score,
     );
-    if let Some(vs) = hit.vector_score {
-      assert!(
-        vs.is_finite(),
-        "vector_score must be finite after saturating boost multiplication; doc {} had vector_score {}",
-        hit.doc_id,
-        vs,
-      );
-    }
+    let vs = hit
+      .vector_score
+      .expect("vector-only query hits must include vector_score");
+    assert!(
+      vs.is_finite(),
+      "vector_score must be finite after saturating boost multiplication; doc {} had vector_score {}",
+      hit.doc_id,
+      vs,
+    );
   }
 }
 
@@ -1300,4 +1301,12 @@ fn vector_boost_preserves_finite_vscore_product_within_f32_range() {
     "expected vscore ≈ 3.0 (cosine 1.0 * boost 3.0), got {vs}"
   );
   assert!(hits[0].score.is_finite());
+  // Vector-only hybrid query (`alpha = 0.0`) with a single clause must
+  // collapse to `hit.score == hit.vector_score`. Asserting the relationship
+  // catches any future divergence between the two fields end-to-end.
+  assert!(
+    (hits[0].score - vs).abs() < 1e-5,
+    "expected score ≈ vector_score for a vector-only query, got score={} vector_score={vs}",
+    hits[0].score
+  );
 }
