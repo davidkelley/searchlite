@@ -4105,12 +4105,14 @@ fn default_percentiles_list() -> Vec<f64> {
 }
 
 /// Map `(val - offset) / interval` to a bucket id, returning `None` when the
-/// quotient cannot be represented as an `i64` without loss (BUG-358).
+/// quotient cannot be represented as an `i64` without loss (BUG-358) or when
+/// the inverse reconstruction `id * interval + offset` used by downstream key
+/// serialization would overflow to a non-finite f64 (BUG-410).
 ///
-/// Two overflow modes must be rejected for histogram arithmetic so that
-/// documents whose bucket id would saturate the `as i64` cast are dropped
-/// rather than silently coalesced into a shared `i64::MAX` / `i64::MIN` bucket
-/// with a wrong reconstructed key:
+/// Three overflow modes must be rejected for histogram arithmetic so that
+/// documents whose bucket id would saturate the `as i64` cast, or whose
+/// reconstructed key would be non-finite, are dropped rather than silently
+/// coalesced into a wrong bucket:
 ///
 /// 1. The quotient itself overflows f64 to `±Infinity` (for example
 ///    `f64::MAX / 0.5`); `is_finite()` rejects this shape.
@@ -4118,6 +4120,19 @@ fn default_percentiles_list() -> Vec<f64> {
 ///    range (for example `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`); the
 ///    magnitude comparison against `i64::MAX as f64 = 2^63` rejects this
 ///    shape.
+/// 3. The reconstruction `id as f64 * interval + offset` overflows to
+///    `±Infinity`. `i64 -> f64` rounding (values above `2^53` are not all
+///    exactly representable) can nudge the product past `f64::MAX` even when
+///    the original quotient was within bounds — for example with
+///    `interval = 3e289` and `val = f64::MAX` the quotient is a finite
+///    in-range i64 but the reverse product evaluates to `f64::INFINITY`,
+///    which `serde_json::Number::from_f64` rejects. The JSON key
+///    serialization paths in `HistogramCollector::collect` and `finish` then
+///    fall back to `unwrap_or_else(|| Number::from(0))`, silently keying the
+///    bucket at `0`. The `hard_bounds` filter compares the reconstruction
+///    directly without a JSON fallback, but treating the infinite product as
+///    a bucket value there is still wrong; centralizing the guard covers
+///    every site uniformly.
 ///
 /// Note: `i64::MAX as f64` rounds up to `2^63` because `2^63 - 1` is not
 /// representable in f64, so the upper bound uses `>=` to keep every `q` whose
@@ -4129,7 +4144,20 @@ fn finite_bucket_id(val: f64, offset: f64, interval: f64) -> Option<i64> {
   if !q.is_finite() || q >= (i64::MAX as f64) || q < (i64::MIN as f64) {
     return None;
   }
-  Some(q as i64)
+  let id = q as i64;
+  // Guard the inverse reconstruction (BUG-410). Downstream call sites
+  // (`HistogramCollector::collect`, `finish`, and the `hard_bounds` filter)
+  // recompute `id as f64 * interval + offset`. On the JSON key serialization
+  // paths a non-finite product flows into `serde_json::Number::from_f64`,
+  // which returns `None`, and the `unwrap_or_else(|| Number::from(0))`
+  // fallback then silently keys the bucket at `0`; the `hard_bounds`
+  // comparison does not re-key but still treats an infinite product as a
+  // bucket value. Rejecting here centralizes the guard so every site is
+  // protected uniformly.
+  if !(id as f64 * interval + offset).is_finite() {
+    return None;
+  }
+  Some(id)
 }
 
 /// Compute the effective fill range for `HistogramCollector::finish`.
@@ -5634,6 +5662,34 @@ mod tests {
     // casts back to `i64::MIN` — legitimate, so the guard accepts it.
     let neg_boundary = i64::MIN as f64;
     assert_eq!(finite_bucket_id(neg_boundary, 0.0, 1.0), Some(i64::MIN));
+  }
+
+  /// BUG-410: even when the quotient is finite and within the `i64`
+  /// representable range (so the BUG-358 guard accepts it), the inverse
+  /// reconstruction `id as f64 * interval + offset` can still overflow to
+  /// `±Infinity`. At `val = ±f64::MAX` with `interval = 3e289` the quotient
+  /// `val / interval ≈ ±5.99e18` is within the i64 range, but the reverse
+  /// product exceeds `f64::MAX` once i64→f64 rounding is applied.
+  /// `serde_json::Number::from_f64` rejects non-finite values, and the
+  /// downstream `unwrap_or_else(|| Number::from(0))` fallback at each call
+  /// site would silently re-key the bucket at `0`, colliding with a
+  /// legitimate bucket at zero. Reject here so every call site is covered.
+  #[test]
+  fn finite_bucket_id_rejects_reconstruction_overflow() {
+    assert_eq!(finite_bucket_id(f64::MAX, 0.0, 3e289), None);
+    assert_eq!(finite_bucket_id(-f64::MAX, 0.0, 3e289), None);
+  }
+
+  /// A near-neighbor case whose reconstruction stays finite must still be
+  /// accepted: the guard should reject only the overflow shape, not every
+  /// extreme interval. `val = f64::MAX` with `interval = 2e289` produces a
+  /// product that is finite (equal to `f64::MAX` within rounding) and must
+  /// round-trip to a valid `i64` bucket id.
+  #[test]
+  fn finite_bucket_id_accepts_near_boundary_finite_reconstruction() {
+    let id = finite_bucket_id(f64::MAX, 0.0, 2e289).expect("reconstruction is finite");
+    let reconstructed = id as f64 * 2e289;
+    assert!(reconstructed.is_finite());
   }
 
   #[test]
