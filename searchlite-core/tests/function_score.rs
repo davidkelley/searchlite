@@ -541,6 +541,110 @@ fn decay_rejects_non_finite_decay_factor_negative_infinity() {
   );
 }
 
+// BUG-392: `compile_functions` validates `FieldValueFactor.factor` for
+// finiteness but not `FieldValueFactor.missing`. A non-finite `missing`
+// (NaN, ±Infinity) propagates through `raw * factor` for docs that omit the
+// numeric field; the downstream `scaled.is_finite()` guard then silently
+// drops the doc's function contribution. Mirrors the symmetric guard on
+// `rank_feature.missing` and the `decay` parameter guards: reject
+// non-finite `missing` at the plan boundary with an actionable error.
+#[test]
+fn field_value_factor_rejects_non_finite_missing_nan() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::NAN),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_rejects_non_finite_missing_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::INFINITY),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_rejects_non_finite_missing_negative_infinity() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(f64::NEG_INFINITY),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("field_value_factor `missing` must be finite"),
+    "expected missing-finitude error, got {err}"
+  );
+}
+
+#[test]
+fn field_value_factor_accepts_finite_missing() {
+  let reader = setup_reader();
+  let req = base_request(QueryNode::FunctionScore {
+    query: Box::new(QueryNode::MatchAll { boost: None }),
+    functions: vec![FunctionSpec::FieldValueFactor {
+      field: "popularity".into(),
+      factor: 1.0,
+      modifier: Some(FieldValueModifier::None),
+      missing: Some(0.0),
+      filter: None,
+    }],
+    score_mode: Some(FunctionScoreMode::Sum),
+    boost_mode: Some(FunctionBoostMode::Replace),
+    max_boost: None,
+    min_score: None,
+    boost: None,
+  });
+  let resp = reader.search(&req).unwrap();
+  assert_eq!(resp.hits.len(), 3);
+}
+
 #[test]
 fn min_score_branch_does_not_drop_other_clauses() {
   let reader = setup_reader();
@@ -2112,14 +2216,21 @@ fn script_score_large_negative_literal_overflow_clamps_to_f32_min() {
 // into the WAND heap (corrupting ordering) and into `Hit.score`, where
 // `serde_json` rejects it as invalid JSON and the HTTP endpoint returns 500.
 // See BUG-370.
+//
+// The planner now catches this class of overflow at build time (the
+// `combine_boost` helper bails when `boost * node_boost` is non-finite),
+// so the request is rejected with an actionable error before it reaches
+// the WAND loop. The evaluator guard remains as defense-in-depth for any
+// non-finite score that might be produced by later arithmetic.
 #[test]
-fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
+fn constant_score_rejects_request_when_boost_product_overflows_to_infinity() {
   let reader = setup_reader();
   // `Bool` with `boost = 1e38` containing a single `ConstantScore` with
   // `boost = 1e38`. Both factors are individually finite and pass
   // `validate_boost`, but their product `1e38 * 1e38 = 1e76` overflows
-  // `f32::MAX ≈ 3.4e38` and saturates to `+INFINITY`. With the guard in
-  // place, the Constant evaluator returns `None` and the hit is dropped.
+  // `f32::MAX ≈ 3.4e38` and saturates to `+INFINITY`. With the planner
+  // guard in place, `search` surfaces the overflow as a validation error
+  // rather than silently dropping the document.
   let req = base_request(QueryNode::Bool {
     must: vec![QueryNode::ConstantScore {
       filter: Filter::KeywordEq {
@@ -2134,12 +2245,12 @@ fn constant_score_rejects_document_when_boost_product_overflows_to_infinity() {
     minimum_should_match: None,
     boost: Some(1e38),
   });
-  let resp = reader.search(&req).unwrap();
+  let err = reader
+    .search(&req)
+    .expect_err("overflowing boost product must be rejected at plan time");
   assert!(
-    resp.hits.is_empty(),
-    "expected no hits when Constant score overflows to infinity, got {} hits with scores {:?}",
-    resp.hits.len(),
-    resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+    err.to_string().contains("overflows"),
+    "expected overflow validation error, got: {err}",
   );
 }
 
