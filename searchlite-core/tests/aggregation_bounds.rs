@@ -3931,12 +3931,15 @@ mod bug_358 {
 /// in f64) can nudge the product past `f64::MAX` and evaluate to `±Infinity`
 /// even when the original quotient was finite and within i64 range.
 ///
-/// At that point `serde_json::Number::from_f64(±Infinity)` returns `None` and
-/// the `unwrap_or_else(|| Number::from(0))` fallback at each call site
-/// silently re-keys the bucket at `0`, potentially colliding with a
-/// legitimate bucket. The fix extends `finite_bucket_id` to also reject
-/// quotients whose reconstruction is non-finite, so the affected documents
-/// are dropped (matching the composite-histogram policy from BUG-356 and the
+/// At that point `serde_json::Number::from_f64(±Infinity)` returns `None`, so
+/// the JSON key serialization paths in `HistogramCollector::collect` and
+/// `finish` fall back to `unwrap_or_else(|| Number::from(0))` and silently
+/// re-key the bucket at `0`, potentially colliding with a legitimate bucket.
+/// (The `hard_bounds` filter compares the reconstruction directly without a
+/// JSON fallback, but still treats an infinite product as a bucket value.)
+/// The fix extends `finite_bucket_id` to also reject quotients whose
+/// reconstruction is non-finite, so the affected documents are dropped
+/// (matching the composite-histogram policy from BUG-356 and the
 /// forward-quotient policy from BUG-358) rather than keyed at `0`.
 mod bug_410 {
   use super::*;

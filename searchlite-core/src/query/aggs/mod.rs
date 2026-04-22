@@ -4124,10 +4124,15 @@ fn default_percentiles_list() -> Vec<f64> {
 ///    `±Infinity`. `i64 -> f64` rounding (values above `2^53` are not all
 ///    exactly representable) can nudge the product past `f64::MAX` even when
 ///    the original quotient was within bounds — for example with
-///    `interval ≈ 2e289` and `val ≈ f64::MAX` the quotient is a finite
+///    `interval = 3e289` and `val = f64::MAX` the quotient is a finite
 ///    in-range i64 but the reverse product evaluates to `f64::INFINITY`,
-///    which `serde_json::Number::from_f64` rejects and the call sites' silent
-///    `unwrap_or_else(|| Number::from(0))` fallback would key at `0`.
+///    which `serde_json::Number::from_f64` rejects. The JSON key
+///    serialization paths in `HistogramCollector::collect` and `finish` then
+///    fall back to `unwrap_or_else(|| Number::from(0))`, silently keying the
+///    bucket at `0`. The `hard_bounds` filter compares the reconstruction
+///    directly without a JSON fallback, but treating the infinite product as
+///    a bucket value there is still wrong; centralizing the guard covers
+///    every site uniformly.
 ///
 /// Note: `i64::MAX as f64` rounds up to `2^63` because `2^63 - 1` is not
 /// representable in f64, so the upper bound uses `>=` to keep every `q` whose
@@ -4142,11 +4147,13 @@ fn finite_bucket_id(val: f64, offset: f64, interval: f64) -> Option<i64> {
   let id = q as i64;
   // Guard the inverse reconstruction (BUG-410). Downstream call sites
   // (`HistogramCollector::collect`, `finish`, and the `hard_bounds` filter)
-  // recompute `id as f64 * interval + offset` to emit the bucket key; if that
-  // overflows to non-finite, `serde_json::Number::from_f64` returns `None` and
-  // the `unwrap_or_else(|| Number::from(0))` fallback at those sites keys the
-  // bucket at `0`, potentially colliding with a legitimate bucket. Rejecting
-  // here centralizes the guard so every call site is protected.
+  // recompute `id as f64 * interval + offset`. On the JSON key serialization
+  // paths a non-finite product flows into `serde_json::Number::from_f64`,
+  // which returns `None`, and the `unwrap_or_else(|| Number::from(0))`
+  // fallback then silently keys the bucket at `0`; the `hard_bounds`
+  // comparison does not re-key but still treats an infinite product as a
+  // bucket value. Rejecting here centralizes the guard so every site is
+  // protected uniformly.
   if !(id as f64 * interval + offset).is_finite() {
     return None;
   }
