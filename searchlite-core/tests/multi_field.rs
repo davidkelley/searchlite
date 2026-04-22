@@ -577,3 +577,83 @@ fn cross_fields_zero_token_analyzer_behavior_is_deterministic() {
   assert_eq!(ranked(&first), ranked(&second));
   assert_eq!(first.hits.first().map(|h| h.doc_id.as_str()), Some("doc-1"));
 }
+
+#[test]
+fn multi_match_rejects_group_times_field_boost_overflow() {
+  // BUG-396: `group.boost` (the combined query boost already validated by
+  // `combine_boost` at plan time) and `field.boost` (per-field multi_match
+  // boost validated by `validate_boost`) are each finite, but their f32
+  // product in `expand_term_groups` can still overflow past `f32::MAX` to
+  // `+inf`. Before the guard, that non-finite weight flowed into
+  // `ScoredTerm.weight`, BM25 `score_tf`, and finally `Hit.score`, tripping
+  // `serde_json` on the HTTP path (HTTP 500) or silently dropping the doc
+  // under the in-flight BUG-381 heap guard. Expansion-time rejection
+  // mirrors the `combine_boost` plan-time error shape for the same class
+  // of bug on the next multiplication site.
+  let (_tmp, reader) = setup_reader();
+  let overflow = QueryNode::MultiMatch {
+    query: "rust".into(),
+    // Each per-field boost is finite on its own (f32::MAX ≈ 3.4e38), so
+    // `validate_boost` accepts both. The query-level boost multiplies into
+    // every per-field weight via `expand_term_groups`, and `1e20 * 1e20`
+    // overflows f32.
+    fields: vec![
+      FieldSpec {
+        field: "title".into(),
+        boost: Some(1e20),
+      },
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(1e20),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(1e20),
+  };
+  let err = reader.search(&request(overflow)).unwrap_err();
+  assert!(
+    err.to_string().contains("overflows"),
+    "expected overflow error from the group.boost * field.boost guard, got: {err}",
+  );
+}
+
+#[test]
+fn multi_match_accepts_group_times_field_boost_within_range() {
+  // Control case for BUG-396: a combined product that stays finite after
+  // multiplication must search cleanly, so the new guard does not regress
+  // legitimate per-field boosts.
+  let (_tmp, reader) = setup_reader();
+  let finite = QueryNode::MultiMatch {
+    query: "rust".into(),
+    fields: vec![
+      FieldSpec {
+        field: "title".into(),
+        boost: Some(3.0),
+      },
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(2.0),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(4.0),
+  };
+  let result = reader
+    .search(&request(finite))
+    .expect("finite group × field boost product must search cleanly");
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-396: legitimate in-range boosts must yield finite scores (got {})",
+      hit.score,
+    );
+  }
+}

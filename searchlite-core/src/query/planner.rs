@@ -950,7 +950,11 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
 /// silently dropped documents further down the pipeline (BUG-381).
 /// Rejecting the overflow at plan-time turns that into a deterministic,
 /// actionable validation error instead.
-fn combine_boost(boost: f32, node_boost: f32) -> Result<f32> {
+///
+/// BUG-396 extends the same guarantee to the per-(group, field) product in
+/// `expand_term_groups`, which multiplies the already-combined query boost
+/// by the per-field multi_match boost when materialising term weights.
+pub(crate) fn combine_boost(boost: f32, node_boost: f32) -> Result<f32> {
   let combined = boost * node_boost;
   if !combined.is_finite() {
     bail!(
