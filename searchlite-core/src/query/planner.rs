@@ -995,6 +995,19 @@ fn clamp_expansions(
 
 fn validate_tie_breaker(tie: &Option<f32>) -> Result<f32> {
   let value = tie.unwrap_or(0.0);
+  // Every ordered comparison with `NaN` returns `false` under IEEE-754, so the
+  // `< 0.0` and `> 1.0` range checks below do not fire for `NaN`. Without this
+  // guard a caller supplying `tie_breaker: NaN` (reachable via the WASM
+  // binding, same as BUG-373 / BUG-379) plants `NaN` into
+  // `ScoreNode::DisMax.tie_breaker` and `ScoreExpr::DisMax.tie_breaker`. At
+  // runtime `max + NaN * (sum - max)` evaluates to `NaN`, which either
+  // silently drops every candidate via the `is_finite()` guard in
+  // `evaluate_compiled_score` or clamps their DisMax contribution to `0.0`
+  // via the matching guard on the BM25 fast path. Reject non-finite
+  // `tie_breaker` at the plan boundary instead, mirroring `validate_boost`.
+  if !value.is_finite() {
+    bail!("tie_breaker must be finite");
+  }
   if value < 0.0 {
     bail!("tie_breaker must be non-negative");
   }
@@ -1661,5 +1674,101 @@ mod tests {
     let plan = build_query_plan(&query, &["body".to_string()])
       .expect("finite nested boost product must plan cleanly");
     assert!(plan.scorer.is_some());
+  }
+
+  // Regression tests for BUG-399. `validate_tie_breaker` previously range-checked
+  // `< 0.0` / `> 1.0` only; both comparisons evaluate to `false` for `NaN` under
+  // IEEE-754, so a `tie_breaker: NaN` planted via the WASM binding flowed into
+  // `ScoreNode::DisMax` / `ScoreExpr::DisMax` and silently dropped or zero-scored
+  // matching candidates at runtime. The guard must reject `NaN` (and `±Infinity`,
+  // for symmetry with `validate_boost`) at plan time.
+
+  #[test]
+  fn validate_tie_breaker_rejects_nan() {
+    let err = validate_tie_breaker(&Some(f32::NAN)).unwrap_err();
+    assert!(
+      err.to_string().contains("must be finite"),
+      "expected finitude error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn validate_tie_breaker_rejects_positive_infinity() {
+    let err = validate_tie_breaker(&Some(f32::INFINITY)).unwrap_err();
+    assert!(
+      err.to_string().contains("must be finite"),
+      "expected finitude error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn validate_tie_breaker_rejects_negative_infinity() {
+    let err = validate_tie_breaker(&Some(f32::NEG_INFINITY)).unwrap_err();
+    assert!(
+      err.to_string().contains("must be finite"),
+      "expected finitude error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn validate_tie_breaker_accepts_finite_in_range() {
+    assert_eq!(validate_tie_breaker(&None).unwrap(), 0.0);
+    assert_eq!(validate_tie_breaker(&Some(0.0)).unwrap(), 0.0);
+    assert_eq!(validate_tie_breaker(&Some(0.5)).unwrap(), 0.5);
+    assert_eq!(validate_tie_breaker(&Some(1.0)).unwrap(), 1.0);
+  }
+
+  #[test]
+  fn validate_tie_breaker_still_rejects_out_of_range() {
+    let err = validate_tie_breaker(&Some(-0.1)).unwrap_err();
+    assert!(
+      err.to_string().contains("non-negative"),
+      "expected non-negative error, got: {err}",
+    );
+    let err = validate_tie_breaker(&Some(1.1)).unwrap_err();
+    assert!(
+      err.to_string().contains("<= 1.0"),
+      "expected upper-bound error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_dis_max_tie_breaker_nan() {
+    let query = Query::Node(QueryNode::DisMax {
+      queries: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: None,
+      }],
+      tie_breaker: Some(f32::NAN),
+      boost: None,
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("tie_breaker must be finite"),
+      "expected tie_breaker finitude error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_multi_match_tie_breaker_nan() {
+    let query = Query::Node(QueryNode::MultiMatch {
+      query: "rust".into(),
+      fields: vec![FieldSpec {
+        field: "body".into(),
+        boost: None,
+      }],
+      match_type: MultiMatchType::BestFields,
+      fuzziness: None,
+      tie_breaker: Some(f32::NAN),
+      operator: None,
+      minimum_should_match: None,
+      boost: None,
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("tie_breaker must be finite"),
+      "expected tie_breaker finitude error, got: {err}",
+    );
   }
 }
