@@ -537,6 +537,19 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
     let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
     for (doc_id, leaves) in scores.into_iter() {
       let mut score = plan.evaluate(&leaves);
+      // BUG-381: the plan-time guard (combine_boost) rejects overflow of
+      // `boost * node_boost`, but the per-doc `bm25 * weight` in score_tf
+      // can still overflow to ±INF when a validated-finite `weight` is
+      // combined with a typical BM25 contribution, and `plan.evaluate`
+      // sums those leaf values. score_adjust is only installed when custom
+      // scoring is active, so for plain BM25 a non-finite value would leak
+      // straight into the heap → `Hit.score` → HTTP 500 (serde_json rejects
+      // ±INF / NaN). Drop the candidate to match the policy enforced by
+      // every `evaluate_compiled_score` variant (BUG-315) and the rescore
+      // combine path (BUG-326).
+      if !score.is_finite() {
+        continue;
+      }
       if let Some(adj) = score_adjust.as_deref_mut() {
         let Some(adjusted) = adj(doc_id, score, &leaves) else {
           continue;
@@ -580,6 +593,13 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
   });
   let mut heap: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
   for (doc_id, mut score) in scores.into_iter() {
+    // BUG-381: see the plan-driven branch above for rationale. The
+    // accumulated `score_tf = bm25 * weight` can overflow to ±INF for a
+    // validated-finite `weight`, and no downstream step in the plain-BM25
+    // path rejects non-finite scores before the heap.
+    if !score.is_finite() {
+      continue;
+    }
     if let Some(adj) = score_adjust.as_deref_mut() {
       let Some(adjusted) = adj(doc_id, score, &[]) else {
         continue;
@@ -838,7 +858,18 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
       }
 
       let leaves_slice = leaf_scores.as_deref().unwrap_or(&[]);
-      let score_opt = if let Some(adj) = score_adjust.as_deref_mut() {
+      // BUG-381: `score_sum` accumulates `score_tf = bm25 * weight` across
+      // matching terms. Each `weight` is validated finite at plan time by
+      // `combine_boost`, but `bm25 * weight` for a single term can still
+      // overflow to +INF when `weight` is near `f32::MAX / bm25`. For plain
+      // BM25 queries `score_adjust` is `None`, so `score_opt = Some(score)`
+      // carries the overflow straight into the heap → `Hit.score` and the
+      // HTTP response, where `serde_json` rejects ±INF and NaN. Drop the
+      // candidate up front so custom-scoring hooks and `accept` never see
+      // a non-finite input.
+      let score_opt = if !score.is_finite() {
+        None
+      } else if let Some(adj) = score_adjust.as_deref_mut() {
         adj(doc_id, score, leaves_slice)
       } else {
         Some(score)
@@ -1374,6 +1405,14 @@ mod tests {
     // Setup: one "anchor" term with normal BM25 scores that seeds the heap
     // with finite scores, and one "overflow" term whose single posting lies
     // past the anchor's doc_ids and whose ub overflows f32.
+    //
+    // Post BUG-381: the new heap-level finitude guard drops docs whose
+    // runtime `bm25 * weight` is non-finite, so this test needs an overflow
+    // term where the *upper bound* still overflows (min_doc_len is small,
+    // so UB uses tight tf-normalization) while the actual per-doc score is
+    // finite (doc 100's recorded length is very large, so tf-normalization
+    // dampens its bm25 contribution enough to stay inside f32). This keeps
+    // the pivot-scan invariant under test without colliding with BUG-381.
     let anchor = term_from_entries(&[
       PostingEntry {
         doc_id: 1,
@@ -1400,6 +1439,8 @@ mod tests {
       }],
       DEFAULT_BLOCK_SIZE,
     );
+    let mut doc_lengths = vec![10.0_f32; 101];
+    doc_lengths[100] = 1.0e20_f32;
     let overflow = ScoredTerm {
       postings: overflow_postings,
       weight: f32::MAX,
@@ -1408,7 +1449,7 @@ mod tests {
       k1: 1.2,
       b: 0.75,
       leaf: 0,
-      doc_lengths: Some(Arc::new(vec![10.0; 101])),
+      doc_lengths: Some(Arc::new(doc_lengths)),
       min_doc_len: Some(10.0),
     };
 
@@ -1420,6 +1461,24 @@ mod tests {
       overflow_state.upper_bound().is_infinite() && overflow_state.upper_bound().is_sign_positive(),
       "overflow term global ub should be +inf; got {}",
       overflow_state.upper_bound(),
+    );
+    // Precondition: doc 100's per-doc score must be finite so the BUG-381
+    // heap-level guard doesn't legitimately drop it — otherwise this test
+    // stops exercising BUG-366 and starts colliding with BUG-381.
+    let doc_100_score = score_tf(
+      u32::MAX as f32,
+      1.0,
+      overflow_state.doc_len(100),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      doc_100_score.is_finite(),
+      "doc 100 per-doc score must be finite (got {doc_100_score}); tune doc_lengths[100] \
+       so tf-normalization keeps bm25 * weight in f32 range",
     );
 
     let mut accept = |_doc: DocId, _score: f32| true;
@@ -1439,6 +1498,176 @@ mod tests {
       results.iter().any(|r| r.doc_id == 100),
       "doc 100 (overflow term) was dropped from top-k: {:?}",
       results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  // BUG-381: construct a term whose validated-finite `weight` combined with
+  // the per-doc `bm25` overflows `f32::MAX` to `+inf`. Before the heap-level
+  // guard, `score_tf = bm25 * weight = +inf` flows through the plain-BM25
+  // branch of `execute_top_k_with_stats_and_mode_internal` (where
+  // `score_adjust` is `None`) and lands in `Hit.score`, which then fails
+  // `serde_json` serialization with an HTTP 500. The fix rejects non-finite
+  // scores before `push_top_k`, matching the defensive pattern used by every
+  // `evaluate_compiled_score` variant (BUG-315) and the rescore combine path
+  // (BUG-326).
+  fn overflow_term_for_bug_381() -> ScoredTerm {
+    let postings = PostingsReader::from_entries_for_test(
+      vec![PostingEntry {
+        doc_id: 5,
+        term_freq: u32::MAX,
+        positions: smallvec![],
+      }],
+      DEFAULT_BLOCK_SIZE,
+    );
+    ScoredTerm {
+      postings,
+      // `combine_boost` (BUG-381 plan-time guard) accepts every finite boost,
+      // so `f32::MAX` is reachable via e.g. a root boost of `sqrt(f32::MAX)`
+      // multiplied by a child boost of `sqrt(f32::MAX)` — both individually
+      // finite, their product saturates the validator's upper bound.
+      weight: f32::MAX,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 6])),
+      min_doc_len: Some(10.0),
+    }
+  }
+
+  fn anchor_term_for_bug_381() -> ScoredTerm {
+    // A second, finite-scoring term so the heap has at least one legitimate
+    // result — asserts the guard drops only the overflowing doc rather than
+    // emptying the result set.
+    term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 2,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ])
+  }
+
+  #[test]
+  fn overflow_term_for_bug_381_produces_non_finite_score() {
+    // Sanity check on the test fixture itself: if bm25 math ever changes
+    // such that this term no longer overflows, the regression tests below
+    // stop exercising the bug and need to be retuned.
+    let overflow = overflow_term_for_bug_381();
+    let tf = u32::MAX as f32;
+    let df = overflow.postings.len() as f32;
+    let score = score_tf(
+      tf,
+      df,
+      overflow.doc_len(5),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      !score.is_finite(),
+      "fixture precondition: overflow term's per-doc score_tf must be non-finite, got {score}",
+    );
+  }
+
+  #[test]
+  fn wand_drops_doc_with_non_finite_bm25_score() {
+    // BUG-381: the overflow doc must not leak a non-finite score through
+    // the WAND pivot-scan heap path.
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "wand leaked non-finite score {}: {:?}",
+        r.score,
+        results,
+      );
+    }
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "wand kept overflow doc 5 despite non-finite bm25*weight: {:?}",
+      results,
+    );
+  }
+
+  #[test]
+  fn bmw_drops_doc_with_non_finite_bm25_score() {
+    // BUG-381: same invariant, BMW strategy (block-max-wand) — shares the
+    // same `wand_loop` heap-push site as plain WAND, so one guard covers
+    // both pivot-advancement paths.
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      &mut accept,
+      None,
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "bmw leaked non-finite score {}: {:?}",
+        r.score,
+        results,
+      );
+    }
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "bmw kept overflow doc 5 despite non-finite bm25*weight: {:?}",
+      results,
+    );
+  }
+
+  #[test]
+  fn brute_force_drops_doc_with_non_finite_bm25_score() {
+    // BUG-381: the brute-force path (enabled via `ExecutionStrategy::Bm25`)
+    // has two heap-push sites (with and without a `ScorePlan`). This test
+    // exercises the no-plan branch, which is the default for plain
+    // Match/MultiMatch/Bool-of-terms queries without custom scoring.
+    let anchor = anchor_term_for_bug_381();
+    let overflow = overflow_term_for_bug_381();
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      &mut accept,
+      None,
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "brute_force leaked non-finite score {}: {:?}",
+        r.score,
+        results,
+      );
+    }
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "brute_force kept overflow doc 5 despite non-finite bm25*weight: {:?}",
+      results,
     );
   }
 
