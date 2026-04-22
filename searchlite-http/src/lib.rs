@@ -963,13 +963,15 @@ impl HttpError {
   }
 }
 
-/// Classify an error from `Index::writer_with_key` / `Index::commit_with_key`
-/// / `Index::compact_with_key` into the HTTP status code the caller should
-/// receive. Uses `anyhow::Error::downcast_ref::<WriteKeyError>()` so the
-/// classification stays correct if the error's `Display` text changes or a
-/// non-auth error coincidentally mentions "write key" — the substring match
-/// this replaces flipped classifications whenever either shifted. Mirrors the
-/// FFI-side `classify_writer_err` (see BUG-020).
+/// Classify an error surfaced by a write-key-gated path — currently
+/// `Index::writer_with_key`, the `writer.commit()` that follows it in the
+/// commit endpoint, and `Index::compact_with_key` — into the HTTP status code
+/// the caller should receive. Uses
+/// `anyhow::Error::downcast_ref::<WriteKeyError>()` so the classification
+/// stays correct if the error's `Display` text changes or a non-auth error
+/// coincidentally mentions "write key" — the substring match this replaces
+/// flipped classifications whenever either shifted. Mirrors the FFI-side
+/// `classify_writer_err` (see BUG-020).
 ///
 /// `write_key_provided` selects 401 (no key supplied) vs 403 (wrong key) on
 /// auth failures, matching the pre-existing behaviour.
@@ -2899,27 +2901,35 @@ mod tests {
   #[test]
   fn classify_writer_error_routes_write_key_variants_to_auth_status() {
     // Every `WriteKeyError` variant must map to an auth status regardless of
-    // its `Display` text, which is what the previous substring match got
-    // wrong (BUG-406, mirrors the FFI-side BUG-020).
-    for err in [
-      WriteKeyError::Required,
-      WriteKeyError::Mismatch("segment binding; index may be tampered"),
-      WriteKeyError::MetadataTampered,
-      WriteKeyError::Empty,
-      WriteKeyError::FeatureDisabled,
-    ] {
-      let anyhow_err: anyhow::Error = err.into();
+    // its `Display` text, under both the no-client-key (401) and
+    // client-key-provided (403) branches. This is what the previous
+    // substring match got wrong (BUG-406, mirrors the FFI-side BUG-020).
+    //
+    // `WriteKeyError` is not `Clone`, so build each variant twice via a
+    // closure: once per assertion branch.
+    let variants: &[fn() -> WriteKeyError] = &[
+      || WriteKeyError::Required,
+      || WriteKeyError::Mismatch("segment binding; index may be tampered"),
+      || WriteKeyError::MetadataTampered,
+      || WriteKeyError::Empty,
+      || WriteKeyError::FeatureDisabled,
+    ];
+
+    for build in variants {
+      let no_key_err: anyhow::Error = build().into();
       assert_eq!(
-        classify_writer_error(&anyhow_err, false),
+        classify_writer_error(&no_key_err, false),
         StatusCode::UNAUTHORIZED,
-        "no client key → 401"
+        "variant {:?} without client key must map to 401",
+        build()
       );
 
-      let anyhow_err: anyhow::Error = WriteKeyError::Required.into();
+      let with_key_err: anyhow::Error = build().into();
       assert_eq!(
-        classify_writer_error(&anyhow_err, true),
+        classify_writer_error(&with_key_err, true),
         StatusCode::FORBIDDEN,
-        "client sent a key → 403"
+        "variant {:?} with client key must map to 403",
+        build()
       );
     }
   }
