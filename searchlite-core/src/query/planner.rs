@@ -940,7 +940,7 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
   Ok(value)
 }
 
-/// Combine a parent boost with a node-local boost, rejecting overflow.
+/// Combine two individually-validated boost factors, rejecting overflow.
 ///
 /// `validate_boost` confirms each individual boost is finite, but the
 /// product of two finite f32 values can still overflow `f32::MAX` to
@@ -948,13 +948,23 @@ fn validate_boost(boost: &Option<f32>) -> Result<f32> {
 /// through term weights into BM25 scores and into `ScoreNode::Constant`
 /// payloads, breaking serialisation and surfacing as HTTP 500 or as
 /// silently dropped documents further down the pipeline (BUG-381).
-/// Rejecting the overflow at plan-time turns that into a deterministic,
-/// actionable validation error instead.
-fn combine_boost(boost: f32, node_boost: f32) -> Result<f32> {
+/// Rejecting the overflow surfaces a deterministic, actionable
+/// validation error instead.
+///
+/// Called at two layers:
+/// - Plan time, from `build_node` for every nested `parent × node` boost
+///   propagation (BUG-381 / #383).
+/// - Expansion time, from `expand_term_groups`, where the already-combined
+///   query boost is multiplied by the per-field multi_match boost when
+///   materialising term weights (BUG-396 / #396). In that layer the
+///   guard runs after planning has completed but before any scoring
+///   takes place, so the error still bubbles out as a search-time
+///   validation failure before any non-finite weight can leak.
+pub(crate) fn combine_boost(boost: f32, node_boost: f32) -> Result<f32> {
   let combined = boost * node_boost;
   if !combined.is_finite() {
     bail!(
-      "combined query boost overflows to non-finite ({boost} * {node_boost}); reduce nested boosts"
+      "combined query boost overflows to non-finite ({boost} * {node_boost}); reduce the query, per-field, and nested boost factors"
     );
   }
   Ok(combined)
