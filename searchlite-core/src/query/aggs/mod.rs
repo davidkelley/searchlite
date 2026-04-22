@@ -4603,7 +4603,10 @@ mod tests {
     // silently without the tightened guard.
     let finite_but_saturates = format!("1{}", "0".repeat(20));
     assert_eq!(parse_interval_seconds(&finite_but_saturates), None);
-    assert_eq!(parse_interval_seconds(&format!("{finite_but_saturates}s")), None);
+    assert_eq!(
+      parse_interval_seconds(&format!("{finite_but_saturates}s")),
+      None
+    );
     assert_eq!(
       parse_interval_seconds(&format!("-{finite_but_saturates}s")),
       None
