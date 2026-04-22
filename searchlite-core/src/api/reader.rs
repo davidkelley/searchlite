@@ -1272,6 +1272,16 @@ impl IndexReader {
         term.group_fields.clone(),
       ));
       entry.1 += term.weight;
+      // BUG-401: individual boosts are validated finite by combine_boost, but the
+      // sum of N finite f32 values can still overflow to +Inf when the same
+      // field:term key appears across multiple query clauses. Reject at the
+      // accumulation point so Inf never reaches ScoredTerm / score_tf.
+      if !entry.1.is_finite() {
+        bail!(
+          "accumulated boost for term `{}` overflows f32; reduce per-clause boost values",
+          term.key
+        );
+      }
       if entry.3.is_none() && term.group_fields.is_some() {
         entry.3 = term.group_fields.clone();
       }
@@ -2105,6 +2115,14 @@ impl IndexReader {
             .entry(term.key.clone())
             .or_insert((term.field.clone(), 0.0, term.leaf));
         entry.1 += term.weight;
+        // BUG-401: guard against finite-but-additive overflow into +Inf when
+        // multiple rescore clauses share the same field:term key.
+        if !entry.1.is_finite() {
+          bail!(
+            "accumulated boost for term `{}` overflows f32; reduce per-clause boost values",
+            term.key
+          );
+        }
       }
       // BM25 N must use total doc_count (including deleted documents) so it matches
       // the df basis (postings.len() includes deleted documents). See BUG-360.
