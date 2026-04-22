@@ -1649,6 +1649,137 @@ mod tests {
     );
   }
 
+  /// BUG-381 salvage path: the finitude guard runs *after* `score_adjust` at
+  /// every push-into-heap site, so a custom scorer (notably `FunctionScore`
+  /// with `boost_mode=Replace`) that turns a non-finite raw BM25 into a
+  /// finite final score keeps the doc in the top-k. Pinning this with a
+  /// regression test prevents a future "drop early to skip work" refactor
+  /// from silently losing salvageable hits — matches the post-output-only
+  /// rejection policy used by `evaluate_compiled_score` (BUG-315) and the
+  /// rescore combine path (BUG-326).
+  #[test]
+  fn wand_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "wand salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results
+      .iter()
+      .find(|r| r.doc_id == 5)
+      .expect("wand dropped overflow doc 5 even though score_adjust returned a finite value");
+    assert_eq!(
+      salvaged.score, 42.0,
+      "wand kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, BMW strategy.
+  #[test]
+  fn bmw_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "bmw salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    assert!(
+      results.iter().any(|r| r.doc_id == 5),
+      "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, brute-force plain-BM25 branch (no ScorePlan).
+  #[test]
+  fn brute_force_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "brute_force salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    assert!(
+      results.iter().any(|r| r.doc_id == 5),
+      "brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}",
+    );
+  }
+
   #[test]
   fn skip_blocks_below_bound_noop_when_threshold_zero() {
     let block_size = 2;
