@@ -751,9 +751,14 @@ fn commit_rejects_vector_component_overflowing_f32_to_negative_inf() {
 }
 
 #[test]
-fn commit_accepts_vector_component_at_f32_max() {
-  // The boundary case: a value that fits in f32 (exactly f32::MAX cast to
-  // f64) must still be accepted to avoid over-rejecting legitimate inputs.
+fn commit_accepts_vector_component_with_finite_squared_magnitude() {
+  // Post-BUG-386 the effective acceptance bound is the sum-of-squares, not
+  // the raw per-component magnitude — `(f32::MAX)^2` itself overflows, so a
+  // literal `f32::MAX` component is now correctly rejected at both commit
+  // and query time. This test covers the adjacent legitimate boundary:
+  // `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`, so the vector must still be
+  // accepted to avoid over-rejecting inputs with large-but-in-range
+  // components.
   let dir = tempdir().unwrap();
   let schema = schema_l2();
   IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
@@ -761,22 +766,19 @@ fn commit_accepts_vector_component_at_f32_max() {
   let mut writer = idx.writer().expect("writer");
   let doc = Document {
     fields: [
-      ("_id".into(), serde_json::json!("at-max")),
+      ("_id".into(), serde_json::json!("finite-sq")),
       ("body".into(), serde_json::json!("body")),
-      (
-        "embedding".into(),
-        serde_json::json!([f32::MAX as f64, 0.0]),
-      ),
+      ("embedding".into(), serde_json::json!([1.0e19_f64, 0.0])),
     ]
     .into_iter()
     .collect(),
   };
   writer
     .add_document(&doc)
-    .expect("finite component at f32::MAX must be accepted");
+    .expect("finite component with finite squared magnitude must be accepted");
   writer
     .commit()
-    .expect("finite component at f32::MAX must commit");
+    .expect("finite component with finite squared magnitude must commit");
 }
 
 #[test]
@@ -917,14 +919,17 @@ fn vector_query_with_finite_boundary_components_is_accepted() {
     }],
   );
   let reader = idx.reader().unwrap();
-  // f32::MAX and f32::MIN are finite boundary values; the validation guard
-  // must not reject them. The downstream L2 distance may saturate to INF
-  // inside `metric_similarity`, but that's a separate concern — this test
-  // only asserts that the request passes the finitude guard.
+  // Post-BUG-386 the effective acceptance bound on query vectors is the
+  // sum-of-squares — `(f32::MAX)^2` itself overflows, so a literal
+  // `[f32::MAX, f32::MIN]` query vector is now correctly rejected. This
+  // test exercises the adjacent legitimate boundary: `(1e19)^2 = 1e38 <
+  // f32::MAX ≈ 3.4e38`, so the sum-of-squares stays finite and the query
+  // passes validation. Cases where `sum-of-squares` itself overflows are
+  // covered by the dedicated `*_overflowing_sum_of_squares_*` tests below.
   let req = SearchRequest {
     query: Query::Node(QueryNode::Vector(VectorQuery {
       field: "embedding".into(),
-      vector: vec![f32::MAX, f32::MIN],
+      vector: vec![1.0e19_f32, 0.0],
       k: Some(3),
       alpha: Some(0.0),
       ef_search: None,
@@ -935,7 +940,9 @@ fn vector_query_with_finite_boundary_components_is_accepted() {
     vector_filter: None,
     ..base_request(Query::String("".into()), 3)
   };
-  let _ = reader.search(&req).expect("boundary f32 values are finite");
+  let _ = reader
+    .search(&req)
+    .expect("query vector with finite sum-of-squares must be accepted");
 }
 
 // BUG-384: cosine query vectors with individually-finite components whose
@@ -984,10 +991,9 @@ fn cosine_query_vector_with_overflowing_sum_of_squares_is_rejected() {
     ..base_request(Query::String("".into()), 3)
   };
   let err = reader.search(&req).unwrap_err().to_string();
+  // BUG-386 unified cosine + L2 under the same guard and error shape.
   assert!(
-    err.contains("cannot be normalized")
-      && err.contains("sum-of-squares")
-      && err.contains("embedding"),
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }
@@ -1018,8 +1024,9 @@ fn commit_rejects_cosine_vector_with_overflowing_sum_of_squares() {
   };
   writer.add_document(&doc).expect("staging accepts the doc");
   let err = writer.commit().unwrap_err().to_string();
+  // BUG-386 unified cosine + L2 under the same guard and error shape.
   assert!(
-    err.contains("cannot be normalized") && err.contains("sum-of-squares"),
+    err.contains("sum-of-squares overflows"),
     "expected sum-of-squares overflow error, got {err}"
   );
 }
@@ -1151,4 +1158,138 @@ fn l2_search_returns_far_doc_when_pairwise_squared_diff_overflows() {
       hit.score,
     );
   }
+}
+
+// BUG-386: L2-indexed documents with individually-finite components whose
+// squared magnitudes sum past `f32::MAX` used to be persisted verbatim, then
+// `l2_distance(v, 0)` accumulated `v[i]^2` into `+inf`, `metric_similarity(L2)
+// = -inf`, and `compute_hybrid_score` dropped the candidate via the BUG-328
+// guard — the caller silently saw an empty hit set for a doc they had just
+// indexed. Post-BUG-388 the distance saturates instead of returning `+inf`,
+// but that just makes the misbehaviour quieter: the vector still cannot be
+// meaningfully compared against any distant query. Extend the BUG-384 sum-of-
+// squares check to L2 so commit refuses the doc at the boundary with a
+// diagnosable error, matching cosine.
+#[test]
+fn commit_rejects_l2_vector_with_overflowing_sum_of_squares() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  let mut writer = idx.writer().expect("writer");
+  // Each component is finite (`3e19 < f32::MAX`) but `(3e19)^2 + (3e19)^2 =
+  // 1.8e39 > f32::MAX`.
+  let doc = Document {
+    fields: [
+      ("_id".into(), serde_json::json!("l2-overflow")),
+      ("body".into(), serde_json::json!("body")),
+      (
+        "embedding".into(),
+        serde_json::json!([3.0e19_f64, 3.0e19_f64]),
+      ),
+    ]
+    .into_iter()
+    .collect(),
+  };
+  writer.add_document(&doc).expect("staging accepts the doc");
+  let err = writer.commit().unwrap_err().to_string();
+  assert!(
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
+    "expected sum-of-squares overflow error, got {err}"
+  );
+}
+
+// BUG-386: symmetric query-side guard — an L2 query vector whose squared
+// magnitudes sum past `f32::MAX` used to slip past the BUG-340 per-component
+// check and drive `l2_distance` into `+inf` (pre-BUG-388) or `f32::MAX`
+// (post-BUG-388); either way the similarity is meaningless against any
+// indexed doc. Reject at plan time with the same message shape as the cosine
+// BUG-384 guard instead of returning zero / garbage hits.
+#[test]
+fn l2_query_vector_with_overflowing_sum_of_squares_is_rejected() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("rust vector")),
+        ("embedding".into(), serde_json::json!([0.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  // Each component is finite but their squared magnitudes sum to `+inf`.
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![3.0e19_f32, 3.0e19_f32],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let err = reader.search(&req).unwrap_err().to_string();
+  assert!(
+    err.contains("sum-of-squares overflows") && err.contains("embedding"),
+    "expected sum-of-squares overflow error, got {err}"
+  );
+}
+
+// BUG-386: boundary test — an L2-indexed doc and query whose sum-of-squares
+// are each finite but close to `f32::MAX` must still round-trip. The new
+// guard must not over-reject legitimate inputs just because the components
+// are large.
+#[test]
+fn l2_vector_with_finite_sum_of_squares_round_trips() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  // `(1e19)^2 = 1e38 < f32::MAX ≈ 3.4e38`, so the sum-of-squares stays
+  // finite even when the component magnitudes are near the top of the f32
+  // range.
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("l2-finite")),
+        ("body".into(), serde_json::json!("rust vector")),
+        ("embedding".into(), serde_json::json!([1.0e19_f64, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0e19_f32, 0.0],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let hits = reader
+    .search(&req)
+    .expect("finite sum-of-squares must be accepted")
+    .hits;
+  assert!(!hits.is_empty(), "expected the single doc to match");
+  assert_eq!(hits[0].doc_id.as_str(), "l2-finite");
 }

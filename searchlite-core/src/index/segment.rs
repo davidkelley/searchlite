@@ -524,20 +524,25 @@ fn collect_vector_value(
       vecvals.len()
     );
   }
+  // BUG-386: reject any vector whose squared magnitudes sum past `f32::MAX`,
+  // regardless of metric. Each component passes the per-value finitude check
+  // above, but their sum-of-squares can still overflow (e.g. `[3e19, 3e19]`).
+  //
+  // For cosine this originally surfaced as `normalize_in_place` dividing by
+  // `+inf` and silently zeroing the vector (BUG-384); that fix rejected only
+  // the cosine path. For L2 the same overflow is just as user-visible — the
+  // vector is persisted, then `l2_distance(v, origin)` accumulates `v[i]^2`
+  // into `+inf` (post-BUG-388 it now saturates to `f32::MAX`, but the
+  // similarity it produces is still meaningless against distant queries).
+  // Guarding both metrics uniformly gives a diagnosable failure at write time
+  // instead of persisting a vector that cannot be meaningfully compared.
+  let sum_sq = vecvals.iter().map(|v| v * v).sum::<f32>();
+  if !sum_sq.is_finite() {
+    bail!(
+      "vector field {field} has components whose sum-of-squares overflows f32; reduce component magnitudes"
+    );
+  }
   if matches!(vf.metric, VectorMetric::Cosine) {
-    // BUG-384: reject cosine-indexed vectors whose squared magnitudes sum past
-    // `f32::MAX` before `normalize_in_place` skips the division. Each
-    // component passes the per-value finitude check above, but their sum-of-
-    // squares can still overflow (e.g. `[3e19, 3e19]`). Cosine scoring
-    // assumes unit-length vectors, so persisting one that cannot be
-    // normalized would feed the query path a vector that either distorts
-    // downstream scores (post-fix: left un-scaled when the norm is non-
-    // finite) or silently collapses to all-zero (pre-fix: division by
-    // `+inf`). Refuse at commit time so the segment never captures it.
-    let sum_sq = vecvals.iter().map(|v| v * v).sum::<f32>();
-    if !sum_sq.is_finite() {
-      bail!("vector field {field} cannot be normalized: sum-of-squares overflows f32");
-    }
     normalize_in_place(&mut vecvals);
   }
   Ok(Some(vecvals))
