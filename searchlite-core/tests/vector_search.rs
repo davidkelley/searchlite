@@ -1152,3 +1152,152 @@ fn l2_search_returns_far_doc_when_pairwise_squared_diff_overflows() {
     );
   }
 }
+
+// BUG-394: BUG-388 saturates `l2_distance` to `f32::MAX` so that
+// `metric_similarity(L2)` returns the finite sentinel `f32::MIN` at the worst
+// pair — avoiding the `-INF` that the BUG-328 hybrid-score guard would
+// otherwise drop. That saturation is local to `l2_distance`, though. The very
+// next step in `collect_vector_maps` is `vscore *= clause.boost`, and any
+// user-supplied `boost > 1.0` turns the `f32::MIN` sentinel straight back
+// into `-INF` via f32 multiplication overflow. The non-finite `vscore` then
+// flows into `vector_scores`, `compute_hybrid_score` rejects it, and the
+// `far` doc is silently dropped again — undoing BUG-388's fix for any query
+// with a non-default boost. This regression is identical in shape to
+// `l2_search_returns_far_doc_when_pairwise_squared_diff_overflows` except for
+// `boost: Some(2.0)`; pre-fix, that single change causes `far` to disappear
+// from the result set, matching exactly the failure mode BUG-388 was written
+// to eliminate.
+#[test]
+fn l2_search_with_boost_gt_one_returns_far_doc_when_pairwise_squared_diff_overflows() {
+  let dir = tempdir().unwrap();
+  let schema = schema_l2();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("near")),
+          ("body".into(), serde_json::json!("rust vector")),
+          ("embedding".into(), serde_json::json!([1.5e19_f64, 0.0_f64])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), serde_json::json!("far")),
+          ("body".into(), serde_json::json!("rust search")),
+          (
+            "embedding".into(),
+            serde_json::json!([-1.5e19_f64, 0.0_f64]),
+          ),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.5e19_f32, 0.0_f32],
+      k: Some(10),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(10),
+      // `boost > 1.0` is the only delta vs the BUG-388 regression: pre-fix,
+      // `f32::MIN * 2.0` overflows to `-INF` and the far doc silently
+      // disappears even though every pre-BUG-394 guard passes.
+      boost: Some(2.0),
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 10)
+  };
+  let hits = reader
+    .search(&req)
+    .expect("pairwise-overflow distance with boost must not fail the query")
+    .hits;
+  let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str().to_string()).collect();
+  assert!(
+    ids.contains(&"far".to_string()),
+    "`far` doc must be returned even with boost > 1.0; got ids={ids:?}",
+  );
+  assert!(
+    ids.contains(&"near".to_string()),
+    "`near` doc must remain in results alongside `far`; got ids={ids:?}",
+  );
+  for hit in hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "every hit score must be finite; doc {} had score {}",
+      hit.doc_id,
+      hit.score,
+    );
+    if let Some(vs) = hit.vector_score {
+      assert!(
+        vs.is_finite(),
+        "vector_score must be finite after saturating boost multiplication; doc {} had vector_score {}",
+        hit.doc_id,
+        vs,
+      );
+    }
+  }
+}
+
+// BUG-394: boundary test. The f64-then-clamp saturation must not silently
+// perturb legitimate in-range products. A cosine query with `boost = 3.0`
+// against a unit vector produces `vscore = 1.0 * 3.0 = 3.0`, which stays
+// well inside the f32 range. The clamp must preserve the exact product.
+#[test]
+fn vector_boost_preserves_finite_vscore_product_within_f32_range() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[Document {
+      fields: [
+        ("_id".into(), serde_json::json!("only-doc")),
+        ("body".into(), serde_json::json!("rust search")),
+        ("embedding".into(), serde_json::json!([1.0, 0.0])),
+      ]
+      .into_iter()
+      .collect(),
+    }],
+  );
+  let reader = idx.reader().unwrap();
+  let req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0],
+      k: Some(3),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(3),
+      boost: Some(3.0),
+    })),
+    vector_query: None,
+    vector_filter: None,
+    ..base_request(Query::String("".into()), 3)
+  };
+  let hits = reader
+    .search(&req)
+    .expect("finite product must be preserved")
+    .hits;
+  assert_eq!(hits.len(), 1);
+  let vs = hits[0]
+    .vector_score
+    .expect("cosine match must carry a vector_score");
+  // Cosine similarity of identical unit vectors is 1.0; times boost=3.0 the
+  // vscore is exactly 3.0. The f64 clamp must not perturb in-range products.
+  assert!(
+    (vs - 3.0).abs() < 1e-5,
+    "expected vscore ≈ 3.0 (cosine 1.0 * boost 3.0), got {vs}"
+  );
+  assert!(hits[0].score.is_finite());
+}

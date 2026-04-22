@@ -32,6 +32,8 @@ use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
 use crate::query::planner::{build_query_plan, QueryMatcher, ScorePlan};
 use crate::query::sort::{SortKey, SortPlan};
+#[cfg(feature = "vectors")]
+use crate::query::util::f64_to_finite_f32;
 use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
   ScoredTerm,
@@ -952,7 +954,22 @@ impl IndexReader {
               continue;
             }
           }
-          vscore *= clause.boost;
+          // BUG-394: saturate the per-candidate `vscore * boost` product to
+          // the f32 range. Both factors are already validated finite at plan
+          // time (per-component vector guards and `boost.is_finite()`), but
+          // the raw `f32 *= f32` can still overflow to `±INF` for L2, where
+          // BUG-388 saturates `l2_distance` to `f32::MAX` so that
+          // `metric_similarity(L2)` returns the finite sentinel `f32::MIN` at
+          // the worst pair. Any user-supplied `boost > 1.0` would then flip
+          // that sentinel straight back to `-INF`, and the BUG-328 hybrid
+          // score guard silently drops the candidate — undoing BUG-388's
+          // contract that far docs rank last rather than disappear entirely.
+          // Promoting to f64 (which cannot overflow for any finite f32 × f32)
+          // and clamping back to the f32 range via `f64_to_finite_f32` keeps
+          // every legitimate in-range product exact while preventing the
+          // non-finite leak. Mirrors the clamp policy already used by
+          // BUG-336 / BUG-342 on the scoring-side f64→f32 cast.
+          vscore = f64_to_finite_f32((vscore as f64) * (clause.boost as f64));
           let cand = VectorCandidate {
             segment_ord: segment_ord as u32,
             doc_id,
