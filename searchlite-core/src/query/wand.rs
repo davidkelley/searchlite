@@ -1522,6 +1522,32 @@ mod tests {
     }
   }
 
+  /// Precondition probe for the BUG-381 salvage tests: assert that a freshly
+  /// constructed overflow term still produces a non-finite per-doc BM25 score
+  /// at `doc_id`. Without this, a future bm25 / `score_tf` math change that
+  /// kept `bm25 * weight` finite would leave the salvage tests passing while
+  /// no longer exercising the post-`score_adjust` ordering they're meant to
+  /// pin — they'd silently degrade into "the heap accepts a finite raw score"
+  /// tautologies. Mirrors the inline probe in
+  /// `wand_drops_doc_with_non_finite_bm25_score` so all BUG-381 fixtures
+  /// share the same fail-loud guarantee.
+  fn assert_overflow_term_score_non_finite_at(term: &ScoredTerm, doc_id: DocId) {
+    let probe_score = score_tf(
+      1.0,
+      term.postings.len() as f32,
+      term.doc_len(doc_id),
+      term.avgdl,
+      term.docs,
+      term.k1,
+      term.b,
+      term.weight,
+    );
+    assert!(
+      !probe_score.is_finite(),
+      "fixture precondition: overflow term's per-doc score at doc {doc_id} must be non-finite to exercise BUG-381 salvage; got {probe_score}",
+    );
+  }
+
   /// BUG-381: a document whose BM25 score overflows to `+inf` must not reach
   /// the top-k heap on the WAND path. Before the fix, `score_sum` flowed
   /// straight from `score_tf` to `push_top_k` whenever no custom scoring
@@ -1665,6 +1691,7 @@ mod tests {
       positions: smallvec![],
     }]);
     let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
     let mut accept = |_doc: DocId, _score: f32| true;
     let mut adjust: Box<ScoreAdjustFn<'_>> =
       Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
@@ -1690,10 +1717,11 @@ mod tests {
         r.score,
       );
     }
-    let salvaged = results
-      .iter()
-      .find(|r| r.doc_id == 5)
-      .expect("wand dropped overflow doc 5 even though score_adjust returned a finite value");
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "wand dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
     assert_eq!(
       salvaged.score, 42.0,
       "wand kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
@@ -1709,6 +1737,7 @@ mod tests {
       positions: smallvec![],
     }]);
     let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
     let mut accept = |_doc: DocId, _score: f32| true;
     let mut adjust: Box<ScoreAdjustFn<'_>> =
       Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
@@ -1734,9 +1763,18 @@ mod tests {
         r.score,
       );
     }
-    assert!(
-      results.iter().any(|r| r.doc_id == 5),
-      "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}",
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
+    // Pin that the heap took the *adjusted* score (42.0), not some other
+    // finite fallback like a clamp of the raw +inf — the salvage contract is
+    // about the adjuster's output landing in the heap, not just any finite
+    // value taking its place.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "bmw kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
     );
   }
 
@@ -1749,6 +1787,7 @@ mod tests {
       positions: smallvec![],
     }]);
     let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
     let mut accept = |_doc: DocId, _score: f32| true;
     let mut adjust: Box<ScoreAdjustFn<'_>> =
       Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
@@ -1774,9 +1813,14 @@ mod tests {
         r.score,
       );
     }
-    assert!(
-      results.iter().any(|r| r.doc_id == 5),
-      "brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}",
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!("brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}")
+    });
+    // Same adjusted-score pin as the BMW variant — keeps the brute-force
+    // heap insertion site honest about which value reaches `Hit.score`.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "brute_force kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
     );
   }
 
