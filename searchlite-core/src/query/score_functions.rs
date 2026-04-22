@@ -60,6 +60,11 @@ pub(crate) fn compile_functions(
         if !factor.is_finite() {
           bail!("field_value_factor `factor` must be finite");
         }
+        if let Some(m) = missing {
+          if !m.is_finite() {
+            bail!("field_value_factor `missing` must be finite");
+          }
+        }
         ensure_numeric_fast(schema, field, "function_score")?;
         compiled.push(CompiledFunction::FieldValueFactor {
           field: field.clone(),
