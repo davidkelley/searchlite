@@ -1667,6 +1667,112 @@ mod tests {
     );
   }
 
+  #[test]
+  fn build_query_plan_rejects_nested_boost_overflow_via_bool_multi_match() {
+    // Mirrors the `match` reproduction from BUG-381 more literally: the
+    // issue's JSON uses a per-field `match` clause with a `body` boost
+    // nested inside a boost-heavy `bool`. `MultiMatch` is the server-side
+    // deserialisation target for that shape, and its term-group build
+    // path goes through `combine_boost(boost, node_boost)` at a different
+    // call site from `QueryString`. Guard it under its own regression so
+    // a future refactor that rewires one variant can't silently regress
+    // the other.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![QueryNode::MultiMatch {
+        query: "hello".into(),
+        fields: vec![FieldSpec {
+          field: "body".into(),
+          boost: None,
+        }],
+        match_type: MultiMatchType::BestFields,
+        fuzziness: None,
+        tie_breaker: None,
+        operator: None,
+        minimum_should_match: None,
+        boost: Some(1e38),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_nested_boost_overflow_via_dis_max() {
+    // `DisMax` combines `boost * node_boost` at its own call site
+    // (`combine_boost` is invoked once and propagated to children), so a
+    // product that overflows `f32::MAX` must be caught there as well.
+    // Without this guard a boost-heavy DisMax would propagate `+inf` into
+    // every child leaf's weight, same 500-on-serialise symptom as the
+    // original BUG-381 reproduction.
+    let dis_max = QueryNode::DisMax {
+      queries: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: None,
+      }],
+      tie_breaker: None,
+      boost: Some(f32::MAX),
+    };
+    // Wrap in a Bool whose own boost pushes the product past `f32::MAX`.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![dis_max],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_deeply_nested_bool_boost_overflow() {
+    // Nested Bool->Bool->Term where each level carries a finite boost but
+    // the accumulated product at the innermost `combine_boost` overflows.
+    // Exercises recursive boost propagation through `build_node` (each
+    // Bool multiplies its own boost into the `child_boost` passed down);
+    // before the guard, the `+inf` would only surface at the bottom and
+    // leak into `ScoredTerm.weight`.
+    let inner = QueryNode::Bool {
+      must: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1e20),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e20),
+    };
+    let outer = Query::Node(QueryNode::Bool {
+      must: vec![inner],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e20),
+    });
+    // 1e20 * 1e20 = 1e40 (finite), then * 1e20 = 1e60 → +inf in f32.
+    let err = build_query_plan(&outer, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
   // -------- BUG-403 regression tests --------
   //
   // `resolve_minimum_should_match` must round percentage-based specs
