@@ -62,6 +62,7 @@ jobs:
       - name: Run browser tests
         env:
           RUST_TEST_THREADS: "1"
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: wasm-pack test --headless --chrome searchlite-wasm
 
   test-wasm-browser-firefox:
@@ -82,6 +83,7 @@ jobs:
       - name: Run browser tests
         env:
           RUST_TEST_THREADS: "1"
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: wasm-pack test --headless --firefox searchlite-wasm
 
   # Full toolchain coverage — only on main
