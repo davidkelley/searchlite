@@ -1667,6 +1667,134 @@ mod tests {
     );
   }
 
+  #[test]
+  fn build_query_plan_rejects_nested_boost_overflow_via_bool_multi_match() {
+    // Mirrors the `match` reproduction from BUG-381 more literally: the
+    // issue's JSON uses a per-field `match` clause with a `body` boost
+    // nested inside a boost-heavy `bool`. `MultiMatch` is the server-side
+    // deserialisation target for that shape, and its term-group build
+    // path goes through `combine_boost(boost, node_boost)` at a different
+    // call site from `QueryString`. Guard it under its own regression so
+    // a future refactor that rewires one variant can't silently regress
+    // the other.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![QueryNode::MultiMatch {
+        query: "hello".into(),
+        fields: vec![FieldSpec {
+          field: "body".into(),
+          boost: None,
+        }],
+        match_type: MultiMatchType::BestFields,
+        fuzziness: None,
+        tie_breaker: None,
+        operator: None,
+        minimum_should_match: None,
+        boost: Some(1e38),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_nested_boost_overflow_via_dis_max() {
+    // `DisMax` combines `boost * node_boost` at its own call site
+    // (`combine_boost` is invoked once and propagated to children), so a
+    // product that overflows `f32::MAX` must be caught there as well.
+    // Without this guard a boost-heavy DisMax would propagate `+inf` into
+    // every child leaf's weight, same 500-on-serialise symptom as the
+    // original BUG-381 reproduction.
+    let dis_max = QueryNode::DisMax {
+      queries: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: None,
+      }],
+      tie_breaker: None,
+      boost: Some(f32::MAX),
+    };
+    // Wrap in a Bool whose own boost pushes the product past `f32::MAX`.
+    let query = Query::Node(QueryNode::Bool {
+      must: vec![dis_max],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e38),
+    });
+    let err = build_query_plan(&query, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+  }
+
+  #[test]
+  fn build_query_plan_rejects_deeply_nested_bool_boost_overflow() {
+    // Nested Bool->Bool->Term where the intermediate `combine_boost` calls
+    // all stay finite and only the innermost one overflows. Exercises the
+    // recursive boost propagation path through `build_node`: each Bool
+    // multiplies its own boost into the `child_boost` passed down to the
+    // next level. The overflow triggering *only* at the deepest
+    // multiplication is what makes this a genuine "deep propagation"
+    // regression — if a future refactor skipped propagation and applied
+    // the outer boost directly to the Term, or missed the guard on one
+    // intermediate hop, the error would surface at a different call site
+    // (or not at all).
+    //
+    // `f32::MAX ≈ 3.4e38`, so:
+    //   outer * inner = 1e19 * 1e19 = 1e38 (finite, just under MAX)
+    //   then         * term.boost = 1e38 * 10 = 1e39 → `+inf`.
+    let inner = QueryNode::Bool {
+      must: vec![QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(10.0),
+      }],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e19),
+    };
+    let outer = Query::Node(QueryNode::Bool {
+      must: vec![inner],
+      should: Vec::new(),
+      must_not: Vec::new(),
+      filter: Vec::new(),
+      minimum_should_match: None,
+      boost: Some(1e19),
+    });
+    let err = build_query_plan(&outer, &["body".to_string()]).unwrap_err();
+    assert!(
+      err.to_string().contains("overflows"),
+      "expected overflow error, got: {err}",
+    );
+    // Sanity-check that the chosen values actually make the intermediate
+    // `combine_boost` calls finite and only the innermost one overflows.
+    // If f32 arithmetic ever changes such that this no longer holds, the
+    // fixture is exercising a different call site than the test claims —
+    // pick new inputs.
+    let outer_times_inner = 1e19_f32 * 1e19_f32;
+    assert!(
+      outer_times_inner.is_finite(),
+      "fixture precondition: outer * inner must be finite to isolate the innermost overflow; got {outer_times_inner}",
+    );
+    assert!(
+      !(outer_times_inner * 10.0_f32).is_finite(),
+      "fixture precondition: (outer * inner) * term.boost must overflow; got {}",
+      outer_times_inner * 10.0_f32,
+    );
+  }
+
   // -------- BUG-403 regression tests --------
   //
   // `resolve_minimum_should_match` must round percentage-based specs
