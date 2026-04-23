@@ -101,19 +101,124 @@ npx http-server -c-1 --cors -p 8080 \
   -H "Cross-Origin-Embedder-Policy: require-corp"
 ```
 
+## Browser test commands
+
+```bash
+# Firefox (local)
+wasm-pack test --headless --firefox --geckodriver /path/to/geckodriver searchlite-wasm
+
+# Chrome (CI/default environments)
+wasm-pack test --headless --chrome searchlite-wasm
+
+# Chrome (local Snap Chromium, avoids chromedriver SIGKILL flakes)
+RUST_TEST_THREADS=1 wasm-pack test --headless --chrome \
+  --chromedriver /snap/bin/chromium.chromedriver searchlite-wasm
+```
+
 ---
 
 ## API notes
 
 - `Searchlite.init(name, schema, storage)` reopens existing indexes with the same name.
   Schema mismatches return an error.
+- `Searchlite.list_indexes()` lists IndexedDB-backed indexes previously initialised by
+  the WASM binding.
+- `Searchlite.clear_index(name)` removes all persisted files for an index while keeping
+  the IndexedDB database container.
+- `Searchlite.drop_index(name)` deletes the persisted IndexedDB database for that index.
+- `Searchlite.storage_usage()` returns browser storage usage/quota estimates when supported:
+  `{ supported, usage_bytes, quota_bytes, remaining_bytes, persisted, note? }`.
+- `Searchlite.cleanup_indexes(stale_older_than_ms, dry_run?)` removes stale IndexedDB-backed
+  indexes based on registry age and returns `{ scanned, matched, dropped, kept, dry_run }`.
+- `Searchlite.plan_migration(name, schema)` returns a compatibility plan with
+  `status: "missing" | "compatible" | "rebuild_required"` and schema hashes.
+- `Searchlite.migrate_index(name, schema)` executes the migration plan and returns
+  `status: "created" | "compatible" | "rebuilt"`. It rebuilds incompatible schemas
+  with rollback to the previous snapshot if rebuild fails.
 - Prefer `add_documents([...])` for bulk ingest over adding one at a time.
+- `delete_document(id)` and `delete_documents(ids)` queue deletes by `_id`/doc id.
+  Deletions are applied on `commit()`.
+- `update_document({ id, set?, unset? })` queues a partial update using patch semantics.
+  `set` is a field-value map and `unset` is a list of field paths to remove; apply with `commit()`.
+- `mget({ ids, return_stored? })` fetches documents by id in request order and returns
+  `found` plus optional `_source` per id.
+- `multi_search({ searches, parallel?, max_concurrency? })` executes multiple search
+  requests and returns ordered per-request results.
+- Controlled search APIs:
+  - `search_controlled(query, limit, returnStored?, abortSignal?, timeoutMs?)`
+  - `search_request_controlled(json, abortSignal?, timeoutMs?)`
+  - `search_request_value_controlled(value, abortSignal?, timeoutMs?)`
+  These return typed `aborted` / `timeout` errors when cancellation or timeout checks trigger.
+- `search_request_value_async(value, abortSignal?, timeoutMs?)` is an async worker-oriented
+  entrypoint for Promise-based execution.
+- Package target note: `wasm-pack build --target web` exports a default init function, while
+  the default bundler target auto-initializes and exposes only named exports (for example `Searchlite`).
+- `compact()` merges segments and returns `{ compacted }`.
+- `inspect()` returns `{ manifest }` with write-key metadata redacted.
+- `stats()` returns document, deletion, and segment counts plus index metadata.
+- `cleanup_orphaned_files(dry_run?)` removes IndexedDB file blobs that are not referenced by
+  the active manifest (`MANIFEST`, `wal.log`, metadata, and live segment files are preserved).
 - Call `commit()` after adding documents to make them searchable.
 - Searches default to `return_stored: false`. Pass `true` as the third argument to
   `search()` to include stored field values.
 - Use `search_request_value` / `search_request` for advanced queries (filters,
   aggregations, highlighting).
 - See [bindings.md](bindings.md) for a reference of binding behaviors.
+
+All WASM errors are returned as structured payloads:
+
+```json
+{
+  "type": "quota_exceeded",
+  "reason": "indexeddb quota exceeded while committing index data; run compact(), remove stale indexes with Searchlite.cleanup_indexes(...), or clear/drop unused indexes before retrying. detail: ..."
+}
+```
+
+---
+
+## Worker-first runtime
+
+The demo app now defaults to worker-first execution for search to keep the main UI thread responsive:
+
+- Worker entrypoint: `searchlite-wasm/searchlite-demo-worker.mjs`
+- Worker client wrapper: `searchlite-wasm/searchlite-worker-client.mjs`
+- Demo UI integration: `searchlite-wasm/index.html`
+
+The worker client restarts the worker after timeout/abort to stop in-flight work. For
+IndexedDB mode this is transparent (state is reopened from persistence). For memory mode,
+worker restarts lose state, so the demo falls back to main-thread execution.
+The worker client validates `timeoutMs`/`delayMs` as non-negative finite numbers and surfaces
+typed `invalid_timeout`/`invalid_argument` errors for invalid values.
+
+### Runtime fallback matrix
+
+| Runtime | Worker mode | Threads | Recommended path |
+| --- | --- | --- | --- |
+| Browser + module workers + IndexedDB | yes | optional | Worker client + `search_request_value_async` / controlled APIs |
+| Browser + no module worker support | no | optional | Main-thread `search_request_controlled` |
+| Browser + memory storage | limited | optional | Main-thread controlled APIs (worker restart would lose memory state) |
+| Service worker / classic worker only | no (module worker client not available) | no | Main-thread controlled APIs or custom classic-worker glue |
+
+### Cancellation and timeout example
+
+```javascript
+const controller = new AbortController();
+const timeoutMs = 250;
+
+setTimeout(() => controller.abort(), 100);
+
+try {
+  const result = db.search_request_value_controlled(
+    { query: "rust", limit: 20, return_stored: true },
+    controller.signal,
+    timeoutMs
+  );
+  console.log(result);
+} catch (err) {
+  // err.type is "aborted" or "timeout"
+  console.error(err.type, err.reason);
+}
+```
 
 ---
 

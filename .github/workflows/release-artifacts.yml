@@ -110,10 +110,42 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Build wasm package
         run: wasm-pack build --release searchlite-wasm
+
+      - name: Smoke test wasm bundle
+        run: |
+          set -euo pipefail
+          test -f searchlite-wasm/pkg/searchlite_wasm.js
+          test -f searchlite-wasm/pkg/searchlite_wasm_bg.wasm
+          node --input-type=module <<'EOF'
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const moduleUrl = pathToFileURL(path.resolve("searchlite-wasm/pkg/searchlite_wasm.js")).href;
+          const wasmModule = await import(moduleUrl);
+          if (typeof wasmModule.Searchlite !== "function") {
+            throw new Error("missing Searchlite export from wasm package");
+          }
+          const schema = {
+            type: "object",
+            properties: {
+              body: { type: "string" }
+            }
+          };
+          const dbName = `release-smoke-${Date.now()}`;
+          const idx = await wasmModule.Searchlite.init(dbName, JSON.stringify(schema), "memory");
+          idx.add_document({ _id: "smoke-doc", body: "hello smoke" });
+          await idx.commit();
+          console.log("WASM package smoke test passed (init + add + commit)");
+          EOF
 
       - name: Package wasm bundle
         run: |

@@ -29,10 +29,16 @@
 			"require": "./dist/index.js"
 		}
 	},
-	"dependencies": {
-		"zod": "^4.3.6"
+	"peerDependencies": {
+		"zod": ">=4.3.6 <5.0.0"
+	},
+	"peerDependenciesMeta": {
+		"zod": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
+		"zod": "^4.3.6",
 		"@biomejs/biome": "^1",
 		"@napi-rs/cli": "^3",
 		"@swc/cli": "^0.6",
@@ -54,7 +60,8 @@
 		"prepublishOnly": "napi prepublish -t npm",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"typecheck": "tsc",
+		"test:types": "tsc --noEmit -p tsconfig.test.json",
+		"typecheck": "tsc && npm run test:types",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write ."
 	},

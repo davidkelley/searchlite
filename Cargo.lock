@@ -2117,6 +2117,7 @@ dependencies = [
  "getrandom 0.2.16",
  "hashbrown 0.14.5",
  "hmac",
+ "js-sys",
  "log",
  "memmap2",
  "parking_lot",

@@ -512,3 +512,203 @@ If you omit `searchlite:docIdField`, the default is `"_id"`:
 ```json
 {"_id": "product-42", "title": "Wireless Mouse"}
 ```
+
+## Authoring schemas with Zod (TypeScript)
+
+In addition to the JSON Schema format above, the Node.js SDK (`searchlite-js`)
+lets you author your index with a [Zod](https://zod.dev) schema. The Zod
+schema serves as the single source of truth for three things at once:
+
+1. **Index definition** — compiled to the same JSON Schema format described
+   in this document and passed to the native engine.
+2. **Runtime validation** — documents are validated on `add()` / `addMany()`
+   and search results are validated on `search()`.
+3. **TypeScript types** — `z.infer<typeof Schema>` gives you the document
+   shape for free, with full autocomplete in your IDE.
+
+All three authoring paths — shorthand, raw JSON Schema, and Zod — produce
+the same compiled output. Choose based on ergonomics; switch freely.
+
+### Quick start
+
+```typescript
+import { z } from "zod";
+import { EmbeddedIndex, sl } from "searchlite-js";
+
+// One schema for everything.
+const ProductSchema = sl.index(
+  z.object({
+    id: z.string().uuid(),              // auto-promoted to keyword
+    name: z.string(),                    // full-text search
+    brand: sl.keyword(),                 // exact match, fast
+    price: sl.float({ stored: true }),
+    year: sl.integer({ stored: true }),
+    tags: z.array(sl.keyword()),         // NOT supported — see below
+  }),
+  { docIdField: "id" },
+);
+
+type Product = z.infer<typeof ProductSchema>;
+
+const index = new EmbeddedIndex<Product>("./products", { schema: ProductSchema });
+await index.add({ id: "550e8400-...", name: "Widget", brand: "Acme", ... });
+await index.commit();
+
+const r = await index.search("widget");
+// r.hits[0].fields: Product (typed + validated)
+```
+
+### `sl.index()` — the root marker
+
+Every Zod schema used as a searchlite index must be wrapped with `sl.index()`.
+This attaches index-level metadata (`docIdField`, `analyzers`) and brands the
+return type so the constructor can detect it at both compile time and runtime.
+
+```typescript
+sl.index<TSchema>(schema: TSchema, opts?: {
+  docIdField?: string;   // defaults to "_id"
+  analyzers?: unknown[]; // custom analyzer definitions
+}): ZodIndexSchema<TSchema>;
+```
+
+The docIdField field should be declared in your `z.object({...})` as well —
+this lets `z.infer<>` include the id on your document type. The compiler
+strips the id from the emitted `properties` map because the engine stores
+document ids as a separate column.
+
+### Field helpers (`sl.*`)
+
+Helpers wrap Zod primitives and attach field-level metadata. They always win
+over the automatic promotion rules below.
+
+```typescript
+sl.text(opts?):    z.ZodString   // full-text, analyzer-driven
+sl.keyword(opts?): z.ZodString   // exact-match, fast
+sl.integer(opts?): z.ZodNumber   // i64, automatically applies .int()
+sl.float(opts?):   z.ZodNumber   // f64
+sl.vector({dim, metric, hnsw?}): z.ZodArray<z.ZodNumber>
+```
+
+Option tables:
+
+| Helper | Options |
+|---|---|
+| `sl.text`    | `analyzer?`, `searchAnalyzer?`, `stored?` (default `true`), `indexed?` (default `true`), `searchAsYouType?: {minGram, maxGram}` |
+| `sl.keyword` | `stored?` (default `true`), `indexed?` (default `true`), `fast?` (default `true`) |
+| `sl.integer` | `stored?` (default `false`), `fast?` (default `true`) |
+| `sl.float`   | `stored?` (default `false`), `fast?` (default `true`) |
+| `sl.vector`  | `dim: number` (required), `metric: "Cosine" \| "L2"` (required), `hnsw?: { m?, efConstruction? }` |
+
+Each helper also has a second-argument overload that wraps an existing Zod
+schema — useful when you want Zod refinements alongside searchlite metadata:
+
+```typescript
+// Migration-style: attach metadata to an already-declared Zod schema
+const email = sl.keyword(z.string().email(), { fast: false });
+```
+
+### Type-mapping rules
+
+The Zod compiler inspects your schema and maps each Zod construct to a
+searchlite field kind. Explicit `sl.*` helpers or `.meta({kind})` always win
+over automatic inference.
+
+| Zod construct | Field kind | Notes |
+|---|---|---|
+| `z.string()` | `text` | Default. Analyzer `"default"` unless overridden. |
+| `z.string().uuid()` / `.cuid()` / `.cuid2()` / `.ulid()` / `.nanoid()` | `keyword` | Auto-promoted; identifiers aren't full-text searched. |
+| `z.string().email()` / `.url()` | `keyword` | Auto-promoted. Override with `sl.text()` for partial-match use cases. |
+| `z.string().regex(...)` / `.min()` / `.max()` | `text` | Refinement is runtime-only; no kind change. |
+| `sl.text(opts?)` | `text` | Explicit — wins over auto-promotion. |
+| `sl.keyword(opts?)` | `keyword` | Explicit — wins over auto-promotion. |
+| `z.literal("x")` | `keyword` | String literal coerced to keyword. |
+| `z.literal(42)` / `z.literal(3.14)` | `integer` / `float` (by value) | |
+| `z.enum(["a","b"])` / `z.nativeEnum(E)` | `keyword` | Fast by default. |
+| `z.number()` | `float` | |
+| `z.number().int()` / `sl.integer()` | `integer` | |
+| `sl.float(opts?)` | `float` | |
+| `z.object({...})` | nested object | Compiles to `type: "object", properties: {...}`. |
+| `z.array(z.object({...}))` | array of nested objects | Multi-valued nested fields. |
+| `z.optional(T)` | wraps T | Field may be omitted from documents. |
+| `z.nullable(T)` | wraps T | Emits `type: [T, "null"]`. |
+| `z.default(T, v)` | wraps T | Default applied by Zod; index unchanged. |
+| `z.brand<X>(T)` | wraps T | Brand is a type-only marker — compiles as the inner type. |
+| `sl.vector({...})` | vector | See [Vector fields](#vector-fields). |
+
+### Unsupported constructs
+
+The compiler hard-errors on constructs that can't be mapped to a searchlite
+field kind, so you know about the limitation at compile time instead of
+silently getting wrong behavior. The error names the offending field path and
+includes a remediation hint.
+
+| Zod construct | Error remediation |
+|---|---|
+| `z.boolean()` | Use `z.enum(["true","false"])` with `sl.keyword()`, or model as integer 0/1. |
+| `z.date()` | Use `z.number().int()` for epoch-ms; convert at your application boundary. |
+| `z.bigint()` | Use `z.number().int()` (if values fit in i64) or store as a keyword string. |
+| `z.record(K, V)` | Lift known keys to a `z.object({...})`. |
+| `z.tuple([...])` | Use `z.array(z.object({...}))` with a discriminator field. |
+| `z.union([...])` / `z.discriminatedUnion` | Lift the discriminator to the parent object. |
+| `z.intersection(A, B)` | Merge at the `z.object({...})` level instead. |
+| `z.array(<primitive>)` | Nest the primitive inside an object: `z.array(z.object({value: ...}))`. |
+| `z.lazy()` | Not supported in v1. Flatten the structure or materialize a fixed depth. |
+| `z.any()` / `z.unknown()` / `z.never()` | Provide a concrete Zod type. |
+| `.transform()` / `.pipe()` / `.preprocess()` | Shape-changing effects break the doc ↔ index mapping. Remove the transform or use a separate validator. |
+
+### Metadata override precedence
+
+Highest → lowest:
+
+1. `sl.*` fluent helper (e.g., `sl.keyword()`)
+2. Explicit registry metadata (`schema.register(SearchliteFieldRegistry, {kind: "keyword"})` or `.meta({kind: "keyword"})`)
+3. Automatic promotion rule (`.uuid()` → keyword)
+4. Default inferred kind from `_def.type`
+
+### Validation behavior
+
+When a Zod schema is supplied at construction:
+
+- **`add(doc)` / `addMany(docs)`** — each doc is validated against the Zod
+  schema before hitting the native engine. Invalid docs throw a `ZodError`
+  (pretty-formatted) with the field path that failed.
+- **`search(query)`** — hit fields are validated against the same schema
+  automatically. You do NOT need to pass the schema again per call.
+- **`search(otherSchema, query)`** — explicit per-call schema wins for that
+  call. Useful when you want to project a subset of fields to a different
+  shape (e.g., a search result view model).
+
+### Cross-path parity
+
+These three schemas all produce identical native behavior:
+
+```typescript
+// Path 1 — shorthand
+new EmbeddedIndex(path, {
+  schema: { title: "text", tag: "keyword", year: "integer" }
+});
+
+// Path 2 — raw JSON Schema
+new EmbeddedIndex(path, {
+  schema: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      tag:   { type: "string", "searchlite:kind": "keyword" },
+      year:  { type: "integer" },
+    },
+  },
+});
+
+// Path 3 — Zod
+new EmbeddedIndex(path, {
+  schema: sl.index(z.object({
+    title: z.string(),
+    tag:   sl.keyword(),
+    year:  sl.integer(),
+  })),
+});
+```
+
+For the longer walkthrough, migration recipes, and runnable examples, see
+[`docs/zod-guide.md`](./zod-guide.md).

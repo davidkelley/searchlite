@@ -38,8 +38,17 @@ web-sys = { version = "0.3.69", features = [
   "IdbTransaction",
   "IdbTransactionMode",
   "IdbObjectStore",
+  "IdbCursor",
+  "IdbCursorWithValue",
   "IdbRequest",
   "DomException",
+  "StorageManager",
+  "AbortSignal",
+  "AbortController",
+  "Worker",
+  "WorkerOptions",
+  "WorkerType",
+  "MessageEvent",
   "Event",
 ] }
 

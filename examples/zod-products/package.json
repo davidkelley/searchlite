@@ -1,0 +1,16 @@
+{
+	"name": "zod-products-example",
+	"private": true,
+	"version": "0.0.0",
+	"scripts": {
+		"example": "tsx index.ts"
+	},
+	"dependencies": {
+		"searchlite-js": "file:../../searchlite-node",
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"tsx": "^4.19.2",
+		"typescript": "^5"
+	}
+}
