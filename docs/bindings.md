@@ -41,6 +41,39 @@ All FFI functions that return `c_int` use the following codes:
 
 ## WASM
 
+### WASM API index
+
+| Category | Method | Kind |
+| --- | --- | --- |
+| Lifecycle | `Searchlite.init(name, schemaJson, storage?)` | static async |
+| Lifecycle | `Searchlite.list_indexes()` | static async |
+| Lifecycle | `Searchlite.clear_index(name)` | static async |
+| Lifecycle | `Searchlite.drop_index(name)` | static async |
+| Lifecycle | `Searchlite.plan_migration(name, schemaJson)` | static async |
+| Lifecycle | `Searchlite.migrate_index(name, schemaJson)` | static async |
+| Lifecycle | `Searchlite.storage_usage()` | static async |
+| Lifecycle | `Searchlite.cleanup_indexes(staleOlderThanMs, dryRun?)` | static async |
+| Ingest | `db.add_document(doc)` / `db.add_documents(docs)` | sync (queued) |
+| Ingest | `db.commit()` | async |
+| Ingest | `db.flush_storage()` | async |
+| Delete / update | `db.delete_document(id)` / `db.delete_documents(ids)` | sync (queued) |
+| Delete / update | `db.update_document({ id, set?, unset? })` | sync (queued) |
+| Query | `db.search(query, limit, returnStored?)` | sync |
+| Query | `db.search_request(json)` / `db.search_request_value(value)` | sync |
+| Query | `db.search_controlled(query, limit, returnStored?, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_controlled(json, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_value_controlled(value, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_value_async(value, signal?, timeoutMs?)` | async |
+| Query | `db.mget({ ids, return_stored? })` | sync |
+| Query | `db.multi_search({ searches, parallel?, max_concurrency? })` | sync |
+| Maintenance | `db.compact()` | async |
+| Maintenance | `db.inspect()` | sync |
+| Maintenance | `db.stats()` | sync |
+| Maintenance | `db.cleanup_orphaned_files(dryRun?)` | async |
+| Threads | `db.init_threads(threads?)` (requires `--features threads`) | async |
+
+### WASM behaviour notes
+
 - `add_document` / `add_documents` queue writes; `commit()` persists them and makes them searchable. `flush_storage()` only drains pending storage writes if you need it.
 - `delete_document(id)` queues a single delete by doc id; `delete_documents(ids)` accepts a string or array of strings for batch deletes. Both require `commit()` to persist.
 - `update_document({ id, set?, unset? })` queues partial updates by doc id; `set` and `unset` follow core patch semantics and require `commit()` to persist.
@@ -75,9 +108,10 @@ WASM methods return structured errors instead of plain strings:
 
 Use `error.type` for programmatic handling and `error.reason` for logging/UI.
 
-`quota_exceeded` is returned when IndexedDB rejects writes due to storage limits; the reason includes recovery guidance (`compact`, stale-index cleanup, or clearing/dropping unused data).
-`aborted` is returned when an `AbortSignal` is already aborted (or becomes aborted at a control check).
-`timeout` is returned when `timeoutMs` is exceeded at a control check.
+See [**docs/wasm-errors.md**](wasm-errors.md) for the full reference — every
+emitted `type`, when it fires, and the recommended recovery action. Commonly
+encountered codes: `quota_exceeded`, `aborted`, `timeout`, `schema_mismatch`,
+`invalid_*`.
 
 ### Worker-first demo notes
 
