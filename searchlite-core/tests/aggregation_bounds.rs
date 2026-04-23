@@ -709,6 +709,397 @@ fn date_histogram_rejects_invalid_config() {
   assert!(msg.contains("extended_bounds") || msg.contains("hard_bounds"));
 }
 
+// Regression test for BUG-338: `parse_date` previously accepted
+// non-finite strings ("NaN", "inf", "-inf", "infinity", "Infinity",
+// "-infinity") via its `f64::from_str` fallback. Those values flowed
+// into `extended_bounds` / `hard_bounds` validation as `Some(NaN)` /
+// `Some(±INF)`, bypassing the `min > max` guard (`NaN > NaN` is
+// `false`) and ultimately saturating through `as i64` casts to
+// epoch 0 or `i64::MAX`. After the fix, non-finite bound strings
+// must surface as the same "not a valid date/number" InvalidConfig
+// error raised for any other unparseable value.
+#[test]
+fn date_histogram_rejects_non_finite_bound_strings() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+
+  let reader = idx.reader().unwrap();
+
+  fn request_with_extended(
+    min: &str,
+    max: &str,
+    aggs_entry: &str,
+  ) -> (BTreeMap<String, Aggregation>, SearchRequest) {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      aggs_entry.into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("day".into()),
+        fixed_interval: None,
+        offset: None,
+        format: None,
+        min_doc_count: None,
+        extended_bounds: Some(DateHistogramBounds {
+          min: min.into(),
+          max: max.into(),
+        }),
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let req = SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: aggs.clone(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+    (aggs, req)
+  }
+
+  for (label, min, max) in [
+    ("nan-min", "NaN", "2024-01-02T00:00:00Z"),
+    ("nan-max", "2024-01-01T00:00:00Z", "NaN"),
+    ("nan-pair", "NaN", "NaN"),
+    ("inf-max", "2024-01-01T00:00:00Z", "inf"),
+    ("neg-inf-min", "-Infinity", "2024-01-02T00:00:00Z"),
+    ("infinity-pair", "-infinity", "infinity"),
+  ] {
+    let (_aggs, req) = request_with_extended(min, max, label);
+    let resp = reader.search(&req);
+    assert!(
+      resp.is_err(),
+      "{label}: expected InvalidConfig for non-finite bound ({min:?}, {max:?})",
+    );
+    let msg = resp.err().unwrap().to_string();
+    assert!(
+      msg.contains("not a valid date/number"),
+      "{label}: expected `not a valid date/number` in error, got `{msg}`",
+    );
+  }
+}
+
+// Regression test for BUG-344: `parse_interval_seconds` previously
+// returned `Some(f64::INFINITY)` for duration strings whose numeric
+// prefix overflowed `f64` (~1e308). The callers cast the result to
+// `i64` via `as i64`, which saturates `f64::INFINITY` to `i64::MAX`,
+// silently producing `DateInterval::Fixed(i64::MAX)` (a single bucket
+// at the offset) or an `i64::MAX` offset (every document dropped). The
+// planner-side validator in `validate_date_histogram_config` already
+// rejects `fixed_interval` whose `parse_interval_seconds` result is
+// non-finite, but for `offset` it only checks `parse_interval_seconds
+// .is_none()` — so without the in-function finitude guard, an overflow
+// returned `Some(INFINITY)` and bypassed the check. After the fix,
+// overflow strings parse to `None` and both call sites surface the
+// expected `InvalidConfig` error.
+#[test]
+fn date_histogram_rejects_overflowing_interval_strings() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+  let reader = idx.reader().unwrap();
+
+  // A 310-digit integer prefix overflows `f64::MAX` and `f64::from_str`
+  // returns `Ok(f64::INFINITY)` rather than `Err`.
+  let overflow_digits: String = "9".repeat(310);
+  let overflow_hours = format!("{overflow_digits}h");
+
+  fn base_request(aggs: BTreeMap<String, Aggregation>) -> SearchRequest {
+    SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  // fixed_interval overflow → "must be a positive duration of at least 1ms"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: None,
+      fixed_interval: Some(overflow_hours.clone()),
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "fixed_interval overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("fixed_interval") && msg.contains("positive duration"),
+    "fixed_interval overflow: expected message about positive duration, got `{msg}`",
+  );
+
+  // offset overflow → "offset `...` is invalid"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("day".into()),
+      fixed_interval: None,
+      offset: Some(overflow_hours.clone()),
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "offset overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("offset") && msg.contains("invalid"),
+    "offset overflow: expected message about invalid offset, got `{msg}`",
+  );
+
+  // Also exercise the post-multiplier overflow path: a finite `value`
+  // close to `f64::MAX` that overflows after being multiplied by a unit
+  // multiplier (`604_800.0` for weeks).
+  let post_mult_overflow = format!("1{}w", "0".repeat(305));
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: Some("day".into()),
+      fixed_interval: None,
+      offset: Some(post_mult_overflow),
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "offset with post-multiplier overflow should surface InvalidConfig",
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("offset") && msg.contains("invalid"),
+    "post-mult offset overflow: expected message about invalid offset, got `{msg}`",
+  );
+}
+
+// Regression test for BUG-408: `parse_interval_seconds` returns a finite
+// `f64` magnitude, but every caller converts the returned seconds value
+// to milliseconds via `secs * 1_000.0` before casting to `i64`. A finite
+// seconds magnitude slightly above `f64::MAX / 1_000.0` (~1.8e305) is
+// below the `magnitude.is_finite()` threshold (BUG-344) yet overflows
+// to `f64::INFINITY` after the millisecond conversion, and Rust's
+// `as i64` cast saturates infinity to `i64::MAX` — silently producing a
+// degenerate `DateInterval::Fixed(i64::MAX)` (all documents collapse
+// into a single bucket) or an `i64::MAX` offset (every document is
+// dropped). After the fix, `parse_interval_seconds` rejects such
+// magnitudes centrally and both call sites surface the expected
+// `InvalidConfig` error.
+#[test]
+fn date_histogram_rejects_finite_seconds_that_overflow_millis_conversion() {
+  let tmp = tempfile::tempdir().unwrap();
+  let path = tmp.path().to_path_buf();
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "ts".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let idx = IndexBuilder::create(&path, schema, build_base_options(&path)).unwrap();
+  let reader = idx.reader().unwrap();
+
+  // `1` followed by 306 zeros is ≈1e306: finite in f64 (~1.8e308) but
+  // above `f64::MAX / 1_000.0` (~1.8e305), so `secs * 1_000.0` overflows
+  // to infinity and `as i64` saturates to `i64::MAX` without the guard.
+  let overflow_seconds = format!("1{}s", "0".repeat(306));
+
+  fn base_request(aggs: BTreeMap<String, Aggregation>) -> SearchRequest {
+    SearchRequest {
+      query: "rust".into(),
+      fields: None,
+      filter: None,
+      limit: 1,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs,
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    }
+  }
+
+  // fixed_interval post-millis overflow → "must be a positive duration of at least 1ms"
+  let mut aggs = BTreeMap::new();
+  aggs.insert(
+    "hist".into(),
+    Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+      field: "ts".into(),
+      calendar_interval: None,
+      fixed_interval: Some(overflow_seconds.clone()),
+      offset: None,
+      format: None,
+      min_doc_count: None,
+      extended_bounds: None,
+      hard_bounds: None,
+      missing: None,
+      sampling: None,
+      aggs: BTreeMap::new(),
+    })),
+  );
+  let resp = reader.search(&base_request(aggs));
+  assert!(
+    resp.is_err(),
+    "fixed_interval post-millis overflow should surface InvalidConfig"
+  );
+  let msg = resp.err().unwrap().to_string();
+  assert!(
+    msg.contains("fixed_interval") && msg.contains("positive duration"),
+    "fixed_interval post-millis overflow: expected message about positive duration, got `{msg}`",
+  );
+
+  // offset post-millis overflow (positive and negative) → "offset `...` is invalid"
+  for signed in [overflow_seconds.clone(), format!("-{overflow_seconds}")] {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: Some("day".into()),
+        fixed_interval: None,
+        offset: Some(signed.clone()),
+        format: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let resp = reader.search(&base_request(aggs));
+    assert!(
+      resp.is_err(),
+      "offset post-millis overflow ({signed}) should surface InvalidConfig"
+    );
+    let msg = resp.err().unwrap().to_string();
+    assert!(
+      msg.contains("offset") && msg.contains("invalid"),
+      "offset post-millis overflow ({signed}): expected message about invalid offset, got `{msg}`",
+    );
+  }
+}
+
 #[test]
 fn top_hits_returns_requested_docs() {
   let tmp = tempfile::tempdir().unwrap();
@@ -1569,6 +1960,193 @@ mod bug_027 {
   }
 }
 
+/// Regression tests for BUG-356 — `CompositeCollector::collect` for a
+/// `CompositeSource::Histogram` stored `(v / interval).floor() * interval`
+/// as a `CompositeKeyPart::F64` bit pattern without checking finitude.
+/// `interval` is validated finite/positive in
+/// `validate_aggregations_in_scope`, but the document value `v` comes
+/// unvalidated from the fast-field store. A large `v` (near `f64::MAX`)
+/// combined with a small `interval` overflows the division to infinity,
+/// producing a non-finite bucket key that serialized as `null` via
+/// `Number::from_f64` and corrupted `after`-cursor ordering. The fix
+/// filters out non-finite histogram values from the source's value
+/// list; a multi-valued field still contributes via its remaining
+/// finite values, and the document is only skipped for that source
+/// when every value is non-finite.
+mod bug_356 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn run_composite(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "c".into(),
+      Aggregation::Composite(Box::new(CompositeAggregation {
+        sources: vec![CompositeSource::Histogram {
+          name: "score_buckets".into(),
+          field: "score".into(),
+          interval,
+        }],
+        size: 100,
+        after: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("c").cloned().expect("composite agg")
+  }
+
+  fn index_docs(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn extract_composite(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Composite { buckets, .. } => buckets,
+      _ => panic!("expected composite aggregation response"),
+    }
+  }
+
+  /// A document whose `score` is large enough that `(v / interval).floor() *
+  /// interval` overflows to `+Infinity` must not produce a bucket. Prior to
+  /// the fix the bucket was committed with `f64::INFINITY.to_bits()` and
+  /// serialized as a `null` key via `Number::from_f64`'s non-finite
+  /// fallback.
+  #[test]
+  fn composite_histogram_drops_document_whose_bucket_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e308 / 0.0001 = 1e312, which saturates to f64::INFINITY. `floor` and
+    // the subsequent multiply preserve the non-finite value.
+    index_docs(&idx, &[1e308]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with non-finite bucket arithmetic must be dropped, got {buckets:?}"
+    );
+    for bucket in buckets {
+      let key = bucket
+        .key
+        .as_object()
+        .and_then(|m| m.get("score_buckets"))
+        .expect("score_buckets key present");
+      assert!(
+        !key.is_null(),
+        "composite bucket key must never be null (got {key:?})"
+      );
+    }
+  }
+
+  /// Regression lock: a document whose field value is large but whose bucket
+  /// arithmetic stays finite must still be emitted. Guards against the new
+  /// finitude filter over-rejecting legitimate large-but-finite values.
+  #[test]
+  fn composite_histogram_keeps_document_with_large_finite_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e10 / 1.0 = 1e10 (finite), floor * 1.0 = 1e10 (finite).
+    index_docs(&idx, &[1e10]);
+
+    let resp = run_composite(&idx, 1.0);
+    let buckets = extract_composite(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected exactly one finite-bucket composite entry, got {buckets:?}"
+    );
+    let key = buckets[0]
+      .key
+      .as_object()
+      .and_then(|m| m.get("score_buckets"))
+      .expect("score_buckets key present");
+    assert!(
+      key.is_number(),
+      "composite bucket key for a finite-valued document must be a number (got {key:?})"
+    );
+    assert_eq!(buckets[0].doc_count, 1);
+  }
+
+  /// Mixed input: overflow docs are skipped, finite docs are emitted with
+  /// number-valued keys. Verifies the finitude gate is applied per-document
+  /// rather than per-segment.
+  #[test]
+  fn composite_histogram_mixed_overflow_and_finite_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // `1e308` overflows with interval `0.0001`; `0.5` and `1.5` stay finite
+    // and land in distinct buckets.
+    index_docs(&idx, &[1e308, 0.5, 1.5]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected two finite-bucket entries (overflow doc dropped), got {buckets:?}"
+    );
+    for bucket in buckets {
+      let key = bucket
+        .key
+        .as_object()
+        .and_then(|m| m.get("score_buckets"))
+        .expect("score_buckets key present");
+      assert!(
+        key.is_number(),
+        "every emitted composite bucket must have a numeric key (got {key:?})"
+      );
+      assert_eq!(bucket.doc_count, 1);
+    }
+  }
+
+  /// Negative-overflow sibling: `-1e308 / 0.0001` saturates to
+  /// `-Infinity`, so the negative-large document must be dropped for the
+  /// same reason as the positive case. Exercises both ends of the
+  /// overflow range in a single test.
+  #[test]
+  fn composite_histogram_drops_document_whose_bucket_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_docs(&idx, &[-1e308]);
+
+    let resp = run_composite(&idx, 0.0001);
+    let buckets = extract_composite(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with negative overflow bucket must be dropped, got {buckets:?}"
+    );
+  }
+}
+
 /// Regression tests for BUG-030 (#186) — `bucket_start` for
 /// `DateInterval::Fixed` used `.ceil()` instead of `.floor()`, causing every
 /// timestamp that did not fall exactly on a bucket boundary to be mis-assigned
@@ -1741,6 +2319,140 @@ mod bug_030 {
         .map(|b| (b.key.clone(), b.doc_count))
         .collect();
       assert_eq!(observed, vec![(json!(500), 2), (json!(1500), 1)]);
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
+  /// Regression test for BUG-295 — `parse_interval_seconds` previously
+  /// rejected any spec with a leading `-`, so negative `offset` values
+  /// (used to shift bucket boundaries backward for e.g. timezone
+  /// alignment) returned HTTP 400 `offset is invalid` instead of being
+  /// honored. With the parser accepting a leading sign, a negative offset
+  /// must now shift the daily bucket boundaries back by six hours.
+  ///
+  /// With `interval = 1d` and `offset = -6h`, bucket boundaries fall at
+  /// `..., -6h, 18h, 42h, ...`. A timestamp of `DAY_MS` (midnight day 2)
+  /// belongs in the `[18h, 42h)` bucket whose key is `18h`.
+  #[test]
+  fn fixed_interval_accepts_negative_offset() {
+    const HOUR_MS: i64 = 3_600_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, ts) in [
+        // 06:00 day 1 -> bucket key -6h (offset -6h places boundary at
+        // -6h, 18h, 42h, ...; 6h lives in the [-6h, 18h) bucket).
+        ("morning-d1", 6 * HOUR_MS),
+        // 23:59 day 1 -> bucket key 18h (inside [18h, 42h)).
+        ("late-d1", DAY_MS - 60_000),
+        // 00:01 day 2 -> bucket key 18h (still inside [18h, 42h)).
+        ("early-d2", DAY_MS + 60_000),
+      ] {
+        writer
+          .add_document(&doc(id, vec![("body", json!("rust")), ("ts", json!(ts))]))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1d".into()),
+        offset: Some("-6h".into()),
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(
+        observed,
+        vec![(json!(-6 * HOUR_MS), 1), (json!(18 * HOUR_MS), 2),],
+        "offset=-6h must shift daily boundaries backward by six hours"
+      );
+    } else {
+      panic!("expected date histogram response");
+    }
+  }
+
+  /// Regression test for BUG-305 — the BUG-295 fix added a strip for a
+  /// leading `-` but did not add the parallel `+` arm, so explicitly
+  /// positive offsets such as `"+6h"` still returned HTTP 400
+  /// `offset is invalid`. Elasticsearch accepts both signs, so users
+  /// following its docs or migrating queries hit the regression.
+  ///
+  /// With `interval = 1d` and `offset = +6h`, bucket boundaries fall at
+  /// `..., 6h, 30h, 54h, ...`. A `+6h` offset is semantically identical
+  /// to `6h` (no prefix), so the bucket layout must match the unsigned
+  /// variant.
+  #[test]
+  fn fixed_interval_accepts_explicit_positive_offset() {
+    const HOUR_MS: i64 = 3_600_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = timestamp_index(tmp.path());
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, ts) in [
+        // 03:00 day 1 -> bucket key -18h (offset +6h places boundaries at
+        // ..., -18h, 6h, 30h, ...; 3h lives in the [-18h, 6h) bucket).
+        ("pre-offset", 3 * HOUR_MS),
+        // 07:00 day 1 -> bucket key 6h (inside [6h, 30h)).
+        ("post-offset", 7 * HOUR_MS),
+        // 23:59 day 1 -> bucket key 6h (still inside [6h, 30h)).
+        ("late-d1", DAY_MS - 60_000),
+      ] {
+        writer
+          .add_document(&doc(id, vec![("body", json!("rust")), ("ts", json!(ts))]))
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::DateHistogram(Box::new(DateHistogramAggregation {
+        field: "ts".into(),
+        calendar_interval: None,
+        fixed_interval: Some("1d".into()),
+        offset: Some("+6h".into()),
+        format: None,
+        min_doc_count: Some(1),
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+
+    let agg = run_date_histogram(&idx, aggs);
+    if let searchlite_core::api::types::AggregationResponse::DateHistogram { buckets, .. } = agg {
+      let observed: Vec<(serde_json::Value, u64)> = buckets
+        .iter()
+        .map(|b| (b.key.clone(), b.doc_count))
+        .collect();
+      assert_eq!(
+        observed,
+        vec![(json!(-18 * HOUR_MS), 1), (json!(6 * HOUR_MS), 2),],
+        "offset=+6h must parse identically to 6h and shift boundaries forward six hours"
+      );
     } else {
       panic!("expected date histogram response");
     }
@@ -3000,5 +3712,357 @@ mod bug_251 {
     // Total doc_count must equal indexed docs (no double-counting)
     let total: u64 = entries.iter().map(|(_, c)| c).sum();
     assert_eq!(total, 2, "total doc_count must equal indexed docs");
+  }
+}
+
+/// Regression tests for BUG-358 — `HistogramCollector::bucket_key` computed
+/// `((val - offset) / interval).floor() as i64` without guarding the
+/// intermediate float against overflow to `±Infinity` or against a finite
+/// quotient above `i64::MAX`. Under either shape the saturating `as i64` cast
+/// silently coalesced documents into an `i64::MAX` / `i64::MIN` bucket with
+/// a reconstructed key orders of magnitude away from the document value.
+///
+/// Two independent overflow modes are exercised:
+///
+/// 1. Quotient overflows f64 to `±Infinity` (`f64::MAX / 0.5`).
+/// 2. Quotient stays finite f64 but exceeds `i64::MAX`
+///    (`1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`).
+///
+/// The fix drops affected documents from the histogram, matching the
+/// composite-histogram finitude filter added in BUG-356 and the
+/// finitude / range policy used across adjacent numeric sites.
+mod bug_358 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn index_scores(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn run_histogram(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("hist").cloned().expect("histogram")
+  }
+
+  fn extract_histogram(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } => buckets,
+      _ => panic!("expected histogram aggregation response"),
+    }
+  }
+
+  /// Scenario 2 from the bug report: `f64::MAX / 0.5` saturates the quotient
+  /// to `f64::INFINITY`. Before the fix the `.floor() as i64` cast clamped
+  /// the bucket id to `i64::MAX`, then the reconstructed key
+  /// `i64::MAX as f64 * 0.5 ≈ 4.61e18` landed nearly 290 orders of magnitude
+  /// away from the document's actual value.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[f64::MAX]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose bucket arithmetic overflows to infinity must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Scenario 1 from the bug report: quotient stays a finite f64 but exceeds
+  /// `i64::MAX`. `1e16 / 0.001 = 1e19 > i64::MAX ≈ 9.22e18`. Before the fix
+  /// the `as i64` cast saturated to `i64::MAX`, reconstructing a key at
+  /// `~9.22e15` — wrong by roughly 8% and liable to coalesce with every
+  /// other over-`i64::MAX` document in the same bucket.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_i64_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // Quotient = 1e19 (finite f64) > i64::MAX ≈ 9.22e18.
+    index_scores(&idx, &[1e16]);
+
+    let resp = run_histogram(&idx, 0.001);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose quotient exceeds i64::MAX must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Symmetric negative overflow: `-f64::MAX / 0.5 = -Infinity`. The same
+  /// finitude guard must reject this shape or the saturating `as i64` would
+  /// land the document in an `i64::MIN` bucket.
+  #[test]
+  fn histogram_drops_document_when_quotient_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[-f64::MAX]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document with negative-overflow quotient must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Coalescing regression: two documents whose quotients both saturate to
+  /// `i64::MAX` previously ended up in the same `i64::MAX` bucket despite
+  /// having different source values. After the fix they are both dropped
+  /// rather than silently merged.
+  #[test]
+  fn histogram_does_not_coalesce_multiple_overflow_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e16 / 0.001 = 1e19 (saturates) and 2e16 / 0.001 = 2e19 (saturates) —
+    // both would collapse to the same i64::MAX bucket under the old code.
+    index_scores(&idx, &[1e16, 2e16]);
+
+    let resp = run_histogram(&idx, 0.001);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "distinct overflow documents must not coalesce into a saturated bucket, got {buckets:?}"
+    );
+  }
+
+  /// Mixed input: overflow docs are dropped, finite-quotient docs land in
+  /// their expected buckets. Locks in per-document (rather than per-segment)
+  /// application of the finitude gate.
+  #[test]
+  fn histogram_mixed_overflow_and_finite_documents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // `f64::MAX` overflows with interval `0.5`; `0.25` and `1.25` stay
+    // finite and land in distinct buckets at keys 0.0 and 1.0.
+    index_scores(&idx, &[f64::MAX, 0.25, 1.25]);
+
+    let resp = run_histogram(&idx, 0.5);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      2,
+      "expected two finite-bucket entries (overflow doc dropped), got {buckets:?}"
+    );
+    for bucket in buckets {
+      assert!(
+        bucket.key.is_number(),
+        "every emitted histogram bucket must have a numeric key (got {:?})",
+        bucket.key
+      );
+      assert_eq!(bucket.doc_count, 1);
+    }
+  }
+
+  /// Regression lock: a document whose raw value is large but whose quotient
+  /// stays well within `i64` range must still be emitted. Guards against
+  /// the finitude filter over-rejecting legitimate large-but-finite values.
+  #[test]
+  fn histogram_keeps_document_with_large_finite_quotient() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // 1e10 / 1.0 = 1e10 (finite f64 well below i64::MAX ≈ 9.22e18).
+    index_scores(&idx, &[1e10]);
+
+    let resp = run_histogram(&idx, 1.0);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected exactly one finite-bucket entry, got {buckets:?}"
+    );
+    assert!(
+      buckets[0].key.is_number(),
+      "finite-quotient document must produce a numeric bucket key (got {:?})",
+      buckets[0].key
+    );
+    assert_eq!(buckets[0].doc_count, 1);
+  }
+}
+
+/// Regression tests for BUG-410 — `HistogramCollector` reconstructs each
+/// bucket's display key via `bucket_id as f64 * interval + offset`. The
+/// BUG-358 guard protects the forward quotient against overflow and
+/// `i64`-range saturation, but does not guard the inverse reconstruction.
+/// `i64 → f64` rounding (values above `2^53` are not all exactly representable
+/// in f64) can nudge the product past `f64::MAX` and evaluate to `±Infinity`
+/// even when the original quotient was finite and within i64 range.
+///
+/// At that point `serde_json::Number::from_f64(±Infinity)` returns `None`, so
+/// the JSON key serialization paths in `HistogramCollector::collect` and
+/// `finish` fall back to `unwrap_or_else(|| Number::from(0))` and silently
+/// re-key the bucket at `0`, potentially colliding with a legitimate bucket.
+/// (The `hard_bounds` filter compares the reconstruction directly without a
+/// JSON fallback, but still treats an infinite product as a bucket value.)
+/// The fix extends `finite_bucket_id` to also reject quotients whose
+/// reconstruction is non-finite, so the affected documents are dropped
+/// (matching the composite-histogram policy from BUG-356 and the
+/// forward-quotient policy from BUG-358) rather than keyed at `0`.
+mod bug_410 {
+  use super::*;
+
+  fn f64_score_index(path: &std::path::Path) -> searchlite_core::api::Index {
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "score".into(),
+      i64: false,
+      fast: true,
+      stored: true,
+      nullable: false,
+    });
+    Index::create(path, schema, build_base_options(path)).unwrap()
+  }
+
+  fn index_scores(idx: &searchlite_core::api::Index, scores: &[f64]) {
+    let mut writer = idx.writer().unwrap();
+    for (i, score) in scores.iter().enumerate() {
+      writer
+        .add_document(&doc(
+          &format!("d-{i}"),
+          vec![("body", json!("rust")), ("score", json!(score))],
+        ))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+
+  fn run_histogram(
+    idx: &searchlite_core::api::Index,
+    interval: f64,
+  ) -> searchlite_core::api::types::AggregationResponse {
+    let mut aggs = BTreeMap::new();
+    aggs.insert(
+      "hist".into(),
+      Aggregation::Histogram(Box::new(HistogramAggregation {
+        field: "score".into(),
+        interval,
+        offset: None,
+        min_doc_count: None,
+        extended_bounds: None,
+        hard_bounds: None,
+        missing: None,
+        sampling: None,
+        aggs: BTreeMap::new(),
+      })),
+    );
+    let mut req = SearchRequest::new("rust");
+    req.aggs = aggs;
+    let resp = idx.reader().unwrap().search(&req).expect("search");
+    resp.aggregations.get("hist").cloned().expect("histogram")
+  }
+
+  fn extract_histogram(
+    resp: &searchlite_core::api::types::AggregationResponse,
+  ) -> &[searchlite_core::api::types::BucketResponse] {
+    match resp {
+      searchlite_core::api::types::AggregationResponse::Histogram { buckets, .. } => buckets,
+      _ => panic!("expected histogram aggregation response"),
+    }
+  }
+
+  /// Primary regression: `val = f64::MAX, interval = 3e289`. The quotient
+  /// `val / interval ≈ 5.99e18` is within the i64 range (BUG-358 guard
+  /// passes), but the reconstruction `id as f64 * 3e289` overflows to
+  /// `+Infinity`. Before the fix the bucket was silently keyed at `0` via
+  /// `serde_json::Number::from_f64(inf).unwrap_or_else(|| Number::from(0))`.
+  #[test]
+  fn histogram_drops_document_when_reconstruction_overflows_to_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose reconstruction overflows must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Symmetric negative overflow: `-f64::MAX` with `interval = 3e289`
+  /// reconstructs to `-Infinity`. Same fallback would key at `0`.
+  #[test]
+  fn histogram_drops_document_when_reconstruction_overflows_to_neg_infinity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    index_scores(&idx, &[-f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert!(
+      buckets.is_empty(),
+      "document whose negative reconstruction overflows must be dropped, got {buckets:?}"
+    );
+  }
+
+  /// Key-collision regression: an overflow document must not coalesce with a
+  /// legitimate document whose bucket key really is `0`. Before the fix the
+  /// overflow document's key was silently replaced with `0` via the
+  /// `unwrap_or_else(|| Number::from(0))` fallback, merging its count into
+  /// the `0` bucket.
+  #[test]
+  fn histogram_reconstruction_overflow_does_not_collide_with_zero_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = f64_score_index(tmp.path());
+    // A legitimate doc at key 0 (value lands in bucket [0, interval)) plus
+    // an overflow doc. The overflow doc must NOT land in the same bucket.
+    index_scores(&idx, &[0.0, f64::MAX]);
+
+    let resp = run_histogram(&idx, 3e289);
+    let buckets = extract_histogram(&resp);
+    assert_eq!(
+      buckets.len(),
+      1,
+      "expected one bucket (zero), overflow doc dropped; got {buckets:?}"
+    );
+    let bucket = &buckets[0];
+    assert!(bucket.key.is_number());
+    assert_eq!(
+      bucket.doc_count, 1,
+      "overflow doc must not be coalesced into the zero bucket"
+    );
   }
 }

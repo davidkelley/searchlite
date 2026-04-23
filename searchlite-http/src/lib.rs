@@ -23,8 +23,8 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
 };
-use searchlite_core::api::PatchError;
 use searchlite_core::api::{IndexReader, MultiSearchResponse, SearchResult};
+use searchlite_core::api::{PatchError, WriteKeyError};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
@@ -963,6 +963,30 @@ impl HttpError {
   }
 }
 
+/// Classify an error surfaced by a write-key-gated path — currently
+/// `Index::writer_with_key`, the `writer.commit()` that follows it in the
+/// commit endpoint, and `Index::compact_with_key` — into the HTTP status code
+/// the caller should receive. Uses
+/// `anyhow::Error::downcast_ref::<WriteKeyError>()` so the classification
+/// stays correct if the error's `Display` text changes or a non-auth error
+/// coincidentally mentions "write key" — the substring match this replaces
+/// flipped classifications whenever either shifted. Mirrors the FFI-side
+/// `classify_writer_err` (see BUG-020).
+///
+/// `write_key_provided` selects 401 (no key supplied) vs 403 (wrong key) on
+/// auth failures, matching the pre-existing behaviour.
+fn classify_writer_error(err: &anyhow::Error, write_key_provided: bool) -> StatusCode {
+  if err.downcast_ref::<WriteKeyError>().is_some() {
+    if write_key_provided {
+      StatusCode::FORBIDDEN
+    } else {
+      StatusCode::UNAUTHORIZED
+    }
+  } else {
+    StatusCode::INTERNAL_SERVER_ERROR
+  }
+}
+
 impl IntoResponse for HttpError {
   fn into_response(self) -> Response {
     let body = Json(ErrorResponse {
@@ -1188,16 +1212,7 @@ async fn add_ndjson(
         let mut writer = index_ref
           .writer_with_key(write_key.as_deref())
           .map_err(|e| {
-            let msg = e.to_string().to_lowercase();
-            let status = if msg.contains("write key") || msg.contains("unauthorized") {
-              if write_key.is_some() {
-                StatusCode::FORBIDDEN
-              } else {
-                StatusCode::UNAUTHORIZED
-              }
-            } else {
-              StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status = classify_writer_error(&e, write_key.is_some());
             HttpError::from_anyhow("writer_open", status, e)
           })?;
         let mut total = 0usize;
@@ -1392,16 +1407,7 @@ async fn bulk_ingest(
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-      let msg = e.to_string().to_lowercase();
-      let status = if msg.contains("write key") || msg.contains("unauthorized") {
-        if write_key.is_some() {
-          StatusCode::FORBIDDEN
-        } else {
-          StatusCode::UNAUTHORIZED
-        }
-      } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-      };
+      let status = classify_writer_error(&e, write_key.is_some());
       HttpError::from_anyhow("writer_open", status, e)
     })?;
     for doc in docs.iter() {
@@ -1454,16 +1460,7 @@ async fn delete_documents(
   }
   let _writer_guard = managed.writer_lock.lock().await;
   let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-    let msg = e.to_string().to_lowercase();
-    let status = if msg.contains("write key") || msg.contains("unauthorized") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&e, write_key.is_some());
     HttpError::from_anyhow("writer_open", status, e)
   })?;
   writer
@@ -1509,16 +1506,7 @@ async fn update_document(
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-      let msg = e.to_string().to_lowercase();
-      let status = if msg.contains("write key") || msg.contains("unauthorized") {
-        if write_key.is_some() {
-          StatusCode::FORBIDDEN
-        } else {
-          StatusCode::UNAUTHORIZED
-        }
-      } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-      };
+      let status = classify_writer_error(&e, write_key.is_some());
       HttpError::from_anyhow("writer_open", status, e)
     })?;
     if let Err(err) = writer.apply_patch(&body.id, &body.set, &body.unset) {
@@ -1613,16 +1601,7 @@ async fn bulk_update(
         let mut writer = index_ref
           .writer_with_key(write_key.as_deref())
           .map_err(|e| {
-            let msg = e.to_string().to_lowercase();
-            let status = if msg.contains("write key") || msg.contains("unauthorized") {
-              if write_key.is_some() {
-                StatusCode::FORBIDDEN
-              } else {
-                StatusCode::UNAUTHORIZED
-              }
-            } else {
-              StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status = classify_writer_error(&e, write_key.is_some());
             HttpError::from_anyhow("writer_open", status, e)
           })?;
         let checkpoint = writer.checkpoint().map_err(|e| {
@@ -1919,16 +1898,7 @@ async fn commit(
     )
   })?
   .map_err(|err| {
-    let msg = err.to_string();
-    let status = if msg.to_lowercase().contains("write key") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&err, write_key.is_some());
     HttpError::from_anyhow("commit_failed", status, err)
   })?;
   Ok(Json(CommitResponse { committed: true }))
@@ -1986,16 +1956,7 @@ async fn compact(
     )
   })?
   .map_err(|err| {
-    let msg = err.to_string();
-    let status = if msg.to_lowercase().contains("write key") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&err, write_key.is_some());
     HttpError::from_anyhow("compact_failed", status, err)
   })?;
   Ok(Json(CompactResponse { compacted: true }))
@@ -2935,6 +2896,86 @@ mod tests {
       "2026-03-03T00:00:01Z"
     ));
     assert!(should_refresh(None, "2026-03-03T00:00:00Z"));
+  }
+
+  #[test]
+  fn classify_writer_error_routes_write_key_variants_to_auth_status() {
+    // Every `WriteKeyError` variant must map to an auth status regardless of
+    // its `Display` text, under both the no-client-key (401) and
+    // client-key-provided (403) branches. This is what the previous
+    // substring match got wrong (BUG-406, mirrors the FFI-side BUG-020).
+    //
+    // `WriteKeyError` is not `Clone`, so build each variant twice via a
+    // closure: once per assertion branch.
+    let variants: &[fn() -> WriteKeyError] = &[
+      || WriteKeyError::Required,
+      || WriteKeyError::Mismatch("segment binding; index may be tampered"),
+      || WriteKeyError::MetadataTampered,
+      || WriteKeyError::Empty,
+      || WriteKeyError::FeatureDisabled,
+    ];
+
+    for build in variants {
+      let no_key_err: anyhow::Error = build().into();
+      assert_eq!(
+        classify_writer_error(&no_key_err, false),
+        StatusCode::UNAUTHORIZED,
+        "variant {:?} without client key must map to 401",
+        build()
+      );
+
+      let with_key_err: anyhow::Error = build().into();
+      assert_eq!(
+        classify_writer_error(&with_key_err, true),
+        StatusCode::FORBIDDEN,
+        "variant {:?} with client key must map to 403",
+        build()
+      );
+    }
+  }
+
+  #[test]
+  fn classify_writer_error_survives_anyhow_context_wrapping() {
+    // anyhow::Context rewrites the Display string, which is exactly what
+    // broke the substring match. Typed downcast must still classify this
+    // as an auth failure.
+    let err: anyhow::Error = WriteKeyError::MetadataTampered.into();
+    let wrapped = err.context("opening writer").context("during compaction");
+    assert_eq!(
+      classify_writer_error(&wrapped, false),
+      StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(classify_writer_error(&wrapped, true), StatusCode::FORBIDDEN);
+  }
+
+  #[test]
+  fn classify_writer_error_does_not_auth_classify_substring_lookalikes() {
+    // The pre-BUG-406 substring match flipped a benign storage error whose
+    // `Display` text happened to include "write key" (e.g. "failed to read
+    // write key binding from WAL") into a 401/403. The typed downcast must
+    // return 500 for such errors.
+    let err = anyhow::anyhow!("failed to read write key binding from WAL");
+    assert_eq!(
+      classify_writer_error(&err, false),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+      classify_writer_error(&err, true),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+  }
+
+  #[test]
+  fn classify_writer_error_maps_non_auth_errors_to_internal() {
+    let err = anyhow::anyhow!("disk full");
+    assert_eq!(
+      classify_writer_error(&err, false),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+      classify_writer_error(&err, true),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
   }
 
   #[tokio::test]

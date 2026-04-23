@@ -543,6 +543,14 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         };
         score = adjusted;
       }
+      // BUG-381: drop documents whose BM25 score is non-finite (typically
+      // +inf from an accumulated boost product overflowing `f32::MAX`).
+      // Without this guard the pure-BM25 path has no filter analogous to
+      // `evaluate_compiled_score`, so a non-finite score reaches the heap
+      // and serialises as an invalid JSON number, returning HTTP 500.
+      if !score.is_finite() {
+        continue;
+      }
       if !accept(doc_id, score) {
         continue;
       }
@@ -585,6 +593,13 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         continue;
       };
       score = adjusted;
+    }
+    // BUG-381: see the plan-driven branch above. `score_tf` returns
+    // `bm25 * weight`; when accumulated boosts push `weight` past
+    // `f32::MAX` the result is `+inf` and leaks into the heap unless we
+    // drop it here.
+    if !score.is_finite() {
+      continue;
     }
     if !accept(doc_id, score) {
       continue;
@@ -760,12 +775,19 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         term.upper_bound()
       };
 
-      if bound.is_finite() {
-        acc += bound;
-        if acc >= pivot_threshold {
-          pivot_idx = Some(i);
-          break;
-        }
+      // Skip NaN bounds only: NaN arithmetic poisons the accumulator and
+      // `NaN >= threshold` is always false, so the term could never trigger
+      // the pivot. Positive infinity, on the other hand, is a valid (if
+      // loose) upper bound — it should immediately satisfy any finite
+      // threshold and set the pivot, otherwise the WAND loop can terminate
+      // early and silently drop documents whose global ub overflowed.
+      if bound.is_nan() {
+        continue;
+      }
+      acc += bound;
+      if acc >= pivot_threshold {
+        pivot_idx = Some(i);
+        break;
       }
     }
 
@@ -835,7 +857,15 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         adj(doc_id, score, leaves_slice)
       } else {
         Some(score)
-      };
+      }
+      // BUG-381: a term's `weight` multiplies into `score_tf` on every
+      // contribution, so accumulated query-boost products overflowing
+      // `f32::MAX` turn `score_sum` into `+inf`. `evaluate_compiled_score`
+      // already drops non-finite scores via `score_adjust`, but the plain
+      // BM25 path has no such hook — filter here so non-finite scores
+      // cannot reach the heap (they serialise as invalid JSON and return
+      // HTTP 500 to the client).
+      .filter(|s| s.is_finite());
 
       if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
         for idx in touched.drain(..) {
@@ -1354,6 +1384,444 @@ mod tests {
 
     // Verify the block at idx=4 has doc_id=4
     assert_eq!(state.doc_id(), 4);
+  }
+
+  #[test]
+  fn wand_does_not_skip_term_with_infinite_upper_bound() {
+    // BUG-366: when a term's global upper bound overflows to +inf (e.g.
+    // because its weight is huge), the pivot-finding loop must not silently
+    // skip it. A +inf bound is a valid (if loose) upper bound — skipping it
+    // can prevent the accumulator from reaching the heap threshold, causing
+    // WAND to exit early and drop the term's documents.
+    //
+    // Setup: one "anchor" term with normal BM25 scores that seeds the heap
+    // with finite scores, and one "overflow" term whose single posting lies
+    // past the anchor's doc_ids and whose ub overflows f32.
+    let anchor = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 3,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ]);
+
+    let overflow_postings = PostingsReader::from_entries_for_test(
+      vec![PostingEntry {
+        doc_id: 100,
+        term_freq: 1,
+        positions: smallvec![],
+      }],
+      DEFAULT_BLOCK_SIZE,
+    );
+    // Craft the overflow term so that its *upper bound* is `+inf` but the
+    // per-doc runtime score at doc 100 is finite. The upper bound is
+    // computed with `min_doc_len`, so a tiny `min_doc_len` inflates the
+    // BM25 tf-norm factor (short docs score higher). The actual runtime
+    // score at doc 100 uses `doc_lengths[100] = 100.0`, 10× `avgdl`, which
+    // drops the tf-norm by ~7× and keeps `bm25 * weight` comfortably
+    // below `f32::MAX`. This separates the two concerns exercised by
+    // BUG-366 (pivot-scan admits +inf ub) and BUG-381 (finite runtime
+    // scores are not filtered out by the new finitude guard).
+    let mut overflow_doc_lengths = vec![10.0; 101];
+    overflow_doc_lengths[100] = 100.0;
+    let overflow = ScoredTerm {
+      postings: overflow_postings,
+      weight: 5.0e36,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(overflow_doc_lengths)),
+      min_doc_len: Some(1.0),
+    };
+
+    // Precondition: the overflow term's global ub really is +inf. If bm25
+    // math ever changes such that this no longer overflows, the test stops
+    // exercising the bug and we need to pick new inputs.
+    let overflow_state = TermState::new(overflow.clone(), DEFAULT_BLOCK_SIZE);
+    assert!(
+      overflow_state.upper_bound().is_infinite() && overflow_state.upper_bound().is_sign_positive(),
+      "overflow term global ub should be +inf; got {}",
+      overflow_state.upper_bound(),
+    );
+    // Precondition: the runtime score at doc 100 is finite, so the BUG-381
+    // finitude guard in wand_loop will let it through. Without this, the
+    // BUG-366 regression would accidentally exercise the BUG-381 path.
+    let runtime_score = score_tf(
+      1.0,
+      overflow_state.df,
+      overflow.doc_len(100),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      runtime_score.is_finite(),
+      "overflow term runtime score at doc 100 should be finite; got {runtime_score}",
+    );
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      2,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+
+    // doc 100's score is dominated by the overflowing weight, so it must be
+    // ranked into the top-k. Before the fix, the `is_finite()` pivot guard
+    // skipped the overflow term and doc 100 was silently dropped.
+    assert!(
+      results.iter().any(|r| r.doc_id == 100),
+      "doc 100 (overflow term) was dropped from top-k: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  // Helper: build a ScoredTerm whose per-doc BM25 score overflows `f32::MAX`
+  // to `+inf`. The setup mimics the trigger described in BUG-381: the query
+  // weight has been multiplied by a nested-boost product that pushes it to
+  // `f32::MAX`, so `bm25 * weight` is always non-finite.
+  fn overflow_scored_term(doc_ids: &[DocId]) -> ScoredTerm {
+    let entries: Vec<PostingEntry> = doc_ids
+      .iter()
+      .map(|&doc_id| PostingEntry {
+        doc_id,
+        term_freq: 1,
+        positions: smallvec![],
+      })
+      .collect();
+    let reader = PostingsReader::from_entries_for_test(entries, DEFAULT_BLOCK_SIZE);
+    let max_doc = doc_ids.iter().copied().max().unwrap_or(0) as usize;
+    let doc_lengths = Arc::new(vec![10.0; max_doc.saturating_add(1)]);
+    ScoredTerm {
+      postings: reader,
+      weight: f32::MAX,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(doc_lengths),
+      min_doc_len: Some(10.0),
+    }
+  }
+
+  /// Precondition probe for the BUG-381 salvage tests: assert that a freshly
+  /// constructed overflow term still produces a non-finite per-doc BM25 score
+  /// at `doc_id`. Without this, a future bm25 / `score_tf` math change that
+  /// kept `bm25 * weight` finite would leave the salvage tests passing while
+  /// no longer exercising the post-`score_adjust` ordering they're meant to
+  /// pin — they'd silently degrade into "the heap accepts a finite raw score"
+  /// tautologies. Mirrors the inline probe in
+  /// `wand_drops_doc_with_non_finite_bm25_score` so all BUG-381 fixtures
+  /// share the same fail-loud guarantee.
+  fn assert_overflow_term_score_non_finite_at(term: &ScoredTerm, doc_id: DocId) {
+    let probe_score = score_tf(
+      1.0,
+      term.postings.len() as f32,
+      term.doc_len(doc_id),
+      term.avgdl,
+      term.docs,
+      term.k1,
+      term.b,
+      term.weight,
+    );
+    assert!(
+      !probe_score.is_finite(),
+      "fixture precondition: overflow term's per-doc score at doc {doc_id} must be non-finite to exercise BUG-381 salvage; got {probe_score}",
+    );
+  }
+
+  /// BUG-381: a document whose BM25 score overflows to `+inf` must not reach
+  /// the top-k heap on the WAND path. Before the fix, `score_sum` flowed
+  /// straight from `score_tf` to `push_top_k` whenever no custom scoring
+  /// hook was active, so `Hit.score = +inf` would cause `serde_json` to
+  /// fail and the HTTP endpoint to return 500.
+  #[test]
+  fn wand_drops_doc_with_non_finite_bm25_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+
+    // Precondition: the runtime BM25 score for the overflow term really is
+    // non-finite. If bm25 math changes so this is no longer true, pick
+    // new inputs — the test is no longer exercising BUG-381.
+    let probe_score = score_tf(
+      1.0,
+      overflow.postings.len() as f32,
+      overflow.doc_len(5),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      !probe_score.is_finite(),
+      "overflow term runtime score should be non-finite; got {probe_score}",
+    );
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "doc 5 (non-finite score) should have been dropped: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  /// BUG-381: BMW path has the same score-accumulation as WAND, so the
+  /// same finitude guard must apply when block-level bounds are enabled.
+  #[test]
+  fn bmw_drops_doc_with_non_finite_bm25_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k via BMW: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "doc 5 (non-finite score) should have been dropped on BMW path: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  /// BUG-381: the brute-force path (`ExecutionStrategy::Bm25`, no score
+  /// plan) accumulates `score_tf` contributions into a hashmap and then
+  /// pushes each doc into the heap. The finitude guard must drop any doc
+  /// whose accumulated contribution is non-finite.
+  #[test]
+  fn brute_force_drops_doc_with_non_finite_bm25_score() {
+    let overflow = overflow_scored_term(&[5, 7]);
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k via brute-force: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    let dropped_docs: Vec<DocId> = results.iter().map(|r| r.doc_id).collect();
+    assert!(
+      !dropped_docs.contains(&5) && !dropped_docs.contains(&7),
+      "overflow docs should have been dropped: {dropped_docs:?}",
+    );
+    // The finite anchor doc should still be ranked.
+    assert!(
+      dropped_docs.contains(&1),
+      "anchor doc 1 should still be ranked: {dropped_docs:?}",
+    );
+  }
+
+  /// BUG-381 salvage path: the finitude guard runs *after* `score_adjust` at
+  /// every push-into-heap site, so a custom scorer (notably `FunctionScore`
+  /// with `boost_mode=Replace`) that turns a non-finite raw BM25 into a
+  /// finite final score keeps the doc in the top-k. Pinning this with a
+  /// regression test prevents a future "drop early to skip work" refactor
+  /// from silently losing salvageable hits — matches the post-output-only
+  /// rejection policy used by `evaluate_compiled_score` (BUG-315) and the
+  /// rescore combine path (BUG-326).
+  #[test]
+  fn wand_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "wand salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "wand dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
+    assert_eq!(
+      salvaged.score, 42.0,
+      "wand kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, BMW strategy.
+  #[test]
+  fn bmw_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "bmw salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
+    // Pin that the heap took the *adjusted* score (42.0), not some other
+    // finite fallback like a clamp of the raw +inf — the salvage contract is
+    // about the adjuster's output landing in the heap, not just any finite
+    // value taking its place.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "bmw kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, brute-force plain-BM25 branch (no ScorePlan).
+  #[test]
+  fn brute_force_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "brute_force salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!("brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}")
+    });
+    // Same adjusted-score pin as the BMW variant — keeps the brute-force
+    // heap insertion site honest about which value reaches `Hit.score`.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "brute_force kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
   }
 
   #[test]
