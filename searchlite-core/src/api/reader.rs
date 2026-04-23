@@ -1,4 +1,5 @@
 use hashbrown::{HashMap, HashSet};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
@@ -10,9 +11,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::{
-  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation, Filter,
-  HistogramAggregation, IndexOptions, MgetDoc, Query, RescoreMode, RescoreRequest, SearchRequest,
-  SortOrder, SuggestResult,
+  Aggregation, AggregationResponse, AggregationSampling, DateHistogramAggregation,
+  DateRangeAggregation, Filter, HistogramAggregation, IndexOptions, MgetDoc, MovingAvgAggregation,
+  Query, RescoreMode, RescoreRequest, SearchRequest, SortOrder, SuggestResult, TopHitsAggregation,
 };
 #[cfg(feature = "vectors")]
 use crate::api::types::{LegacyVectorQuery, VectorQuery, VectorQuerySpec};
@@ -32,6 +33,8 @@ use crate::query::collector::{AggregationSegmentCollector, DocCollector};
 use crate::query::filters::passes_filter;
 use crate::query::planner::{build_query_plan, QueryMatcher, ScorePlan};
 use crate::query::sort::{SortKey, SortPlan};
+#[cfg(feature = "vectors")]
+use crate::query::util::f64_to_finite_f32;
 use crate::query::wand::{
   execute_top_k_with_stats_and_mode_internal, score_tf, QueryStats, ScoreAdjustFn, ScoreMode,
   ScoredTerm,
@@ -45,6 +48,7 @@ use crate::DocId;
 
 use super::pagination::{
   decode_cursor, decode_search_after_token, encode_cursor, encode_search_after_token, CursorState,
+  DocLookupMap,
 };
 use super::phrase::{
   build_phrase_runtimes, build_phrase_term_map, build_term_doc_lists, expand_phrase_fields,
@@ -216,7 +220,7 @@ fn compute_hybrid_score(
   bm25_score: f32,
   plan: &VectorPlan,
   vector_scores: &[HashMap<(u32, DocId), f32>],
-) -> (f32, Option<f32>, bool) {
+) -> Option<(f32, Option<f32>, bool)> {
   let mut blended_sum = 0.0_f32;
   let mut vector_sum = 0.0_f32;
   let mut has_vector = false;
@@ -238,7 +242,26 @@ fn compute_hybrid_score(
   }
   let denom = plan.clauses.len().max(1) as f32;
   let final_score = blended_sum / denom;
-  (final_score, has_vector.then_some(vector_sum), has_vector)
+  // `blended_sum` accumulates per-clause contributions that are individually
+  // bounded but can still overflow f32 past `±f32::MAX` to `±INF` once summed
+  // across multiple clauses — notably when a doc is missing its vector in
+  // multiple L2 clauses, since `missing_vector_score(L2) = f32::MIN` is
+  // already at the edge of representable f32. A non-finite `final_score`
+  // would leak into `hit.score`, the explanation payload, and the sort key
+  // (breaking strict ordering under `NaN` and pinning the doc to a sort
+  // extreme under `±INF`). `vector_sum` accumulates the raw per-clause
+  // vector scores separately and flows into `hit.vector_score`; it can
+  // independently be non-finite because `collect_vector_value`
+  // (`index/segment.rs`) casts JSON `f64` components to `f32` without an
+  // `is_finite()` check, so a value past `f32::MAX` is persisted as `±INF`
+  // in the indexed vector and propagates through `metric_similarity`. Drop
+  // the candidate in either case, matching the policy enforced by
+  // `evaluate_compiled_score` (BUG-315) and the rescore combination branch
+  // (BUG-326).
+  if !final_score.is_finite() || (has_vector && !vector_sum.is_finite()) {
+    return None;
+  }
+  Some((final_score, has_vector.then_some(vector_sum), has_vector))
 }
 
 use super::scoring::{
@@ -345,7 +368,7 @@ fn passes_root_filter(reader: &FastFieldsReader, doc_id: DocId, root: RootFilter
 pub struct IndexReader {
   pub manifest: Manifest,
   pub segments: Vec<SegmentReader>,
-  doc_lookup: OnceLock<HashMap<String, Vec<(usize, DocId)>>>,
+  doc_lookup: OnceLock<DocLookupMap>,
   pub(crate) analysis: SchemaAnalyzers,
   options: IndexOptions,
 }
@@ -494,7 +517,41 @@ impl IndexReader {
           vector_query.vector.len()
         );
       }
+      // Reject non-finite query vector components before they reach
+      // `normalize_in_place` (which yields NaN for cosine when any component
+      // overflows to ±INF) or `metric_similarity` (where L2 surfaces the raw
+      // ±INF into `hit.vector_score` and fails JSON serialization). Mirrors
+      // the write-side guard in `collect_vector_value` (BUG-330).
+      for (idx, value) in vector_query.vector.iter().enumerate() {
+        if !value.is_finite() {
+          bail!(
+            "vector query for field `{}` contains non-finite component at index {}",
+            vector_query.field,
+            idx
+          );
+        }
+      }
       let mut query_vec = vector_query.vector.clone();
+      // BUG-386: reject any query vector whose squared magnitudes sum past
+      // `f32::MAX` regardless of metric. Each component passes the BUG-340
+      // per-value guard above, but their pairwise combination can still
+      // overflow (e.g. `[3e19, 3e19]` gives `1.8e39`).
+      //
+      // For cosine this was originally called out in BUG-384 because
+      // `normalize_in_place` would divide by `+inf` and silently produce
+      // garbage / zeroed query vectors. For L2 the same overflow manifests a
+      // step later: `l2_distance(q, doc)` accumulates `(q_i - doc_i)^2` into
+      // `+inf`, `metric_similarity(L2) = -inf`, and `compute_hybrid_score`
+      // drops every candidate via the BUG-328 guard — the caller silently
+      // sees an empty hit set with no actionable diagnostic. Guarding both
+      // metrics uniformly turns that into a plain validation error.
+      let sum_sq = query_vec.iter().map(|v| v * v).sum::<f32>();
+      if !sum_sq.is_finite() {
+        bail!(
+          "vector query for field `{}` has components whose sum-of-squares overflows f32; reduce component magnitudes",
+          vector_query.field
+        );
+      }
       if matches!(
         schema_field.metric,
         crate::index::manifest::VectorMetric::Cosine
@@ -678,7 +735,10 @@ impl IndexReader {
       for doc_id in seg_docs.into_iter() {
         let key_tuple = (segment_ord as u32, doc_id);
         let (final_score, vector_score, _) =
-          compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores);
+          match compute_hybrid_score(key_tuple, 0.0, plan, &vector_scores) {
+            Some(t) => t,
+            None => continue,
+          };
         let key = if req.return_hits {
           let key = sort_plan.build_key(seg, doc_id, final_score, segment_ord as u32);
           if let Some(cur) = &cursor_key {
@@ -925,7 +985,22 @@ impl IndexReader {
               continue;
             }
           }
-          vscore *= clause.boost;
+          // BUG-394: saturate the per-candidate `vscore * boost` product to
+          // the f32 range. Both factors are already validated finite at plan
+          // time (per-component vector guards and `boost.is_finite()`), but
+          // the raw `f32 *= f32` can still overflow to `±INF` for L2, where
+          // BUG-388 saturates `l2_distance` to `f32::MAX` so that
+          // `metric_similarity(L2)` returns the finite sentinel `f32::MIN` at
+          // the worst pair. Any user-supplied `boost > 1.0` would then flip
+          // that sentinel straight back to `-INF`, and the BUG-328 hybrid
+          // score guard silently drops the candidate — undoing BUG-388's
+          // contract that far docs rank last rather than disappear entirely.
+          // Promoting to f64 (which cannot overflow for any finite f32 × f32)
+          // and clamping back to the f32 range via `f64_to_finite_f32` keeps
+          // every legitimate in-range product exact while preventing the
+          // non-finite leak. Mirrors the clamp policy already used by
+          // BUG-336 / BUG-342 on the scoring-side f64→f32 cast.
+          vscore = f64_to_finite_f32((vscore as f64) * (clause.boost as f64));
           let cand = VectorCandidate {
             segment_ord: segment_ord as u32,
             doc_id,
@@ -1008,7 +1083,10 @@ impl IndexReader {
         explanation = existing.explanation;
       }
       let (final_score, vector_score, has_vector) =
-        compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores);
+        match compute_hybrid_score((seg_ord, doc_id), bm25_score, plan, vector_scores) {
+          Some(t) => t,
+          None => continue,
+        };
       if all_vector_only && !has_vector {
         continue;
       }
@@ -1222,6 +1300,16 @@ impl IndexReader {
         term.group_fields.clone(),
       ));
       entry.1 += term.weight;
+      // BUG-401: individual boosts are validated finite by combine_boost, but the
+      // sum of N finite f32 values can still overflow to +Inf when the same
+      // field:term key appears across multiple query clauses. Reject at the
+      // accumulation point so Inf never reaches ScoredTerm / score_tf.
+      if !entry.1.is_finite() {
+        bail!(
+          "accumulated boost for term `{}` overflows f32; reduce per-clause boost values",
+          term.key
+        );
+      }
       if entry.3.is_none() && term.group_fields.is_some() {
         entry.3 = term.group_fields.clone();
       }
@@ -1256,8 +1344,17 @@ impl IndexReader {
         let mut agg_ref = agg_collector
           .as_mut()
           .map(|collector| collector as &mut dyn DocCollector);
+        // When any custom scoring node is active — constant_score,
+        // function_score, script_score, or rank_feature (see
+        // `has_custom_scoring`) — WAND's per-term BM25 upper bounds no
+        // longer bound the candidate score. Pass a collector so
+        // `pivot_threshold` drops to NEG_INFINITY and pruning is disabled.
+        // See BUG-376.
         if agg_ref.is_none()
-          && (page_limit == 0 || !req.return_hits || (!score_fast_path && page_limit > 0))
+          && (page_limit == 0
+            || !req.return_hits
+            || (!score_fast_path && page_limit > 0)
+            || needs_score_hook)
         {
           agg_ref = Some(&mut noop_collector);
         }
@@ -1578,14 +1675,15 @@ impl IndexReader {
       };
       let mut chosen: Option<(usize, DocId)> = None;
       for (seg_idx, doc_idx) in entries.iter().rev() {
+        let seg_usize = *seg_idx as usize;
         let seg = self
           .segments
-          .get(*seg_idx)
+          .get(seg_usize)
           .ok_or_else(|| anyhow::anyhow!("segment {seg_idx} missing for mget"))?;
         if seg.is_deleted(*doc_idx) {
           continue;
         }
-        chosen = Some((*seg_idx, *doc_idx));
+        chosen = Some((seg_usize, *doc_idx));
         break;
       }
       let Some((seg_idx, doc_idx)) = chosen else {
@@ -1608,18 +1706,20 @@ impl IndexReader {
     Ok(results)
   }
 
-  fn doc_lookup(&self) -> &HashMap<String, Vec<(usize, DocId)>> {
+  fn doc_lookup(&self) -> &DocLookupMap {
     self.doc_lookup.get_or_init(|| {
-      let mut map = HashMap::new();
+      let mut map: DocLookupMap = HashMap::new();
       for (seg_idx, seg) in self.segments.iter().enumerate() {
+        let seg_ord = seg_idx as u32;
         for (doc_idx, doc_id) in seg.doc_ids().iter().enumerate() {
-          if seg.is_deleted(doc_idx as DocId) {
+          let doc_ord = doc_idx as DocId;
+          if seg.is_deleted(doc_ord) {
             continue;
           }
           map
-            .entry(doc_id.clone())
-            .or_insert_with(Vec::new)
-            .push((seg_idx, doc_idx as DocId));
+            .entry(Arc::clone(doc_id))
+            .or_insert_with(SmallVec::new)
+            .push((seg_ord, doc_ord));
         }
       }
       map
@@ -1704,7 +1804,9 @@ impl IndexReader {
     }
     let explanations: RefCell<HashMap<DocId, HitExplanation>> = RefCell::new(HashMap::new());
 
-    let docs = seg.live_docs() as f32;
+    // BM25 N must use total doc_count (including deleted documents) so it matches
+    // the df basis (postings.len() includes deleted documents). See BUG-360.
+    let docs = seg.meta.doc_count as f32;
     let mut terms: Vec<ScoredTerm> = Vec::new();
     for (key, (field, weight, leaf, group_fields)) in term_weights.iter() {
       if let Some(mut postings) = seg.postings(key) {
@@ -2035,8 +2137,18 @@ impl IndexReader {
             .entry(term.key.clone())
             .or_insert((term.field.clone(), 0.0, term.leaf));
         entry.1 += term.weight;
+        // BUG-401: guard against finite-but-additive overflow into +Inf when
+        // multiple rescore clauses share the same field:term key.
+        if !entry.1.is_finite() {
+          bail!(
+            "accumulated boost for term `{}` overflows f32; reduce per-clause boost values",
+            term.key
+          );
+        }
       }
-      let docs_count = seg.live_docs() as f32;
+      // BM25 N must use total doc_count (including deleted documents) so it matches
+      // the df basis (postings.len() includes deleted documents). See BUG-360.
+      let docs_count = seg.meta.doc_count as f32;
       let mut terms: Vec<ScoredTerm> = Vec::new();
       for (key, (field, weight, leaf)) in term_weights.into_iter() {
         if let Some(mut postings) = seg.postings(&key) {
@@ -2060,6 +2172,26 @@ impl IndexReader {
           continue;
         }
         if !query_eval.matches(doc_id) {
+          let hit = hits.get_mut(hit_idx).unwrap();
+          let orig_score = hit.score;
+          let combined = combine_rescore_scores(rescore.score_mode, orig_score, 0.0);
+          hit.score = combined;
+          hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
+          if req.explain {
+            let mut expl = hit.explanation.take().unwrap_or(HitExplanation {
+              base_score: orig_score,
+              functions: Vec::new(),
+              rescore: None,
+              final_score: orig_score,
+            });
+            expl.rescore = Some(RescoreExplanation {
+              rescore_score: 0.0,
+              combined_score: combined,
+              functions: Vec::new(),
+            });
+            expl.final_score = combined;
+            hit.explanation = Some(expl);
+          }
           continue;
         }
         stats.candidates_examined += 1;
@@ -2107,6 +2239,21 @@ impl IndexReader {
         let hit = hits.get_mut(hit_idx).unwrap();
         let orig_score = hit.score;
         let combined = combine_rescore_scores(rescore.score_mode, orig_score, rescore_score);
+        // Reject non-finite combined scores (BUG-326). Even though `rescore_score`
+        // is guarded finite by `evaluate_compiled_score` (BUG-315) and `orig_score`
+        // is a finite f32, combining the two can still produce a non-finite value:
+        // a Sum/Total or Multiply of two large finite inputs can exceed `f32::MAX`
+        // and yield +/-inf, and a saturating Sum/Multiply that produces +inf against
+        // a finite operand of the opposite sign can then fall out as NaN. A
+        // non-finite value would otherwise leak into `hit.score`, `hit.key`, and the
+        // serialized JSON response; drop the doc instead, matching the
+        // "evaluate_compiled_score returned None" branch above and the policy used
+        // by `eval_rpn` (BUG-287), `combine_function_scores` (BUG-315), and the
+        // pipeline-agg paths (BUG-322, BUG-324).
+        if !combined.is_finite() {
+          to_remove.push(hit_idx);
+          continue;
+        }
         hit.score = combined;
         hit.key = sort_plan.build_key(seg, doc_id, combined, segment_ord);
         if req.explain {
@@ -2126,14 +2273,22 @@ impl IndexReader {
         }
       }
     }
-    if !to_remove.is_empty() {
+    let removed = if !to_remove.is_empty() {
       to_remove.sort_unstable();
       to_remove.dedup();
+      let n = to_remove.len();
       for idx in to_remove.into_iter().rev() {
         hits.remove(idx);
       }
-    }
-    let sort_window = rescore.window_size.min(hits.len());
+      n
+    } else {
+      0
+    };
+    // Only hits that were actually rescored (the first `window - removed`
+    // survivors) are on the combined-score scale. Any hits that shifted left
+    // due to removals still carry raw scores and must not be re-sorted against
+    // rescored survivors.
+    let sort_window = window.saturating_sub(removed).min(hits.len());
     if sort_window > 0 {
       hits[..sort_window].sort_by(|a, b| a.key.cmp(&b.key));
     }
@@ -2331,6 +2486,7 @@ fn validate_aggregations_in_scope(
       }
       Aggregation::DateRange(r) => {
         ensure_numeric_fast(schema, &r.field, name, scope_path)?;
+        validate_date_range_config(name, r)?;
         validate_sampling(name, &r.sampling)?;
         validate_aggregations_in_scope(schema, &r.aggs, scope_path, inside_nested)?;
       }
@@ -2403,12 +2559,9 @@ fn validate_aggregations_in_scope(
       | Aggregation::AvgBucket(_)
       | Aggregation::SumBucket(_)
       | Aggregation::Derivative(_)
-      | Aggregation::MovingAvg(_)
       | Aggregation::BucketScript(_) => {}
-      Aggregation::TopHits(t) => {
-        SortPlan::from_request(schema, &t.sort)
-          .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
-      }
+      Aggregation::MovingAvg(m) => validate_moving_avg_config(name, m)?,
+      Aggregation::TopHits(t) => validate_top_hits_config(schema, name, t)?,
     }
   }
   Ok(())
@@ -2871,6 +3024,105 @@ fn validate_sampling(name: &str, sampling: &Option<AggregationSampling>) -> Resu
   Ok(())
 }
 
+/// Reject `moving_avg` requests that would let untrusted input drive an unbounded
+/// `Vec<f64>` allocation in the response finalization step (BUG-221).
+///
+/// `predict` is fed straight into `vec![last_avg; predict]` inside
+/// `apply_moving_avg_pipeline`; without this gate a tiny request body (well under
+/// the HTTP body cap) can request multi-gigabyte allocations and OOM the process.
+/// We also bound `window` to the same ceiling so a runaway value cannot mask
+/// other validation failures or surprise future maintainers, even though `window`
+/// is not itself a direct allocation source today.
+fn validate_moving_avg_config(name: &str, agg: &MovingAvgAggregation) -> Result<()> {
+  if agg.window == 0 {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!("moving_avg `{name}` requires window >= 1 (got 0)"),
+      }
+      .into(),
+    );
+  }
+  if agg.window > crate::query::aggs::MAX_BUCKETS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "moving_avg `{name}` window {} exceeds limit {}",
+          agg.window,
+          crate::query::aggs::MAX_BUCKETS
+        ),
+      }
+      .into(),
+    );
+  }
+  if let Some(predict) = agg.predict {
+    if predict > crate::query::aggs::MAX_PREDICTIONS {
+      return Err(
+        AggregationError::InvalidConfig {
+          reason: format!(
+            "moving_avg `{name}` predict {predict} exceeds limit {}",
+            crate::query::aggs::MAX_PREDICTIONS
+          ),
+        }
+        .into(),
+      );
+    }
+  }
+  Ok(())
+}
+
+/// Reject `top_hits` requests that would let untrusted input drive an unbounded
+/// `BinaryHeap<RankedDoc>` allocation in the per-segment collector (BUG-222).
+///
+/// `size` and `from` are forwarded directly into `TopHitsCollector::new` and used
+/// to size the per-segment heap (`size + from`). Without a request-time gate, a
+/// tiny request body can ask for `size = 10_000_000_000` and OOM the process as
+/// the heap grows during collection. We reject `size`, `from`, and the saturating
+/// sum independently so the error message names the offending dimension and so
+/// the additive case (`size = cap`, `from = cap`) cannot bypass either single
+/// bound. The existing sort-plan validation is preserved so a malformed sort
+/// surfaces at request-parse time rather than a collector panic.
+fn validate_top_hits_config(schema: &Schema, name: &str, agg: &TopHitsAggregation) -> Result<()> {
+  SortPlan::from_request(schema, &agg.sort)
+    .with_context(|| format!("invalid top_hits sort in aggregation `{name}`"))?;
+  if agg.size > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size {} exceeds limit {}",
+          agg.size,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  if agg.from > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` from {} exceeds limit {}",
+          agg.from,
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  let combined = agg.size.saturating_add(agg.from);
+  if combined > crate::query::aggs::MAX_TOP_HITS {
+    return Err(
+      AggregationError::InvalidConfig {
+        reason: format!(
+          "top_hits `{name}` size + from = {combined} exceeds limit {}",
+          crate::query::aggs::MAX_TOP_HITS
+        ),
+      }
+      .into(),
+    );
+  }
+  Ok(())
+}
+
 fn validate_histogram_config(name: &str, agg: &HistogramAggregation) -> Result<()> {
   if !agg.interval.is_finite() || agg.interval <= 0.0 {
     return Err(
@@ -2951,6 +3203,42 @@ fn validate_histogram_bounds(name: &str, which: &str, min: f64, max: f64) -> Res
       }
       .into(),
     );
+  }
+  Ok(())
+}
+
+fn validate_date_range_config(name: &str, agg: &DateRangeAggregation) -> Result<()> {
+  // `DateRangeCollector::new` builds each range via
+  // `from.as_deref().and_then(parse_date)` / `to.as_deref().and_then(parse_date)`
+  // and `RangeCollector::collect` treats `None` as an unbounded side. If a
+  // caller supplies a non-finite string (`"NaN"` / `"inf"` / `"-infinity"`),
+  // `parse_date` now correctly returns `None` (BUG-338), but the collector
+  // would then silently widen the bound to "unbounded" and match far more
+  // documents than intended. Surface those inputs — and any other
+  // unparseable date string — as an `InvalidConfig` error at planning time
+  // instead of letting them corrupt bucket membership. An `Option::None`
+  // (field omitted) is still legal and keeps the side open.
+  for range in &agg.ranges {
+    if let Some(from) = range.from.as_deref() {
+      if parse_date(from).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `from` `{from}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
+    if let Some(to) = range.to.as_deref() {
+      if parse_date(to).is_none() {
+        return Err(
+          AggregationError::InvalidConfig {
+            reason: format!("date_range `{name}` range `to` `{to}` is not a valid date/number"),
+          }
+          .into(),
+        );
+      }
+    }
   }
   Ok(())
 }
@@ -4072,6 +4360,232 @@ mod tests {
   }
 
   #[test]
+  fn wildcard_expansion_handles_trailing_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-trailing-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [
+      ("1", "hello"),
+      ("2", "helloworld"),
+      ("3", "help"),
+      ("4", "world"),
+    ] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Trailing wildcard: "hello*" must match "hello" and "helloworld".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "hello*".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:hello"),
+      "trailing star must match exact term"
+    );
+    assert!(
+      keys.contains("body:helloworld"),
+      "trailing star must match extended term"
+    );
+    assert!(
+      !keys.contains("body:help"),
+      "trailing star must not match non-prefix term"
+    );
+    assert!(
+      !keys.contains("body:world"),
+      "trailing star must not match unrelated term"
+    );
+  }
+
+  #[test]
+  fn wildcard_expansion_handles_leading_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-leading-star");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "helloworld"), ("2", "bigworld"), ("3", "hello")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Leading wildcard: "*world" must match terms ending in "world".
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "*world".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(
+      keys.contains("body:helloworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      keys.contains("body:bigworld"),
+      "leading star must match term ending in 'world'"
+    );
+    assert!(
+      !keys.contains("body:hello"),
+      "leading star must not match term without suffix"
+    );
+  }
+
+  #[test]
+  fn regex_expansion_handles_trailing_metacharacters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-trailing");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in [("1", "rust"), ("2", "ruby"), ("3", "rope"), ("4", "run")] {
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    // Regex "r.+" must match any term starting with 'r' followed by one or more chars.
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "r.+".into(),
+        max_expansions: None,
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = groups[0].keys.iter().cloned().collect();
+    assert!(keys.contains("body:rust"), "r.+ must match 'rust'");
+    assert!(keys.contains("body:ruby"), "r.+ must match 'ruby'");
+    assert!(keys.contains("body:rope"), "r.+ must match 'rope'");
+    assert!(keys.contains("body:run"), "r.+ must match 'run'");
+  }
+
+  #[test]
   fn regex_expansion_applies_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx-regex");
@@ -4290,6 +4804,240 @@ mod tests {
     );
   }
 
+  /// BUG-316 regression: `max_expansions` must bound the total number of
+  /// expanded terms across *all* segments, not per-segment. Before the fix
+  /// the `expanded` counter in `expand_prefix`/`expand_wildcard`/`expand_regex`
+  /// lived inside the segment loop and reset to 0 for each segment, letting
+  /// a 3-segment index return up to `3 * max_expansions` unique terms.
+  #[test]
+  fn prefix_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-prefix-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    // Three segments, each containing disjoint unique terms starting with "ap".
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(
+      reader.segments.len() >= 2,
+      "expected multiple segments, got {}",
+      reader.segments.len()
+    );
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Prefix {
+        field: "body".into(),
+        value: "ap".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "prefix expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
+  /// BUG-316 regression for the wildcard branch of `expand_wildcard`.
+  #[test]
+  fn wildcard_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-wildcard-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(reader.segments.len() >= 2);
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Wildcard {
+        field: "body".into(),
+        value: "ap*".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "wildcard expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
+  /// BUG-316 regression for the regex branch of `expand_regex`.
+  #[test]
+  fn regex_expansion_cap_is_global_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx-regex-multi-seg");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    for batch in [
+      vec![("1", "app"), ("2", "apple")],
+      vec![("3", "apply"), ("4", "apt")],
+      vec![("5", "apricot")],
+    ] {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in batch {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    assert!(reader.segments.len() >= 2);
+    let default_fields: Vec<String> = reader
+      .manifest
+      .schema
+      .text_fields
+      .iter()
+      .map(|f| f.name.clone())
+      .collect();
+    let plan = build_query_plan(
+      &Query::Node(QueryNode::Regex {
+        field: "body".into(),
+        value: "ap.*".into(),
+        max_expansions: Some(2),
+        boost: None,
+      }),
+      &default_fields,
+    )
+    .unwrap();
+    let (_, term_groups) = expand_term_groups(
+      &reader.segments,
+      &plan.term_groups,
+      None,
+      &reader.analysis,
+      &reader.manifest.schema,
+    )
+    .unwrap();
+    let keys: HashSet<_> = term_groups[0].keys.iter().cloned().collect();
+    assert_eq!(
+      keys.len(),
+      2,
+      "regex expansion must cap globally at max_expansions=2, got {keys:?}"
+    );
+  }
+
   #[test]
   fn completion_suggest_prefers_higher_doc_freq() {
     let dir = tempfile::tempdir().unwrap();
@@ -4434,6 +5182,364 @@ mod tests {
       "plan candidate_size {} exceeds cap {}",
       plan.candidate_size,
       DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
+    );
+  }
+
+  #[test]
+  fn doc_lookup_shares_doc_id_allocations_with_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for i in 0..8 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("doc-{i}"))),
+            ("body".into(), json!("rust search")),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let lookup = reader.doc_lookup();
+    assert!(!lookup.is_empty(), "doc_lookup should be populated");
+
+    let seg = reader.segments.first().expect("segment present");
+    for arc in seg.doc_ids().iter() {
+      let key: &str = arc.as_ref();
+      assert!(
+        lookup.contains_key(key),
+        "lookup missing key {key}; expected Arc<str> sharing"
+      );
+      assert!(
+        Arc::strong_count(arc) >= 2,
+        "doc_id Arc<str> should be shared with doc_lookup; got strong_count={}",
+        Arc::strong_count(arc)
+      );
+    }
+  }
+
+  #[test]
+  fn doc_lookup_resolves_updates_to_latest_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!("shared-1")),
+            ("body".into(), json!("first version")),
+          ]),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!("shared-1")),
+            ("body".into(), json!("second version")),
+          ]),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let reader = idx.reader().unwrap();
+    let docs = reader
+      .mget(&["shared-1".to_string()], true)
+      .expect("mget ok");
+    assert_eq!(docs.len(), 1);
+    assert!(docs[0].found, "updated doc should be reachable via mget");
+    let source = docs[0]._source.as_ref().expect("source payload");
+    assert_eq!(
+      source.get("body").and_then(|v| v.as_str()),
+      Some("second version"),
+      "mget should return the most recent version"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_drops_candidate_on_negative_infinity() {
+    // Regression test for BUG-328. Two L2 clauses where the candidate doc is
+    // absent from both vector postings: `missing_vector_score(L2)` is
+    // `f32::MIN ≈ -3.4e38`, so `f32::MIN + f32::MIN` saturates to
+    // `f32::NEG_INFINITY` when accumulated, and the division by the clause
+    // count preserves that infinity. Before the fix the non-finite
+    // `final_score` leaked into `hit.score`, the sort key, and the
+    // `expl.final_score` payload.
+    let plan = VectorPlan {
+      clauses: vec![
+        VectorClausePlan {
+          field: "vec_a".into(),
+          vector: vec![0.1, 0.2],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+        VectorClausePlan {
+          field: "vec_b".into(),
+          vector: vec![0.3, 0.4],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+      ],
+      candidate_size: 32,
+      vector_only: true,
+    };
+    let vector_scores: Vec<HashMap<(u32, DocId), f32>> = vec![HashMap::new(), HashMap::new()];
+    let result = compute_hybrid_score((0, 1), 0.0, &plan, &vector_scores);
+    assert!(
+      result.is_none(),
+      "candidate with saturating blended_sum must be dropped rather than leaking non-finite score"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_drops_candidate_when_vector_sum_is_non_finite() {
+    // Regression guard for the symmetric leak path flagged during review of
+    // BUG-328: `collect_vector_value` casts JSON `f64` components to `f32`
+    // without an `is_finite()` check, so a doc indexed with a component
+    // past `f32::MAX` surfaces as `±INF` in the cached `vector_scores` map.
+    // `compute_hybrid_score` threads that raw per-clause value through
+    // `vector_sum`, which then flows into `hit.vector_score` — `Hit` serializes
+    // `vector_score` as a bare number when `Some`, so a non-finite value
+    // would break JSON serialization even when `final_score` is finite
+    // (e.g. `alpha >= 1.0` makes `final_score` equal to the finite
+    // `bm25_score`). The candidate must be dropped.
+    let plan = VectorPlan {
+      clauses: vec![VectorClausePlan {
+        field: "vec_a".into(),
+        vector: vec![0.1, 0.2],
+        k: 10,
+        alpha: 1.0,
+        ef_search: 16,
+        candidate_size: 16,
+        boost: 1.0,
+        metric: VectorMetric::Cosine,
+      }],
+      candidate_size: 16,
+      vector_only: false,
+    };
+    let mut scores: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores.insert((0, 1), f32::INFINITY);
+    let vector_scores = vec![scores];
+    let result = compute_hybrid_score((0, 1), 1.0, &plan, &vector_scores);
+    assert!(
+      result.is_none(),
+      "candidate whose raw vector_sum is non-finite must be dropped so \
+       hit.vector_score cannot leak ±INF into JSON serialization"
+    );
+  }
+
+  #[cfg(feature = "vectors")]
+  #[test]
+  fn compute_hybrid_score_keeps_candidate_when_finite() {
+    // Same plan shape, but both clauses have a vector score for the doc, so
+    // `blended_sum` stays bounded and a finite score flows through.
+    let plan = VectorPlan {
+      clauses: vec![
+        VectorClausePlan {
+          field: "vec_a".into(),
+          vector: vec![0.1, 0.2],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+        VectorClausePlan {
+          field: "vec_b".into(),
+          vector: vec![0.3, 0.4],
+          k: 10,
+          alpha: 0.0,
+          ef_search: 16,
+          candidate_size: 16,
+          boost: 1.0,
+          metric: VectorMetric::L2,
+        },
+      ],
+      candidate_size: 32,
+      vector_only: true,
+    };
+    let mut scores_a: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores_a.insert((0, 1), -0.5);
+    let mut scores_b: HashMap<(u32, DocId), f32> = HashMap::new();
+    scores_b.insert((0, 1), -0.25);
+    let vector_scores = vec![scores_a, scores_b];
+    let result =
+      compute_hybrid_score((0, 1), 0.0, &plan, &vector_scores).expect("finite result expected");
+    assert!(
+      result.0.is_finite(),
+      "finite inputs should yield a finite final_score, got {}",
+      result.0
+    );
+    assert!(
+      result.2,
+      "has_vector should be true when both clauses contribute"
+    );
+  }
+
+  // BUG-360: BM25 N (total docs) must use seg.meta.doc_count rather than
+  // seg.live_docs(), so N remains consistent with df = postings.len() after
+  // deletions. Deleting documents that do not share a term's posting list
+  // should not alter the BM25 score of documents still matching the term.
+  #[test]
+  fn bm25_score_is_stable_across_deletions_of_unrelated_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let idx = Index::create(
+      &path,
+      Schema::default_text_body(),
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    // 3 documents containing the target term "foo".
+    for i in 0..3 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("foo-{i}"))),
+            ("body".into(), json!("foo filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    // 7 documents NOT containing "foo" so that deleting them shrinks
+    // live_docs without changing the "foo" posting list (df stays at 3).
+    for i in 0..7 {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(format!("bar-{i}"))),
+            ("body".into(), json!("bar filler filler")),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+
+    let search_request = || SearchRequest {
+      query: Query::String("foo".into()),
+      fields: None,
+      filter: None,
+      limit: 10,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor: None,
+      search_after: None,
+      execution: ExecutionStrategy::Wand,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: None,
+      explain: false,
+      profile: false,
+    };
+
+    let reader = idx.reader().unwrap();
+    let before = reader.search(&search_request()).unwrap();
+    assert_eq!(before.hits.len(), 3);
+    let before_score = before
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present before deletion")
+      .score;
+
+    // Delete all bar-* documents. This shrinks live_docs but leaves the
+    // "foo" posting list (and df) unchanged.
+    let mut writer = idx.writer().unwrap();
+    let to_delete: Vec<String> = (0..7).map(|i| format!("bar-{i}")).collect();
+    writer.delete_documents(&to_delete).unwrap();
+    writer.commit().unwrap();
+
+    let reader = idx.reader().unwrap();
+    let after = reader.search(&search_request()).unwrap();
+    assert_eq!(after.hits.len(), 3);
+    let after_score = after
+      .hits
+      .iter()
+      .find(|h| h.doc_id == "foo-0")
+      .expect("foo-0 present after deletion")
+      .score;
+
+    // With live_docs as N, deletion of unrelated documents drops IDF to the
+    // clamped floor of 1.0; with doc_count as N, the score is unchanged.
+    assert!(
+      (before_score - after_score).abs() < 1e-6,
+      "BM25 score changed after unrelated deletions: before={before_score} after={after_score}"
     );
   }
 }

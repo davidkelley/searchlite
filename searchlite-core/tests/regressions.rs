@@ -197,27 +197,31 @@ fn collapse_rejects_multivalued_fast_field() {
 
 struct FailingManifestStorage {
   inner: searchlite_core::storage::InMemoryStorage,
-  fail_manifest: std::sync::atomic::AtomicBool,
+  fail_pending_manifest: std::sync::atomic::AtomicBool,
 }
 
 impl FailingManifestStorage {
   fn new(root: PathBuf) -> Self {
     Self {
       inner: searchlite_core::storage::InMemoryStorage::new(root),
-      fail_manifest: std::sync::atomic::AtomicBool::new(false),
+      fail_pending_manifest: std::sync::atomic::AtomicBool::new(false),
     }
   }
 
-  fn fail_next_manifest_store(&self) {
+  fn fail_next_pending_manifest_store(&self) {
     self
-      .fail_manifest
+      .fail_pending_manifest
       .store(true, std::sync::atomic::Ordering::SeqCst);
   }
 
   fn should_fail(&self, path: &Path) -> bool {
-    path.ends_with("MANIFEST.json")
+    let name = path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or_default();
+    name == "MANIFEST.json.pending"
       && self
-        .fail_manifest
+        .fail_pending_manifest
         .swap(false, std::sync::atomic::Ordering::SeqCst)
   }
 }
@@ -273,6 +277,12 @@ impl Storage for FailingManifestStorage {
 
 #[test]
 fn failed_manifest_persistence_does_not_publish_in_memory_state() {
+  // The pre-fence manifest stage (`MANIFEST.json.pending`) is the last
+  // recoverable failure point in the BUG-018 ordering — anything past it
+  // crosses the WAL durability fence and is treated as a successful
+  // commit. This test pins the original "if persistence fails, in-memory
+  // state stays put and the WAL replays cleanly" contract on the
+  // pre-fence path, where it still applies.
   let dir = tempdir().unwrap();
   let storage = Arc::new(FailingManifestStorage::new(dir.path().to_path_buf()));
   let mut opts = opts(dir.path());
@@ -291,12 +301,14 @@ fn failed_manifest_persistence_does_not_publish_in_memory_state() {
       vec![("body", json!("commit failure should rollback"))],
     ))
     .unwrap();
-  storage.fail_next_manifest_store();
+  storage.fail_next_pending_manifest_store();
   let err = writer.commit().unwrap_err();
+  let msg = format!("{err:#}");
   assert!(
-    err.to_string().contains("manifest write failed")
-      || err.to_string().contains("writing manifest"),
-    "unexpected error: {err}"
+    msg.contains("manifest write failed")
+      || msg.contains("staging manifest")
+      || msg.contains("writing manifest"),
+    "unexpected error: {msg}"
   );
   // Manifest in memory should not show the failed segment.
   assert_eq!(idx.manifest().segments.len(), 0);
@@ -477,4 +489,183 @@ fn keyword_match_and_filter_agree_on_non_ascii_case() {
     .map(|h| h.doc_id)
     .collect();
   assert_eq!(cyrillic_query_ids, cyrillic_filter_ids);
+}
+
+/// Regression test for davidkelley/searchlite#255.
+///
+/// The default tokenizer applies ASCII-only case-folding
+/// (`char::to_ascii_lowercase`), so "RÉSUMÉ" is indexed as the token
+/// "rÉsumÉ" (É is not ASCII and stays uppercase). Before the fix,
+/// `normalize_pattern` applied full Unicode lowering (`str::to_lowercase`),
+/// producing "rés*" for the wildcard pattern "RÉS*". The byte sequences
+/// diverge (É = 0xC3 0x89 vs é = 0xC3 0xA9), so the prefix match failed
+/// and the document was silently omitted from results.
+///
+/// After the fix, `normalize_pattern` uses ASCII-only lowering when the
+/// tokenizer is `Default`, producing "rÉs*" which correctly matches the
+/// indexed prefix "rÉs".
+#[test]
+fn wildcard_query_matches_non_ascii_uppercase_with_default_tokenizer() {
+  let dir = tempdir().unwrap();
+  let path = dir.path().to_path_buf();
+  let idx = Index::create(&path, Schema::default_text_body(), opts(&path)).unwrap();
+  {
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&doc(
+        "resume_doc",
+        vec![("body", json!("RÉSUMÉ WRITING GUIDE"))],
+      ))
+      .unwrap();
+    writer
+      .add_document(&doc(
+        "plain_doc",
+        vec![("body", json!("REGULAR WRITING GUIDE"))],
+      ))
+      .unwrap();
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+
+  // Wildcard query "RÉS*" must match the document with "RÉSUMÉ".
+  let wildcard_req = SearchRequest {
+    query: Query::Node(QueryNode::Wildcard {
+      field: "body".into(),
+      value: "RÉS*".into(),
+      max_expansions: None,
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let wildcard_ids: Vec<String> = reader
+    .search(&wildcard_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(wildcard_ids, vec!["resume_doc".to_string()]);
+
+  // A query-string search for the same term should also find the document,
+  // confirming both paths agree on case folding.
+  let match_req = SearchRequest {
+    query: Query::String("RÉSUMÉ".into()),
+    ..base_request("", None)
+  };
+  let match_ids: Vec<String> = reader
+    .search(&match_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_eq!(match_ids, vec!["resume_doc".to_string()]);
+}
+
+/// Regression test for davidkelley/searchlite#316.
+///
+/// `expand_prefix`, `expand_wildcard`, and `expand_regex` previously reset
+/// their `expanded` counter at the top of each segment loop, applying
+/// `max_expansions` per-segment rather than as a global cap. On a multi-
+/// segment index with disjoint terms per segment, the total number of
+/// expanded terms could grow to `num_segments * max_expansions` — up to
+/// `(num_segments - 1) * max_expansions` over the caller-requested limit.
+///
+/// The fix moves the counter outside the segment loop and uses a labeled
+/// break, matching the pattern already in `expand_term_fuzzy`. This test
+/// builds a 3-segment index where each segment contains unique
+/// prefix-matching terms and each seeded term maps 1:1 to a distinct
+/// document, runs each of the three expansion paths with
+/// `max_expansions = 2`, and asserts the returned hit count never
+/// exceeds the requested limit.
+#[test]
+fn term_expansion_max_expansions_is_global_across_segments() {
+  let dir = tempdir().unwrap();
+  let path = dir.path().to_path_buf();
+  let idx = Index::create(&path, Schema::default_text_body(), opts(&path)).unwrap();
+  // Three segments, each holding disjoint terms that all match the prefix
+  // `ap`, wildcard `ap*`, and regex `ap.*` (regex queries are anchored
+  // internally by `anchored_regex`, so no leading `^` is needed; adding
+  // one would also empty the literal-prefix optimisation). Committing
+  // between batches flushes a new segment per batch.
+  let segments: [&[(&str, &str)]; 3] = [
+    &[("s0a", "app"), ("s0b", "apple")],
+    &[("s1a", "apply"), ("s1b", "apt")],
+    &[("s2a", "apricot"), ("s2b", "apogee")],
+  ];
+  for batch in segments.iter() {
+    let mut writer = idx.writer().unwrap();
+    for (id, body) in batch.iter() {
+      writer
+        .add_document(&doc(id, vec![("body", json!(body))]))
+        .unwrap();
+    }
+    writer.commit().unwrap();
+  }
+  let reader = idx.reader().unwrap();
+
+  // Each seeded term occurs in exactly one document, so the number of
+  // returned hits is a direct proxy for the number of expanded terms.
+  let max_expansions = 2usize;
+  let assert_global_cap = |hits: Vec<String>, label: &str| {
+    assert!(
+      hits.len() <= max_expansions,
+      "{label}: expected <= {max_expansions} matched docs (one per expanded term), got {} — {hits:?}",
+      hits.len()
+    );
+  };
+
+  let prefix_req = SearchRequest {
+    query: Query::Node(QueryNode::Prefix {
+      field: "body".into(),
+      value: "ap".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let prefix_hits: Vec<String> = reader
+    .search(&prefix_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(prefix_hits, "prefix");
+
+  let wildcard_req = SearchRequest {
+    query: Query::Node(QueryNode::Wildcard {
+      field: "body".into(),
+      value: "ap*".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let wildcard_hits: Vec<String> = reader
+    .search(&wildcard_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(wildcard_hits, "wildcard");
+
+  let regex_req = SearchRequest {
+    query: Query::Node(QueryNode::Regex {
+      field: "body".into(),
+      value: "ap.*".into(),
+      max_expansions: Some(max_expansions),
+      boost: None,
+    }),
+    ..base_request("", None)
+  };
+  let regex_hits: Vec<String> = reader
+    .search(&regex_req)
+    .unwrap()
+    .hits
+    .into_iter()
+    .map(|h| h.doc_id)
+    .collect();
+  assert_global_cap(regex_hits, "regex");
 }

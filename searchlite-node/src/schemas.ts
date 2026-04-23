@@ -144,10 +144,17 @@ export function expandSchema(input: Record<string, unknown>): JsonSchemaOutput {
 
 // --- Input schemas (camelCase) ---
 
+// The `schema` field accepts three shapes:
+//   1. Flat shorthand (`Record<string, FieldDefinition>`)
+//   2. Raw JSON Schema (`{ type: "object", properties: {...} }`)
+//   3. A Zod-authored index schema (branded via `sl.index(...)`)
+// Shape (3) is a ZodObject instance, which would be rejected by
+// `z.record(z.string(), z.unknown())`, so we accept any object here and let
+// the constructors dispatch on the concrete shape at runtime.
 export const OpenOptionsSchema = z
 	.object({
 		writeKey: z.string().optional(),
-		schema: z.record(z.string(), z.unknown()).optional(),
+		schema: z.unknown().optional(),
 	})
 	.strict()
 	.optional();

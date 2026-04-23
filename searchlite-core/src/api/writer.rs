@@ -3,12 +3,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
-use crate::api::errors::PatchError;
+use crate::api::errors::{PatchError, WriteKeyError};
 use crate::api::reader::IndexReader;
 use crate::api::types::Document;
 use crate::index::manifest::{Manifest, NestedField, NestedProperty, Schema};
@@ -122,25 +122,23 @@ impl IndexWriter {
     if binding_required {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for this index"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest.write_key.as_ref() {
           verify_write_key(key, meta)?;
         }
         let candidate = binding_for_uuid(key, &manifest.uuid);
         if let Some(b) = wal_binding.as_ref() {
           if !verify_binding(b, &candidate) {
-            bail!("write key does not match WAL binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("WAL binding; index may be tampered").into());
           }
         }
         for seg_binding in segments_binding.iter() {
           if !verify_binding(seg_binding, &candidate) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         if manifest.write_key.is_none() && (wal_binding.is_some() || !segments_binding.is_empty()) {
-          bail!(
-            "write key metadata missing but bindings exist; index metadata was likely tampered"
-          );
+          return Err(WriteKeyError::MetadataTampered.into());
         }
         write_binding = Some(candidate.clone());
         if wal_binding.is_none() {
@@ -151,7 +149,7 @@ impl IndexWriter {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
     let live_docs = load_live_docs(inner.as_ref(), &manifest)?;
@@ -202,6 +200,14 @@ impl IndexWriter {
   pub fn add_document(&mut self, doc: &Document) -> Result<u32> {
     let inner = self.inner.clone();
     let _guard = inner.writer_lock.lock();
+    // BUG-224: enforce required-field presence only at the user-facing
+    // ingest boundary. `add_document_locked` is also reached from
+    // `apply_patch`, which re-inserts documents reconstructed from the
+    // docstore; those reconstructed documents may legitimately be missing
+    // top-level fields that serialize away (empty arrays, nested
+    // containers whose stored children all serialize to null), so the
+    // presence check cannot live inside the locked path.
+    self.schema.check_required_fields_present(doc)?;
     self.add_document_locked(doc)
   }
 
@@ -355,28 +361,91 @@ impl IndexWriter {
       .unwrap_or(0);
     new_manifest.committed_at = Utc::now().to_rfc3339();
     let manifest_path = self.inner.manifest_path();
+    let pending_manifest_path = Manifest::manifest_pending_path(&self.inner.path);
     let wal_len = self.wal.len()?;
-    if let Err(e) = (|| -> Result<()> {
-      new_manifest.store(self.inner.storage.as_ref(), &manifest_path)?;
-      // `append_commit` fsyncs before returning, so no separate `sync` call
-      // is needed to guarantee the commit record is durable on disk.
-      self.wal.append_commit()?;
-      Ok(())
-    })() {
-      // Roll back manifest to the previous snapshot and restore WAL to its
-      // pre-commit length so pending ops can be retried safely.
+
+    // BUG-018: the WAL commit record is the durability fence. Storing the
+    // manifest *before* appending the commit (the previous order) opened a
+    // crash window in which the manifest referenced a freshly-published
+    // segment but the WAL had no matching `Commit` marker — recovery then
+    // re-applied the same pending ops on the next `commit()`, producing a
+    // duplicate segment and tombstoning every doc in the original one.
+    //
+    // The new order is the standard WAL pattern:
+    //   1. Stage the new manifest to `MANIFEST.json.pending` so the commit
+    //      content survives a crash even if `MANIFEST.json` itself never
+    //      gets republished. If this fails the commit is rolled back —
+    //      nothing has been made durable yet.
+    //   2. Append the WAL commit record (fsync'd internally per BUG-006).
+    //      This is the durability fence. After it returns Ok the batch is
+    //      committed regardless of what happens next.
+    //   3. Promote the staged manifest to the live `MANIFEST.json`. If this
+    //      fails the staged file plus the WAL trailing-commit marker let
+    //      `Index::open` finish the publish on the next start.
+    //
+    // Step 1 must be a separate write rather than an in-memory buffer
+    // because we need the manifest content to survive a crash that happens
+    // between steps 2 and 3 — only durably-staged content can be promoted
+    // by `Index::open`'s reconciliation pass.
+
+    let serialized_manifest =
+      serde_json::to_vec_pretty(&new_manifest).context("serializing manifest for commit")?;
+
+    // Promote any leftover `.pending` from a prior commit whose manifest
+    // publish failed post-fence. This prevents overwriting a durable staged
+    // manifest with uncommitted content — without this, the old `.pending`
+    // (which represents an already-committed batch) would be silently
+    // replaced by the new staging write below.
+    if self.inner.storage.exists(&pending_manifest_path) {
+      match self.inner.storage.read_to_end(&pending_manifest_path) {
+        Ok(prior_data) => {
+          if let Err(e) = self.inner.storage.atomic_write(&manifest_path, &prior_data) {
+            log::error!(
+              "failed to promote leftover staged manifest before new commit: {e}; \
+               proceeding with overwrite — recovery on next open will reconcile"
+            );
+          }
+          let _ = self.inner.storage.remove(&pending_manifest_path);
+        }
+        Err(e) => {
+          log::error!(
+            "failed to read leftover staged manifest before new commit: {e}; \
+             proceeding with overwrite — recovery on next open will reconcile"
+          );
+        }
+      }
+    }
+
+    // Step 1 — stage manifest (pre-fence; rollback on failure).
+    if let Err(e) = self
+      .inner
+      .storage
+      .atomic_write(&pending_manifest_path, &serialized_manifest)
+    {
+      let _ = self.inner.storage.remove(&pending_manifest_path);
+      if !new_segments.is_empty() {
+        let _ = crate::index::cleanup_segments(self.inner.storage.as_ref(), &new_segments);
+      }
+      self.patch_reader = None;
+      self.patch_reader_stamp = None;
+      return Err(e.context("staging manifest for commit"));
+    }
+
+    // Step 2 — WAL commit fence. After Ok the batch is durable; before Ok
+    // we can still roll the entire commit back.
+    if let Err(e) = self.wal.append_commit() {
+      // The WAL fence failed: there is no durable commit yet. Roll back
+      // every pre-fence side effect so a retry sees a clean slate.
       if let Err(truncate_err) = self.wal.truncate_to(wal_len) {
         log::error!(
           "WAL rollback failed while handling commit error: \
            unable to truncate WAL back to length {wal_len}: {truncate_err}"
         );
       }
-      if let Err(manifest_err) =
-        manifest_snapshot.store(self.inner.storage.as_ref(), &manifest_path)
-      {
+      if let Err(remove_err) = self.inner.storage.remove(&pending_manifest_path) {
         log::error!(
-          "Manifest rollback failed while handling commit error: {manifest_err}. \
-           The on-disk manifest and WAL may be inconsistent."
+          "Pending manifest cleanup failed while handling commit error: {remove_err}. \
+           Recovery on the next open will discard the staged file."
         );
       }
       if !new_segments.is_empty() {
@@ -386,11 +455,56 @@ impl IndexWriter {
       self.patch_reader_stamp = None;
       return Err(e);
     }
+
+    // Step 3 — post-fence: promote the staged manifest to live. Failures
+    // here cannot roll back the commit (it is already durable) — they are
+    // surfaced via logs and reconciled by `Index::open` on the next start,
+    // which detects the staged file plus the WAL trailing-commit marker
+    // and promotes the staged manifest.
+    let manifest_published = match new_manifest.store(self.inner.storage.as_ref(), &manifest_path) {
+      Ok(()) => {
+        // Best-effort cleanup of the staging file. A leftover `.pending`
+        // file is harmless: the next `Index::open` removes it after
+        // reconciliation.
+        if let Err(remove_err) = self.inner.storage.remove(&pending_manifest_path) {
+          log::warn!(
+            "removing staged manifest at {pending_manifest_path:?} failed: {remove_err}; \
+             recovery on next open will clean it up"
+          );
+        }
+        true
+      }
+      Err(store_err) => {
+        log::error!(
+          "Manifest publish failed after WAL commit fence; the batch is durably \
+           committed and `Index::open` will promote the staged manifest on the \
+           next start: {store_err}"
+        );
+        false
+      }
+    };
+
     {
       let mut manifest_guard = self.inner.manifest.write();
       *manifest_guard = new_manifest;
     }
-    self.wal.truncate()?;
+    if manifest_published {
+      // Reclaim WAL space now that the trailing commit marker is no
+      // longer needed for recovery.
+      if let Err(truncate_err) = self.wal.truncate() {
+        // The commit is durable; failing to reclaim WAL space is not
+        // fatal. The next replay still sees the trailing commit and
+        // treats this batch as committed.
+        log::warn!(
+          "WAL truncation after commit failed: {truncate_err}; \
+           the commit remains durable but the WAL file will grow until next truncation"
+        );
+      }
+    }
+    // If `manifest_published` is false the WAL is intentionally left
+    // alone so that the next `Index::open` can detect the trailing
+    // commit and promote the staged manifest. Truncating here would
+    // erase the only on-disk evidence that the batch is durable.
     self.pending_ops.clear();
     self.pending_latest.clear();
     self.patch_reader = None;
@@ -410,10 +524,14 @@ impl IndexWriter {
   /// `commit_with_merge_and_key` instead.
   pub fn commit_with_merge(&mut self, merge: bool) -> Result<()> {
     if merge && self.write_binding.is_some() {
-      bail!(
+      // Classify as a typed write-key error so FFI / downstream callers can
+      // recognise it via `downcast_ref::<WriteKeyError>` without sniffing the
+      // error's Display string. Attach the API-hint as anyhow context so the
+      // human-readable advice (`use commit_with_merge_and_key ...`) survives.
+      return Err(anyhow::Error::from(WriteKeyError::Required).context(
         "this index requires a write key for merge; \
-         use commit_with_merge_and_key(merge, Some(key)) instead"
-      );
+         use commit_with_merge_and_key(merge, Some(key)) instead",
+      ));
     }
     self.commit_with_merge_and_key(merge, None)
   }
@@ -463,7 +581,14 @@ impl IndexWriter {
     let _guard = inner.writer_lock.lock();
     let checkpoint = self.checkpoint_locked()?;
     for doc in docs {
-      if let Err(e) = self.add_document_locked(doc) {
+      // BUG-224: enforce required-field presence at the ingest boundary;
+      // see the note in `add_document` for why this is kept out of
+      // `add_document_locked`.
+      if let Err(e) = self
+        .schema
+        .check_required_fields_present(doc)
+        .and_then(|()| self.add_document_locked(doc).map(|_| ()))
+      {
         self.rollback_to_locked(checkpoint)?;
         return Err(e);
       }
@@ -654,7 +779,54 @@ fn validate_patch_fields(
       bail!("unknown field {path}");
     }
   }
+  // BUG-224 patch-path guard: reject `unset` on a non-nullable top-level
+  // field. `apply_patch` cannot rely on `check_required_fields_present`
+  // to catch this because the reconstructed-from-docstore document is
+  // lossy for legitimate ingest shapes (empty arrays, nested containers
+  // whose stored children all serialize to null), so post-patch presence
+  // enforcement would reject docs that were valid at ingest. Rejecting
+  // the user-initiated unset here is the narrower guard that captures
+  // the real schema-contract violation without false positives on
+  // round-tripped data. Unsetting a nested sub-path is still caught by
+  // `NestedField::validate` in `validate_document` when the container is
+  // present.
+  //
+  // `apply_patch` applies `unset` first and then `set`, so a payload
+  // that unsets a required field and re-sets it in the same patch ends
+  // up with the field present again; allow that overlap case.
+  let non_nullable_tops = non_nullable_top_level_field_names(schema);
+  for path in unset.iter() {
+    if non_nullable_tops.contains(path) && !set.contains_key(path) {
+      bail!("cannot unset non-nullable field `{path}`");
+    }
+  }
   Ok(())
+}
+
+fn non_nullable_top_level_field_names(schema: &Schema) -> HashSet<String> {
+  let doc_id_name = schema.doc_id_field().to_string();
+  let mut out = HashSet::new();
+  for f in schema.text_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.keyword_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.numeric_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  for f in schema.nested_fields.iter() {
+    if !f.nullable && f.name != doc_id_name {
+      out.insert(f.name.clone());
+    }
+  }
+  out
 }
 
 fn patchable_schema_paths(schema: &Schema) -> HashSet<String> {
@@ -937,6 +1109,7 @@ mod tests {
   struct FailingManifestStorage {
     inner: InMemoryStorage,
     fail_manifest: AtomicBool,
+    fail_pending_manifest: AtomicBool,
   }
 
   impl FailingManifestStorage {
@@ -944,6 +1117,7 @@ mod tests {
       Self {
         inner: InMemoryStorage::new(root),
         fail_manifest: AtomicBool::new(false),
+        fail_pending_manifest: AtomicBool::new(false),
       }
     }
 
@@ -951,8 +1125,23 @@ mod tests {
       self.fail_manifest.store(true, Ordering::SeqCst);
     }
 
+    fn fail_next_pending_manifest_store(&self) {
+      self.fail_pending_manifest.store(true, Ordering::SeqCst);
+    }
+
     fn should_fail(&self, path: &std::path::Path) -> bool {
-      path.ends_with("MANIFEST.json") && self.fail_manifest.swap(false, Ordering::SeqCst)
+      let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+      if name == "MANIFEST.json.pending" && self.fail_pending_manifest.swap(false, Ordering::SeqCst)
+      {
+        return true;
+      }
+      if name == "MANIFEST.json" && self.fail_manifest.swap(false, Ordering::SeqCst) {
+        return true;
+      }
+      false
     }
   }
 
@@ -1006,7 +1195,11 @@ mod tests {
   }
 
   #[test]
-  fn wal_retains_pending_when_manifest_store_fails() {
+  fn commit_rolls_back_when_pending_manifest_stage_fails() {
+    // BUG-018: staging the manifest to `MANIFEST.json.pending` happens
+    // *before* the WAL commit fence. A failure here is recoverable —
+    // nothing is durable yet — so the writer must roll back cleanly and
+    // leave the pending ops in place for retry.
     let dir = tempdir().unwrap();
     let schema = Schema::default_text_body();
     let storage = Arc::new(FailingManifestStorage::new(dir.path().to_path_buf()));
@@ -1022,9 +1215,10 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       storage: storage.clone(),
+      reader_opens: std::sync::atomic::AtomicUsize::new(0),
     });
 
-    storage.fail_next_manifest_store();
+    storage.fail_next_pending_manifest_store();
 
     let mut writer = super::IndexWriter::new(inner, None).unwrap();
     writer
@@ -1038,21 +1232,327 @@ mod tests {
       })
       .unwrap();
     let err = writer.commit();
-    assert!(err.is_err());
+    assert!(
+      err.is_err(),
+      "commit must fail when the pre-fence stage fails"
+    );
     assert_eq!(
       writer
         .pending_ops
         .iter()
         .filter(|op| matches!(op, PendingOp::Add { .. }))
         .count(),
-      1
+      1,
+      "pending ops are retained for retry when the commit is rolled back",
     );
 
     let wal_path = directory::wal_path(dir.path());
     let (_, pending) = Wal::last_pending_ops(storage.as_ref(), &wal_path).unwrap();
     assert!(
       !pending.is_empty(),
-      "wal should retain pending ops when manifest persistence fails"
+      "WAL must retain pending ops when the pre-fence manifest stage fails",
+    );
+    assert!(
+      !Wal::contains_commit(storage.as_ref(), &wal_path).unwrap(),
+      "no WAL commit should have been appended on a pre-fence failure",
+    );
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+    assert!(
+      !storage.exists(&pending_path),
+      "the staged manifest must be cleaned up on a pre-fence rollback",
+    );
+  }
+
+  #[test]
+  fn commit_is_durable_when_post_fence_manifest_publish_fails() {
+    // BUG-018: once `Wal::append_commit` returns Ok the batch is durably
+    // committed. A subsequent failure to publish the live `MANIFEST.json`
+    // must NOT roll back — the staged `MANIFEST.json.pending` plus the
+    // trailing WAL commit marker let `Index::open` finish the publish on
+    // the next start. The writer should treat the commit as successful.
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let storage = Arc::new(FailingManifestStorage::new(dir.path().to_path_buf()));
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let manifest = Manifest::new(schema.clone());
+    manifest.store(storage.as_ref(), &manifest_path).unwrap();
+
+    let mut opts = opts(dir.path());
+    opts.storage = StorageType::InMemory;
+    let inner = Arc::new(InnerIndex {
+      path: dir.path().to_path_buf(),
+      options: opts,
+      manifest: RwLock::new(manifest),
+      writer_lock: Mutex::new(()),
+      storage: storage.clone(),
+      reader_opens: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    storage.fail_next_manifest_store();
+
+    let mut writer = super::IndexWriter::new(inner, None).unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("_id".into(), serde_json::json!("1")),
+          ("body".into(), serde_json::json!("durable commit")),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    writer
+      .commit()
+      .expect("commit must succeed when the WAL fence is crossed even if manifest publish fails");
+
+    assert!(
+      writer.pending_ops.is_empty(),
+      "pending ops must be cleared when the WAL commit fence is crossed",
+    );
+    let wal_path = directory::wal_path(dir.path());
+    assert!(
+      Wal::contains_commit(storage.as_ref(), &wal_path).unwrap(),
+      "WAL must contain a commit marker after the durability fence",
+    );
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+    assert!(
+      storage.exists(&pending_path),
+      "the staged manifest must remain on disk so `Index::open` can promote it",
+    );
+  }
+
+  #[test]
+  fn open_promotes_pending_manifest_when_wal_has_commit() {
+    // BUG-018 reconciliation: on startup, if the previous commit was
+    // interrupted between the WAL commit fence and the live manifest
+    // publish, `Index::open` must promote the staged manifest so the next
+    // reader/writer sees the committed state.
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+
+    // Drive the index through a single normal commit so the manifest
+    // contains one segment we can reference as "the previously-committed
+    // baseline" to compare against.
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("baseline")),
+            ("body".into(), serde_json::json!("baseline")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let storage = idx.inner.storage.clone();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    // Synthesize a "crash between WAL commit fence and manifest publish":
+    // build a manifest that has a *different* (recognisable) committed_at
+    // timestamp, write it to `.pending`, and append a WAL commit so the
+    // reconciler will recognise the staged file as durable.
+    let mut staged = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    staged.committed_at = "2099-09-09T09:09:09+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+    {
+      let mut wal = idx.inner.wal().unwrap();
+      wal.append_commit().unwrap();
+    }
+    drop(idx);
+
+    // Reopen and verify the staged manifest was promoted.
+    let opts2 = opts(dir.path());
+    let idx2 = Index::open_with_storage(opts2, storage.clone()).unwrap();
+    let live = idx2.manifest();
+    assert_eq!(
+      live.committed_at, "2099-09-09T09:09:09+00:00",
+      "the staged manifest should have been promoted on open",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the staging file must be cleaned up after reconciliation",
+    );
+  }
+
+  #[test]
+  fn open_discards_pending_manifest_when_wal_has_no_commit() {
+    // BUG-018: a `.pending` file with no trailing WAL commit corresponds
+    // to a commit that never crossed the durability fence. The staged
+    // manifest must be discarded so the live manifest stays authoritative.
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+    let storage = idx.inner.storage.clone();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    let original = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    let mut staged = original.clone();
+    staged.committed_at = "2099-09-09T09:09:09+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+    drop(idx);
+
+    let opts2 = opts(dir.path());
+    let idx2 = Index::open_with_storage(opts2, storage.clone()).unwrap();
+    let live = idx2.manifest();
+    assert_eq!(
+      live.committed_at, original.committed_at,
+      "the live manifest must be left untouched when the WAL has no trailing commit",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the orphan staged manifest must be cleaned up",
+    );
+  }
+
+  #[test]
+  fn bug_018_recovery_avoids_duplicate_segment_after_interrupted_commit() {
+    // BUG-018 end-to-end: prior to the fix, a crash between the manifest
+    // store and the WAL commit caused the next `commit()` to re-apply the
+    // pending ops, producing a *second* segment containing duplicate copies
+    // of every doc and tombstoning the original segment. With the fix the
+    // WAL commit is the durability fence, the staged manifest captures the
+    // batch, and recovery promotes it cleanly — so no duplicate segment is
+    // produced and no docs are tombstoned.
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      for i in 0..5u32 {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(format!("doc-{i}"))),
+              ("body".into(), serde_json::json!(format!("body {i}"))),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let storage = idx.inner.storage.clone();
+    let segments_after_normal_commit = idx.manifest().segments.len();
+    drop(idx);
+
+    // Simulate the interrupted-commit state: a `.pending` manifest is
+    // staged with content matching the live manifest (since no further
+    // ops were committed), and the WAL has a trailing commit marker.
+    // Recovery must promote `.pending` and not duplicate any segments.
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+    let live_bytes = storage.read_to_end(&manifest_path).unwrap();
+    storage.atomic_write(&pending_path, &live_bytes).unwrap();
+    {
+      let mut wal = Wal::open(storage.clone(), &directory::wal_path(dir.path())).unwrap();
+      wal.append_commit().unwrap();
+    }
+
+    let opts2 = opts(dir.path());
+    let idx2 = Index::open_with_storage(opts2, storage.clone()).unwrap();
+    let recovered = idx2.manifest();
+    assert_eq!(
+      recovered.segments.len(),
+      segments_after_normal_commit,
+      "recovery must not introduce duplicate segments",
+    );
+    let total_deleted: usize = recovered
+      .segments
+      .iter()
+      .map(|s| s.deleted_docs.len())
+      .sum();
+    assert_eq!(
+      total_deleted, 0,
+      "recovery must not tombstone any docs from the pre-crash batch",
+    );
+
+    // A subsequent commit on the recovered index should also not introduce
+    // a second segment (no pending ops to flush) — this is the property
+    // that the original BUG-018 violated.
+    {
+      let mut writer = idx2.writer().unwrap();
+      writer.commit().unwrap();
+    }
+    let after_second_commit = idx2.manifest().segments.len();
+    assert_eq!(
+      after_second_commit, segments_after_normal_commit,
+      "an empty commit on the recovered index must not produce another segment",
+    );
+  }
+
+  #[test]
+  fn open_promotes_pending_manifest_despite_uncommitted_entries_after_fence() {
+    // Codex/Copilot review scenario: post-fence manifest publish fails,
+    // then a later uncommitted write is appended before a crash. The WAL
+    // looks like [..., Commit, AddDoc]. Recovery must still promote
+    // `.pending` because the Commit is durable — the trailing AddDoc
+    // must not hide it. `last_pending_ops` correctly replays only the
+    // entries after the last Commit (the uncommitted AddDoc).
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+    let storage = idx.inner.storage.clone();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    // Synthesize the interrupted state: staged manifest + durable commit
+    // + a subsequent uncommitted AddDoc.
+    let mut staged = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    staged.committed_at = "2099-12-31T23:59:59+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+    {
+      let wal_path = directory::wal_path(dir.path());
+      let mut wal = Wal::open(storage.clone(), &wal_path).unwrap();
+      // Durable commit for the staged manifest's batch.
+      wal.append_commit().unwrap();
+      // Uncommitted write appended after the fence, before the crash.
+      wal
+        .append_add_doc(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("uncommitted")),
+            ("body".into(), serde_json::json!("pending after fence")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      wal.sync().unwrap();
+    }
+    drop(idx);
+
+    // Reopen: recovery must promote `.pending` and replay the uncommitted
+    // AddDoc as a pending op.
+    let opts2 = opts(dir.path());
+    let idx2 = Index::open_with_storage(opts2, storage.clone()).unwrap();
+    let live = idx2.manifest();
+    assert_eq!(
+      live.committed_at, "2099-12-31T23:59:59+00:00",
+      "the staged manifest must be promoted even when uncommitted entries follow the fence",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the staging file must be cleaned up after reconciliation",
+    );
+    // The uncommitted AddDoc must appear as a pending op in the new writer.
+    let writer = idx2.writer().unwrap();
+    assert_eq!(
+      writer
+        .pending_ops
+        .iter()
+        .filter(|op| matches!(op, PendingOp::Add { .. }))
+        .count(),
+      1,
+      "the uncommitted AddDoc after the fence must be replayed as a pending op",
     );
   }
 
@@ -1268,9 +1768,12 @@ mod tests {
     let mut writer = idx.writer_with_key(Some(key)).unwrap();
     writer
       .add_document(&Document {
-        fields: [("_id".into(), serde_json::json!("1"))]
-          .into_iter()
-          .collect(),
+        fields: [
+          ("_id".into(), serde_json::json!("1")),
+          ("body".into(), serde_json::json!("hello")),
+        ]
+        .into_iter()
+        .collect(),
       })
       .unwrap();
     writer.commit().unwrap();

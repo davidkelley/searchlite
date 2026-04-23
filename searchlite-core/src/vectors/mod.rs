@@ -73,7 +73,13 @@ impl VectorStore {
 
 pub fn normalize_in_place(vec: &mut [f32]) {
   let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-  if norm > 0.0 {
+  // BUG-384: the sum-of-squares of individually-finite components can still
+  // overflow `f32::MAX` to `+inf` (e.g. `[3e19, 3e19]`). Under `norm = +inf`,
+  // `v / norm` silently collapses every component to `0.0`, poisoning any
+  // downstream cosine similarity. Leave the vector un-normalized in that case
+  // so the caller's overflow guard surfaces an actionable error rather than a
+  // segment with all-zero cosine vectors that are invisible to every query.
+  if norm > 0.0 && norm.is_finite() {
     for v in vec.iter_mut() {
       *v /= norm;
     }
@@ -101,7 +107,25 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
     let d = x - y;
     sum += d * d;
   }
-  sum.sqrt()
+  let dist = sum.sqrt();
+  // BUG-388: saturate to `f32::MAX` when the accumulated sum overflows.
+  // BUG-384 / BUG-386 bound every indexed and queried vector to
+  // `sum(v_i^2) <= f32::MAX`, which constrains `|v_i| <= sqrt(f32::MAX) ≈
+  // 1.84e19` per component. Pairwise `|a_i - b_i|` can still reach
+  // `3.68e19`, so `(a_i - b_i)^2` can exceed `f32::MAX` in a single
+  // dimension (e.g. `a = [1.5e19, 0]`, `b = [-1.5e19, 0]` gives `(3e19)^2
+  // = 9e38 > f32::MAX`). Without a guard here, `sum` saturates to `+inf`,
+  // `sqrt(+inf) = +inf`, `metric_similarity(L2) = -inf`, and the BUG-328
+  // hybrid-score guard silently drops the doc from results. Returning a
+  // finite sentinel keeps the ordering well-defined (the doc ranks at the
+  // bottom, consistent with `missing_vector_score(L2) = f32::MIN`) and
+  // prevents non-finite scores from leaking into HNSW graph construction,
+  // `compute_hybrid_score`, or the explanation payload.
+  if dist.is_finite() {
+    dist
+  } else {
+    f32::MAX
+  }
 }
 
 pub fn metric_similarity(metric: &VectorMetric, a: &[f32], b: &[f32]) -> f32 {
@@ -126,4 +150,122 @@ pub fn blend_scores(bm25: f32, vector_score: f32, alpha: f32, higher_is_better: 
     -vector_score
   };
   alpha * bm25 + (1.0 - alpha) * vec_component
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn normalize_in_place_scales_finite_vector_to_unit_length() {
+    let mut v = vec![3.0_f32, 4.0_f32];
+    normalize_in_place(&mut v);
+    assert!((v[0] - 0.6).abs() < 1e-6, "expected 0.6, got {}", v[0]);
+    assert!((v[1] - 0.8).abs() < 1e-6, "expected 0.8, got {}", v[1]);
+    let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+    assert!((norm_sq - 1.0).abs() < 1e-6);
+  }
+
+  // BUG-384: `[3e19, 3e19]` has finite components but `(3e19)^2 = 9e38` alone
+  // already exceeds `f32::MAX`, so the sum-of-squares saturates to `+inf`. The
+  // pre-fix code computed `norm = sqrt(inf) = inf`, passed the `norm > 0.0`
+  // check, and then divided every component by `inf` — silently zeroing the
+  // vector and poisoning every downstream cosine score to exactly `0`.
+  #[test]
+  fn normalize_in_place_leaves_vector_untouched_when_sum_of_squares_overflows() {
+    let input: Vec<f32> = vec![3.0e19_f32, 3.0e19_f32];
+    let mut v = input.clone();
+    normalize_in_place(&mut v);
+    assert_eq!(
+      v, input,
+      "non-finite norm must leave the vector un-normalized, not zero it"
+    );
+    assert!(
+      v.iter().all(|x| *x == 3.0e19_f32),
+      "no component should be silently collapsed to zero"
+    );
+  }
+
+  #[test]
+  fn normalize_in_place_leaves_zero_vector_untouched() {
+    let mut v = vec![0.0_f32, 0.0_f32];
+    normalize_in_place(&mut v);
+    assert_eq!(v, vec![0.0, 0.0]);
+  }
+
+  // BUG-388: even with the BUG-384 / BUG-386 sum-of-squares guard at the
+  // validation boundary (every indexed and queried vector has
+  // `sum(v_i^2) <= f32::MAX`, so `|v_i| <= sqrt(f32::MAX) ≈ 1.84e19`),
+  // pairwise `|a_i - b_i|` can still reach `3.68e19`, so the per-dimension
+  // squared difference `(a_i - b_i)^2` can exceed `f32::MAX` in a single
+  // dimension. Before the guard, `sum` saturated to `+inf`, `sqrt(+inf) =
+  // +inf`, and `metric_similarity(L2) = -inf` flowed into
+  // `compute_hybrid_score`, which silently dropped the candidate via the
+  // BUG-328 non-finite guard. After the guard, `l2_distance` returns a
+  // finite sentinel so the doc ranks at the bottom instead of silently
+  // disappearing from the result set.
+  #[test]
+  fn l2_distance_saturates_to_f32_max_when_squared_diff_overflows() {
+    // Both vectors pass the BUG-386 sum-of-squares guard: `(1.5e19)^2 =
+    // 2.25e38 < f32::MAX ≈ 3.4e38`. But `(a[0] - b[0])^2 = (3e19)^2 =
+    // 9e38 > f32::MAX`, which overflows the accumulator in a single step.
+    let a = [1.5e19_f32, 0.0_f32];
+    let b = [-1.5e19_f32, 0.0_f32];
+    let sum_a: f32 = a.iter().map(|v| v * v).sum();
+    let sum_b: f32 = b.iter().map(|v| v * v).sum();
+    assert!(
+      sum_a.is_finite() && sum_b.is_finite(),
+      "precondition: both vectors must pass BUG-386 sum-of-squares guard (sum_a={sum_a}, sum_b={sum_b})",
+    );
+    let dist = l2_distance(&a, &b);
+    assert!(dist.is_finite(), "expected finite distance, got {dist}");
+    assert_eq!(
+      dist,
+      f32::MAX,
+      "overflow must saturate to `f32::MAX`, not `+inf` or `0`",
+    );
+  }
+
+  // BUG-388: the downstream `metric_similarity(L2)` contract is that its
+  // output is always finite when inputs pass validation — the BUG-328
+  // hybrid guard uses the finitude of the blended score to decide whether
+  // to drop a candidate, so a non-finite return here is observationally
+  // identical to "the doc doesn't exist" from the caller's perspective.
+  #[test]
+  fn metric_similarity_l2_stays_finite_when_l2_distance_overflows() {
+    use crate::api::types::VectorMetric;
+    let a = [1.5e19_f32, 0.0_f32];
+    let b = [-1.5e19_f32, 0.0_f32];
+    let sim = metric_similarity(&VectorMetric::L2, &a, &b);
+    assert!(
+      sim.is_finite(),
+      "metric_similarity(L2) must be finite when l2_distance overflows, got {sim}",
+    );
+  }
+
+  // Boundary: an in-range pairwise squared diff must not be truncated by
+  // the saturation guard. `(1e9 - (-1e9))^2 = (2e9)^2 = 4e18`, well below
+  // `f32::MAX`; the accurate distance `sqrt(4e18) = 2e9` must be returned
+  // as-is so the guard doesn't over-clamp legitimate distances.
+  #[test]
+  fn l2_distance_preserves_finite_result_within_range() {
+    let a = [1.0e9_f32, 0.0_f32];
+    let b = [-1.0e9_f32, 0.0_f32];
+    let dist = l2_distance(&a, &b);
+    assert!(dist.is_finite(), "in-range distance must remain finite");
+    let expected = 2.0e9_f32;
+    let tolerance = expected * 1e-5;
+    assert!(
+      (dist - expected).abs() < tolerance,
+      "expected ~{expected}, got {dist}",
+    );
+  }
+
+  // Sanity: the ordinary 3-4-5 triangle still round-trips exactly.
+  #[test]
+  fn l2_distance_returns_exact_value_for_small_vectors() {
+    let a = [0.0_f32, 0.0_f32];
+    let b = [3.0_f32, 4.0_f32];
+    assert_eq!(l2_distance(&a, &b), 5.0);
+  }
 }

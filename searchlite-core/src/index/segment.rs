@@ -511,13 +511,35 @@ fn collect_vector_value(
     let Some(num) = v.as_f64() else {
       bail!("vector field {field} must contain numbers");
     };
-    vecvals.push(num as f32);
+    let num_f32 = num as f32;
+    if !num_f32.is_finite() {
+      bail!("vector field {field} contains non-finite component");
+    }
+    vecvals.push(num_f32);
   }
   if vecvals.len() != vf.dim {
     bail!(
       "vector field {field} expected dimension {}, got {}",
       vf.dim,
       vecvals.len()
+    );
+  }
+  // BUG-386: reject any vector whose squared magnitudes sum past `f32::MAX`,
+  // regardless of metric. Each component passes the per-value finitude check
+  // above, but their sum-of-squares can still overflow (e.g. `[3e19, 3e19]`).
+  //
+  // For cosine this originally surfaced as `normalize_in_place` dividing by
+  // `+inf` and silently zeroing the vector (BUG-384); that fix rejected only
+  // the cosine path. For L2 the same overflow is just as user-visible — the
+  // vector is persisted, then `l2_distance(v, 0)` accumulates `v[i]^2` into
+  // `+inf`, `metric_similarity(L2) = -inf`, and `compute_hybrid_score` drops
+  // the doc via the BUG-328 guard so the caller silently gets an empty / wrong
+  // hit set. Guarding both metrics uniformly gives a diagnosable failure at
+  // write time instead of invisible misbehaviour at read time.
+  let sum_sq = vecvals.iter().map(|v| v * v).sum::<f32>();
+  if !sum_sq.is_finite() {
+    bail!(
+      "vector field {field} has components whose sum-of-squares overflows f32; reduce component magnitudes"
     );
   }
   if matches!(vf.metric, VectorMetric::Cosine) {
@@ -1278,7 +1300,7 @@ pub struct SegmentReader {
   terms: TinyTerms,
   postings: RefCell<Box<dyn StorageFile>>,
   docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
-  doc_ids: Vec<String>,
+  doc_ids: Vec<Arc<str>>,
   deleted: FastHashSet<DocId>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
@@ -1290,7 +1312,7 @@ pub struct SegmentReader {
 impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
-    let seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
+    let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     #[cfg(not(feature = "zstd"))]
     if seg_meta.use_zstd {
       bail!(
@@ -1362,12 +1384,16 @@ impl SegmentReader {
         );
       }
     }
+    let doc_ids: Vec<Arc<str>> = std::mem::take(&mut seg_meta.doc_ids)
+      .into_iter()
+      .map(Arc::<str>::from)
+      .collect();
     Ok(Self {
       meta,
       terms: TinyTerms(terms),
       postings: RefCell::new(postings),
       docstore: RefCell::new(docstore),
-      doc_ids: seg_meta.doc_ids.clone(),
+      doc_ids,
       deleted,
       fast_fields,
       keep_positions,
@@ -1407,18 +1433,18 @@ impl SegmentReader {
   }
 
   pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {
-    self.doc_ids.get(doc_id as usize).map(|s| s.as_str())
+    self.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
   }
 
   pub fn find_doc_id(&self, id: &str) -> Option<DocId> {
     self
       .doc_ids
       .iter()
-      .position(|d| d == id)
+      .position(|d| d.as_ref() == id)
       .map(|i| i as DocId)
   }
 
-  pub fn doc_ids(&self) -> &[String] {
+  pub fn doc_ids(&self) -> &[Arc<str>] {
     &self.doc_ids
   }
 

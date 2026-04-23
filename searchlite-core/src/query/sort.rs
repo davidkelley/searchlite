@@ -261,7 +261,16 @@ impl SortPlan {
           let f = n
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
-          SortValue::Score(f as f32)
+          // Narrow from f64 to f32 explicitly so a finite JSON number larger
+          // than f32::MAX (which Rust's `as` cast saturates to ±f32::INFINITY)
+          // is rejected here rather than poisoning the sort key and silently
+          // corrupting pagination via `total_cmp`. Mirrors the write-side
+          // guards in BUG-330 (collect_vector_value) and BUG-336 (scoring).
+          let score = f as f32;
+          if !score.is_finite() {
+            bail!("search_after _score value must fit in a finite f32 (received {f})");
+          }
+          SortValue::Score(score)
         }
         (SortField::Keyword(_), Value::String(s)) => SortValue::Str(s.clone()),
         (SortField::I64(_), Value::Number(n)) => {
@@ -274,6 +283,14 @@ impl SortPlan {
           let f = n
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("search_after sort value must be number"))?;
+          // `serde_json::Number::as_f64` returns `f64::INFINITY` for JSON
+          // numbers that overflow (e.g. `1e309`), and +/-inf or NaN poisons
+          // `total_cmp`-based keyset pagination. Mirrors the Score guard
+          // above (BUG-342) — the f64 path doesn't narrow, but it still
+          // has to reject non-finite values at the boundary.
+          if !f.is_finite() {
+            bail!("search_after sort value must be finite for numeric field (received {f})");
+          }
           SortValue::F64(f)
         }
         (SortField::Keyword(_), _) => {
@@ -487,6 +504,129 @@ mod tests {
     };
     assert!(higher_asc > key_asc);
     assert!(higher_desc < key_desc);
+  }
+
+  fn score_sort_plan() -> SortPlan {
+    let schema = Schema {
+      doc_id_field: crate::index::manifest::default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    SortPlan::from_request(&schema, &[]).unwrap()
+  }
+
+  #[test]
+  fn values_from_json_rejects_score_overflow_to_positive_inf() {
+    // `1e40` is a valid finite JSON number (well within f64::MAX) but larger
+    // than f32::MAX, so `f as f32` saturates to `f32::INFINITY`. Feeding that
+    // poisoned value into the sort key via `search_after` silently corrupts
+    // pagination comparisons under `total_cmp`; the decode must bail.
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(1.0e40_f64)];
+    let err = plan.values_from_json(&raw).unwrap_err();
+    assert!(
+      err.to_string().contains("finite f32"),
+      "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn values_from_json_rejects_score_overflow_to_negative_inf() {
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(-1.0e40_f64)];
+    let err = plan.values_from_json(&raw).unwrap_err();
+    assert!(
+      err.to_string().contains("finite f32"),
+      "unexpected error: {err}"
+    );
+  }
+
+  #[test]
+  fn values_from_json_accepts_score_at_f32_max() {
+    // Boundary: `f32::MAX as f64` round-trips through the cast unchanged and
+    // must continue to be accepted so legitimate large-but-finite scores are
+    // not over-rejected.
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(f32::MAX as f64)];
+    let values = plan.values_from_json(&raw).unwrap();
+    assert_eq!(values.len(), 1);
+    match &values[0] {
+      SortValue::Score(v) => {
+        assert!(v.is_finite());
+        assert_eq!(*v, f32::MAX);
+      }
+      other => panic!("expected SortValue::Score, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn values_from_json_accepts_small_finite_score() {
+    let plan = score_sort_plan();
+    let raw = vec![serde_json::json!(0.5_f64)];
+    let values = plan.values_from_json(&raw).unwrap();
+    assert_eq!(values.len(), 1);
+    match &values[0] {
+      SortValue::Score(v) => assert_eq!(*v, 0.5_f32),
+      other => panic!("expected SortValue::Score, got {other:?}"),
+    }
+  }
+
+  fn f64_sort_plan() -> SortPlan {
+    let schema = Schema {
+      doc_id_field: crate::index::manifest::default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: vec![NumericField {
+        name: "price".into(),
+        i64: false,
+        fast: true,
+        stored: false,
+        nullable: false,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    SortPlan::from_request(
+      &schema,
+      &[SortSpec {
+        field: "price".into(),
+        order: Some(SortOrder::Desc),
+      }],
+    )
+    .unwrap()
+  }
+
+  #[test]
+  fn values_from_json_accepts_f64_at_boundary() {
+    // Positive control for the F64 finitude guard (BUG-369): `f64::MAX`
+    // is the largest finite f64 and must continue to be accepted so
+    // legitimate large-but-finite sort values are not over-rejected.
+    // The non-finite rejection path is covered indirectly via the
+    // cursor-decode tests in `pagination.rs`; with default `serde_json`
+    // (no `arbitrary_precision` feature), the parser itself rejects
+    // JSON literals that would overflow to non-finite before they
+    // reach this function, so the guard here is defense-in-depth that
+    // mirrors the Score guard (BUG-342) and protects against any
+    // future path that could construct `Value::Number` with a
+    // non-finite f64.
+    let plan = f64_sort_plan();
+    let raw = vec![serde_json::json!(f64::MAX)];
+    let values = plan.values_from_json(&raw).unwrap();
+    assert_eq!(values.len(), 1);
+    match &values[0] {
+      SortValue::F64(v) => {
+        assert!(v.is_finite());
+        assert_eq!(*v, f64::MAX);
+      }
+      other => panic!("expected SortValue::F64, got {other:?}"),
+    }
   }
 
   #[test]

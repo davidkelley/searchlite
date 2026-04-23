@@ -307,6 +307,7 @@ Run this (or a subset) on app start or on an idle timer. `cleanup_indexes`
 with a `dry_run` flag is safe to call interactively to preview the impact
 before committing.
 
+
 ---
 
 ## Worker-first runtime
@@ -380,6 +381,7 @@ The worker client's method surface:
 | `flushStorage()` | Drain pending writes. |
 | `storageUsage()` | Query browser storage usage (same shape as `Searchlite.storage_usage`). |
 | `dispose()` | Terminate the worker and reject pending calls. |
+
 
 ### Runtime fallback matrix
 

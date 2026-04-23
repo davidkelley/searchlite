@@ -577,3 +577,269 @@ fn cross_fields_zero_token_analyzer_behavior_is_deterministic() {
   assert_eq!(ranked(&first), ranked(&second));
   assert_eq!(first.hits.first().map(|h| h.doc_id.as_str()), Some("doc-1"));
 }
+
+#[test]
+fn multi_match_rejects_group_times_field_boost_overflow() {
+  // BUG-396: `group.boost` (the combined query boost already validated by
+  // `combine_boost` at plan time) and `field.boost` (per-field multi_match
+  // boost validated by `validate_boost`) are each finite, but their f32
+  // product in `expand_term_groups` can still overflow past `f32::MAX` to
+  // `+inf`. Before the guard, that non-finite weight flowed into
+  // `ScoredTerm.weight`, BM25 `score_tf`, and finally `Hit.score`, tripping
+  // `serde_json` on the HTTP path (HTTP 500) or silently dropping the doc
+  // under the in-flight BUG-381 heap guard. Expansion-time rejection
+  // mirrors the `combine_boost` plan-time error shape for the same class
+  // of bug on the next multiplication site.
+  let (_tmp, reader) = setup_reader();
+  let overflow = QueryNode::MultiMatch {
+    query: "rust".into(),
+    // Each per-field boost is finite on its own (f32::MAX ≈ 3.4e38), so
+    // `validate_boost` accepts both. The query-level boost multiplies into
+    // every per-field weight via `expand_term_groups`, and `1e20 * 1e20`
+    // overflows f32.
+    fields: vec![
+      FieldSpec {
+        field: "title".into(),
+        boost: Some(1e20),
+      },
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(1e20),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(1e20),
+  };
+  let err = reader.search(&request(overflow)).unwrap_err();
+  assert!(
+    err.to_string().contains("overflows"),
+    "expected overflow error from the group.boost * field.boost guard, got: {err}",
+  );
+}
+
+#[test]
+fn multi_match_accepts_group_times_field_boost_within_range() {
+  // Control case for BUG-396: a combined product that stays finite after
+  // multiplication must search cleanly, so the new guard does not regress
+  // legitimate per-field boosts.
+  let (_tmp, reader) = setup_reader();
+  let finite = QueryNode::MultiMatch {
+    query: "rust".into(),
+    fields: vec![
+      FieldSpec {
+        field: "title".into(),
+        boost: Some(3.0),
+      },
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(2.0),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(4.0),
+  };
+  let result = reader
+    .search(&request(finite))
+    .expect("finite group × field boost product must search cleanly");
+  // Guard against vacuous pass: the corpus in `setup_reader` seeds
+  // several docs whose `body`/`title` contain "rust", so this query must
+  // return hits. A zero-hit result would skip the finitude loop below
+  // and silently mask a guard that rejected every legitimate doc.
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-396 control case: legitimate in-range boosts must still return hits — the \
+     new guard cannot accidentally reject every candidate",
+  );
+  let matching_ids = ids(&result);
+  assert!(
+    matching_ids.contains("doc-2") || matching_ids.contains("doc-4"),
+    "BUG-396 control case: at least one known-\"rust\"-bearing doc must be returned, got {:?}",
+    matching_ids,
+  );
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-396: legitimate in-range boosts must yield finite scores (got {})",
+      hit.score,
+    );
+  }
+}
+
+#[test]
+fn multi_match_ignores_overflow_boost_on_numeric_field_kind() {
+  // BUG-396: the `combine_boost(group.boost, field.boost)?` guard must be
+  // scoped to Text/Keyword field kinds. `Numeric` and `Unknown` fields
+  // are no-ops inside `expand_term_groups` (nothing consumes `weight`),
+  // so an overflowing boost on one of those fields must not abort the
+  // whole query. Raising there would be a behavior regression for
+  // mixed / typoed field lists where Text fields still have legitimate
+  // finite boosts. Verifies Codex's P2 comment on the initial patch.
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("idx-bug-396-numeric-nop");
+  let mut schema = Schema::default_text_body();
+  schema.numeric_fields.push(NumericField {
+    name: "year".into(),
+    i64: true,
+    fast: true,
+    stored: true,
+    nullable: false,
+  });
+  let opts = IndexOptions {
+    path: path.clone(),
+    create_if_missing: true,
+    enable_positions: true,
+    bm25_k1: 0.9,
+    bm25_b: 0.4,
+    storage: StorageType::Filesystem,
+    #[cfg(feature = "vectors")]
+    vector_defaults: None,
+  };
+  let idx = Index::create(&path, schema, opts).unwrap();
+  let mut writer = idx.writer().unwrap();
+  writer
+    .add_document(&Document {
+      fields: [
+        ("_id".to_string(), serde_json::json!("doc-1")),
+        ("body".to_string(), serde_json::json!("rust systems")),
+        ("year".to_string(), serde_json::json!(2024)),
+      ]
+      .into_iter()
+      .collect(),
+    })
+    .unwrap();
+  writer.commit().unwrap();
+  let reader = idx.reader().unwrap();
+  // `body` carries a sane 2.0 boost; `year` (numeric) carries an
+  // overflow-trigger 1e20 with a query-level 1e20 boost. The guard must
+  // not fire on the numeric field because its branch discards `weight`.
+  let query = QueryNode::MultiMatch {
+    query: "rust".into(),
+    fields: vec![
+      FieldSpec {
+        field: "body".into(),
+        boost: Some(2.0),
+      },
+      FieldSpec {
+        field: "year".into(),
+        boost: Some(1e20),
+      },
+    ],
+    match_type: MultiMatchType::BestFields,
+    fuzziness: None,
+    tie_breaker: None,
+    operator: None,
+    minimum_should_match: None,
+    boost: Some(1e20),
+  };
+  let result = reader
+    .search(&request(query))
+    .expect("overflow boost on Numeric field must be a no-op, not a hard error");
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-396: mixed field list must still surface the Text-field match",
+  );
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-396: Text field's finite weight must still produce finite scores (got {})",
+      hit.score,
+    );
+  }
+}
+
+#[test]
+fn bool_rejects_accumulated_term_weight_overflow() {
+  // BUG-401: `term_weights` in `IndexReader::search` sums per-term weights
+  // with `entry.1 += term.weight` when multiple query clauses resolve to the
+  // same `field:term` key. Each individual boost is validated finite by
+  // `combine_boost` at plan/expansion time (BUG-381 / BUG-396), but the sum
+  // of N finite f32 values can still overflow `f32::MAX` (~3.4e38) to `+Inf`.
+  // Before the guard, that `Inf` propagated into `ScoredTerm.weight` and
+  // through BM25 `score_tf` into the WAND/brute-force heap, corrupting
+  // ranking (WAND+Sum silently clamped to 0.0 per BUG-364) or producing an
+  // `Inf` in the serialised response (HTTP 500 on `serde_json::to_vec`).
+  // The guard must fire at accumulation time and mirror the
+  // `combine_boost` error shape.
+  let (_tmp, reader) = setup_reader();
+  // Two `should` clauses, each matching `body:rust` with a boost that is
+  // individually finite (f32::MAX ≈ 3.4e38). Their accumulated sum
+  // (3.6e38) exceeds f32::MAX and overflows to +Inf.
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1.8e38),
+      },
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(1.8e38),
+      },
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let err = reader.search(&request(query)).unwrap_err();
+  let msg = err.to_string();
+  assert!(
+    msg.contains("overflows"),
+    "expected overflow error from the term_weights accumulation guard, got: {msg}",
+  );
+  assert!(
+    msg.contains("body:rust"),
+    "error should name the field:term key that overflowed, got: {msg}",
+  );
+}
+
+#[test]
+fn bool_accepts_accumulated_term_weight_within_range() {
+  // Control case for BUG-401: two clauses sharing a key whose summed weight
+  // stays finite must continue to search cleanly. Guards against a guard
+  // that rejects every legitimate multi-clause query.
+  let (_tmp, reader) = setup_reader();
+  let query = QueryNode::Bool {
+    must: Vec::new(),
+    should: vec![
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(2.0),
+      },
+      QueryNode::Term {
+        field: "body".into(),
+        value: "rust".into(),
+        boost: Some(3.0),
+      },
+    ],
+    must_not: Vec::new(),
+    filter: Vec::new(),
+    minimum_should_match: None,
+    boost: None,
+  };
+  let result = reader
+    .search(&request(query))
+    .expect("finite summed weight must search cleanly");
+  assert!(
+    !result.hits.is_empty(),
+    "BUG-401 control case: legitimate in-range boosts must still return hits",
+  );
+  for hit in result.hits.iter() {
+    assert!(
+      hit.score.is_finite(),
+      "BUG-401 control case: legitimate summed weights must yield finite scores (got {})",
+      hit.score,
+    );
+  }
+}
