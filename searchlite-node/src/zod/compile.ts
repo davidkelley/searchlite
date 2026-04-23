@@ -36,8 +36,9 @@ declare const __searchliteIndexBrand: unique symbol;
  * `sl.index(...)`. The brand is a phantom type marker — at runtime, it's the
  * original `z.ZodObject` with metadata attached to `SearchliteIndexRegistry`.
  */
-export type ZodIndexSchema<TSchema extends z.ZodObject<z.ZodRawShape> = z.ZodObject<z.ZodRawShape>> =
-	TSchema & { readonly [__searchliteIndexBrand]: "searchlite:index" };
+export type ZodIndexSchema<
+	TSchema extends z.ZodObject<z.ZodRawShape> = z.ZodObject<z.ZodRawShape>,
+> = TSchema & { readonly [__searchliteIndexBrand]: "searchlite:index" };
 
 /**
  * Runtime predicate: returns true when the passed value has been registered as
@@ -132,7 +133,12 @@ function validateFieldName(name: string, _docIdField: string): void {
 
 function emitField(schema: unknown, path: string): Record<string, unknown> {
 	const state = wrapperState(schema);
-	const nullable = state.nullable;
+	// Both `z.optional()` and `z.nullable()` map to nullable on the native
+	// side: searchlite-core treats missing fields and null fields identically
+	// (both require `searchlite:nullable: true` / a type array containing
+	// "null"). Zod distinguishes them at the TS level (`undefined` vs `null`)
+	// but the engine doesn't — so any wrapped field is emitted as nullable.
+	const nullable = state.nullable || state.optional;
 	const inner = state.inner;
 
 	const meta = resolveFieldMetadata(
@@ -264,11 +270,7 @@ function emitFloat(
 
 // ── Complex emitters ─────────────────────────────────────────────────────────
 
-function emitObject(
-	inner: unknown,
-	path: string,
-	nullable: boolean,
-): Record<string, unknown> {
+function emitObject(inner: unknown, path: string, nullable: boolean): Record<string, unknown> {
 	const shape = getShape(inner);
 	if (!shape) {
 		throw new InvalidZodSchemaError({
@@ -292,11 +294,7 @@ function emitObject(
 	return prop;
 }
 
-function emitArray(
-	inner: unknown,
-	path: string,
-	nullable: boolean,
-): Record<string, unknown> {
+function emitArray(inner: unknown, path: string, nullable: boolean): Record<string, unknown> {
 	const element = getArrayElement(inner);
 	if (!element) {
 		throw new InvalidZodSchemaError({
@@ -440,8 +438,7 @@ function ensureNumericCompatible(inner: unknown, path: string, target: "integer"
 const UNSUPPORTED_HINTS: Record<string, string> = {
 	boolean:
 		"searchlite-core has no boolean kind. Use `z.enum(['true','false'])` with `sl.keyword()`, or model as an integer (0/1).",
-	date:
-		"searchlite-core has no date kind. Use `z.number().int()` for epoch-ms and convert at your application boundary.",
+	date: "searchlite-core has no date kind. Use `z.number().int()` for epoch-ms and convert at your application boundary.",
 	bigint:
 		"searchlite-core has no 128-bit integer kind. Use `z.number().int()` (if values fit in i64) or store as a keyword string.",
 	record:
@@ -454,10 +451,8 @@ const UNSUPPORTED_HINTS: Record<string, string> = {
 		"no core kind can represent a discriminated union. Extract the discriminator as a keyword field on the parent object and store variant-specific fields as optional.",
 	intersection:
 		"intersections can't be reconciled to a single index field. Merge at the `z.object({...})` level instead.",
-	lazy:
-		"recursive Zod schemas are not supported in v1. Flatten the structure or materialize a fixed depth.",
-	pipe:
-		"shape-changing `.transform()` / `.pipe()` / `.preprocess()` breaks the document ↔ index mapping. Remove the transform or use a separate validator.",
+	lazy: "recursive Zod schemas are not supported in v1. Flatten the structure or materialize a fixed depth.",
+	pipe: "shape-changing `.transform()` / `.pipe()` / `.preprocess()` breaks the document ↔ index mapping. Remove the transform or use a separate validator.",
 	any: "index field kind must be known. Provide a concrete Zod type.",
 	unknown: "index field kind must be known. Provide a concrete Zod type.",
 	never: "a `z.never()` field can never be satisfied. Remove the field or use a concrete type.",
@@ -465,12 +460,10 @@ const UNSUPPORTED_HINTS: Record<string, string> = {
 	set: "Set fields are not supported. Convert to `z.array(z.object({...}))` or a keyword array.",
 	function:
 		"function-valued fields cannot be indexed. Remove the field or compute it at search time.",
-	promise:
-		"promise-valued fields cannot be indexed. Resolve values before indexing.",
+	promise: "promise-valued fields cannot be indexed. Resolve values before indexing.",
 	void: "void-typed fields can't be indexed. Remove the field.",
 	null: "null-only fields have no kind. Wrap with `.nullable()` around a concrete type.",
-	undefined:
-		"undefined-only fields have no kind. Wrap with `.optional()` around a concrete type.",
+	undefined: "undefined-only fields have no kind. Wrap with `.optional()` around a concrete type.",
 	boolean_literal:
 		"boolean literals aren't a searchlite kind. Use `z.enum(['true','false'])` with `sl.keyword()`.",
 };
@@ -491,7 +484,8 @@ function rejectUnsupported(inner: unknown, path: string): never {
 		}
 	}
 
-	const hint = UNSUPPORTED_HINTS[t] ?? `the Zod type \`${t}\` cannot be mapped to a searchlite field.`;
+	const hint =
+		UNSUPPORTED_HINTS[t] ?? `the Zod type \`${t}\` cannot be mapped to a searchlite field.`;
 	throw new UnsupportedZodTypeError({
 		path,
 		zodType: zodTypeName(t),

@@ -258,9 +258,7 @@ describe("Zod path: per-call schema override", () => {
 		await idx.commit();
 
 		const WrongSchema = z.object({ nonexistent: z.string() });
-		await expect(idx.search(WrongSchema, "mismatch")).rejects.toThrowError(
-			/hit 0.*docId/s,
-		);
+		await expect(idx.search(WrongSchema, "mismatch")).rejects.toThrowError(/hit 0.*docId/s);
 		await idx.close();
 	});
 });

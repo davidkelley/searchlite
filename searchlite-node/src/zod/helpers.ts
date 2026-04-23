@@ -1,9 +1,9 @@
 import { z } from "zod";
-import { type ZodIndexSchema } from "./compile";
+import type { ZodIndexSchema } from "./compile";
 import {
 	type SearchliteFieldMetadata,
-	type SearchliteIndexMetadata,
 	SearchliteFieldRegistry,
+	type SearchliteIndexMetadata,
 	SearchliteIndexRegistry,
 } from "./registries";
 
@@ -61,10 +61,7 @@ function attach<T extends z.ZodType>(schema: T, meta: SearchliteFieldMetadata): 
  */
 export function text(opts?: TextOpts): z.ZodString;
 export function text<S extends z.ZodString>(inner: S, opts?: TextOpts): S;
-export function text(
-	innerOrOpts?: z.ZodString | TextOpts,
-	maybeOpts?: TextOpts,
-): z.ZodString {
+export function text(innerOrOpts?: z.ZodString | TextOpts, maybeOpts?: TextOpts): z.ZodString {
 	let inner: z.ZodString;
 	let opts: TextOpts | undefined;
 	if (isZodString(innerOrOpts)) {
@@ -136,7 +133,9 @@ export function integer(
 		// intermediate _zod.input shapes that don't align with our ZodType<number>.
 		// At runtime, the pipeline is: accept number|bigint → coerce → int check.
 		const guard = z.union([z.number(), z.bigint()]) as z.ZodType<number | bigint>;
-		inner = guard.pipe(z.coerce.number().int() as z.ZodType<number, number | bigint>) as unknown as z.ZodType<number>;
+		inner = guard.pipe(
+			z.coerce.number().int() as z.ZodType<number, number | bigint>,
+		) as unknown as z.ZodType<number>;
 		opts = innerOrOpts as NumericOpts | undefined;
 	}
 	return attach(inner, { kind: "integer", ...opts });

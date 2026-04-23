@@ -159,9 +159,7 @@ export function resolveFieldMetadata(
 	const unwrapped = unwrapSchema(schema);
 
 	const fieldMeta =
-		fieldRegistry.get(schema as never) ??
-		fieldRegistry.get(unwrapped as never) ??
-		{};
+		fieldRegistry.get(schema as never) ?? fieldRegistry.get(unwrapped as never) ?? {};
 
 	const globalMeta =
 		(globalRegistry.get(schema as never) as Record<string, unknown> | undefined) ??

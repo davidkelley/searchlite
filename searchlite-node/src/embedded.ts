@@ -80,9 +80,7 @@ function getNative(): NativeBinding {
  */
 function isZodLike(value: unknown): boolean {
 	return (
-		!!value &&
-		typeof value === "object" &&
-		typeof (value as { _def?: unknown })._def === "object"
+		!!value && typeof value === "object" && typeof (value as { _def?: unknown })._def === "object"
 	);
 }
 
@@ -97,10 +95,7 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	/** Set when the index was constructed with a Zod-authored schema. */
 	#zodSchema: ZodIndexSchema | undefined;
 
-	constructor(
-		path: string,
-		options?: { writeKey?: string; schema?: AnySchemaInput },
-	) {
+	constructor(path: string, options?: { writeKey?: string; schema?: AnySchemaInput }) {
 		if (typeof path !== "string" || path.length === 0) {
 			throw new Error("path must be a non-empty string");
 		}

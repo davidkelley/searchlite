@@ -153,9 +153,7 @@ describe("compileZodSchema: text options", () => {
 
 	it("searchAsYouType is passed through", () => {
 		const out = compileZodSchema(
-			sl.index(
-				z.object({ title: sl.text({ searchAsYouType: { minGram: 2, maxGram: 8 } }) }),
-			),
+			sl.index(z.object({ title: sl.text({ searchAsYouType: { minGram: 2, maxGram: 8 } }) })),
 		);
 		expect(out.properties.title["searchlite:searchAsYouType"]).toEqual({
 			minGram: 2,
@@ -262,9 +260,12 @@ describe("compileZodSchema: literals and enums", () => {
 // ── Wrappers: optional / nullable / default ──────────────────────────────────
 
 describe("compileZodSchema: wrappers", () => {
-	it("optional wraps without affecting output (required-set is not emitted)", () => {
+	it("optional wraps as nullable type (core treats missing ≡ null)", () => {
+		// `.optional()` and `.nullable()` both map to a nullable type on the
+		// native side because searchlite-core doesn't distinguish "missing"
+		// from "null" — both require the field to tolerate absence.
 		const out = compileZodSchema(sl.index(z.object({ t: z.string().optional() })));
-		expect(out.properties.t).toEqual({ type: "string" });
+		expect(out.properties.t).toEqual({ type: ["string", "null"] });
 	});
 
 	it("nullable emits type array [string, null]", () => {
@@ -288,7 +289,7 @@ describe("compileZodSchema: wrappers", () => {
 	it("optional + keyword metadata preserved through wrapper", () => {
 		const out = compileZodSchema(sl.index(z.object({ tag: sl.keyword().optional() })));
 		expect(out.properties.tag).toEqual({
-			type: "string",
+			type: ["string", "null"],
 			"searchlite:kind": "keyword",
 		});
 	});
@@ -345,9 +346,9 @@ describe("compileZodSchema: nested structures", () => {
 	});
 
 	it("array of primitives is rejected", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ tags: z.array(z.string()) }))),
-		).toThrowError(UnsupportedZodTypeError);
+		expect(() => compileZodSchema(sl.index(z.object({ tags: z.array(z.string()) })))).toThrowError(
+			UnsupportedZodTypeError,
+		);
 	});
 
 	it("deeply nested object (2 levels) compiles", () => {
@@ -421,9 +422,9 @@ describe("compileZodSchema: vectors", () => {
 
 describe("compileZodSchema: field name validation", () => {
 	it('rejects field names containing "."', () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ "a.b": z.string() }))),
-		).toThrowError(/must not contain "\."/);
+		expect(() => compileZodSchema(sl.index(z.object({ "a.b": z.string() })))).toThrowError(
+			/must not contain "\."/,
+		);
 	});
 });
 
@@ -431,21 +432,21 @@ describe("compileZodSchema: field name validation", () => {
 
 describe("compileZodSchema: unsupported types", () => {
 	it("z.boolean() throws with remediation hint", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ flag: z.boolean() }))),
-		).toThrowError(/z\.boolean\(\).*z\.enum/s);
+		expect(() => compileZodSchema(sl.index(z.object({ flag: z.boolean() })))).toThrowError(
+			/z\.boolean\(\).*z\.enum/s,
+		);
 	});
 
 	it("z.date() throws with epoch-ms hint", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ t: z.date() }))),
-		).toThrowError(/z\.date\(\).*epoch-ms/s);
+		expect(() => compileZodSchema(sl.index(z.object({ t: z.date() })))).toThrowError(
+			/z\.date\(\).*epoch-ms/s,
+		);
 	});
 
 	it("z.bigint() throws with i64 hint", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ big: z.bigint() }))),
-		).toThrowError(/z\.bigint\(\).*i64/s);
+		expect(() => compileZodSchema(sl.index(z.object({ big: z.bigint() })))).toThrowError(
+			/z\.bigint\(\).*i64/s,
+		);
 	});
 
 	it("z.record() throws", () => {
@@ -462,9 +463,7 @@ describe("compileZodSchema: unsupported types", () => {
 
 	it("z.union() throws", () => {
 		expect(() =>
-			compileZodSchema(
-				sl.index(z.object({ u: z.union([z.string(), z.number()]) })),
-			),
+			compileZodSchema(sl.index(z.object({ u: z.union([z.string(), z.number()]) }))),
 		).toThrowError(/z\.union/);
 	});
 
@@ -473,10 +472,7 @@ describe("compileZodSchema: unsupported types", () => {
 			compileZodSchema(
 				sl.index(
 					z.object({
-						i: z.intersection(
-							z.object({ a: z.string() }),
-							z.object({ b: z.string() }),
-						),
+						i: z.intersection(z.object({ a: z.string() }), z.object({ b: z.string() })),
 					}),
 				),
 			),
@@ -488,15 +484,13 @@ describe("compileZodSchema: unsupported types", () => {
 	});
 
 	it("z.unknown() throws", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ u: z.unknown() }))),
-		).toThrowError(/z\.unknown/);
+		expect(() => compileZodSchema(sl.index(z.object({ u: z.unknown() })))).toThrowError(
+			/z\.unknown/,
+		);
 	});
 
 	it("z.never() throws", () => {
-		expect(() =>
-			compileZodSchema(sl.index(z.object({ n: z.never() }))),
-		).toThrowError(/z\.never/);
+		expect(() => compileZodSchema(sl.index(z.object({ n: z.never() })))).toThrowError(/z\.never/);
 	});
 
 	it("z.transform() throws", () => {
@@ -626,9 +620,7 @@ describe("compileZodSchema: Zod-specific behaviors", () => {
 
 describe("compileZodSchema: deep wrappers", () => {
 	it("sl.keyword().nullable().optional() compiles as keyword + nullable", () => {
-		const out = compileZodSchema(
-			sl.index(z.object({ tag: sl.keyword().nullable().optional() })),
-		);
+		const out = compileZodSchema(sl.index(z.object({ tag: sl.keyword().nullable().optional() })));
 		expect(out.properties.tag).toEqual({
 			type: ["string", "null"],
 			"searchlite:kind": "keyword",
@@ -636,9 +628,7 @@ describe("compileZodSchema: deep wrappers", () => {
 	});
 
 	it("sl.keyword().optional().nullable() (reversed order) compiles the same", () => {
-		const out = compileZodSchema(
-			sl.index(z.object({ tag: sl.keyword().optional().nullable() })),
-		);
+		const out = compileZodSchema(sl.index(z.object({ tag: sl.keyword().optional().nullable() })));
 		expect(out.properties.tag).toEqual({
 			type: ["string", "null"],
 			"searchlite:kind": "keyword",
@@ -656,9 +646,7 @@ describe("compileZodSchema: deep wrappers", () => {
 	});
 
 	it("sl.integer().nullable() compiles as nullable integer + stored", () => {
-		const out = compileZodSchema(
-			sl.index(z.object({ count: sl.integer().nullable() })),
-		);
+		const out = compileZodSchema(sl.index(z.object({ count: sl.integer().nullable() })));
 		expect(out.properties.count).toEqual({
 			type: ["integer", "null"],
 			"searchlite:stored": true,
@@ -672,7 +660,8 @@ describe("compileZodSchema: deep wrappers", () => {
 			),
 		);
 		expect(out.properties.title).toEqual({
-			type: "string",
+			// .optional() propagates to nullable on the native side.
+			type: ["string", "null"],
 			"searchlite:analyzer": "stemmed",
 		});
 	});

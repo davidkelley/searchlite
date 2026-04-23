@@ -8,22 +8,11 @@
 import { expectTypeOf } from "vitest";
 import { z } from "zod";
 
-import type {
-	Hit,
-	SearchResult,
-	TypedSearchResult,
-	ZodIndexSchema,
-} from "../src";
-import {
-	EmbeddedIndex,
-	RemoteIndex,
-	compileZodSchema,
-	isZodIndexSchema,
-	sl,
-} from "../src";
+import type { Hit, SearchResult, TypedSearchResult, ZodIndexSchema } from "../src";
+import { EmbeddedIndex, RemoteIndex, compileZodSchema, isZodIndexSchema, sl } from "../src";
 
 // ── sl.* helper return types ─────────────────────────────────────────────────
-
+// biome-ignore lint/complexity/noUselessLoneBlockStatements: scoping tests
 {
 	expectTypeOf(sl.text()).toEqualTypeOf<z.ZodString>();
 	expectTypeOf(sl.keyword()).toEqualTypeOf<z.ZodString>();
@@ -31,9 +20,7 @@ import {
 	// don't break validation. `z.infer<typeof sl.integer()>` is still `number`.
 	expectTypeOf<z.infer<ReturnType<typeof sl.integer>>>().toEqualTypeOf<number>();
 	expectTypeOf(sl.float()).toEqualTypeOf<z.ZodNumber>();
-	expectTypeOf(sl.vector({ dim: 4, metric: "Cosine" })).toEqualTypeOf<
-		z.ZodArray<z.ZodNumber>
-	>();
+	expectTypeOf(sl.vector({ dim: 4, metric: "Cosine" })).toEqualTypeOf<z.ZodArray<z.ZodNumber>>();
 }
 
 // ── sl.index() preserves the inner schema's shape for z.infer<> ──────────────
@@ -76,9 +63,7 @@ import {
 	// Return is `JsonSchemaOutput` (i.e., ZodCompiledJsonSchema), which has
 	// `type: "object"` and `properties`.
 	expectTypeOf(_result.type).toEqualTypeOf<"object">();
-	expectTypeOf(_result.properties).toEqualTypeOf<
-		Record<string, Record<string, unknown>>
-	>();
+	expectTypeOf(_result.properties).toEqualTypeOf<Record<string, Record<string, unknown>>>();
 }
 
 // ── isZodIndexSchema type predicate narrows correctly ────────────────────────
@@ -99,9 +84,7 @@ import {
 
 	// `.search("q")` returns SearchResult<Record<string, unknown>>.
 	const searchReturn = idx.search("q");
-	expectTypeOf(searchReturn).toEqualTypeOf<
-		Promise<SearchResult<Record<string, unknown>>>
-	>();
+	expectTypeOf(searchReturn).toEqualTypeOf<Promise<SearchResult<Record<string, unknown>>>>();
 
 	// `.add(doc)` accepts an arbitrary record (today's behavior).
 	idx.add({ anything: "goes" });
@@ -136,7 +119,7 @@ import {
 
 	// hit.fields has the right shape (nullable for default behavior):
 	r.then((res) => {
-		expectTypeOf<typeof res.hits[number]>().toMatchTypeOf<Hit<User>>();
+		expectTypeOf<(typeof res.hits)[number]>().toMatchTypeOf<Hit<User>>();
 	});
 }
 
@@ -171,7 +154,7 @@ import {
 }
 
 // ── Constructor accepts schema in multiple shapes ────────────────────────────
-
+// biome-ignore lint/complexity/noUselessLoneBlockStatements: scoping tests
 {
 	// 1. Shorthand
 	new EmbeddedIndex("/tmp/a", { schema: { title: "text" } });
@@ -211,6 +194,3 @@ import {
 	type V = z.infer<typeof v>;
 	expectTypeOf<V>().toEqualTypeOf<number[]>();
 }
-
-// ── Explicit annotation: this file is consumed only by tsc (type tests) ──────
-export {};

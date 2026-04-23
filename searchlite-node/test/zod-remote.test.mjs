@@ -106,27 +106,21 @@ describe("RemoteIndex Zod path: add() validation", () => {
 	it("rejects invalid UUID before hitting the server", async () => {
 		const fetch = mockFetch(BULK_RESPONSE);
 		const idx = new RemoteIndex("http://srv", "users", { schema: UserSchema, fetch });
-		await expect(
-			idx.add({ ...VALID_USER, id: "not-a-uuid" }),
-		).rejects.toThrow();
+		await expect(idx.add({ ...VALID_USER, id: "not-a-uuid" })).rejects.toThrow();
 		expect(fetch._calls).toHaveLength(0);
 	});
 
 	it("rejects invalid enum before hitting the server", async () => {
 		const fetch = mockFetch(BULK_RESPONSE);
 		const idx = new RemoteIndex("http://srv", "users", { schema: UserSchema, fetch });
-		await expect(
-			idx.add({ ...VALID_USER, role: "unknown" }),
-		).rejects.toThrow();
+		await expect(idx.add({ ...VALID_USER, role: "unknown" })).rejects.toThrow();
 		expect(fetch._calls).toHaveLength(0);
 	});
 
 	it("rejects invalid email before hitting the server", async () => {
 		const fetch = mockFetch(BULK_RESPONSE);
 		const idx = new RemoteIndex("http://srv", "users", { schema: UserSchema, fetch });
-		await expect(
-			idx.add({ ...VALID_USER, email: "not-an-email" }),
-		).rejects.toThrow();
+		await expect(idx.add({ ...VALID_USER, email: "not-an-email" })).rejects.toThrow();
 		expect(fetch._calls).toHaveLength(0);
 	});
 
@@ -153,9 +147,9 @@ describe("RemoteIndex Zod path: addMany", () => {
 	it("reports the index of the failing document", async () => {
 		const fetch = mockFetch({ body: { queued: 0 } });
 		const idx = new RemoteIndex("http://srv", "users", { schema: UserSchema, fetch });
-		await expect(
-			idx.addMany([VALID_USER, { ...VALID_USER, id: "bad" }]),
-		).rejects.toThrow(/documents\[1\]/);
+		await expect(idx.addMany([VALID_USER, { ...VALID_USER, id: "bad" }])).rejects.toThrow(
+			/documents\[1\]/,
+		);
 		expect(fetch._calls).toHaveLength(0);
 	});
 });

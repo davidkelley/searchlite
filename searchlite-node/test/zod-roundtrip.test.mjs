@@ -332,9 +332,7 @@ describe("round-trip: uuid auto-promotes to keyword", () => {
 		const shorthand = expandSchema({ id: "keyword" });
 		// The Zod compiler omits the id field from properties because it matches
 		// docIdField; to compare compiled properties, use a non-id field name.
-		const zod = compileZodSchema(
-			sl.index(z.object({ ref: z.string().uuid() })),
-		);
+		const zod = compileZodSchema(sl.index(z.object({ ref: z.string().uuid() })));
 		const shorthandRef = expandSchema({ ref: "keyword" });
 		expect(zod).toEqual(shorthandRef);
 	});
