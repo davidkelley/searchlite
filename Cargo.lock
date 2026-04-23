@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-ffi"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "searchlite-core",
@@ -2186,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-wasm"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "futures",
