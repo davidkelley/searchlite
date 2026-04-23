@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/davidkelley/searchlite/compare/searchlite-node-v0.2.3...searchlite-node-v0.2.4) - 2026-04-23
+
+### Added
+
+- *(node)* Zod-native schema authoring ([#244](https://github.com/davidkelley/searchlite/pull/244))
+
+### Fixed
+
+- *(schema)* reject documents that omit non-nullable top-level fields (BUG-224) ([#226](https://github.com/davidkelley/searchlite/pull/226))
+
 ## [0.2.2](https://github.com/davidkelley/searchlite/compare/searchlite-node-v0.2.1...searchlite-node-v0.2.2) - 2026-04-13
 
 ### Added
