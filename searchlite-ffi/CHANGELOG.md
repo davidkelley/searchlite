@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.6...searchlite-ffi-v0.1.7) - 2026-04-23
+
+### Fixed
+
+- *(ffi)* classify write-key auth errors via typed downcast (BUG-020) ([#237](https://github.com/davidkelley/searchlite/pull/237))
+- *(ffi)* signal buffer-too-small instead of truncating JSON (BUG-029) ([#229](https://github.com/davidkelley/searchlite/pull/229))
+
 ## [0.1.6](https://github.com/davidkelley/searchlite/compare/searchlite-ffi-v0.1.5...searchlite-ffi-v0.1.6) - 2026-04-10
 
 ### Added
