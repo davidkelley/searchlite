@@ -4,7 +4,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use searchlite_wasm::Searchlite;
+use searchlite_wasm::{Searchlite, WASM_MAX_PAGE_SIZE};
 use wasm_bindgen_test::*;
 
 mod common;
@@ -323,4 +323,118 @@ async fn search_request_value_async_propagates_timeout() {
     .unwrap_err();
   let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
   assert_eq!(payload.error_type, "timeout");
+}
+
+// BUG-163: a JS caller passing `limit = 4_000_000_000` to `search()` would
+// grow the result heap until the WebAssembly linear memory aborts with no
+// recovery path. The validator must surface a `page_too_large`-style error
+// before any allocation happens.
+#[wasm_bindgen_test]
+async fn search_rejects_limit_above_max_page_size() {
+  let idx = seeded_index("searchlite-bug-163-search").await;
+
+  let err = idx
+    .search("hello".to_string(), WASM_MAX_PAGE_SIZE + 1, Some(true))
+    .expect_err("limit above WASM_MAX_PAGE_SIZE must be rejected");
+  let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+  assert_eq!(payload.error_type, "invalid_search_request");
+  assert!(
+    payload.reason.contains("max page size"),
+    "expected 'max page size' message, got {:?}",
+    payload.reason,
+  );
+
+  // The cap itself is allowed.
+  idx
+    .search("hello".to_string(), WASM_MAX_PAGE_SIZE, Some(true))
+    .expect("limit at the cap must still be accepted");
+}
+
+// BUG-163: the JSON-decoded `search_request` path must also reject huge
+// `limit`, `from`, and `from + limit`, rather than allocating a million-slot
+// top-k heap.
+#[wasm_bindgen_test]
+async fn search_request_rejects_oversized_limits() {
+  let idx = seeded_index("searchlite-bug-163-request").await;
+
+  let request = serde_json::json!({
+    "query": "hello",
+    "limit": WASM_MAX_PAGE_SIZE + 1,
+    "return_stored": true,
+  });
+  let err = idx
+    .search_request(request.to_string())
+    .expect_err("oversized limit must be rejected");
+  let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+  assert_eq!(payload.error_type, "invalid_search_request");
+  assert!(
+    payload.reason.contains("max page size"),
+    "expected 'max page size' message, got {:?}",
+    payload.reason,
+  );
+
+  // `from + limit` over the cap is also rejected, even when `limit` alone
+  // fits.
+  let paginated = serde_json::json!({
+    "query": "hello",
+    "from": WASM_MAX_PAGE_SIZE,
+    "limit": 1,
+    "return_stored": true,
+  });
+  let err = idx
+    .search_request(paginated.to_string())
+    .expect_err("from + limit above cap must be rejected");
+  let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+  assert_eq!(payload.error_type, "invalid_search_request");
+  assert!(
+    payload.reason.contains("max page size"),
+    "expected 'max page size' message, got {:?}",
+    payload.reason,
+  );
+}
+
+// BUG-163: the JsValue-decoded entrypoint shares the same allocation hazard
+// as `search_request`, so it must enforce the same cap.
+#[wasm_bindgen_test]
+async fn search_request_value_rejects_oversized_limit() {
+  let idx = seeded_index("searchlite-bug-163-request-value").await;
+
+  let request = serde_json::json!({
+    "query": "hello",
+    "limit": WASM_MAX_PAGE_SIZE + 1,
+    "return_stored": true,
+  });
+  let request_js = serde_wasm_bindgen::to_value(&request).unwrap();
+  let err = idx
+    .search_request_value(request_js)
+    .expect_err("oversized limit must be rejected");
+  let payload: WasmErrorPayload = serde_wasm_bindgen::from_value(err).unwrap();
+  assert_eq!(payload.error_type, "invalid_search_request");
+  assert!(
+    payload.reason.contains("max page size"),
+    "expected 'max page size' message, got {:?}",
+    payload.reason,
+  );
+}
+
+// BUG-163 follow-up: aggregation-only / metadata queries that disable
+// hits don't grow the result heap, so the page-size cap must mirror
+// core's behavior and skip the `limit`/`from`/`from + limit` checks
+// when `return_hits = false`. Matches what `IndexReader::search()` and
+// `searchlite-http`'s `validate_search` already accept.
+#[wasm_bindgen_test]
+async fn search_request_skips_page_cap_when_return_hits_false() {
+  let idx = seeded_index("searchlite-bug-163-no-hits").await;
+
+  // `from + limit` well above the cap, but `return_hits = false` — must
+  // be accepted, matching `IndexReader::search()`.
+  let request = serde_json::json!({
+    "query": "hello",
+    "limit": WASM_MAX_PAGE_SIZE + 1,
+    "from": WASM_MAX_PAGE_SIZE + 1,
+    "return_hits": false,
+  });
+  idx
+    .search_request(request.to_string())
+    .expect("oversized limit/from must be allowed when return_hits=false");
 }
