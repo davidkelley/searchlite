@@ -338,8 +338,8 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "top_hits" },
-        "size": { "type": "integer", "minimum": 0 },
-        "from": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Per-segment hits to retain. Must be <= 10000; requests exceeding this limit are rejected server-side. `size + from` must also stay within the cap." },
+        "from": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Offset into the merged hit list. Must be <= 10000; requests exceeding this limit are rejected server-side. `size + from` must also stay within the cap." },
         "fields": { "type": "array", "items": { "type": "string" } },
         "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
         "highlight_field": { "type": "string" }
@@ -426,8 +426,8 @@
       "properties": {
         "type": { "const": "moving_avg" },
         "buckets_path": { "type": "string", "description": "Metric path to average." },
-        "window": { "type": "integer", "minimum": 1 },
-        "predict": { "type": "integer", "minimum": 0 },
+        "window": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "predict": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Forecast horizon in buckets. Capped server-side to bound response memory." },
         "gap_policy": { "type": "string", "enum": ["skip", "insert_zeros"] }
       }
     },

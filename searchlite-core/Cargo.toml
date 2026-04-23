@@ -1,6 +1,6 @@
 [package]
 name = "searchlite-core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
@@ -52,6 +52,7 @@ memmap2 = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }
 getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3.69"
 
 [dev-dependencies]
 rand = { workspace = true }

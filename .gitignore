@@ -1,8 +1,10 @@
 target
 /examples/**/idx
+/examples/**/node_modules/
 .tmp
 .worktrees/
 docs/plans/
 searchlite-node/node_modules/
 searchlite-node/dist/
 searchlite-node/*.node
+searchlite-node/index.d.ts

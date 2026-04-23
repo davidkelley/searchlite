@@ -1,6 +1,6 @@
 [package]
 name = "searchlite-wasm"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
@@ -38,8 +38,17 @@ web-sys = { version = "0.3.69", features = [
   "IdbTransaction",
   "IdbTransactionMode",
   "IdbObjectStore",
+  "IdbCursor",
+  "IdbCursorWithValue",
   "IdbRequest",
   "DomException",
+  "StorageManager",
+  "AbortSignal",
+  "AbortController",
+  "Worker",
+  "WorkerOptions",
+  "WorkerType",
+  "MessageEvent",
   "Event",
 ] }
 

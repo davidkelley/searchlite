@@ -83,6 +83,17 @@ impl Manifest {
   pub fn manifest_path(root: &Path) -> PathBuf {
     root.join("MANIFEST.json")
   }
+
+  /// Path for a staged manifest that has been written but not yet promoted
+  /// to the live `MANIFEST.json`.
+  ///
+  /// `Writer::commit` stages the new manifest here *before* appending the
+  /// WAL commit record (the durability fence). On a crash between the WAL
+  /// commit fence and the live manifest publish, [`Index::open`] reconciles
+  /// the two by promoting this file to `MANIFEST.json` (see BUG-018).
+  pub fn manifest_pending_path(root: &Path) -> PathBuf {
+    root.join("MANIFEST.json.pending")
+  }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -363,6 +374,62 @@ impl Schema {
       }
       if let Some(meta) = self.field_meta(name) {
         validate_field_value(&meta, value)?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Reject documents that omit any non-nullable top-level field declared in
+  /// the schema. Per `docs/schema.md`, every schema field is required unless
+  /// it is explicitly marked nullable.
+  ///
+  /// Separated from `validate_document` because round-tripping a document
+  /// through the docstore is lossy for several legitimate schema shapes
+  /// (empty arrays and fields whose values all serialize away via
+  /// `stored_nested_value`). The writer therefore invokes this check only
+  /// on user-supplied documents at the ingest boundary (`add_document` /
+  /// `add_documents_batch`). Reconstruction-based flows (`compact`,
+  /// `merge_segments`, `apply_patch`) continue to use `validate_document`
+  /// alone so they don't reject documents that were valid when ingested.
+  ///
+  /// Vector fields do not carry a nullability marker in the current schema
+  /// model and are treated as implicitly optional by `collect_vector_value`,
+  /// so they are excluded from this presence check by design.
+  pub fn check_required_fields_present(
+    &self,
+    doc: &crate::api::types::Document,
+  ) -> anyhow::Result<()> {
+    let doc_id_name = self.doc_id_field();
+    for f in self.text_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.keyword_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.numeric_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
+      }
+    }
+    for f in self.nested_fields.iter() {
+      if f.nullable || f.name == doc_id_name {
+        continue;
+      }
+      if !doc.fields.contains_key(&f.name) {
+        anyhow::bail!("missing required field `{}`", f.name);
       }
     }
     Ok(())
@@ -720,6 +787,421 @@ mod tests {
     let err = schema.validate_document(&bad_type).unwrap_err();
     assert!(err.to_string().contains("must be a number"));
   }
+
+  #[test]
+  fn nested_keyword_rejects_non_string_array_elements() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "tags".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "value".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    // Array of numbers must be rejected for a keyword field.
+    let bad_numbers = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        ("tags".into(), serde_json::json!({ "value": [1, 2, 3] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&bad_numbers).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of strings")),
+      "unexpected error chain: {messages:?}"
+    );
+    // Error message should include the fully-qualified nested path so
+    // sibling nested objects sharing property names stay distinguishable.
+    assert!(
+      messages.iter().any(|m| m.contains("tags.value")),
+      "error chain should include the fully-qualified path: {messages:?}"
+    );
+
+    // Mixed string/non-string elements must also be rejected.
+    let mixed = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        (
+          "tags".into(),
+          serde_json::json!({ "value": ["ok", 1, true] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    assert!(schema.validate_document(&mixed).is_err());
+
+    // A pure array of strings continues to be accepted.
+    let good = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d3")),
+        ("tags".into(), serde_json::json!({ "value": ["a", "b"] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema.validate_document(&good).expect("string array ok");
+  }
+
+  #[test]
+  fn nested_text_rejects_non_string_array_elements() {
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comments".into(),
+        fields: vec![NestedProperty::Text(TextField {
+          name: "body".into(),
+          analyzer: "default".into(),
+          search_analyzer: None,
+          stored: true,
+          indexed: true,
+          nullable: false,
+          search_as_you_type: None,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    let bad = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        (
+          "comments".into(),
+          serde_json::json!({ "body": [{ "x": 1 }, null] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = schema.validate_document(&bad).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of strings")),
+      "unexpected error chain: {messages:?}"
+    );
+
+    let ok = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        (
+          "comments".into(),
+          serde_json::json!({ "body": ["hello", "world"] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema.validate_document(&ok).expect("string array ok");
+  }
+
+  #[test]
+  fn nested_numeric_rejects_non_number_array_elements() {
+    fn schema_with(use_i64: bool) -> Schema {
+      Schema {
+        doc_id_field: default_doc_id_field(),
+        analyzers: Vec::new(),
+        text_fields: Vec::new(),
+        keyword_fields: Vec::new(),
+        numeric_fields: Vec::new(),
+        nested_fields: vec![NestedField {
+          name: "metrics".into(),
+          fields: vec![NestedProperty::Numeric(NumericField {
+            name: "values".into(),
+            i64: use_i64,
+            fast: false,
+            stored: false,
+            nullable: false,
+          })],
+          nullable: false,
+        }],
+        #[cfg(feature = "vectors")]
+        vector_fields: Vec::new(),
+      }
+    }
+
+    let i64_schema = schema_with(true);
+    let bad_strings = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d1")),
+        (
+          "metrics".into(),
+          serde_json::json!({ "values": ["1", "2"] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    let err = i64_schema.validate_document(&bad_strings).unwrap_err();
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    assert!(
+      messages.iter().any(|m| m.contains("array of numbers")),
+      "unexpected error chain: {messages:?}"
+    );
+
+    // i64 fields must reject floats mixed into the array.
+    let bad_floats = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d2")),
+        ("metrics".into(), serde_json::json!({ "values": [1, 2.5] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    assert!(i64_schema.validate_document(&bad_floats).is_err());
+
+    let good_ints = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d3")),
+        ("metrics".into(), serde_json::json!({ "values": [1, 2, 3] })),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    i64_schema
+      .validate_document(&good_ints)
+      .expect("integer array ok");
+
+    // f64 fields accept integers and floats but still reject strings.
+    let f64_schema = schema_with(false);
+    let good_floats = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("d4")),
+        (
+          "metrics".into(),
+          serde_json::json!({ "values": [1, 2.5, 3] }),
+        ),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    f64_schema
+      .validate_document(&good_floats)
+      .expect("number array ok");
+    assert!(f64_schema.validate_document(&bad_strings).is_err());
+  }
+
+  #[test]
+  fn check_required_fields_present_rejects_missing_non_nullable_top_level_fields() {
+    // Regression for BUG-224: a user-submitted document that omits a
+    // declared-required top-level field must be rejected at the ingest
+    // boundary, mirroring the nested-field behaviour. This check lives in
+    // `check_required_fields_present` (invoked by `add_document` /
+    // `add_documents_batch`), not `validate_document`, so that rewrite
+    // flows that re-validate reconstructed documents do not false-fail.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "tag".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: false,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: false,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+
+    for missing in ["body", "tag", "price"] {
+      let mut fields: std::collections::BTreeMap<String, serde_json::Value> = [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect();
+      fields.remove(missing);
+      let doc = crate::api::types::Document { fields };
+      let err = schema
+        .check_required_fields_present(&doc)
+        .expect_err("validation must reject missing required field");
+      let msg = err.to_string();
+      assert!(
+        msg.contains(&format!("missing required field `{missing}`")),
+        "unexpected error for missing field `{missing}`: {msg}"
+      );
+    }
+
+    // Complete document passes both checks.
+    let complete = crate::api::types::Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-ok")),
+        ("body".into(), serde_json::json!("hello")),
+        ("tag".into(), serde_json::json!("gadget")),
+        ("price".into(), serde_json::json!(10)),
+      ]
+      .into_iter()
+      .collect(),
+    };
+    schema
+      .validate_document(&complete)
+      .expect("complete document passes validation");
+    schema
+      .check_required_fields_present(&complete)
+      .expect("complete document passes required-fields check");
+  }
+
+  #[test]
+  fn check_required_fields_present_allows_missing_nullable_top_level_fields() {
+    // Complements the regression test above: nullable fields must still be
+    // allowed to be omitted entirely at ingest.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "subtitle".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: true,
+        search_as_you_type: None,
+      }],
+      keyword_fields: vec![KeywordField {
+        name: "brand".into(),
+        stored: true,
+        indexed: true,
+        fast: false,
+        nullable: true,
+      }],
+      numeric_fields: vec![NumericField {
+        name: "sale_price".into(),
+        i64: true,
+        fast: false,
+        stored: false,
+        nullable: true,
+      }],
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("only-id"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .check_required_fields_present(&doc)
+      .expect("nullable-only schema permits omission");
+  }
+
+  #[test]
+  fn validate_document_does_not_enforce_required_presence() {
+    // BUG-224 split: `validate_document` must stay permissive about
+    // missing top-level fields because rewrite flows (`compact`,
+    // `merge_segments`, `apply_patch`) re-validate documents
+    // reconstructed from the docstore, and round-tripping is lossy for
+    // several legitimate schema shapes (empty arrays, nested containers
+    // whose stored children serialize away). The presence check lives
+    // in `check_required_fields_present` and is invoked only on
+    // user-supplied documents at the ingest boundary.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: vec![TextField {
+        name: "body".into(),
+        analyzer: "default".into(),
+        search_analyzer: None,
+        stored: true,
+        indexed: true,
+        nullable: false,
+        search_as_you_type: None,
+      }],
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: Vec::new(),
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let reconstructed = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    schema
+      .validate_document(&reconstructed)
+      .expect("validate_document must not enforce required-field presence");
+  }
+
+  #[test]
+  fn check_required_fields_present_requires_nested_top_level_container() {
+    // A non-nullable nested container itself must be present at ingest,
+    // not just its sub-fields. Complements the existing nested sub-field
+    // check performed by `NestedField::validate` when the container is
+    // present.
+    let schema = Schema {
+      doc_id_field: default_doc_id_field(),
+      analyzers: Vec::new(),
+      text_fields: Vec::new(),
+      keyword_fields: Vec::new(),
+      numeric_fields: Vec::new(),
+      nested_fields: vec![NestedField {
+        name: "comment".into(),
+        fields: vec![NestedProperty::Keyword(KeywordField {
+          name: "author".into(),
+          stored: true,
+          indexed: true,
+          fast: false,
+          nullable: false,
+        })],
+        nullable: false,
+      }],
+      #[cfg(feature = "vectors")]
+      vector_fields: Vec::new(),
+    };
+    let doc = crate::api::types::Document {
+      fields: [("_id".into(), serde_json::json!("c1"))]
+        .into_iter()
+        .collect(),
+    };
+    let err = schema
+      .check_required_fields_present(&doc)
+      .expect_err("missing nested container must error at ingest");
+    assert!(
+      err.to_string().contains("missing required field `comment`"),
+      "unexpected error: {err}"
+    );
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,9 +1363,9 @@ impl NestedField {
       serde_json::Value::Object(map) => {
         for (k, v) in map.iter() {
           let Some(prop) = self.fields.iter().find(|p| p.name() == k) else {
-            return Err(anyhow!("unknown nested field {k}"));
+            return Err(anyhow!("unknown nested field {}.{}", self.name, k));
           };
-          prop.validate_value(k, v)?;
+          prop.validate_value(&format!("{}.{}", self.name, k), v)?;
         }
         for prop in self.fields.iter() {
           if map.contains_key(prop.name()) {
@@ -956,8 +1438,10 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_string() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be string or array"));
+        if !is_string_or_string_array(v) {
+          return Err(anyhow!(
+            "nested field {key} must be a string or array of strings"
+          ));
         }
         Ok(())
       }
@@ -968,8 +1452,10 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_string() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be string or array"));
+        if !is_string_or_string_array(v) {
+          return Err(anyhow!(
+            "nested field {key} must be a string or array of strings"
+          ));
         }
         Ok(())
       }
@@ -980,8 +1466,15 @@ impl NestedProperty {
           }
           return Err(anyhow!("nested field {key} cannot be null"));
         }
-        if !(v.is_number() || v.is_array()) {
-          return Err(anyhow!("nested field {key} must be number or array"));
+        let ok = if f.i64 {
+          is_i64_or_array(v)
+        } else {
+          is_f64_or_array(v)
+        };
+        if !ok {
+          return Err(anyhow!(
+            "nested field {key} must be a number or array of numbers"
+          ));
         }
         Ok(())
       }

@@ -25,7 +25,7 @@ paths:
       summary: List configured indexes and aliases
       responses:
         "200":
-          description: Names and on-disk paths for mounted indexes
+          description: Names and runtime metadata for mounted indexes
           content:
             application/json:
               schema:
@@ -449,8 +449,6 @@ components:
       properties:
         name:
           type: string
-        path:
-          type: string
         exists:
           type: boolean
         committed_at:
@@ -471,7 +469,6 @@ components:
       required:
         [
           name,
-          path,
           exists,
           auto_commit_secs,
           auto_refresh_secs,
@@ -744,11 +741,9 @@ components:
           type: string
         index_uuid:
           type: string
-        index_path:
-          type: string
         index_name:
           type: string
-      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_path, index_name]
+      required: [documents, deleted_documents, segments, committed_at, index_uuid, index_name]
     SearchResult:
       type: object
       properties:

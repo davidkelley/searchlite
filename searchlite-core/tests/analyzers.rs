@@ -122,6 +122,65 @@ fn search_analyzer_expands_synonyms() {
 }
 
 #[test]
+fn multi_token_synonym_preserves_phrase_matching() {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("idx");
+  let schema = Schema {
+    doc_id_field: "_id".into(),
+    analyzers: vec![AnalyzerDef {
+      name: "synonyms".into(),
+      tokenizer: "default".into(),
+      filters: vec![TokenFilterDef::Synonyms(vec![SynonymRule {
+        from: vec!["new".into(), "york".into()],
+        to: vec!["nyc".into()],
+      }])],
+    }],
+    text_fields: vec![TextField {
+      name: "body".into(),
+      analyzer: "synonyms".into(),
+      search_analyzer: Some("default".into()),
+      stored: true,
+      indexed: true,
+      nullable: false,
+      search_as_you_type: None,
+    }],
+    keyword_fields: Vec::new(),
+    numeric_fields: Vec::new(),
+    nested_fields: Vec::new(),
+    #[cfg(feature = "vectors")]
+    vector_fields: Vec::new(),
+  };
+  let idx = Index::create(&path, schema, opts(&path)).unwrap();
+  let mut writer = idx.writer().unwrap();
+  let docs = vec![
+    Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-1")),
+        ("body".into(), serde_json::json!("hello new york subway")),
+      ]
+      .into_iter()
+      .collect(),
+    },
+    Document {
+      fields: [
+        ("_id".into(), serde_json::json!("doc-2")),
+        ("body".into(), serde_json::json!("boston metro")),
+      ]
+      .into_iter()
+      .collect(),
+    },
+  ];
+  for doc in docs {
+    writer.add_document(&doc).unwrap();
+  }
+  writer.commit().unwrap();
+  let reader = idx.reader().unwrap();
+  let resp = reader.search(&request("\"hello nyc\"")).unwrap();
+  let got = ids(&resp);
+  assert_eq!(got, vec!["doc-1".to_string()]);
+}
+
+#[test]
 fn edge_ngram_index_analyzer_supports_prefix_queries() {
   let dir = tempfile::tempdir().unwrap();
   let path = dir.path().join("idx");

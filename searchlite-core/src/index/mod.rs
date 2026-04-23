@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 
+use crate::api::errors::WriteKeyError;
 use crate::api::types::{Document, IndexOptions, StorageType};
 use crate::index::directory::ensure_root;
 use crate::index::manifest::{Manifest, Schema};
@@ -39,6 +41,10 @@ pub(crate) struct InnerIndex {
   pub manifest: RwLock<Manifest>,
   pub writer_lock: Mutex<()>,
   pub storage: Arc<dyn Storage>,
+  /// Monotonic count of successful `Index::reader()` calls. Exposed via
+  /// `Index::reader_open_count` so pooling/caching layers can be regression-
+  /// tested without relying on wall-clock heuristics.
+  pub(crate) reader_opens: AtomicUsize,
 }
 
 impl Index {
@@ -96,6 +102,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
   }
@@ -108,6 +115,10 @@ impl Index {
   pub fn open_with_storage(opts: IndexOptions, storage: Arc<dyn Storage>) -> Result<Self> {
     ensure_root(storage.as_ref(), &opts.path)?;
     let manifest_path = Manifest::manifest_path(&opts.path);
+    // BUG-018 recovery: if a previous `Writer::commit` crashed between the
+    // WAL commit fence and the live manifest publish, finish promoting the
+    // staged manifest now (or discard it if the WAL never crossed the fence).
+    reconcile_pending_manifest(storage.as_ref(), &opts.path, &manifest_path)?;
     let manifest = if storage.exists(&manifest_path) {
       Manifest::load(storage.as_ref(), &manifest_path)?
     } else if opts.create_if_missing {
@@ -124,6 +135,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
   }
@@ -140,7 +152,19 @@ impl Index {
   }
 
   pub fn reader(&self) -> Result<crate::api::reader::IndexReader> {
-    crate::api::reader::IndexReader::open(self.inner.clone())
+    let reader = crate::api::reader::IndexReader::open(self.inner.clone())?;
+    self.inner.reader_opens.fetch_add(1, Ordering::Relaxed);
+    Ok(reader)
+  }
+
+  /// Number of successful `reader()` calls issued against this `Index`.
+  ///
+  /// Exposed as an observability hook so reader-reuse behavior (e.g. the
+  /// bounded pool in HTTP `multi_search`) can be exercised in regression
+  /// tests without relying on timing or log parsing.
+  #[doc(hidden)]
+  pub fn reader_open_count(&self) -> usize {
+    self.inner.reader_opens.load(Ordering::Relaxed)
   }
 
   pub fn compact(&self) -> Result<()> {
@@ -182,14 +206,14 @@ impl Index {
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for compaction"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest_snapshot.write_key.as_ref() {
           crate::util::write_key::verify_write_key(key, meta)?;
         }
         let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
         for seg_binding in seg_bindings.iter() {
           if !crate::util::write_key::verify_binding(seg_binding, &binding) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         write_binding = Some(binding);
@@ -197,7 +221,7 @@ impl Index {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
     if manifest_snapshot.segments.len() <= 1 {
@@ -272,17 +296,28 @@ impl Index {
       .iter()
       .filter(|s| merge_set.contains(s.id.as_str()))
       .collect();
-    if merge_metas.len() < 2 {
-      // Nothing useful to merge.
-      return Ok(());
-    }
-    // Verify all unique requested segment IDs exist.
+    // Verify all unique requested segment IDs exist before deciding there is
+    // nothing to merge, so typo'd or half-committed IDs surface as errors
+    // rather than being silently swallowed by the `< 2` early return below.
     if merge_metas.len() != merge_set.len() {
+      let found: std::collections::HashSet<&str> =
+        merge_metas.iter().map(|s| s.id.as_str()).collect();
+      let mut missing: Vec<&str> = merge_set
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect();
+      missing.sort_unstable();
       bail!(
-        "some segment IDs not found in manifest (requested {}, found {})",
+        "some segment IDs not found in manifest: {:?} (requested {}, found {})",
+        missing,
         merge_set.len(),
         merge_metas.len()
       );
+    }
+    if merge_metas.len() < 2 {
+      // Nothing useful to merge.
+      return Ok(());
     }
 
     // Handle write-key bindings.
@@ -315,14 +350,14 @@ impl Index {
     if manifest_snapshot.write_key.is_some() || !seg_bindings.is_empty() {
       #[cfg(feature = "write-key")]
       {
-        let key = write_key.ok_or_else(|| anyhow!("write key required for merge"))?;
+        let key = write_key.ok_or(WriteKeyError::Required)?;
         if let Some(meta) = manifest_snapshot.write_key.as_ref() {
           crate::util::write_key::verify_write_key(key, meta)?;
         }
         let binding = crate::util::write_key::binding_for_uuid(key, &manifest_snapshot.uuid);
         for seg_binding in seg_bindings.iter() {
           if !crate::util::write_key::verify_binding(seg_binding, &binding) {
-            bail!("write key does not match segment binding; index may be tampered");
+            return Err(WriteKeyError::Mismatch("segment binding; index may be tampered").into());
           }
         }
         write_binding = Some(binding);
@@ -330,7 +365,7 @@ impl Index {
       #[cfg(not(feature = "write-key"))]
       {
         let _ = write_key;
-        crate::util::write_key::require_write_key_feature()?;
+        return Err(WriteKeyError::FeatureDisabled.into());
       }
     }
 
@@ -435,6 +470,51 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
   }
 }
 
+/// Reconcile a `MANIFEST.json.pending` left behind by a crashed `Writer::commit`.
+///
+/// The commit pipeline writes the staged manifest to `MANIFEST.json.pending`
+/// *before* appending the WAL commit record (the durability fence), then
+/// promotes the staging file to `MANIFEST.json` once the fence has been crossed.
+/// A crash between those steps therefore leaves one of two recoverable states:
+///
+/// * **WAL contains at least one `Commit` record** — the batch was durably
+///   committed but the live manifest publish (or the cleanup that follows
+///   it) did not complete. The staged file is the authoritative manifest for
+///   that batch and we promote it now so the next reader/writer sees a
+///   consistent index. Uncommitted entries appended *after* the durable
+///   `Commit` (e.g. an `AddDoc` written before the crash) do not invalidate
+///   this — `last_pending_ops` correctly replays only post-commit entries.
+///
+/// * **No `Commit` record in WAL** — the WAL never crossed the durability
+///   fence, so the staged manifest belongs to a batch that was effectively
+///   rolled back. The pending entries still in the WAL will replay through
+///   the next commit; we discard the staging file.
+///
+/// In either case the staging file is removed before we return, so subsequent
+/// opens see a clean slate. This is the BUG-018 reconciler.
+fn reconcile_pending_manifest(
+  storage: &dyn Storage,
+  root: &Path,
+  manifest_path: &Path,
+) -> Result<()> {
+  let pending_path = Manifest::manifest_pending_path(root);
+  if !storage.exists(&pending_path) {
+    return Ok(());
+  }
+  let wal_path = directory::wal_path(root);
+  if Wal::contains_commit(storage, &wal_path)? {
+    let pending_data = storage
+      .read_to_end(&pending_path)
+      .with_context(|| format!("reading staged manifest at {pending_path:?}"))?;
+    storage
+      .atomic_write(manifest_path, &pending_data)
+      .with_context(|| format!("promoting staged manifest to {manifest_path:?}"))?;
+  }
+  // Best-effort cleanup of the staging file in either branch.
+  let _ = storage.remove(&pending_path);
+  Ok(())
+}
+
 pub(crate) fn cleanup_segments(
   storage: &dyn Storage,
   segments: &[crate::index::manifest::SegmentMeta],
@@ -487,6 +567,80 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
+  }
+
+  #[test]
+  fn reconcile_pending_manifest_promotes_when_wal_has_commit() {
+    // BUG-018: a `.pending` manifest paired with a trailing WAL `Commit`
+    // marker means the prior commit crossed the durability fence but the
+    // live `MANIFEST.json` was never published. Recovery must copy the
+    // staged content over and clean up the staging file.
+    let dir = tempdir().unwrap();
+    let storage: Arc<dyn Storage> =
+      Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    ensure_root(storage.as_ref(), dir.path()).unwrap();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    let live = Manifest::new(Schema::default_text_body());
+    live.store(storage.as_ref(), &manifest_path).unwrap();
+    let mut staged = live.clone();
+    staged.committed_at = "2099-01-01T00:00:00+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+
+    // Simulate "WAL crossed the fence": append a commit marker.
+    {
+      let mut wal = Wal::open(storage.clone(), &directory::wal_path(dir.path())).unwrap();
+      wal.append_commit().unwrap();
+    }
+
+    super::reconcile_pending_manifest(storage.as_ref(), dir.path(), &manifest_path).unwrap();
+
+    let promoted = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    assert_eq!(
+      promoted.committed_at, "2099-01-01T00:00:00+00:00",
+      "the staged manifest should have been promoted to MANIFEST.json",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the staging file must be removed after promotion",
+    );
+  }
+
+  #[test]
+  fn reconcile_pending_manifest_discards_when_wal_has_no_trailing_commit() {
+    // BUG-018: a `.pending` manifest with no trailing WAL `Commit`
+    // corresponds to a commit that never reached the durability fence —
+    // its pending ops will be replayed via the WAL, so the staged file
+    // is stale and must be discarded without touching the live manifest.
+    let dir = tempdir().unwrap();
+    let storage: Arc<dyn Storage> =
+      Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    ensure_root(storage.as_ref(), dir.path()).unwrap();
+    let manifest_path = Manifest::manifest_path(dir.path());
+    let pending_path = Manifest::manifest_pending_path(dir.path());
+
+    let live = Manifest::new(Schema::default_text_body());
+    live.store(storage.as_ref(), &manifest_path).unwrap();
+    let original_committed_at = live.committed_at.clone();
+    let mut staged = live.clone();
+    staged.committed_at = "2099-01-01T00:00:00+00:00".into();
+    let staged_bytes = serde_json::to_vec_pretty(&staged).unwrap();
+    storage.atomic_write(&pending_path, &staged_bytes).unwrap();
+
+    // No WAL written → no trailing commit.
+    super::reconcile_pending_manifest(storage.as_ref(), dir.path(), &manifest_path).unwrap();
+
+    let live_after = Manifest::load(storage.as_ref(), &manifest_path).unwrap();
+    assert_eq!(
+      live_after.committed_at, original_committed_at,
+      "the live manifest must be untouched when the WAL did not cross the fence",
+    );
+    assert!(
+      !storage.exists(&pending_path),
+      "the orphan staging file must be removed even when not promoted",
+    );
   }
 
   #[test]
@@ -560,9 +714,12 @@ mod tests {
       let mut writer = idx.writer_with_key(Some(key)).unwrap();
       writer
         .add_document(&Document {
-          fields: [("_id".into(), serde_json::json!("1"))]
-            .into_iter()
-            .collect(),
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("hello")),
+          ]
+          .into_iter()
+          .collect(),
         })
         .unwrap();
       writer.commit().unwrap();
@@ -732,6 +889,62 @@ mod tests {
         result.total_hits_estimate
       );
     }
+  }
+
+  #[test]
+  fn merge_segments_errors_when_any_id_missing() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Create two real segments so the manifest has something to look up.
+    for (i, word) in ["alpha", "bravo"].iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 2);
+    let real_id = idx.manifest().segments[0].id.clone();
+
+    // Requesting a merge of one real segment and one typo'd ID must fail
+    // rather than silently returning Ok. Before BUG-028 was fixed, the
+    // `merge_metas.len() < 2` early return masked the missing ID.
+    let err = idx
+      .merge_segments(&[real_id.clone(), "does-not-exist".into()], None)
+      .expect_err("expected merge_segments to error on unknown segment id");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("does-not-exist"),
+      "error should name the missing segment: {msg}"
+    );
+
+    // A request that names only missing IDs should also error (previously
+    // silent-Ok because the filtered set had fewer than two entries).
+    let err = idx
+      .merge_segments(&["missing-a".into(), "missing-b".into()], None)
+      .expect_err("expected merge_segments to error when all ids missing");
+    let msg = err.to_string();
+    assert!(
+      msg.contains("missing-a") && msg.contains("missing-b"),
+      "error should name both missing segments: {msg}"
+    );
+
+    // Sanity check: the no-op paths we intentionally keep still succeed.
+    idx.merge_segments(&[], None).unwrap(); // empty input
+    idx
+      .merge_segments(std::slice::from_ref(&real_id), None)
+      .unwrap(); // single real id
+                 // The manifest must be unchanged by the no-op / error cases.
+    assert_eq!(idx.manifest().segments.len(), 2);
   }
 
   #[test]

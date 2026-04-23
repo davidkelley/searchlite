@@ -256,6 +256,41 @@ impl TermState {
     }
     self.idx.saturating_sub(prev)
   }
+
+  /// Skip forward through blocks whose per-block max-tf score contribution
+  /// is below `min_contribution`. Stops at the first block whose upper bound
+  /// meets the threshold, or at the end of the postings list.
+  ///
+  /// This is the BMW (Block-Max WAND) optimisation described in BUG-005:
+  /// during the advancement phase, blocks whose max-tf cannot contribute
+  /// enough to push a candidate past the heap threshold are skipped entirely,
+  /// avoiding unnecessary `advance_to` work within those blocks.
+  fn skip_blocks_below_bound(&mut self, min_contribution: f32) -> usize {
+    if min_contribution <= 0.0 {
+      return 0;
+    }
+    let prev = self.idx;
+    let mut block_idx = self.block_index();
+    while block_idx < self.block_meta.tfs.len() {
+      let tf = self.block_meta.tfs[block_idx];
+      let bound = score_tf(
+        tf,
+        self.df,
+        self.min_doc_len,
+        self.avgdl,
+        self.docs,
+        self.k1,
+        self.b,
+        self.weight,
+      );
+      if bound >= min_contribution {
+        break;
+      }
+      block_idx += 1;
+      self.idx = (block_idx * self.block_meta.block_size).min(self.postings.len());
+    }
+    self.idx.saturating_sub(prev)
+  }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +543,14 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         };
         score = adjusted;
       }
+      // BUG-381: drop documents whose BM25 score is non-finite (typically
+      // +inf from an accumulated boost product overflowing `f32::MAX`).
+      // Without this guard the pure-BM25 path has no filter analogous to
+      // `evaluate_compiled_score`, so a non-finite score reaches the heap
+      // and serialises as an invalid JSON number, returning HTTP 500.
+      if !score.is_finite() {
+        continue;
+      }
       if !accept(doc_id, score) {
         continue;
       }
@@ -550,6 +593,13 @@ fn brute_force<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         continue;
       };
       score = adjusted;
+    }
+    // BUG-381: see the plan-driven branch above. `score_tf` returns
+    // `bm25 * weight`; when accumulated boosts push `weight` past
+    // `f32::MAX` the result is `+inf` and leaks into the heap unless we
+    // drop it here.
+    if !score.is_finite() {
+      continue;
     }
     if !accept(doc_id, score) {
       continue;
@@ -725,12 +775,19 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         term.upper_bound()
       };
 
-      if bound.is_finite() {
-        acc += bound;
-        if acc >= pivot_threshold {
-          pivot_idx = Some(i);
-          break;
-        }
+      // Skip NaN bounds only: NaN arithmetic poisons the accumulator and
+      // `NaN >= threshold` is always false, so the term could never trigger
+      // the pivot. Positive infinity, on the other hand, is a valid (if
+      // loose) upper bound — it should immediately satisfy any finite
+      // threshold and set the pivot, otherwise the WAND loop can terminate
+      // early and silently drop documents whose global ub overflowed.
+      if bound.is_nan() {
+        continue;
+      }
+      acc += bound;
+      if acc >= pivot_threshold {
+        pivot_idx = Some(i);
+        break;
       }
     }
 
@@ -800,7 +857,15 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         adj(doc_id, score, leaves_slice)
       } else {
         Some(score)
-      };
+      }
+      // BUG-381: a term's `weight` multiplies into `score_tf` on every
+      // contribution, so accumulated query-boost products overflowing
+      // `f32::MAX` turn `score_sum` into `+inf`. `evaluate_compiled_score`
+      // already drops non-finite scores via `score_adjust`, but the plain
+      // BM25 path has no such hook — filter here so non-finite scores
+      // cannot reach the heap (they serialise as invalid JSON and return
+      // HTTP 500 to the client).
+      .filter(|s| s.is_finite());
 
       if let (Some(buf), Some(flags)) = (leaf_scores.as_mut(), touched_flags.as_mut()) {
         for idx in touched.drain(..) {
@@ -827,16 +892,42 @@ fn wand_loop<F: FnMut(DocId, f32) -> bool, C: DocCollector + ?Sized>(
         }
       }
     } else {
-      // Pivot > Smallest. Advance terms < pivot to pivot_doc
-      for term in queue[0..p_idx].iter_mut() {
-        if use_block_bounds {
+      // Pivot > Smallest. Advance terms < pivot to pivot_doc.
+      //
+      // BMW optimisation (BUG-005): when we have a full top-k heap and
+      // block-level bounds are available, skip blocks whose per-block
+      // max-tf score cannot contribute enough to push a candidate past
+      // the heap threshold. For each term being advanced, the minimum
+      // contribution needed from this term is:
+      //   min_needed = heap_threshold - Σ UB_global(other terms)
+      // because the global upper bound of every other term is an upper
+      // bound on what those terms could contribute at any doc_id.
+      if use_block_bounds && rank_hits && heap.len() >= k {
+        let total_ub: f32 = queue.iter().map(|t| t.upper_bound()).sum();
+        for term in queue[0..p_idx].iter_mut() {
+          let other_ub = total_ub - term.upper_bound();
+          let min_needed = (heap_threshold - other_ub).max(0.0);
+          let moved = term.skip_blocks_below_bound(min_needed);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
           let moved = term.skip_to_block(pivot_doc);
           with_stats(&mut stats, |s| s.postings_advanced += moved);
+          let moved = term.advance_to(pivot_doc);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
+          if term.is_done() {
+            prune_done = true;
+          }
         }
-        let moved = term.advance_to(pivot_doc);
-        with_stats(&mut stats, |s| s.postings_advanced += moved);
-        if term.is_done() {
-          prune_done = true;
+      } else {
+        for term in queue[0..p_idx].iter_mut() {
+          if use_block_bounds {
+            let moved = term.skip_to_block(pivot_doc);
+            with_stats(&mut stats, |s| s.postings_advanced += moved);
+          }
+          let moved = term.advance_to(pivot_doc);
+          with_stats(&mut stats, |s| s.postings_advanced += moved);
+          if term.is_done() {
+            prune_done = true;
+          }
         }
       }
       // Reposition only the advanced prefix.
@@ -995,5 +1086,779 @@ mod tests {
     let mut ids: Vec<DocId> = collector.docs.iter().map(|(id, _)| *id).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
+  }
+
+  /// Helper that builds a ScoredTerm with a specific block size so the caller
+  /// can control per-block tf upper bounds in tests.
+  fn term_from_entries_with_block_size(entries: &[PostingEntry], block_size: usize) -> ScoredTerm {
+    let reader = PostingsReader::from_entries_for_test(entries.to_vec(), block_size);
+    let max_doc = entries.iter().map(|e| e.doc_id).max().unwrap_or(0) as usize;
+    let doc_lengths = Arc::new(vec![10.0; max_doc.saturating_add(1)]);
+    ScoredTerm {
+      postings: reader,
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(doc_lengths),
+      min_doc_len: Some(10.0),
+    }
+  }
+
+  #[test]
+  fn bmw_produces_same_top_k_as_wand() {
+    // Two terms with overlapping postings; verify BMW and WAND return
+    // identical top-k results (correctness invariant).
+    let term1 = term_from_entries(&[
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 3,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 5,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 8,
+        term_freq: 2,
+        positions: smallvec![],
+      },
+    ]);
+    let term2 = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 4,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 7,
+        term_freq: 6,
+        positions: smallvec![],
+      },
+    ]);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let wand = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![term1.clone(), term2.clone()],
+      3,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+    let bmw = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![term1, term2],
+      3,
+      ExecutionStrategy::Bmw,
+      None,
+      &mut accept,
+      None,
+    );
+    assert_eq!(
+      wand.len(),
+      bmw.len(),
+      "WAND and BMW should return same count"
+    );
+    for (w, b) in wand.iter().zip(bmw.iter()) {
+      assert_eq!(w.doc_id, b.doc_id, "doc_id mismatch");
+      assert!(
+        (w.score - b.score).abs() < 1e-6,
+        "score mismatch: wand={} bmw={}",
+        w.score,
+        b.score
+      );
+    }
+  }
+
+  #[test]
+  fn bmw_block_tf_skipping_exercises_advancement_path() {
+    // Regression test for BUG-005: exercises the `pivot_doc > smallest_doc`
+    // advancement branch where `skip_blocks_below_bound` is called.
+    //
+    // Layout (block_size = 4):
+    //
+    //   anchor: 8 entries at doc_ids [0..4, 40..44], all tf=20
+    //     block 0 (entries 0-3): docs [0,1,2,3],     max_tf=20
+    //     block 1 (entries 4-7): docs [40,41,42,43],  max_tf=20
+    //
+    //   spread: 44 entries at doc_ids [0..4] tf=20, [4..40] tf=1, [40..44] tf=20
+    //     block 0  (entries 0-3):   docs [0,1,2,3],     max_tf=20
+    //     block 1  (entries 4-7):   docs [4,5,6,7],     max_tf=1   ← skippable
+    //     block 2  (entries 8-11):  docs [8,9,10,11],   max_tf=1   ← skippable
+    //     ...
+    //     block 9  (entries 36-39): docs [36,37,38,39], max_tf=1   ← skippable
+    //     block 10 (entries 40-43): docs [40,41,42,43], max_tf=20
+    //
+    // Phase 1 (docs 0-3): both terms score together (tf=20 each).
+    //   The top-k heap fills with high combined scores (k=3).
+    //
+    // Phase 2: anchor jumps to doc 40. spread is at doc 4.
+    //   Queue: [spread(4), anchor(40)]
+    //   Pivot scan accumulates spread.block_ub(tf=1) + anchor.block_ub(tf=20).
+    //   pivot_doc = 40 > smallest_doc = 4 → advancement branch entered.
+    //   spread must advance from doc 4 to doc 40 through 9 blocks of tf=1.
+    //   skip_blocks_below_bound skips those low-tf blocks.
+    let block_size = 4;
+
+    // anchor: high-tf entries at low and high doc_ids with a gap.
+    let mut anchor_entries = Vec::new();
+    for doc_id in 0..4 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 40..44 {
+      anchor_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    let anchor = term_from_entries_with_block_size(&anchor_entries, block_size);
+
+    // spread: overlaps anchor at both ends, with many low-tf entries in between.
+    let mut spread_entries = Vec::new();
+    for doc_id in 0..4 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 4..40 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 1,
+        positions: smallvec![],
+      });
+    }
+    for doc_id in 40..44 {
+      spread_entries.push(PostingEntry {
+        doc_id,
+        term_freq: 20,
+        positions: smallvec![],
+      });
+    }
+    let spread = term_from_entries_with_block_size(&spread_entries, block_size);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+
+    // Run with plain WAND (no block-tf skipping)
+    let mut wand_stats = QueryStats::default();
+    let wand_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor.clone(), spread.clone()],
+      3,
+      ExecutionStrategy::Wand,
+      Some(block_size),
+      &mut accept,
+      None,
+      Some(&mut wand_stats),
+    );
+
+    // Run with BMW (block-tf skipping active)
+    let mut bmw_stats = QueryStats::default();
+    let bmw_results = execute_top_k_with_stats::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, spread],
+      3,
+      ExecutionStrategy::Bmw,
+      Some(block_size),
+      &mut accept,
+      None,
+      Some(&mut bmw_stats),
+    );
+
+    // Results must be identical (correctness).
+    assert_eq!(
+      wand_results.len(),
+      bmw_results.len(),
+      "WAND and BMW should return same number of results"
+    );
+    for (w, b) in wand_results.iter().zip(bmw_results.iter()) {
+      assert_eq!(w.doc_id, b.doc_id, "doc_id mismatch");
+      assert!(
+        (w.score - b.score).abs() < 1e-6,
+        "score mismatch at doc {}: wand={} bmw={}",
+        w.doc_id,
+        w.score,
+        b.score
+      );
+    }
+
+    // BMW should advance strictly fewer postings than plain WAND because
+    // spread's low-tf blocks (doc_ids 4-39) are skipped in the advancement
+    // phase rather than walked entry-by-entry.
+    assert!(
+      bmw_stats.postings_advanced < wand_stats.postings_advanced,
+      "BMW should advance strictly fewer postings than WAND: bmw={} wand={}",
+      bmw_stats.postings_advanced,
+      wand_stats.postings_advanced
+    );
+  }
+
+  #[test]
+  fn skip_blocks_below_bound_skips_low_tf_blocks() {
+    // Directly test the skip_blocks_below_bound method on a TermState
+    // with known block-level tf values.
+    let block_size = 2;
+    // 3 blocks: block 0 (tf=1), block 1 (tf=1), block 2 (tf=10)
+    let entries = vec![
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 3,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 4,
+        term_freq: 10,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 5,
+        term_freq: 10,
+        positions: smallvec![],
+      },
+    ];
+    let term = ScoredTerm {
+      postings: PostingsReader::from_entries_for_test(entries, block_size),
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 6])),
+      min_doc_len: Some(10.0),
+    };
+    let mut state = TermState::new(term, block_size);
+
+    // Compute the score bound for tf=1 (low blocks) and tf=10 (high block)
+    let low_bound = score_tf(1.0, 6.0, 10.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+    let high_bound = score_tf(10.0, 6.0, 10.0, 10.0, 100.0, 1.2, 0.75, 1.0);
+
+    // Set min_contribution between low and high so low blocks are skipped
+    let threshold = (low_bound + high_bound) / 2.0;
+    assert!(
+      threshold > low_bound,
+      "threshold must exceed low block bound"
+    );
+    assert!(
+      threshold < high_bound,
+      "threshold must be below high block bound"
+    );
+
+    // Start at block 0 (idx=0). Calling skip_blocks_below_bound should skip
+    // blocks 0 and 1 (both have tf=1 < threshold) and land at block 2 (idx=4).
+    let skipped = state.skip_blocks_below_bound(threshold);
+    assert_eq!(state.idx, 4, "should advance to block 2 (idx=4)");
+    assert_eq!(skipped, 4, "should have skipped 4 postings");
+
+    // Verify the block at idx=4 has doc_id=4
+    assert_eq!(state.doc_id(), 4);
+  }
+
+  #[test]
+  fn wand_does_not_skip_term_with_infinite_upper_bound() {
+    // BUG-366: when a term's global upper bound overflows to +inf (e.g.
+    // because its weight is huge), the pivot-finding loop must not silently
+    // skip it. A +inf bound is a valid (if loose) upper bound — skipping it
+    // can prevent the accumulator from reaching the heap threshold, causing
+    // WAND to exit early and drop the term's documents.
+    //
+    // Setup: one "anchor" term with normal BM25 scores that seeds the heap
+    // with finite scores, and one "overflow" term whose single posting lies
+    // past the anchor's doc_ids and whose ub overflows f32.
+    let anchor = term_from_entries(&[
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 2,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 3,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ]);
+
+    let overflow_postings = PostingsReader::from_entries_for_test(
+      vec![PostingEntry {
+        doc_id: 100,
+        term_freq: 1,
+        positions: smallvec![],
+      }],
+      DEFAULT_BLOCK_SIZE,
+    );
+    // Craft the overflow term so that its *upper bound* is `+inf` but the
+    // per-doc runtime score at doc 100 is finite. The upper bound is
+    // computed with `min_doc_len`, so a tiny `min_doc_len` inflates the
+    // BM25 tf-norm factor (short docs score higher). The actual runtime
+    // score at doc 100 uses `doc_lengths[100] = 100.0`, 10× `avgdl`, which
+    // drops the tf-norm by ~7× and keeps `bm25 * weight` comfortably
+    // below `f32::MAX`. This separates the two concerns exercised by
+    // BUG-366 (pivot-scan admits +inf ub) and BUG-381 (finite runtime
+    // scores are not filtered out by the new finitude guard).
+    let mut overflow_doc_lengths = vec![10.0; 101];
+    overflow_doc_lengths[100] = 100.0;
+    let overflow = ScoredTerm {
+      postings: overflow_postings,
+      weight: 5.0e36,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(overflow_doc_lengths)),
+      min_doc_len: Some(1.0),
+    };
+
+    // Precondition: the overflow term's global ub really is +inf. If bm25
+    // math ever changes such that this no longer overflows, the test stops
+    // exercising the bug and we need to pick new inputs.
+    let overflow_state = TermState::new(overflow.clone(), DEFAULT_BLOCK_SIZE);
+    assert!(
+      overflow_state.upper_bound().is_infinite() && overflow_state.upper_bound().is_sign_positive(),
+      "overflow term global ub should be +inf; got {}",
+      overflow_state.upper_bound(),
+    );
+    // Precondition: the runtime score at doc 100 is finite, so the BUG-381
+    // finitude guard in wand_loop will let it through. Without this, the
+    // BUG-366 regression would accidentally exercise the BUG-381 path.
+    let runtime_score = score_tf(
+      1.0,
+      overflow_state.df,
+      overflow.doc_len(100),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      runtime_score.is_finite(),
+      "overflow term runtime score at doc 100 should be finite; got {runtime_score}",
+    );
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      2,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+
+    // doc 100's score is dominated by the overflowing weight, so it must be
+    // ranked into the top-k. Before the fix, the `is_finite()` pivot guard
+    // skipped the overflow term and doc 100 was silently dropped.
+    assert!(
+      results.iter().any(|r| r.doc_id == 100),
+      "doc 100 (overflow term) was dropped from top-k: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  // Helper: build a ScoredTerm whose per-doc BM25 score overflows `f32::MAX`
+  // to `+inf`. The setup mimics the trigger described in BUG-381: the query
+  // weight has been multiplied by a nested-boost product that pushes it to
+  // `f32::MAX`, so `bm25 * weight` is always non-finite.
+  fn overflow_scored_term(doc_ids: &[DocId]) -> ScoredTerm {
+    let entries: Vec<PostingEntry> = doc_ids
+      .iter()
+      .map(|&doc_id| PostingEntry {
+        doc_id,
+        term_freq: 1,
+        positions: smallvec![],
+      })
+      .collect();
+    let reader = PostingsReader::from_entries_for_test(entries, DEFAULT_BLOCK_SIZE);
+    let max_doc = doc_ids.iter().copied().max().unwrap_or(0) as usize;
+    let doc_lengths = Arc::new(vec![10.0; max_doc.saturating_add(1)]);
+    ScoredTerm {
+      postings: reader,
+      weight: f32::MAX,
+      avgdl: 10.0,
+      docs: 1.0e30,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(doc_lengths),
+      min_doc_len: Some(10.0),
+    }
+  }
+
+  /// Precondition probe for the BUG-381 salvage tests: assert that a freshly
+  /// constructed overflow term still produces a non-finite per-doc BM25 score
+  /// at `doc_id`. Without this, a future bm25 / `score_tf` math change that
+  /// kept `bm25 * weight` finite would leave the salvage tests passing while
+  /// no longer exercising the post-`score_adjust` ordering they're meant to
+  /// pin — they'd silently degrade into "the heap accepts a finite raw score"
+  /// tautologies. Mirrors the inline probe in
+  /// `wand_drops_doc_with_non_finite_bm25_score` so all BUG-381 fixtures
+  /// share the same fail-loud guarantee.
+  fn assert_overflow_term_score_non_finite_at(term: &ScoredTerm, doc_id: DocId) {
+    let probe_score = score_tf(
+      1.0,
+      term.postings.len() as f32,
+      term.doc_len(doc_id),
+      term.avgdl,
+      term.docs,
+      term.k1,
+      term.b,
+      term.weight,
+    );
+    assert!(
+      !probe_score.is_finite(),
+      "fixture precondition: overflow term's per-doc score at doc {doc_id} must be non-finite to exercise BUG-381 salvage; got {probe_score}",
+    );
+  }
+
+  /// BUG-381: a document whose BM25 score overflows to `+inf` must not reach
+  /// the top-k heap on the WAND path. Before the fix, `score_sum` flowed
+  /// straight from `score_tf` to `push_top_k` whenever no custom scoring
+  /// hook was active, so `Hit.score = +inf` would cause `serde_json` to
+  /// fail and the HTTP endpoint to return 500.
+  #[test]
+  fn wand_drops_doc_with_non_finite_bm25_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+
+    // Precondition: the runtime BM25 score for the overflow term really is
+    // non-finite. If bm25 math changes so this is no longer true, pick
+    // new inputs — the test is no longer exercising BUG-381.
+    let probe_score = score_tf(
+      1.0,
+      overflow.postings.len() as f32,
+      overflow.doc_len(5),
+      overflow.avgdl,
+      overflow.docs,
+      overflow.k1,
+      overflow.b,
+      overflow.weight,
+    );
+    assert!(
+      !probe_score.is_finite(),
+      "overflow term runtime score should be non-finite; got {probe_score}",
+    );
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "doc 5 (non-finite score) should have been dropped: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  /// BUG-381: BMW path has the same score-accumulation as WAND, so the
+  /// same finitude guard must apply when block-level bounds are enabled.
+  #[test]
+  fn bmw_drops_doc_with_non_finite_bm25_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k via BMW: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    assert!(
+      !results.iter().any(|r| r.doc_id == 5),
+      "doc 5 (non-finite score) should have been dropped on BMW path: {:?}",
+      results.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+    );
+  }
+
+  /// BUG-381: the brute-force path (`ExecutionStrategy::Bm25`, no score
+  /// plan) accumulates `score_tf` contributions into a hashmap and then
+  /// pushes each doc into the heap. The finitude guard must drop any doc
+  /// whose accumulated contribution is non-finite.
+  #[test]
+  fn brute_force_drops_doc_with_non_finite_bm25_score() {
+    let overflow = overflow_scored_term(&[5, 7]);
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let results = execute_top_k::<_, crate::query::collector::MatchCountingCollector>(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      &mut accept,
+      None,
+    );
+
+    assert!(
+      results.iter().all(|r| r.score.is_finite()),
+      "non-finite scores leaked into top-k via brute-force: {:?}",
+      results.iter().map(|r| r.score).collect::<Vec<_>>(),
+    );
+    let dropped_docs: Vec<DocId> = results.iter().map(|r| r.doc_id).collect();
+    assert!(
+      !dropped_docs.contains(&5) && !dropped_docs.contains(&7),
+      "overflow docs should have been dropped: {dropped_docs:?}",
+    );
+    // The finite anchor doc should still be ranked.
+    assert!(
+      dropped_docs.contains(&1),
+      "anchor doc 1 should still be ranked: {dropped_docs:?}",
+    );
+  }
+
+  /// BUG-381 salvage path: the finitude guard runs *after* `score_adjust` at
+  /// every push-into-heap site, so a custom scorer (notably `FunctionScore`
+  /// with `boost_mode=Replace`) that turns a non-finite raw BM25 into a
+  /// finite final score keeps the doc in the top-k. Pinning this with a
+  /// regression test prevents a future "drop early to skip work" refactor
+  /// from silently losing salvageable hits — matches the post-output-only
+  /// rejection policy used by `evaluate_compiled_score` (BUG-315) and the
+  /// rescore combine path (BUG-326).
+  #[test]
+  fn wand_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Wand,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "wand salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "wand dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
+    assert_eq!(
+      salvaged.score, 42.0,
+      "wand kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, BMW strategy.
+  #[test]
+  fn bmw_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bmw,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "bmw salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!(
+        "bmw dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}"
+      )
+    });
+    // Pin that the heap took the *adjusted* score (42.0), not some other
+    // finite fallback like a clamp of the raw +inf — the salvage contract is
+    // about the adjuster's output landing in the heap, not just any finite
+    // value taking its place.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "bmw kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  /// BUG-381 salvage path, brute-force plain-BM25 branch (no ScorePlan).
+  #[test]
+  fn brute_force_score_adjust_can_salvage_non_finite_raw_score() {
+    let anchor = term_from_entries(&[PostingEntry {
+      doc_id: 1,
+      term_freq: 1,
+      positions: smallvec![],
+    }]);
+    let overflow = overflow_scored_term(&[5]);
+    assert_overflow_term_score_non_finite_at(&overflow, 5);
+    let mut accept = |_doc: DocId, _score: f32| true;
+    let mut adjust: Box<ScoreAdjustFn<'_>> =
+      Box::new(|_doc: DocId, _raw: f32, _leaves: &[f32]| Some(42.0_f32));
+    let results = execute_top_k_with_stats_and_mode_internal::<
+      _,
+      crate::query::collector::MatchCountingCollector,
+    >(
+      vec![anchor, overflow],
+      10,
+      ExecutionStrategy::Bm25,
+      None,
+      None,
+      &mut accept,
+      None,
+      None,
+      ScoreMode::Score,
+      Some(&mut adjust),
+    );
+    for r in results.iter() {
+      assert!(
+        r.score.is_finite(),
+        "brute_force salvage path leaked non-finite score {}",
+        r.score,
+      );
+    }
+    let salvaged = results.iter().find(|r| r.doc_id == 5).unwrap_or_else(|| {
+      panic!("brute_force dropped overflow doc 5 even though score_adjust returned a finite value: {results:?}")
+    });
+    // Same adjusted-score pin as the BMW variant — keeps the brute-force
+    // heap insertion site honest about which value reaches `Hit.score`.
+    assert_eq!(
+      salvaged.score, 42.0,
+      "brute_force kept overflow doc 5 but did not take the adjusted score: {salvaged:?}",
+    );
+  }
+
+  #[test]
+  fn skip_blocks_below_bound_noop_when_threshold_zero() {
+    let block_size = 2;
+    let entries = vec![
+      PostingEntry {
+        doc_id: 0,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+      PostingEntry {
+        doc_id: 1,
+        term_freq: 1,
+        positions: smallvec![],
+      },
+    ];
+    let term = ScoredTerm {
+      postings: PostingsReader::from_entries_for_test(entries, block_size),
+      weight: 1.0,
+      avgdl: 10.0,
+      docs: 100.0,
+      k1: 1.2,
+      b: 0.75,
+      leaf: 0,
+      doc_lengths: Some(Arc::new(vec![10.0; 2])),
+      min_doc_len: Some(10.0),
+    };
+    let mut state = TermState::new(term, block_size);
+
+    // With threshold <= 0, nothing should be skipped
+    let skipped = state.skip_blocks_below_bound(0.0);
+    assert_eq!(skipped, 0);
+    assert_eq!(state.idx, 0);
+
+    let skipped = state.skip_blocks_below_bound(-1.0);
+    assert_eq!(skipped, 0);
+    assert_eq!(state.idx, 0);
   }
 }

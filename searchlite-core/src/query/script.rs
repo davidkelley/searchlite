@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::manifest::Schema;
-use crate::query::util::ensure_numeric_fast;
+use crate::query::util::{ensure_numeric_fast, f64_to_finite_f32};
 use crate::DocId;
 
 const MAX_SCRIPT_LENGTH: usize = 512;
@@ -142,7 +142,7 @@ impl CompiledScript {
     if !value.is_finite() {
       return None;
     }
-    Some(value as f32)
+    Some(f64_to_finite_f32(value))
   }
 }
 
@@ -251,9 +251,20 @@ fn read_number_literal(first: char, chars: &mut Peekable<Chars<'_>>) -> Result<f
   if digit_count == 0 {
     bail!("invalid number literal `{num}`");
   }
-  num
+  // `str::parse::<f64>` returns `Ok(f64::INFINITY)` for decimal strings whose
+  // magnitude exceeds `f64::MAX` (~1.8e308) instead of surfacing an error, so
+  // a 309+ digit literal would otherwise compile to `Instruction::PushConst(
+  // f64::INFINITY)` and silently drop the document at evaluate time. Reject
+  // the overflow here, matching the parse-time policy used by `params`
+  // validation below, which also rejects non-finite values, and by BUG-334 /
+  // BUG-338 / BUG-344 for sibling `str::parse::<f64>` sites.
+  let value: f64 = num
     .parse::<f64>()
-    .map_err(|_| anyhow!("invalid number literal `{num}`"))
+    .map_err(|_| anyhow!("invalid number literal `{num}`"))?;
+  if !value.is_finite() {
+    bail!("number literal `{num}` overflows to infinity");
+  }
+  Ok(value)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>> {
@@ -276,9 +287,26 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
         expect_operand = false;
       }
       '+' => {
-        tokens.push(Token::Op(Op::Add));
         chars.next();
-        expect_operand = true;
+        if expect_operand {
+          // Unary plus is a no-op. If followed by a digit or `.`, parse
+          // it as a positive number literal; otherwise skip the `+` and
+          // let the next iteration handle the operand. `expect_operand`
+          // stays true so the subsequent token is still parsed as an
+          // operand.
+          if let Some(next) = chars.peek() {
+            if next.is_ascii_digit() || *next == '.' {
+              let first = chars.next().unwrap();
+              let value = read_number_literal(first, &mut chars)?;
+              tokens.push(Token::Number(value));
+              expect_operand = false;
+              continue;
+            }
+          }
+        } else {
+          tokens.push(Token::Op(Op::Add));
+          expect_operand = true;
+        }
       }
       '-' => {
         chars.next();

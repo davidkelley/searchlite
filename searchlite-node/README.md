@@ -80,10 +80,51 @@ const index = new EmbeddedIndex('./products', {
 });
 ```
 
-> **Note:** Both shorthand (`{ name: 'text' }`) and full JSON Schema formats are accepted.
-> The shorthand is a Node.js convenience -- `expandSchema()` converts it to JSON Schema
-> internally. The JSON Schema format is the canonical representation shared across all
-> searchlite clients.
+Or, if you prefer a single schema for indexing **and** runtime validation **and** TypeScript types,
+use the Zod-native authoring path:
+
+```typescript
+import { z } from 'zod';
+import { EmbeddedIndex, sl } from 'searchlite-js';
+
+const ProductSchema = sl.index(
+  z.object({
+    id: z.string().uuid(),              // auto-promoted to keyword
+    name: z.string(),                    // text (full-text)
+    brand: sl.keyword(),                 // keyword (exact match, fast)
+    price: sl.float({ stored: true }),
+    year: sl.integer({ stored: true }),
+  }),
+  { docIdField: 'id' },
+);
+
+type Product = z.infer<typeof ProductSchema>;
+
+const index = new EmbeddedIndex<Product>('./products', { schema: ProductSchema });
+await index.add({
+  id: '550e8400-e29b-41d4-a716-446655440000',
+  name: 'Wireless Headphones',
+  brand: 'AudioCo',
+  price: 79.99,
+  year: 2024,
+});
+await index.commit();
+
+const result = await index.search('wireless');
+// result.hits[0].fields is typed as Product
+```
+
+With the Zod path:
+- `add()` / `addMany()` validate documents against the Zod schema before indexing.
+- `search()` results are validated and typed against the same schema — no need to pass it again.
+- `z.infer<typeof Schema>` gives you the document type for free.
+
+> **All three forms** (shorthand, raw JSON Schema, Zod) compile to the same internal representation and are fully interchangeable. Choose based on ergonomics:
+> - Shorthand — fastest to author for simple flat schemas
+> - Raw JSON Schema — interop with non-TS clients (sharable as a `schema.json` file)
+> - Zod — single source of truth for indexing + validation + TS types; supports nested objects and arrays natively
+>
+> See [`docs/zod-guide.md`](../docs/zod-guide.md) for the full Zod walkthrough, the type-mapping rules, and migration recipes.
 
 ### 2. Add Documents
 

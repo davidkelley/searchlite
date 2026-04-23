@@ -1411,8 +1411,8 @@ pub enum AggregationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     size: Option<usize>,
   },
-  AvgBucket(BucketMetricResponse),
-  SumBucket(BucketMetricResponse),
+  AvgBucket(OptionalBucketMetricResponse),
+  SumBucket(OptionalBucketMetricResponse),
   Derivative(OptionalBucketMetricResponse),
   MovingAvg(MovingAvgResponse),
   BucketScript(OptionalBucketMetricResponse),
@@ -1455,12 +1455,19 @@ pub struct CardinalityResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PercentilesResponse {
-  pub values: BTreeMap<String, f64>,
+  /// Percentile values keyed by their percent (e.g. `"50"`, `"99.9"`). The
+  /// value is `None` when the aggregation observed no documents with the
+  /// requested field — matching Elasticsearch, which serializes those entries
+  /// as JSON `null`. Pipeline aggregations treat `None` as a missing value.
+  pub values: BTreeMap<String, Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PercentileRanksResponse {
-  pub values: BTreeMap<String, f64>,
+  /// Rank values keyed by their target value. `None` signals that the
+  /// aggregation observed no documents with the requested field (rather than
+  /// a genuine `0.0` rank) so pipeline aggregations can skip the bucket.
+  pub values: BTreeMap<String, Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1475,11 +1482,6 @@ pub struct TopHit {
   pub score: Option<f32>,
   pub fields: Option<serde_json::Value>,
   pub snippet: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BucketMetricResponse {
-  pub value: f64,
 }
 
 pub use crate::index::manifest::{

@@ -26,14 +26,99 @@ All FFI functions that return `c_int` use the following codes:
 
 ### FFI search buffer behavior
 
-`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`). If the result exceeds `buf_cap`, the output is silently truncated to `buf_cap - 1` bytes plus a null terminator. Treat a returned byte count equal to `buf_cap - 1` as potentially truncated and retry with a larger buffer.
+`searchlite_search` and `searchlite_search_request` write JSON results into a caller-provided buffer (`out_json_buf` / `buf_cap`) and use the return value to report success, error, or buffer-too-small:
+
+| Return value `N` | Meaning |
+| --- | --- |
+| `0` | Error (null argument, search failure, or JSON serialization failure). Buffer is untouched. |
+| `0 < N <= buf_cap - 1` | Success. `N` bytes of JSON were written, followed by a NUL terminator. Read the result from `out_json_buf`. |
+| `N > buf_cap` | Buffer was too small. No JSON was written (when `buf_cap >= 1` the buffer is NUL-terminated at index 0). `N` is the required size including the NUL terminator -- allocate `N` bytes and retry. |
+| `-100` | `searchlite_search` only: a Rust panic was caught (`SEARCHLITE_ERR_PANIC`). |
+
+`N == buf_cap` is never returned: success always leaves at least one byte for the NUL terminator, so `N > buf_cap` is an unambiguous "buffer too small" signal even when `buf_cap == 0`.
+
+**C callers, signed/unsigned caveat for `searchlite_search`:** the return type is `ssize_t` but `buf_cap` is `size_t`. A direct `ret > buf_cap` comparison will promote a negative sentinel such as `SEARCHLITE_ERR_PANIC` (`-100`) to a huge unsigned value and misclassify it as "buffer too small". Check `ret <= 0` first (handling errors and panics), then compare `(size_t)ret > buf_cap` only when `ret > 0`. `searchlite_search_request` returns `size_t`, so a plain `ret > buf_cap` check is sufficient.
 
 ## WASM
 
+### WASM API index
+
+| Category | Method | Kind |
+| --- | --- | --- |
+| Lifecycle | `Searchlite.init(name, schemaJson, storage?)` | static async |
+| Lifecycle | `Searchlite.list_indexes()` | static async |
+| Lifecycle | `Searchlite.clear_index(name)` | static async |
+| Lifecycle | `Searchlite.drop_index(name)` | static async |
+| Lifecycle | `Searchlite.plan_migration(name, schemaJson)` | static async |
+| Lifecycle | `Searchlite.migrate_index(name, schemaJson)` | static async |
+| Lifecycle | `Searchlite.storage_usage()` | static async |
+| Lifecycle | `Searchlite.cleanup_indexes(staleOlderThanMs, dryRun?)` | static async |
+| Ingest | `db.add_document(doc)` / `db.add_documents(docs)` | sync (queued) |
+| Ingest | `db.commit()` | async |
+| Ingest | `db.flush_storage()` | async |
+| Delete / update | `db.delete_document(id)` / `db.delete_documents(ids)` | sync (queued) |
+| Delete / update | `db.update_document({ id, set?, unset? })` | sync (queued) |
+| Query | `db.search(query, limit, returnStored?)` | sync |
+| Query | `db.search_request(json)` / `db.search_request_value(value)` | sync |
+| Query | `db.search_controlled(query, limit, returnStored?, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_controlled(json, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_value_controlled(value, signal?, timeoutMs?)` | sync |
+| Query | `db.search_request_value_async(value, signal?, timeoutMs?)` | async |
+| Query | `db.mget({ ids, return_stored? })` | sync |
+| Query | `db.multi_search({ searches, parallel?, max_concurrency? })` | sync |
+| Maintenance | `db.compact()` | async |
+| Maintenance | `db.inspect()` | sync |
+| Maintenance | `db.stats()` | sync |
+| Maintenance | `db.cleanup_orphaned_files(dryRun?)` | async |
+| Threads | `db.init_threads(threads?)` (requires `--features threads`) | async |
+
+### WASM behaviour notes
+
 - `add_document` / `add_documents` queue writes; `commit()` persists them and makes them searchable. `flush_storage()` only drains pending storage writes if you need it.
+- `delete_document(id)` queues a single delete by doc id; `delete_documents(ids)` accepts a string or array of strings for batch deletes. Both require `commit()` to persist.
+- `update_document({ id, set?, unset? })` queues partial updates by doc id; `set` and `unset` follow core patch semantics and require `commit()` to persist.
+- `mget({ ids, return_stored? })` returns `{ docs: [...] }` in input order with per-id `found` and optional `_source`.
+- `multi_search({ searches, parallel?, max_concurrency? })` returns `{ results: [...] }` preserving request order.
+- Maintenance helpers: `compact()` -> `{ compacted }`, `inspect()` -> `{ manifest }` (write-key fields redacted), and `stats()` -> index-level counts and metadata.
 - `search(query, limit, returnStored?)` takes an optional third argument; omit it for the default (`false`) or pass `true` to fetch stored fields.
 - `search_request` accepts a JSON string; `search_request_value` takes a JS object. Both support the full `SearchRequest` surface with the same `return_stored` default of `false`.
-- Reusing a `db_name` reopens an existing index; schema mismatches return an error (there is no migration path; use a new `db_name` or delete the stored index).
+- Package target note: `wasm-pack build --target web` exposes a default init export; the default bundler target auto-initializes and only exposes named exports (for example `Searchlite`).
+- Controlled search variants accept cancellation and timeout controls:
+  - `search_controlled(query, limit, returnStored?, abortSignal?, timeoutMs?)`
+  - `search_request_controlled(json, abortSignal?, timeoutMs?)`
+  - `search_request_value_controlled(value, abortSignal?, timeoutMs?)`
+  - `search_request_value_async(value, abortSignal?, timeoutMs?)` (Promise-based worker-oriented entrypoint)
+- Lifecycle helpers are exposed as static methods: `Searchlite.list_indexes()`, `Searchlite.clear_index(name)`, and `Searchlite.drop_index(name)`.
+- Storage helpers: `Searchlite.storage_usage()` reports usage/quota when the browser exposes it; `Searchlite.cleanup_indexes(stale_older_than_ms, dry_run?)` removes stale persisted indexes by age.
+- Index cleanup helper: `db.cleanup_orphaned_files(dry_run?)` removes IndexedDB blobs not referenced by the active manifest.
+- `Searchlite.plan_migration(name, schemaJson)` reports `missing`, `compatible`, or `rebuild_required` without mutating state.
+- `Searchlite.migrate_index(name, schemaJson)` applies migration planning and returns `created`, `compatible`, or `rebuilt`; on rebuild failure it restores the previous snapshot before returning a typed error.
+- Reusing a `db_name` reopens an existing index; schema mismatches still return `schema_mismatch` if you call `init` directly.
+
+### WASM error shape
+
+WASM methods return structured errors instead of plain strings:
+
+```json
+{
+  "type": "invalid_search_request",
+  "reason": "..."
+}
+```
+
+Use `error.type` for programmatic handling and `error.reason` for logging/UI.
+
+See [**docs/wasm-errors.md**](wasm-errors.md) for the full reference — every
+emitted `type`, when it fires, and the recommended recovery action. Commonly
+encountered codes: `quota_exceeded`, `aborted`, `timeout`, `schema_mismatch`,
+`invalid_*`.
+
+### Worker-first demo notes
+
+- `searchlite-wasm/searchlite-worker-client.mjs` provides a worker-first search wrapper over `searchlite-wasm/searchlite-demo-worker.mjs`.
+- The client restarts workers after timeout/abort to stop in-flight operations.
+- Worker client options validate `timeoutMs` and `delayMs` as non-negative finite numbers and return typed `invalid_timeout` / `invalid_argument` errors when invalid.
+- With `indexeddb` storage this preserves state on restart; with `memory` storage it does not, so the demo falls back to main-thread execution.
 
 ### WASM threading
 

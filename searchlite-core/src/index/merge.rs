@@ -102,17 +102,26 @@ impl TieredMergePolicy {
 
     // Find the first tier that has too many segments.
     for tier in tiers.iter() {
-      if tier.len() > self.segments_per_tier {
-        let take = tier.len().min(self.max_merge_at_once);
-        let ids: Vec<String> = tier[..take].iter().map(|s| s.id.clone()).collect();
-        // Check that the merged result would not exceed the max size.
+      if tier.len() <= self.segments_per_tier {
+        continue;
+      }
+      // Greedy pick of the smallest `take` segments may overshoot
+      // `max_merged_segment_docs`. Because `tier` is sorted by effective doc
+      // count ascending, the cumulative total grows monotonically with `take`,
+      // so shrinking the batch until the total fits yields the largest valid
+      // prefix. Only give up on the tier if even the two smallest segments
+      // together exceed the cap.
+      let mut take = tier.len().min(self.max_merge_at_once);
+      while take >= 2 {
         let total_docs: u64 = tier[..take]
           .iter()
           .map(|s| effective_doc_count(s) as u64)
           .sum();
         if total_docs <= self.max_merged_segment_docs as u64 {
+          let ids: Vec<String> = tier[..take].iter().map(|s| s.id.clone()).collect();
           return vec![ids];
         }
+        take -= 1;
       }
     }
 
@@ -239,6 +248,89 @@ mod tests {
     let merges = policy.find_merges(&segments);
     assert_eq!(merges.len(), 1);
     assert!(merges[0].contains(&"mostly_deleted".to_string()));
+  }
+
+  #[test]
+  fn shrinks_batch_when_greedy_pick_overshoots_max_merged_docs() {
+    // Regression for BUG-008: previously the policy abandoned the tier when
+    // the first `max_merge_at_once` segments summed above the cap. It must
+    // instead shrink the batch until the cumulative total fits so overflowing
+    // tiers do not stall indefinitely.
+    let policy = TieredMergePolicy {
+      max_merge_at_once: 10,
+      segments_per_tier: 10,
+      floor_segment_docs: 100_000,
+      max_merged_segment_docs: 5_000_000,
+    };
+    // 11 × 800k: first 10 sum to 8M (> 5M cap). A batch of 6 sums to 4.8M,
+    // which is the largest prefix that fits.
+    let segments: Vec<_> = (0..11)
+      .map(|i| make_segment(&format!("s{i}"), 800_000))
+      .collect();
+    let merges = policy.find_merges(&segments);
+    assert_eq!(
+      merges.len(),
+      1,
+      "oversized greedy pick must not stall the tier"
+    );
+    assert_eq!(merges[0].len(), 6);
+    // The 6 smallest segments (which, at equal size, is a deterministic prefix
+    // after the stable sort) should be selected and their total must fit.
+    let selected: std::collections::HashSet<_> = merges[0].iter().cloned().collect();
+    assert_eq!(selected.len(), 6, "no duplicate segment ids");
+  }
+
+  #[test]
+  fn gives_up_tier_when_even_two_smallest_exceed_cap() {
+    // If even the two smallest segments together overshoot the cap, no valid
+    // merge can come from this tier. Policy must not emit a degenerate single-
+    // segment "merge" and must not loop forever.
+    let policy = TieredMergePolicy {
+      max_merge_at_once: 10,
+      segments_per_tier: 2,
+      floor_segment_docs: 100_000,
+      max_merged_segment_docs: 1_000_000,
+    };
+    // 3 × 700k: all still below the 1M cap (so they pass the eligibility
+    // filter) but any pair sums to 1.4M (> 1M cap).
+    let segments: Vec<_> = (0..3)
+      .map(|i| make_segment(&format!("s{i}"), 700_000))
+      .collect();
+    let merges = policy.find_merges(&segments);
+    assert!(
+      merges.is_empty(),
+      "no valid batch exists when pairs exceed the cap"
+    );
+  }
+
+  #[test]
+  fn shrinks_batch_to_include_deleted_docs_in_cap_check() {
+    // The shrink loop must use *effective* doc counts (i.e. honour tombstones),
+    // matching the rest of the policy. A tier where the live docs fit but the
+    // raw totals wouldn't should still merge.
+    let policy = TieredMergePolicy {
+      max_merge_at_once: 10,
+      segments_per_tier: 2,
+      floor_segment_docs: 100,
+      max_merged_segment_docs: 1_000,
+    };
+    // 3 segments, each 900 total with 500 deleted (live = 400). Raw totals
+    // would sum to 2700 (> 1000 cap), but effective totals sum to 1200 (> 1000
+    // too, so take=3 is out). A batch of 2 sums to 800 effective docs => fits.
+    let segments: Vec<_> = (0..3)
+      .map(|i| {
+        let mut s = make_segment(&format!("s{i}"), 900);
+        s.deleted_docs = (0..500).collect();
+        s
+      })
+      .collect();
+    let merges = policy.find_merges(&segments);
+    assert_eq!(
+      merges.len(),
+      1,
+      "effective doc counts must drive the shrink"
+    );
+    assert_eq!(merges[0].len(), 2);
   }
 
   #[test]

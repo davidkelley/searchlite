@@ -23,8 +23,8 @@ use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, IndexOptions, MgetRequest, MgetResponse, MultiSearchRequest, SearchRequest, StorageType,
 };
-use searchlite_core::api::PatchError;
-use searchlite_core::api::{MultiSearchResponse, SearchResult};
+use searchlite_core::api::{IndexReader, MultiSearchResponse, SearchResult};
+use searchlite_core::api::{PatchError, WriteKeyError};
 use searchlite_core::util::doc_id::validate_doc_id;
 use searchlite_core::{Index, Manifest, Schema};
 use thiserror::Error;
@@ -38,7 +38,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_K1: f32 = 0.9;
@@ -370,7 +370,6 @@ impl ManagedIndex {
 
     Ok(IndexDescriptor {
       name: self.name.clone(),
-      path: self.path.display().to_string(),
       exists,
       committed_at,
       doc_count,
@@ -743,10 +742,19 @@ struct HttpError {
 
 type ApiResult<T> = Result<T, HttpError>;
 
+// Returned to every caller whose request body fails JSON deserialization. The
+// underlying `JsonRejection::to_string()` contains the target-type field path
+// of the failing value (e.g. `text_fields: invalid type: integer ...`), which
+// lets an unauthenticated probe enumerate the server's internal request
+// types. Log the detail for operators and return a constant message. See
+// BUG-016.
+const MALFORMED_REQUEST_BODY_MESSAGE: &str = "malformed request body";
+
 fn parse_json<T>(payload: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
-  payload
-    .map(|Json(inner)| inner)
-    .map_err(|err| HttpError::bad_request("invalid_request", err.to_string()))
+  payload.map(|Json(inner)| inner).map_err(|err| {
+    warn!(error = %err, "malformed request body");
+    HttpError::bad_request("invalid_request", MALFORMED_REQUEST_BODY_MESSAGE)
+  })
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -811,6 +819,9 @@ struct InspectResponse {
   manifest: Manifest,
 }
 
+// Note: `index_path` was removed from this response as a Security fix (BUG-015).
+// The on-disk filesystem path of an index is an operator-side implementation
+// detail and must not be exposed to unauthenticated callers of `/stats`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StatsResponse {
   documents: u64,
@@ -818,7 +829,6 @@ struct StatsResponse {
   segments: usize,
   committed_at: String,
   index_uuid: String,
-  index_path: String,
   index_name: String,
 }
 
@@ -827,10 +837,13 @@ struct HealthResponse {
   status: String,
 }
 
+// Note: `path` was removed from this descriptor as a Security fix (BUG-219),
+// mirroring the BUG-015 fix to `StatsResponse`. The on-disk filesystem path of
+// an index is an operator-side implementation detail and must not be exposed
+// to unauthenticated callers of `/indexes`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct IndexDescriptor {
   name: String,
-  path: String,
   exists: bool,
   committed_at: Option<String>,
   doc_count: Option<u64>,
@@ -950,6 +963,30 @@ impl HttpError {
   }
 }
 
+/// Classify an error surfaced by a write-key-gated path — currently
+/// `Index::writer_with_key`, the `writer.commit()` that follows it in the
+/// commit endpoint, and `Index::compact_with_key` — into the HTTP status code
+/// the caller should receive. Uses
+/// `anyhow::Error::downcast_ref::<WriteKeyError>()` so the classification
+/// stays correct if the error's `Display` text changes or a non-auth error
+/// coincidentally mentions "write key" — the substring match this replaces
+/// flipped classifications whenever either shifted. Mirrors the FFI-side
+/// `classify_writer_err` (see BUG-020).
+///
+/// `write_key_provided` selects 401 (no key supplied) vs 403 (wrong key) on
+/// auth failures, matching the pre-existing behaviour.
+fn classify_writer_error(err: &anyhow::Error, write_key_provided: bool) -> StatusCode {
+  if err.downcast_ref::<WriteKeyError>().is_some() {
+    if write_key_provided {
+      StatusCode::FORBIDDEN
+    } else {
+      StatusCode::UNAUTHORIZED
+    }
+  } else {
+    StatusCode::INTERNAL_SERVER_ERROR
+  }
+}
+
 impl IntoResponse for HttpError {
   fn into_response(self) -> Response {
     let body = Json(ErrorResponse {
@@ -1041,11 +1078,14 @@ async fn handle_middleware_error(err: BoxError) -> Response {
     )
     .into_response();
   }
+  // The `Debug` form of the underlying `BoxError` can include panic messages,
+  // tokio runtime state, and source-chain stringifications — information that
+  // belongs in operator logs, not in the response body. See BUG-016.
   error!(error = ?err, "middleware error");
   HttpError::from_anyhow(
     "middleware_error",
     StatusCode::INTERNAL_SERVER_ERROR,
-    anyhow::anyhow!(format!("{err:?}")),
+    anyhow::anyhow!("internal server error"),
   )
   .into_response()
 }
@@ -1100,6 +1140,33 @@ async fn init_index(
   Ok(Json(InitResponse { created: true }))
 }
 
+// Await the ingest writer task, surfacing its returned `HttpError` on success
+// and converting a `JoinError` (i.e. task panic) into a generic 500 while
+// recording the panic detail via `tracing`. `JoinError::to_string()` leaks the
+// panic message and source location, so it must never reach the response body.
+// See BUG-016.
+async fn await_writer_or_default(
+  writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>,
+  default: HttpError,
+) -> HttpError {
+  if let Some(handle) = writer_task.take() {
+    match handle.await {
+      Ok(Err(e)) => e,
+      Ok(Ok(_)) => default,
+      Err(join_err) => {
+        error!(error = %join_err, "ingest writer task failed to join");
+        HttpError::from_anyhow(
+          "add_join",
+          StatusCode::INTERNAL_SERVER_ERROR,
+          anyhow::anyhow!("internal server error"),
+        )
+      }
+    }
+  } else {
+    default
+  }
+}
+
 async fn add_ndjson(
   State(state): State<Arc<AppState>>,
   Path(index_name): Path<String>,
@@ -1123,25 +1190,6 @@ async fn add_ndjson(
   let mut reader = StreamReader::new(mapped_stream);
   let mut buf = String::new();
 
-  async fn await_writer_or_default(
-    writer_task: &mut Option<tokio::task::JoinHandle<Result<usize, HttpError>>>,
-    default: HttpError,
-  ) -> HttpError {
-    if let Some(handle) = writer_task.take() {
-      match handle.await {
-        Ok(Err(e)) => e,
-        Ok(Ok(_)) => default,
-        Err(join_err) => HttpError::from_anyhow(
-          "add_join",
-          StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ),
-      }
-    } else {
-      default
-    }
-  }
-
   let (tx, rx) = mpsc::channel::<IngestMsg>(INGEST_CHANNEL_BUFFER_BATCHES);
   let mut rx_slot = Some(rx);
   let mut writer_task: Option<tokio::task::JoinHandle<Result<usize, HttpError>>> = None;
@@ -1164,16 +1212,7 @@ async fn add_ndjson(
         let mut writer = index_ref
           .writer_with_key(write_key.as_deref())
           .map_err(|e| {
-            let msg = e.to_string().to_lowercase();
-            let status = if msg.contains("write key") || msg.contains("unauthorized") {
-              if write_key.is_some() {
-                StatusCode::FORBIDDEN
-              } else {
-                StatusCode::UNAUTHORIZED
-              }
-            } else {
-              StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status = classify_writer_error(&e, write_key.is_some());
             HttpError::from_anyhow("writer_open", status, e)
           })?;
         let mut total = 0usize;
@@ -1314,11 +1353,14 @@ async fn add_ndjson(
       Ok(Ok(total)) => total,
       Ok(Err(e)) => return Err(e),
       Err(join_err) => {
+        // See BUG-016: `JoinError::to_string()` carries the panic message and
+        // source location. Keep that in operator logs, not the response body.
+        error!(error = %join_err, "ingest writer task failed to join");
         return Err(HttpError::from_anyhow(
           "add_join",
           StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ))
+          anyhow::anyhow!("internal server error"),
+        ));
       }
     },
     None => {
@@ -1365,16 +1407,7 @@ async fn bulk_ingest(
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-      let msg = e.to_string().to_lowercase();
-      let status = if msg.contains("write key") || msg.contains("unauthorized") {
-        if write_key.is_some() {
-          StatusCode::FORBIDDEN
-        } else {
-          StatusCode::UNAUTHORIZED
-        }
-      } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-      };
+      let status = classify_writer_error(&e, write_key.is_some());
       HttpError::from_anyhow("writer_open", status, e)
     })?;
     for doc in docs.iter() {
@@ -1427,16 +1460,7 @@ async fn delete_documents(
   }
   let _writer_guard = managed.writer_lock.lock().await;
   let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-    let msg = e.to_string().to_lowercase();
-    let status = if msg.contains("write key") || msg.contains("unauthorized") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&e, write_key.is_some());
     HttpError::from_anyhow("writer_open", status, e)
   })?;
   writer
@@ -1482,16 +1506,7 @@ async fn update_document(
   tokio::task::spawn_blocking(move || {
     let _writer_guard = writer_lock.blocking_lock();
     let mut writer = index.writer_with_key(write_key.as_deref()).map_err(|e| {
-      let msg = e.to_string().to_lowercase();
-      let status = if msg.contains("write key") || msg.contains("unauthorized") {
-        if write_key.is_some() {
-          StatusCode::FORBIDDEN
-        } else {
-          StatusCode::UNAUTHORIZED
-        }
-      } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-      };
+      let status = classify_writer_error(&e, write_key.is_some());
       HttpError::from_anyhow("writer_open", status, e)
     })?;
     if let Err(err) = writer.apply_patch(&body.id, &body.set, &body.unset) {
@@ -1546,11 +1561,17 @@ async fn bulk_update(
       match handle.await {
         Ok(Err(e)) => e,
         Ok(Ok(_)) => default,
-        Err(join_err) => HttpError::from_anyhow(
-          "bulk_update_join",
-          StatusCode::INTERNAL_SERVER_ERROR,
-          anyhow::anyhow!(join_err.to_string()),
-        ),
+        Err(join_err) => {
+          // See BUG-016: `JoinError::to_string()` carries the panic message
+          // and source location. Keep that in operator logs rather than the
+          // client-visible response body.
+          error!(error = %join_err, "bulk update writer task failed to join");
+          HttpError::from_anyhow(
+            "bulk_update_join",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("internal server error"),
+          )
+        }
       }
     } else {
       default
@@ -1580,16 +1601,7 @@ async fn bulk_update(
         let mut writer = index_ref
           .writer_with_key(write_key.as_deref())
           .map_err(|e| {
-            let msg = e.to_string().to_lowercase();
-            let status = if msg.contains("write key") || msg.contains("unauthorized") {
-              if write_key.is_some() {
-                StatusCode::FORBIDDEN
-              } else {
-                StatusCode::UNAUTHORIZED
-              }
-            } else {
-              StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status = classify_writer_error(&e, write_key.is_some());
             HttpError::from_anyhow("writer_open", status, e)
           })?;
         let checkpoint = writer.checkpoint().map_err(|e| {
@@ -1886,16 +1898,7 @@ async fn commit(
     )
   })?
   .map_err(|err| {
-    let msg = err.to_string();
-    let status = if msg.to_lowercase().contains("write key") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&err, write_key.is_some());
     HttpError::from_anyhow("commit_failed", status, err)
   })?;
   Ok(Json(CommitResponse { committed: true }))
@@ -1953,16 +1956,7 @@ async fn compact(
     )
   })?
   .map_err(|err| {
-    let msg = err.to_string();
-    let status = if msg.to_lowercase().contains("write key") {
-      if write_key.is_some() {
-        StatusCode::FORBIDDEN
-      } else {
-        StatusCode::UNAUTHORIZED
-      }
-    } else {
-      StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let status = classify_writer_error(&err, write_key.is_some());
     HttpError::from_anyhow("compact_failed", status, err)
   })?;
   Ok(Json(CompactResponse { compacted: true }))
@@ -2189,8 +2183,33 @@ async fn multi_search(
     return Ok(Json(resp));
   }
 
+  // Share a bounded pool of IndexReaders across sub-searches rather than
+  // re-opening one per task. Pool size matches the effective concurrency so
+  // each permit is always backed by an available reader, and reuse eliminates
+  // the repeated segment-open cost for large multi_search payloads.
+  let pool_size = max_concurrency.min(searches.len()).max(1);
   let idx = index.clone();
-  let semaphore = Arc::new(Semaphore::new(max_concurrency));
+  let readers = {
+    let idx_for_pool = idx.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<IndexReader>> {
+      let mut readers = Vec::with_capacity(pool_size);
+      for _ in 0..pool_size {
+        readers.push(idx_for_pool.reader()?);
+      }
+      Ok(readers)
+    })
+    .await
+    .map_err(|err| {
+      HttpError::from_anyhow(
+        "multi_search_join",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        anyhow::anyhow!(err.to_string()),
+      )
+    })?
+    .map_err(|err| HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err))?
+  };
+  let pool = Arc::new(tokio::sync::Mutex::new(readers));
+  let semaphore = Arc::new(Semaphore::new(pool_size));
   let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
   for (search_idx, mut req) in searches.into_iter().enumerate() {
     if req.cursor.is_some() {
@@ -2198,6 +2217,7 @@ async fn multi_search(
       req.from = 0;
     }
     let semaphore_clone = semaphore.clone();
+    let pool_clone = pool.clone();
     let index_clone = idx.clone();
     tasks.push(async move {
       let permit = semaphore_clone.acquire_owned().await.map_err(|err| {
@@ -2207,19 +2227,39 @@ async fn multi_search(
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchResult> {
-        let _permit = permit;
-        let reader = index_clone.reader()?;
-        reader.search(&req)
+      // Holding a permit guarantees a reader is available in steady state.
+      // The pool can briefly be empty if a prior blocking task panicked and
+      // dropped its reader; defer the fallback open into the blocking task
+      // below so file I/O never runs on a Tokio worker thread.
+      let pooled = pool_clone.lock().await.pop();
+      // Keep `permit` in the outer async scope so it is not released until
+      // after the reader is returned to the pool. Dropping it inside the
+      // blocking closure (i.e. as soon as `reader.search` returns) would let
+      // a waiting task acquire the freed permit, find the pool momentarily
+      // empty, and open a new reader — growing the pool past its bound.
+      let handle = tokio::task::spawn_blocking(move || {
+        let reader = match pooled {
+          Some(reader) => reader,
+          None => match index_clone.reader() {
+            Ok(reader) => reader,
+            Err(err) => return (None, Err(err)),
+          },
+        };
+        let result = reader.search(&req);
+        (Some(reader), result)
       });
-      let joined = handle.await.map_err(|err: tokio::task::JoinError| {
+      let (reader, result) = handle.await.map_err(|err: tokio::task::JoinError| {
         HttpError::from_anyhow(
           "multi_search_join",
           StatusCode::INTERNAL_SERVER_ERROR,
           anyhow::anyhow!(err.to_string()),
         )
       })?;
-      let search_res = joined.map_err(|err| {
+      if let Some(reader) = reader {
+        pool_clone.lock().await.push(reader);
+      }
+      drop(permit);
+      let search_res = result.map_err(|err| {
         HttpError::from_anyhow("multi_search_failed", StatusCode::BAD_REQUEST, err)
       })?;
       Ok::<(usize, SearchResult), HttpError>((search_idx, search_res))
@@ -2290,7 +2330,6 @@ async fn stats(
     segments: manifest.segments.len(),
     committed_at: manifest.committed_at.clone(),
     index_uuid: manifest.uuid.to_string(),
-    index_path: managed.path.display().to_string(),
     index_name: managed.name.clone(),
   }))
 }
@@ -2620,6 +2659,182 @@ mod tests {
     let _ = handle.await;
   }
 
+  // Regression test for BUG-015: the public `/stats` endpoint must not leak
+  // the on-disk filesystem path of the index. Operator-only details are
+  // confined to server logs / admin tooling.
+  #[tokio::test]
+  async fn stats_response_does_not_expose_filesystem_path() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-stats-no-path");
+    let (client, _base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/add"))
+      .body("{\"_id\":\"1\",\"body\":\"doc\"}\n")
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let stats: serde_json::Value = client
+      .get(format!("{index_base}/stats"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+
+    // Path-leaking fields must not appear in the response under any alias.
+    // Walk the parsed JSON and check string values directly so we are not
+    // tricked by JSON escaping (e.g. Windows backslashes are doubled in the
+    // raw serialized form, which would let a regression slip past a naive
+    // substring check on the wire bytes).
+    fn json_contains_string_value(value: &serde_json::Value, target: &str) -> bool {
+      match value {
+        serde_json::Value::String(s) => s == target,
+        serde_json::Value::Array(values) => values
+          .iter()
+          .any(|value| json_contains_string_value(value, target)),
+        serde_json::Value::Object(map) => map
+          .values()
+          .any(|value| json_contains_string_value(value, target)),
+        _ => false,
+      }
+    }
+
+    let stats_obj = stats.as_object().expect("stats body is a JSON object");
+    assert!(
+      !stats_obj.contains_key("index_path"),
+      "stats response must not include `index_path` (leaks FS layout): {stats_obj:?}"
+    );
+    let fs_path_str = index_path.display().to_string();
+    assert!(
+      !json_contains_string_value(&stats, fs_path_str.as_str()),
+      "stats response must not contain the raw index filesystem path: {stats:?}"
+    );
+
+    // Sanity: the public fields are still present.
+    assert_eq!(stats["index_name"], INDEX_NAME);
+    assert!(stats["index_uuid"].as_str().is_some());
+    assert_eq!(stats["documents"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  // Regression test for BUG-219: the public `/indexes` endpoint must not leak
+  // the on-disk filesystem path of any mounted index. This mirrors BUG-015,
+  // which removed the same field from `/stats`. Read-side endpoints are
+  // unauthenticated by design, so the response surface is restricted to
+  // operator-chosen logical identifiers and aggregate counts.
+  #[tokio::test]
+  async fn list_indexes_response_does_not_expose_filesystem_path() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-list-no-path");
+    let (client, base, index_base, handle, _state, _args) = setup_server(index_path.clone()).await;
+
+    // Walk the parsed JSON and check string values directly so we are not
+    // tricked by JSON escaping (e.g. Windows backslashes are doubled in the
+    // raw serialized form, which would let a regression slip past a naive
+    // substring check on the wire bytes).
+    fn json_contains_string_value(value: &serde_json::Value, target: &str) -> bool {
+      match value {
+        serde_json::Value::String(s) => s == target,
+        serde_json::Value::Array(values) => values
+          .iter()
+          .any(|value| json_contains_string_value(value, target)),
+        serde_json::Value::Object(map) => map
+          .values()
+          .any(|value| json_contains_string_value(value, target)),
+        _ => false,
+      }
+    }
+
+    let fs_path_str = index_path.display().to_string();
+
+    // Pre-init: descriptor still must not carry the path.
+    let before: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_before = before["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_before.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_before:?}"
+    );
+    assert!(
+      !json_contains_string_value(&before, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {before:?}"
+    );
+
+    // Post-init/commit: descriptor still must not carry the path even after
+    // the on-disk index has materialized.
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/add"))
+      .body("{\"_id\":\"1\",\"body\":\"doc\"}\n")
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    let after: serde_json::Value = client
+      .get(format!("{base}/indexes"))
+      .send()
+      .await
+      .unwrap()
+      .json()
+      .await
+      .unwrap();
+    let first_after = after["indexes"][0]
+      .as_object()
+      .expect("descriptor is a JSON object");
+    assert!(
+      !first_after.contains_key("path"),
+      "indexes response must not include `path` (leaks FS layout): {first_after:?}"
+    );
+    assert!(
+      !json_contains_string_value(&after, fs_path_str.as_str()),
+      "indexes response must not contain the raw index filesystem path: {after:?}"
+    );
+
+    // Sanity: the public fields are still present.
+    assert_eq!(first_after["name"], INDEX_NAME);
+    assert_eq!(first_after["exists"], true);
+    assert_eq!(first_after["doc_count"], 1);
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
   #[tokio::test]
   async fn auto_commit_persists_pending_writes() {
     init_tracing();
@@ -2681,6 +2896,86 @@ mod tests {
       "2026-03-03T00:00:01Z"
     ));
     assert!(should_refresh(None, "2026-03-03T00:00:00Z"));
+  }
+
+  #[test]
+  fn classify_writer_error_routes_write_key_variants_to_auth_status() {
+    // Every `WriteKeyError` variant must map to an auth status regardless of
+    // its `Display` text, under both the no-client-key (401) and
+    // client-key-provided (403) branches. This is what the previous
+    // substring match got wrong (BUG-406, mirrors the FFI-side BUG-020).
+    //
+    // `WriteKeyError` is not `Clone`, so build each variant twice via a
+    // closure: once per assertion branch.
+    let variants: &[fn() -> WriteKeyError] = &[
+      || WriteKeyError::Required,
+      || WriteKeyError::Mismatch("segment binding; index may be tampered"),
+      || WriteKeyError::MetadataTampered,
+      || WriteKeyError::Empty,
+      || WriteKeyError::FeatureDisabled,
+    ];
+
+    for build in variants {
+      let no_key_err: anyhow::Error = build().into();
+      assert_eq!(
+        classify_writer_error(&no_key_err, false),
+        StatusCode::UNAUTHORIZED,
+        "variant {:?} without client key must map to 401",
+        build()
+      );
+
+      let with_key_err: anyhow::Error = build().into();
+      assert_eq!(
+        classify_writer_error(&with_key_err, true),
+        StatusCode::FORBIDDEN,
+        "variant {:?} with client key must map to 403",
+        build()
+      );
+    }
+  }
+
+  #[test]
+  fn classify_writer_error_survives_anyhow_context_wrapping() {
+    // anyhow::Context rewrites the Display string, which is exactly what
+    // broke the substring match. Typed downcast must still classify this
+    // as an auth failure.
+    let err: anyhow::Error = WriteKeyError::MetadataTampered.into();
+    let wrapped = err.context("opening writer").context("during compaction");
+    assert_eq!(
+      classify_writer_error(&wrapped, false),
+      StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(classify_writer_error(&wrapped, true), StatusCode::FORBIDDEN);
+  }
+
+  #[test]
+  fn classify_writer_error_does_not_auth_classify_substring_lookalikes() {
+    // The pre-BUG-406 substring match flipped a benign storage error whose
+    // `Display` text happened to include "write key" (e.g. "failed to read
+    // write key binding from WAL") into a 401/403. The typed downcast must
+    // return 500 for such errors.
+    let err = anyhow::anyhow!("failed to read write key binding from WAL");
+    assert_eq!(
+      classify_writer_error(&err, false),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+      classify_writer_error(&err, true),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+  }
+
+  #[test]
+  fn classify_writer_error_maps_non_auth_errors_to_internal() {
+    let err = anyhow::anyhow!("disk full");
+    assert_eq!(
+      classify_writer_error(&err, false),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+      classify_writer_error(&err, true),
+      StatusCode::INTERNAL_SERVER_ERROR
+    );
   }
 
   #[tokio::test]
@@ -3729,6 +4024,100 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn multi_search_parallel_reuses_reader_pool() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let index_path = dir.path().join("idx-multi-pool");
+    let (client, _base, index_base, handle, state, _args) = setup_server(index_path).await;
+
+    client
+      .post(format!("{index_base}/init"))
+      .json(&Schema::default_text_body())
+      .send()
+      .await
+      .unwrap();
+    let ndjson =
+      "{\"_id\":\"1\",\"body\":\"rust\"}\n{\"_id\":\"2\",\"body\":\"go\"}\n{\"_id\":\"3\",\"body\":\"rust go\"}\n";
+    client
+      .post(format!("{index_base}/add"))
+      .body(ndjson.to_string())
+      .send()
+      .await
+      .unwrap();
+    client
+      .post(format!("{index_base}/commit"))
+      .send()
+      .await
+      .unwrap();
+
+    // Capture the baseline reader-open count *after* init/add/commit so the
+    // assertion below only measures opens caused by this multi_search call.
+    let managed = state.registry().resolve(INDEX_NAME).unwrap();
+    let index = managed.require_index().await.unwrap();
+    let opens_before = index.reader_open_count();
+
+    // Eight sub-searches with a pool capped at two exercises reader reuse:
+    // the pool is strictly smaller than the search count, so correctness here
+    // depends on readers being handed back and picked up again by later tasks.
+    const POOL_SIZE: usize = 2;
+    let searches: Vec<serde_json::Value> = (0..8)
+      .map(|i| {
+        let term = if i % 2 == 0 { "rust" } else { "go" };
+        json!({ "query": term, "limit": 5, "return_stored": false })
+      })
+      .collect();
+    let req = json!({
+      "searches": searches,
+      "parallel": true,
+      "max_concurrency": POOL_SIZE
+    });
+    let res = client
+      .post(format!("{index_base}/multi_search"))
+      .json(&req)
+      .send()
+      .await
+      .unwrap();
+    assert!(res.status().is_success());
+    let body: MultiSearchResponse = res.json().await.unwrap();
+    assert_eq!(body.results.len(), 8);
+    for (i, result) in body.results.iter().enumerate() {
+      let ids: Vec<&str> = result.hits.iter().map(|h| h.doc_id.as_str()).collect();
+      if i % 2 == 0 {
+        assert!(
+          ids.contains(&"1"),
+          "expected doc 1 for rust query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for rust query #{i}: {ids:?}"
+        );
+      } else {
+        assert!(
+          ids.contains(&"2"),
+          "expected doc 2 for go query #{i}: {ids:?}"
+        );
+        assert!(
+          ids.contains(&"3"),
+          "expected doc 3 for go query #{i}: {ids:?}"
+        );
+      }
+    }
+
+    // The pool caps concurrent readers at `POOL_SIZE`, so a multi_search with
+    // 8 sub-requests must open no more than that many fresh readers. Opening
+    // one per sub-search (the pre-fix behavior) would produce 8 here.
+    let opens_after = index.reader_open_count();
+    let opens_for_multi_search = opens_after - opens_before;
+    assert!(
+      opens_for_multi_search <= POOL_SIZE,
+      "expected at most {POOL_SIZE} reader opens from multi_search, observed {opens_for_multi_search}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
   async fn require_existing_index_blocks_startup() {
     let dir = tempdir().unwrap();
     let index_path = dir.path().join("missing");
@@ -4551,5 +4940,92 @@ mod tests {
       Ok(_) => panic!("expected duplicate index name error"),
       Err(err) => assert!(err.to_string().contains("duplicate index name provided")),
     }
+  }
+
+  // Regression tests for BUG-016: error responses must not leak internal
+  // deserialization, middleware, or task-panic detail to clients.
+
+  #[tokio::test]
+  async fn malformed_json_body_returns_generic_reason() {
+    init_tracing();
+    let dir = tempdir().unwrap();
+    let (client, _base, index_base, handle, _state, _args) =
+      setup_server(dir.path().join("idx-malformed-json")).await;
+    // `text_fields` is an array of strings on `Schema`. Supplying an integer
+    // triggers a `JsonRejection` whose `Display` includes the field path and
+    // expected type — the exact detail the bug says must not be echoed.
+    let invalid = json!({ "text_fields": 1 });
+    let res = client
+      .post(format!("{index_base}/init"))
+      .json(&invalid)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(res.status(), HttpStatus::BAD_REQUEST);
+    let body: ErrorResponse = res.json().await.unwrap();
+    assert_eq!(body.error.r#type, "invalid_request");
+    assert_eq!(body.error.reason, MALFORMED_REQUEST_BODY_MESSAGE);
+    // The leaked serde detail must not appear in the client-visible body.
+    assert!(
+      !body.error.reason.contains("text_fields"),
+      "reason leaked serde field path: {}",
+      body.error.reason
+    );
+    assert!(
+      !body.error.reason.contains("expected"),
+      "reason leaked serde expected-type detail: {}",
+      body.error.reason
+    );
+    handle.abort();
+    let _ = handle.await;
+  }
+
+  #[tokio::test]
+  async fn handle_middleware_error_returns_generic_reason() {
+    init_tracing();
+    // A synthetic `BoxError` whose Debug form would leak a panic-like message.
+    #[derive(Debug)]
+    struct NoisyError;
+    impl std::fmt::Display for NoisyError {
+      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+          f,
+          "task panicked at src/secret.rs:42: internal state violated"
+        )
+      }
+    }
+    impl std::error::Error for NoisyError {}
+
+    let err: BoxError = Box::new(NoisyError);
+    let response = handle_middleware_error(err).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+      .await
+      .unwrap();
+    let body: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body.error.r#type, "middleware_error");
+    assert_eq!(body.error.reason, "internal server error");
+    // Neither the noisy Display nor its Debug form should be reflected.
+    assert!(!body.error.reason.contains("src/secret.rs"));
+    assert!(!body.error.reason.contains("panicked"));
+    assert!(!body.error.reason.contains("NoisyError"));
+  }
+
+  #[tokio::test]
+  async fn await_writer_or_default_masks_task_panic() {
+    init_tracing();
+    // Spawn a task that panics with a message that would otherwise leak into
+    // the response via `JoinError::to_string()`.
+    let handle: tokio::task::JoinHandle<Result<usize, HttpError>> = tokio::spawn(async {
+      panic!("index out of bounds: the len is 0 but the index is 4");
+    });
+    let mut slot = Some(handle);
+    let default = HttpError::bad_request("should_not_be_used", "default");
+    let err = await_writer_or_default(&mut slot, default).await;
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.kind, "add_join");
+    assert_eq!(err.reason, "internal server error");
+    assert!(!err.reason.contains("index out of bounds"));
+    assert!(!err.reason.contains("panicked"));
   }
 }

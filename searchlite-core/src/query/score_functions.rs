@@ -7,7 +7,7 @@ use crate::api::types::{
 use crate::index::fastfields::FastFieldsReader;
 use crate::index::manifest::Schema;
 use crate::query::filters::passes_filter;
-use crate::query::util::ensure_numeric_fast;
+use crate::query::util::{ensure_numeric_fast, f64_to_finite_f32};
 use crate::DocId;
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,11 @@ pub(crate) fn compile_functions(
         if !factor.is_finite() {
           bail!("field_value_factor `factor` must be finite");
         }
+        if let Some(m) = missing {
+          if !m.is_finite() {
+            bail!("field_value_factor `missing` must be finite");
+          }
+        }
         ensure_numeric_fast(schema, field, "function_score")?;
         compiled.push(CompiledFunction::FieldValueFactor {
           field: field.clone(),
@@ -78,14 +83,25 @@ pub(crate) fn compile_functions(
         function,
         filter,
       } => {
+        if !origin.is_finite() {
+          bail!("decay origin must be finite");
+        }
         if !scale.is_finite() {
           bail!("decay scale must be finite");
+        }
+        if let Some(off) = offset {
+          if !off.is_finite() {
+            bail!("decay offset must be finite");
+          }
         }
         ensure_numeric_fast(schema, field, "function_score")?;
         if *scale <= 0.0 {
           bail!("decay scale must be > 0");
         }
         let decay = decay.unwrap_or(0.5);
+        if !decay.is_finite() {
+          bail!("decay factor must be finite");
+        }
         if decay <= 0.0 || decay > 1.0 {
           bail!("decay factor must be in the range (0, 1]");
         }
@@ -108,13 +124,19 @@ pub(crate) fn combine_function_scores(values: &[f32], mode: FunctionScoreMode) -
   if values.is_empty() {
     return None;
   }
-  match mode {
-    FunctionScoreMode::Sum => Some(values.iter().copied().sum()),
-    FunctionScoreMode::Multiply => Some(values.iter().copied().product()),
-    FunctionScoreMode::Max => Some(values.iter().copied().reduce(|a, b| a.max(b)).unwrap()),
-    FunctionScoreMode::Min => Some(values.iter().copied().reduce(|a, b| a.min(b)).unwrap()),
-    FunctionScoreMode::Avg => Some(values.iter().copied().sum::<f32>() / values.len() as f32),
-  }
+  let result = match mode {
+    FunctionScoreMode::Sum => values.iter().copied().sum(),
+    FunctionScoreMode::Multiply => values.iter().copied().product(),
+    FunctionScoreMode::Max => values.iter().copied().reduce(|a, b| a.max(b)).unwrap(),
+    FunctionScoreMode::Min => values.iter().copied().reduce(|a, b| a.min(b)).unwrap(),
+    FunctionScoreMode::Avg => values.iter().copied().sum::<f32>() / values.len() as f32,
+  };
+  // `None` means "no function values"; `Some(result)` is the combined value
+  // and may be non-finite when Sum/Multiply/Avg overflow past f32::MAX to
+  // infinity. Callers are responsible for rejecting non-finite results; we
+  // preserve the overflow here so `max_boost` can still cap infinity to a
+  // finite value (`f32::INFINITY.min(max) == max`) before rejection.
+  Some(result)
 }
 
 pub(crate) fn apply_boost_mode(base: f32, func_score: f32, mode: FunctionBoostMode) -> f32 {
@@ -155,7 +177,7 @@ impl CompiledFunction {
         if !modified.is_finite() {
           return None;
         }
-        Some(modified as f32)
+        Some(f64_to_finite_f32(modified))
       }
       CompiledFunction::Decay {
         field,
@@ -174,7 +196,7 @@ impl CompiledFunction {
         let norm = (distance.max(0.0)) / *scale;
         let score = decay_value(*decay, norm, function);
         if score.is_finite() {
-          Some(score as f32)
+          Some(f64_to_finite_f32(score))
         } else {
           None
         }
@@ -198,21 +220,21 @@ fn apply_modifier(value: f64, modifier: &FieldValueModifier) -> f64 {
       if value <= 0.0 {
         0.0
       } else {
-        value.ln()
+        value.log10()
       }
     }
     FieldValueModifier::Log1p => {
       if value <= -1.0 {
         0.0
       } else {
-        value.ln_1p()
+        (1.0 + value).log10()
       }
     }
     FieldValueModifier::Log2p => {
-      if value <= -1.0 {
+      if value <= -2.0 {
         0.0
       } else {
-        (value + 1.0).log2()
+        (value + 2.0).log10()
       }
     }
     FieldValueModifier::Sqrt => {
