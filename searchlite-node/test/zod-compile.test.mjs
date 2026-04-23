@@ -5,6 +5,7 @@ import {
 	InvalidZodSchemaError,
 	UnsupportedZodTypeError,
 	compileZodSchema,
+	deriveResponseSchema,
 	isZodIndexSchema,
 	sl,
 } from "../dist/zod/index.js";
@@ -693,5 +694,88 @@ describe("sl.integer: coerce behavior", () => {
 	it("rejects a boolean", () => {
 		const schema = sl.integer();
 		expect(schema.safeParse(true).success).toBe(false);
+	});
+});
+
+// ── Nested field name validation (PR comment #6) ─────────────────────────────
+
+describe("compileZodSchema: nested field name validation", () => {
+	it('rejects "." in a nested object property name', () => {
+		expect(() =>
+			compileZodSchema(sl.index(z.object({ meta: z.object({ "a.b": z.string() }) }))),
+		).toThrowError(/must not contain "\."/);
+	});
+
+	it('rejects "." in an array-of-object item property name', () => {
+		expect(() =>
+			compileZodSchema(sl.index(z.object({ items: z.array(z.object({ "x.y": z.string() })) }))),
+		).toThrowError(/must not contain "\."/);
+	});
+
+	it("rejects empty nested property name", () => {
+		expect(() =>
+			compileZodSchema(sl.index(z.object({ meta: z.object({ "": z.string() }) }))),
+		).toThrowError(/must not be empty/);
+	});
+});
+
+// ── deriveResponseSchema (PR comment #10) ────────────────────────────────────
+
+describe("deriveResponseSchema: non-stored fields don't block hit validation", () => {
+	it("top-level fields become optional so stored-only subsets validate", () => {
+		const Schema = sl.index(
+			z.object({
+				id: z.string().uuid(),
+				title: z.string(),
+				views: sl.integer({ stored: false }),
+			}),
+			{ docIdField: "id" },
+		);
+		const response = deriveResponseSchema(Schema);
+		// A hit containing only stored fields (no `views`, no `id`) validates:
+		const stored = { title: "hello" };
+		expect(response.safeParse(stored).success).toBe(true);
+		// A hit with all fields present also validates:
+		expect(
+			response.safeParse({
+				id: "550e8400-e29b-41d4-a716-446655440000",
+				title: "hi",
+				views: 3,
+			}).success,
+		).toBe(true);
+	});
+
+	it("the derived schema is shallow — nested required fields still required", () => {
+		const Schema = sl.index(
+			z.object({
+				id: z.string().uuid(),
+				meta: z.object({ sku: sl.keyword() }),
+			}),
+			{ docIdField: "id" },
+		);
+		const response = deriveResponseSchema(Schema);
+		// Missing `meta` → OK (top-level is optional):
+		expect(response.safeParse({}).success).toBe(true);
+		// `meta` present but missing `sku` → fails (nested still required):
+		expect(response.safeParse({ meta: {} }).success).toBe(false);
+	});
+});
+
+// ── sl.index docIdField validation (PR comment #9) ───────────────────────────
+
+describe('sl.index: docIdField must not contain "."', () => {
+	it("rejects nested docIdField with .", () => {
+		expect(() => sl.index(z.object({}), { docIdField: "a.b" })).toThrowError(
+			/must not contain "\."/,
+		);
+	});
+
+	it("still rejects empty docIdField", () => {
+		expect(() => sl.index(z.object({}), { docIdField: "" })).toThrowError(/non-empty string/);
+	});
+
+	it("accepts simple non-empty docIdField", () => {
+		const schema = sl.index(z.object({ urn: z.string() }), { docIdField: "urn" });
+		expect(isZodIndexSchema(schema)).toBe(true);
 	});
 });

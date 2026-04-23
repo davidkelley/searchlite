@@ -114,7 +114,7 @@ export type ZodIntegerLike = z.ZodType<number, number | bigint>;
  * are handled seamlessly without silently coercing arbitrary inputs.
  */
 export function integer(opts?: NumericOpts): ZodIntegerLike;
-export function integer<S extends z.ZodNumber>(inner: S, opts?: NumericOpts): S;
+export function integer(inner: z.ZodNumber, opts?: NumericOpts): z.ZodNumber;
 export function integer(
 	innerOrOpts?: z.ZodNumber | NumericOpts,
 	maybeOpts?: NumericOpts,
@@ -122,16 +122,18 @@ export function integer(
 	let inner: z.ZodType<number>;
 	let opts: NumericOpts | undefined;
 	if (isZodNumber(innerOrOpts)) {
+		// Attach the .int() refinement if the caller didn't already add it.
+		// `.int()` returns a new ZodNumber (it adds a check); we return the
+		// refined schema, which is why the overload declares `z.ZodNumber` as
+		// the concrete return type — the generic-`S` form would have been
+		// inaccurate since `.int()` doesn't preserve arbitrary subtypes.
 		inner = innerOrOpts.int();
 		opts = maybeOpts;
 	} else {
-		// Accept number OR bigint, then coerce to number + validate .int().
+		// Accept number OR bigint, then coerce to number and validate .int().
 		// This is tighter than a blanket z.coerce.number() which would also
-		// accept strings, booleans, null, and Date objects.
-		// Accept number | bigint, then coerce to number and validate .int().
-		// The double cast is needed because Zod's pipe types are strict about
-		// intermediate _zod.input shapes that don't align with our ZodType<number>.
-		// At runtime, the pipeline is: accept number|bigint → coerce → int check.
+		// accept strings, booleans, null, and Date objects. The casts bridge
+		// Zod's pipe intermediates to our ZodType<number> constraint.
 		const guard = z.union([z.number(), z.bigint()]) as z.ZodType<number | bigint>;
 		inner = guard.pipe(
 			z.coerce.number().int() as z.ZodType<number, number | bigint>,
@@ -196,6 +198,13 @@ export function index<TSchema extends z.ZodObject<z.ZodRawShape>>(
 	if (opts?.docIdField !== undefined) {
 		if (typeof opts.docIdField !== "string" || opts.docIdField.length === 0) {
 			throw new Error("sl.index: `docIdField` must be a non-empty string");
+		}
+		if (opts.docIdField.includes(".")) {
+			// The native engine rejects nested doc id fields during manifest
+			// validation; surface the error early with a clearer message.
+			throw new Error(
+				`sl.index: \`docIdField\` must not contain "." (got "${opts.docIdField}"). The document id is a top-level field, not a nested path.`,
+			);
 		}
 		meta.docIdField = opts.docIdField;
 	}

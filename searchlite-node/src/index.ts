@@ -35,6 +35,7 @@ export type {
 } from "./zod/helpers";
 export {
 	compileZodSchema,
+	deriveResponseSchema,
 	isZodIndexSchema,
 	type ZodCompiledJsonSchema,
 	type ZodIndexSchema,

@@ -14,7 +14,8 @@ import {
 	validate,
 	validateTypedResult,
 } from "./transform";
-import { type ZodIndexSchema, isZodIndexSchema } from "./zod/compile";
+import { type ZodIndexSchema, deriveResponseSchema, isZodIndexSchema } from "./zod/compile";
+import { SearchliteIndexRegistry } from "./zod/registries";
 
 export interface RemoteIndexOptions<T = Record<string, unknown>> {
 	/** Write key sent via X-Write-Key header for protected indexes. */
@@ -39,6 +40,14 @@ export class RemoteIndex<T = Record<string, unknown>> implements SearchIndex<T> 
 	readonly #writeKey?: string;
 	readonly #fetch: typeof globalThis.fetch;
 	readonly #zodSchema: ZodIndexSchema | undefined;
+	/**
+	 * Derived partial schema used for auto-validating search hits. See
+	 * `deriveResponseSchema()` — non-stored / missing fields don't fail
+	 * validation, which matches the runtime reality of search results.
+	 */
+	readonly #responseSchema: ZodType | undefined;
+	/** docIdField resolved from the Zod index metadata, or undefined. */
+	readonly #docIdField: string | undefined;
 
 	constructor(baseUrl: string, indexName: string, options?: RemoteIndexOptions<T>) {
 		if (typeof baseUrl !== "string" || baseUrl.length === 0) {
@@ -59,27 +68,51 @@ export class RemoteIndex<T = Record<string, unknown>> implements SearchIndex<T> 
 				);
 			}
 			this.#zodSchema = options.schema;
+			this.#responseSchema = deriveResponseSchema(options.schema);
+			this.#docIdField = SearchliteIndexRegistry.get(options.schema as never)?.docIdField ?? "_id";
+		} else {
+			this.#responseSchema = undefined;
+			this.#docIdField = undefined;
 		}
+	}
+
+	/**
+	 * Validate and parse a single document against the stored Zod schema,
+	 * restoring the docIdField from the raw input if Zod stripped it (users
+	 * commonly don't declare `_id` in their z.object when the default
+	 * docIdField is used).
+	 */
+	#parseDoc(doc: T, label: string): Record<string, unknown> {
+		const schema = this.#zodSchema as unknown as ZodType<T>;
+		const parsed = validate(schema, doc, label) as Record<string, unknown>;
+		const idField = this.#docIdField;
+		if (idField && !(idField in parsed) && doc && typeof doc === "object") {
+			const src = doc as Record<string, unknown>;
+			if (idField in src) parsed[idField] = src[idField];
+		}
+		return parsed;
 	}
 
 	async add(doc: T): Promise<void> {
+		// Use the parsed/coerced output so coercion and defaults flow into the
+		// payload (e.g. `sl.integer()` coerces bigint → number).
+		let toSend: unknown;
 		if (this.#zodSchema) {
-			validate(this.#zodSchema as unknown as ZodType<T>, doc, "document");
+			toSend = this.#parseDoc(doc, "document");
 		} else {
 			validate(DocumentSchema, doc as Record<string, unknown>, "document");
+			toSend = doc;
 		}
-		await this.#post("bulk", { docs: [doc] });
+		await this.#post("bulk", { docs: [toSend] });
 	}
 
 	async addMany(docs: T[] | T): Promise<number> {
+		let payload: unknown[];
 		if (this.#zodSchema) {
-			if (Array.isArray(docs)) {
-				const zod = this.#zodSchema as unknown as ZodType<T>;
-				for (let i = 0; i < docs.length; i++) {
-					validate(zod, docs[i], `documents[${i}]`);
-				}
-			} else {
-				validate(this.#zodSchema as unknown as ZodType<T>, docs, "document");
+			const asArray = Array.isArray(docs) ? docs : [docs];
+			payload = new Array(asArray.length);
+			for (let i = 0; i < asArray.length; i++) {
+				payload[i] = this.#parseDoc(asArray[i], `documents[${i}]`);
 			}
 		} else {
 			validate(
@@ -87,9 +120,9 @@ export class RemoteIndex<T = Record<string, unknown>> implements SearchIndex<T> 
 				docs as Record<string, unknown>[] | Record<string, unknown>,
 				"documents",
 			);
+			payload = Array.isArray(docs) ? docs : [docs];
 		}
-		const docsArray = Array.isArray(docs) ? docs : [docs];
-		const body = await this.#post<{ queued: number }>("bulk", { docs: docsArray });
+		const body = await this.#post<{ queued: number }>("bulk", { docs: payload });
 		return body.queued;
 	}
 
@@ -119,8 +152,10 @@ export class RemoteIndex<T = Record<string, unknown>> implements SearchIndex<T> 
 			query = queryOrSchema as string | SearchRequest;
 		}
 
+		// Per-call schema wins; otherwise fall back to the derived response
+		// schema (partial) so non-stored fields don't fail hit validation.
 		const effectiveSchema: ZodType<unknown> | undefined =
-			fieldsSchema ?? (this.#zodSchema as ZodType<unknown> | undefined);
+			fieldsSchema ?? (this.#responseSchema as ZodType<unknown> | undefined);
 
 		if (effectiveSchema) {
 			if (typeof query === "string") {

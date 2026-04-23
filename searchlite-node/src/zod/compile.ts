@@ -50,6 +50,31 @@ export function isZodIndexSchema(value: unknown): value is ZodIndexSchema {
 	return SearchliteIndexRegistry.get(value as never) !== undefined;
 }
 
+/**
+ * Derive a "search response" Zod schema from a full index schema by making
+ * every top-level field optional.
+ *
+ * Why this exists: the full schema validates documents on *insert*, where
+ * all required fields must be present. But search results only include
+ * fields the index *stores* (text/keyword default to stored, numerics too
+ * in the Zod path, but vectors are not stored in hit.fields and any field
+ * can be explicitly marked `stored: false` to save space). If we validated
+ * hit fields against the full schema, required-but-not-stored fields would
+ * cause `validateTypedResult()` to throw on otherwise valid hits.
+ *
+ * The derived response schema is used for auto-validation of `search()`
+ * results when the user didn't pass a per-call schema. It's a shallow
+ * partial — nested objects remain required within themselves. Users with
+ * deep non-stored fields should pass a per-call schema to `search()`.
+ */
+export function deriveResponseSchema(schema: ZodIndexSchema): z.ZodType {
+	// `.partial()` on a ZodObject returns a new ZodObject where every
+	// top-level property is wrapped in `z.optional()`. The output shape
+	// still includes every field name — missing fields just parse as
+	// `undefined` rather than failing.
+	return (schema as unknown as z.ZodObject<z.ZodRawShape>).partial();
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /**
@@ -108,22 +133,32 @@ export function compileZodSchema(schema: ZodIndexSchema): JsonSchemaOutput {
 // ── Field name validation ────────────────────────────────────────────────────
 //
 // Diverges from `expandSchema` in one way: we allow the docIdField to appear
-// as a property in the Zod schema. Zod users naturally declare their id field
-// (`id: z.string().uuid()`) so that `z.infer<>` carries it; rejecting it would
-// force them to keep the shape out-of-sync with `docIdField`. The Rust side
-// accepts schemas where docIdField is also a regular property, so emitting
-// both is safe.
+// as a property in the Zod schema so `z.infer<>` carries the id field
+// naturally. But the native engine's manifest validator rejects any overlap
+// between `doc_id_field` and resolved fields in `properties` (see
+// searchlite-core/src/index/manifest.rs), so we strip the docIdField from the
+// emitted properties map (line 89 above) before handing the JSON to Rust. The
+// Zod schema retains the id field for runtime validation and typing.
 
 function validateFieldName(name: string, _docIdField: string): void {
+	validateFieldSegment(name, name);
+}
+
+/**
+ * Validate a single field-name segment. `name` is the raw segment being
+ * validated (used in the error message); `path` is the dot-joined full path
+ * where the error should point (for nested fields, e.g. `meta.bad.name`).
+ */
+function validateFieldSegment(name: string, path: string): void {
 	if (name.length === 0) {
 		throw new InvalidZodSchemaError({
-			path: name,
+			path,
 			message: "field name must not be empty",
 		});
 	}
 	if (name.includes(".")) {
 		throw new InvalidZodSchemaError({
-			path: name,
+			path,
 			message: `field name "${name}" must not contain "." (use nested fields instead)`,
 		});
 	}
@@ -282,6 +317,7 @@ function emitObject(inner: unknown, path: string, nullable: boolean): Record<str
 	const properties: Record<string, Record<string, unknown>> = {};
 	for (const [name, childSchema] of Object.entries(shape)) {
 		const childPath = path ? `${path}.${name}` : name;
+		validateFieldSegment(name, childPath);
 		properties[name] = emitField(childSchema, childPath);
 	}
 
@@ -326,7 +362,9 @@ function emitArray(inner: unknown, path: string, nullable: boolean): Record<stri
 	if (childShape) {
 		const properties: Record<string, Record<string, unknown>> = {};
 		for (const [name, childSchema] of Object.entries(childShape)) {
-			properties[name] = emitField(childSchema, `${itemsPath}.${name}`);
+			const childPath = `${itemsPath}.${name}`;
+			validateFieldSegment(name, childPath);
+			properties[name] = emitField(childSchema, childPath);
 		}
 		if (Object.keys(properties).length > 0) {
 			items.properties = properties;

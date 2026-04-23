@@ -14,6 +14,7 @@ export type {
 
 export {
 	compileZodSchema,
+	deriveResponseSchema,
 	isZodIndexSchema,
 	type JsonSchemaOutput as ZodCompiledJsonSchema,
 	type ZodIndexSchema,

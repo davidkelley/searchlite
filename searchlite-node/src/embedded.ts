@@ -18,7 +18,13 @@ import {
 	validate,
 	validateTypedResult,
 } from "./transform";
-import { type ZodIndexSchema, compileZodSchema, isZodIndexSchema } from "./zod/compile";
+import {
+	type ZodIndexSchema,
+	compileZodSchema,
+	deriveResponseSchema,
+	isZodIndexSchema,
+} from "./zod/compile";
+import { SearchliteIndexRegistry } from "./zod/registries";
 
 // --- Native binding loader ---
 
@@ -94,6 +100,14 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	#closed = false;
 	/** Set when the index was constructed with a Zod-authored schema. */
 	#zodSchema: ZodIndexSchema | undefined;
+	/**
+	 * Derived partial schema used for auto-validating search hits. See
+	 * `deriveResponseSchema()` — non-stored / missing fields don't fail
+	 * validation, which matches the runtime reality of search results.
+	 */
+	#responseSchema: ZodType | undefined;
+	/** docIdField resolved from the Zod index metadata, or undefined. */
+	#docIdField: string | undefined;
 
 	constructor(path: string, options?: { writeKey?: string; schema?: AnySchemaInput }) {
 		if (typeof path !== "string" || path.length === 0) {
@@ -116,10 +130,22 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 						);
 					}
 					this.#zodSchema = schemaInput;
+					this.#responseSchema = deriveResponseSchema(schemaInput);
+					this.#docIdField = SearchliteIndexRegistry.get(schemaInput as never)?.docIdField ?? "_id";
 					nativeOpts.schema = compileZodSchema(schemaInput);
-				} else {
+				} else if (
+					schemaInput !== null &&
+					typeof schemaInput === "object" &&
+					!Array.isArray(schemaInput)
+				) {
 					// Shorthand / raw JSON Schema: delegate to the existing expander.
 					nativeOpts.schema = expandSchema(schemaInput as Record<string, unknown>);
+				} else {
+					throw new Error(
+						`schema must be a plain object, a Zod index schema (from sl.index()), or a SchemaDefinition; received ${
+							schemaInput === null ? "null" : typeof schemaInput
+						}`,
+					);
 				}
 			}
 		}
@@ -130,33 +156,54 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 		);
 	}
 
+	/**
+	 * Validate `doc` against the stored Zod schema and return the parsed
+	 * output. If the parsed output doesn't contain the configured docIdField
+	 * (because the user didn't declare it in their Zod schema, e.g. the
+	 * default `_id` is not part of `z.object({...})`), the original value is
+	 * preserved from the input so the native engine can identify the doc.
+	 */
+	#parseDoc(doc: T, label: string): Record<string, unknown> {
+		const schema = this.#zodSchema as unknown as ZodType<T>;
+		const parsed = validate(schema, doc, label) as Record<string, unknown>;
+		const idField = this.#docIdField;
+		if (idField && !(idField in parsed) && doc && typeof doc === "object") {
+			const src = doc as Record<string, unknown>;
+			if (idField in src) parsed[idField] = src[idField];
+		}
+		return parsed;
+	}
+
 	async add(doc: T): Promise<void> {
+		// Use the parsed/coerced Zod output when available — schemas using
+		// coercion (e.g. `sl.integer()` accepts bigint → coerces to number)
+		// or `.default()` rely on the output value, not the input.
+		let toStore: unknown;
 		if (this.#zodSchema) {
-			validate(this.#zodSchema as unknown as ZodType<T>, doc, "document");
+			toStore = this.#parseDoc(doc, "document");
 		} else {
 			validate(DocumentSchema, doc as Record<string, unknown>, "document");
+			toStore = doc;
 		}
-		this.#native.add(doc);
+		this.#native.add(toStore);
 	}
 
 	async addMany(docs: T[] | T): Promise<number> {
 		if (this.#zodSchema) {
-			// Validate each doc against the Zod schema.
 			if (Array.isArray(docs)) {
-				const zod = this.#zodSchema as unknown as ZodType<T>;
+				const parsed: unknown[] = new Array(docs.length);
 				for (let i = 0; i < docs.length; i++) {
-					validate(zod, docs[i], `documents[${i}]`);
+					parsed[i] = this.#parseDoc(docs[i], `documents[${i}]`);
 				}
-			} else {
-				validate(this.#zodSchema as unknown as ZodType<T>, docs, "document");
+				return this.#native.addMany(parsed);
 			}
-		} else {
-			validate(
-				DocumentsSchema,
-				docs as Record<string, unknown>[] | Record<string, unknown>,
-				"documents",
-			);
+			return this.#native.addMany(this.#parseDoc(docs, "document"));
 		}
+		validate(
+			DocumentsSchema,
+			docs as Record<string, unknown>[] | Record<string, unknown>,
+			"documents",
+		);
 		return this.#native.addMany(docs);
 	}
 
@@ -182,11 +229,12 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 			query = queryOrSchema as string | SearchRequest;
 		}
 
-		// Explicit per-call schema wins. Otherwise, fall back to the
-		// construction-time Zod schema (if any) so hit fields are validated and
-		// typed without the caller having to pass it again.
+		// Explicit per-call schema wins. Otherwise, fall back to the derived
+		// response schema (a partial of the construction-time schema) so
+		// hit.fields is validated without failing on non-stored / missing
+		// fields. See `deriveResponseSchema()` for rationale.
 		const effectiveSchema: ZodType<unknown> | undefined =
-			fieldsSchema ?? (this.#zodSchema as ZodType<unknown> | undefined);
+			fieldsSchema ?? (this.#responseSchema as ZodType<unknown> | undefined);
 
 		if (effectiveSchema) {
 			if (typeof query === "string") {
