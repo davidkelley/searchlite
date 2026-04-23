@@ -1739,23 +1739,31 @@ mod tests {
 
   #[test]
   fn build_query_plan_rejects_deeply_nested_bool_boost_overflow() {
-    // Nested Bool->Bool->Term where each level carries a finite boost but
-    // the accumulated product at the innermost `combine_boost` overflows.
-    // Exercises recursive boost propagation through `build_node` (each
-    // Bool multiplies its own boost into the `child_boost` passed down);
-    // before the guard, the `+inf` would only surface at the bottom and
-    // leak into `ScoredTerm.weight`.
+    // Nested Bool->Bool->Term where the intermediate `combine_boost` calls
+    // all stay finite and only the innermost one overflows. Exercises the
+    // recursive boost propagation path through `build_node`: each Bool
+    // multiplies its own boost into the `child_boost` passed down to the
+    // next level. The overflow triggering *only* at the deepest
+    // multiplication is what makes this a genuine "deep propagation"
+    // regression — if a future refactor skipped propagation and applied
+    // the outer boost directly to the Term, or missed the guard on one
+    // intermediate hop, the error would surface at a different call site
+    // (or not at all).
+    //
+    // `f32::MAX ≈ 3.4e38`, so:
+    //   outer * inner = 1e19 * 1e19 = 1e38 (finite, just under MAX)
+    //   then         * term.boost = 1e38 * 10 = 1e39 → `+inf`.
     let inner = QueryNode::Bool {
       must: vec![QueryNode::Term {
         field: "body".into(),
         value: "rust".into(),
-        boost: Some(1e20),
+        boost: Some(10.0),
       }],
       should: Vec::new(),
       must_not: Vec::new(),
       filter: Vec::new(),
       minimum_should_match: None,
-      boost: Some(1e20),
+      boost: Some(1e19),
     };
     let outer = Query::Node(QueryNode::Bool {
       must: vec![inner],
@@ -1763,13 +1771,27 @@ mod tests {
       must_not: Vec::new(),
       filter: Vec::new(),
       minimum_should_match: None,
-      boost: Some(1e20),
+      boost: Some(1e19),
     });
-    // 1e20 * 1e20 = 1e40 (finite), then * 1e20 = 1e60 → +inf in f32.
     let err = build_query_plan(&outer, &["body".to_string()]).unwrap_err();
     assert!(
       err.to_string().contains("overflows"),
       "expected overflow error, got: {err}",
+    );
+    // Sanity-check that the chosen values actually make the intermediate
+    // `combine_boost` calls finite and only the innermost one overflows.
+    // If f32 arithmetic ever changes such that this no longer holds, the
+    // fixture is exercising a different call site than the test claims —
+    // pick new inputs.
+    let outer_times_inner = 1e19_f32 * 1e19_f32;
+    assert!(
+      outer_times_inner.is_finite(),
+      "fixture precondition: outer * inner must be finite to isolate the innermost overflow; got {outer_times_inner}",
+    );
+    assert!(
+      !(outer_times_inner * 10.0_f32).is_finite(),
+      "fixture precondition: (outer * inner) * term.boost must overflow; got {}",
+      outer_times_inner * 10.0_f32,
     );
   }
 
