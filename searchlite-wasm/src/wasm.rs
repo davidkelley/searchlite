@@ -2571,9 +2571,10 @@ mod tests {
     storage.write_all(&path, b"hello wasm").unwrap();
     storage.flush().await.unwrap();
     drop(storage);
-    let restored = JsStorage::new(db, root.clone()).await.unwrap();
+    let restored = JsStorage::new(db.clone(), root.clone()).await.unwrap();
     let contents = restored.read_to_end(&path).unwrap();
     assert_eq!(contents, b"hello wasm");
+    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
@@ -2601,7 +2602,7 @@ mod tests {
   async fn js_storage_methods_roundtrip() {
     let db = unique_db("searchlite-storage-methods");
     let root = PathBuf::from("idx-methods");
-    let storage = JsStorage::new(db, root.clone()).await.unwrap();
+    let storage = JsStorage::new(db.clone(), root.clone()).await.unwrap();
     let path = root.join("notes.txt");
 
     storage.ensure_dir(&root).unwrap();
@@ -2636,6 +2637,7 @@ mod tests {
     storage.flush().await.unwrap();
     let contents = storage.read_to_end(&atomic_path).unwrap();
     assert_eq!(contents, b"atomic");
+    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
@@ -2674,7 +2676,7 @@ mod tests {
   async fn js_file_seek_behaves() {
     let db = unique_db("searchlite-seek");
     let root = PathBuf::from("idx-seek");
-    let storage = JsStorage::new(db, root.clone()).await.unwrap();
+    let storage = JsStorage::new(db.clone(), root.clone()).await.unwrap();
     let path = root.join("seek.txt");
     let mut file = storage.open_write(&path).unwrap();
 
@@ -2690,13 +2692,16 @@ mod tests {
     assert_eq!(&tail, b"ef");
     file.seek(SeekFrom::Start(0)).unwrap();
     assert!(file.seek(SeekFrom::Current(-1)).is_err());
+    drop(file);
+    storage.flush().await.unwrap();
+    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
   async fn indexes_and_searches() {
     let db = unique_db("searchlite-index");
     let root = PathBuf::from("idx2");
-    let storage = Arc::new(JsStorage::new(db, root.clone()).await.unwrap());
+    let storage = Arc::new(JsStorage::new(db.clone(), root.clone()).await.unwrap());
     let schema = Schema::default_text_body();
     let opts = IndexOptions {
       path: root.clone(),
@@ -2757,13 +2762,16 @@ mod tests {
     };
     let result = reader.search(&request).unwrap();
     assert_eq!(result.hits.len(), 1);
+    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
   async fn wasm_core_parity_search_mget_multi_search_update_delete() {
     let db = unique_db("searchlite-parity");
     let schema_json = serde_json::to_string(&Schema::default_text_body()).unwrap();
-    let idx = Searchlite::init(db, schema_json, None).await.unwrap();
+    let idx = Searchlite::init(db.clone(), schema_json, None)
+      .await
+      .unwrap();
     let docs = vec![
       serde_json::json!({ "_id": "doc-1", "body": "alpha token" }),
       serde_json::json!({ "_id": "doc-2", "body": "beta token" }),
@@ -2876,6 +2884,7 @@ mod tests {
     })
     .unwrap();
     assert_eq!(wasm_verify_json, core_verify_json);
+    Searchlite::drop_index(db).await.unwrap();
   }
 
   #[wasm_bindgen_test]
@@ -2978,11 +2987,12 @@ mod tests {
     let hits = result_json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
 
-    let mismatch = match Searchlite::init(db, schema_v2_json, None).await {
+    let mismatch = match Searchlite::init(db.clone(), schema_v2_json, None).await {
       Ok(_) => panic!("expected schema mismatch after rollback"),
       Err(err) => err,
     };
     let mismatch_payload: WasmErrorPayload = serde_wasm_bindgen::from_value(mismatch).unwrap();
     assert_eq!(mismatch_payload.error_type, "schema_mismatch");
+    Searchlite::drop_index(db).await.unwrap();
   }
 }
