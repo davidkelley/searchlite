@@ -44,12 +44,9 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
-  # Headless Chrome hangs after 8 of 11 lib tests (hosted runner regression).
-  # Firefox still gates correctness; see test-wasm-browser-diagnose below.
   test-wasm-browser:
     name: WASM Browser
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -67,36 +64,6 @@ jobs:
           RUST_TEST_THREADS: "1"
           WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: wasm-pack test --headless --chrome searchlite-wasm
-
-  # Runs each suspect test individually to pinpoint the Chrome hang.
-  # Remove once root-caused.
-  test-wasm-browser-diagnose:
-    name: WASM Browser Diagnose (${{ matrix.test }})
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        test:
-          - indexes_and_searches
-          - commit_surfaces_quota_exceeded_error_type
-          - cleanup_orphaned_files_removes_only_unknown_paths
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
-      - name: Run single test in Chrome
-        env:
-          RUST_TEST_THREADS: "1"
-          WASM_BINDGEN_TEST_TIMEOUT: "30"
-        run: wasm-pack test --headless --chrome searchlite-wasm --lib -- --exact "wasm::tests::${{ matrix.test }}"
 
   test-wasm-browser-firefox:
     name: WASM Browser (Firefox)
