@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.8.0...searchlite-core-v0.8.1) - 2026-04-24
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.8.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.7.0...searchlite-core-v0.8.0) - 2026-04-23
 
 ### Added

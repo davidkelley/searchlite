@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/davidkelley/searchlite/compare/integration-v0.2.3...integration-v0.2.4) - 2026-04-24
+
+### Fixed
+
+- *(http)* drop index_path from /stats response (BUG-015) ([#178](https://github.com/davidkelley/searchlite/pull/178))
+
 ## [0.2.2](https://github.com/davidkelley/searchlite/compare/integration-v0.2.1...integration-v0.2.2) - 2026-04-13
 
 ### Added
