@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandSchema } from "../dist/schemas.js";
+import { SearchRequestSchema, expandSchema } from "../dist/schemas.js";
 
 describe("expandSchema", () => {
 	describe("shorthand strings", () => {
@@ -201,5 +201,123 @@ describe("expandSchema", () => {
 				/doc_id_field must be a non-empty string/,
 			);
 		});
+	});
+});
+
+// =============================================================================
+// SearchRequestSchema — field coverage
+// =============================================================================
+
+describe("SearchRequestSchema", () => {
+	describe("candidateSize and bmwBlockSize", () => {
+		// Regression: both fields appeared in `REQUEST_KEY_MAP` but were
+		// undeclared in the schema, so the default strip-mode z.object() silently
+		// dropped user-supplied values before they could reach the mapper. Callers
+		// could not tune the WAND candidate pool or BMW block size from Node at
+		// all — the mapping entries were dead code.
+		it("preserves candidateSize through validation", () => {
+			const parsed = SearchRequestSchema.parse({ query: "x", candidateSize: 250 });
+			expect(parsed.candidateSize).toBe(250);
+		});
+
+		it("preserves bmwBlockSize through validation", () => {
+			const parsed = SearchRequestSchema.parse({ query: "x", bmwBlockSize: 32 });
+			expect(parsed.bmwBlockSize).toBe(32);
+		});
+
+		it("rejects non-positive candidateSize", () => {
+			expect(() => SearchRequestSchema.parse({ query: "x", candidateSize: 0 })).toThrow();
+			expect(() => SearchRequestSchema.parse({ query: "x", candidateSize: -1 })).toThrow();
+		});
+
+		it("rejects non-integer candidateSize", () => {
+			expect(() => SearchRequestSchema.parse({ query: "x", candidateSize: 1.5 })).toThrow();
+		});
+
+		it("rejects non-positive bmwBlockSize", () => {
+			expect(() => SearchRequestSchema.parse({ query: "x", bmwBlockSize: 0 })).toThrow();
+		});
+	});
+});
+
+// =============================================================================
+// SearchRequestSchema.sort — normalization to canonical {field, order?}
+// =============================================================================
+//
+// Regression: before this fix, `SortSpecSchema` accepted three shorthand
+// forms that all failed at the Rust `SortSpec = {field: String, order: Option}`
+// deserialization step, and rejected the canonical form that would have
+// worked. Sorting was effectively broken from the Node client. The fix
+// normalizes every accepted shape to the canonical wire format defined by
+// `search-request.schema.json`'s `sort_spec`.
+
+describe("SearchRequestSchema.sort", () => {
+	it("accepts the canonical {field, order} form", () => {
+		const parsed = SearchRequestSchema.parse({
+			query: "x",
+			sort: [{ field: "price", order: "asc" }],
+		});
+		expect(parsed.sort).toEqual([{ field: "price", order: "asc" }]);
+	});
+
+	it("accepts canonical {field} without order", () => {
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ field: "price" }] });
+		expect(parsed.sort).toEqual([{ field: "price" }]);
+	});
+
+	it("normalizes string shorthand to canonical", () => {
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: ["price"] });
+		expect(parsed.sort).toEqual([{ field: "price" }]);
+	});
+
+	it("normalizes single-key {field: 'asc'} shorthand to canonical", () => {
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ price: "asc" }] });
+		expect(parsed.sort).toEqual([{ field: "price", order: "asc" }]);
+	});
+
+	it("normalizes single-key {field: {order}} shorthand to canonical", () => {
+		const parsed = SearchRequestSchema.parse({
+			query: "x",
+			sort: [{ price: { order: "desc" } }],
+		});
+		expect(parsed.sort).toEqual([{ field: "price", order: "desc" }]);
+	});
+
+	it("normalizes mixed forms within a single sort array", () => {
+		const parsed = SearchRequestSchema.parse({
+			query: "x",
+			sort: [
+				{ field: "price", order: "desc" },
+				"title",
+				{ year: "asc" },
+				{ author: { order: "desc" } },
+			],
+		});
+		expect(parsed.sort).toEqual([
+			{ field: "price", order: "desc" },
+			{ field: "title" },
+			{ field: "year", order: "asc" },
+			{ field: "author", order: "desc" },
+		]);
+	});
+
+	it("rejects multi-key shorthand records", () => {
+		// `{a: "asc", b: "desc"}` is ambiguous — two fields in one sort slot. The
+		// canonical form would be `[{field: "a", order: "asc"}, {field: "b", order: "desc"}]`.
+		expect(() =>
+			SearchRequestSchema.parse({ query: "x", sort: [{ a: "asc", b: "desc" }] }),
+		).toThrow();
+	});
+
+	it("rejects invalid order values", () => {
+		expect(() => SearchRequestSchema.parse({ query: "x", sort: [{ price: "up" }] })).toThrow();
+		expect(() =>
+			SearchRequestSchema.parse({ query: "x", sort: [{ field: "price", order: "up" }] }),
+		).toThrow();
+	});
+
+	it("rejects non-string sort entries", () => {
+		expect(() => SearchRequestSchema.parse({ query: "x", sort: [42] })).toThrow();
+		expect(() => SearchRequestSchema.parse({ query: "x", sort: [null] })).toThrow();
 	});
 });

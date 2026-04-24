@@ -251,6 +251,123 @@ describe("search options", () => {
 });
 
 // =============================================================================
+// Sort — native round-trip
+// =============================================================================
+//
+// Regression: before this fix, `SortSpecSchema` accepted three shorthand
+// forms that all failed on the Rust deserializer's `SortSpec = {field,
+// order}` struct, and rejected the canonical form that would have worked.
+// These tests confirm sort now functions end-to-end via the native binding
+// regardless of which form the caller used.
+
+describe("sort", () => {
+	async function priced() {
+		const idx = createIndex({
+			body: "text",
+			price: { type: "float", fast: true, stored: true },
+		});
+		await idx.addMany([
+			{ _id: "1", body: "widget", price: 30.0 },
+			{ _id: "2", body: "widget", price: 10.0 },
+			{ _id: "3", body: "widget", price: 20.0 },
+		]);
+		await idx.commit();
+		return idx;
+	}
+
+	it("sorts by canonical {field, order} form (asc)", async () => {
+		const idx = await priced();
+		const result = await idx.search({
+			query: "widget",
+			sort: [{ field: "price", order: "asc" }],
+		});
+		expect(result.hits.map((h) => h.docId)).toEqual(["2", "3", "1"]);
+		await idx.close();
+	});
+
+	it("sorts by canonical {field, order} form (desc)", async () => {
+		const idx = await priced();
+		const result = await idx.search({
+			query: "widget",
+			sort: [{ field: "price", order: "desc" }],
+		});
+		expect(result.hits.map((h) => h.docId)).toEqual(["1", "3", "2"]);
+		await idx.close();
+	});
+
+	it("sorts by single-key {field: 'asc'} shorthand", async () => {
+		const idx = await priced();
+		const result = await idx.search({ query: "widget", sort: [{ price: "asc" }] });
+		expect(result.hits.map((h) => h.docId)).toEqual(["2", "3", "1"]);
+		await idx.close();
+	});
+
+	it("sorts by single-key {field: {order}} shorthand", async () => {
+		const idx = await priced();
+		const result = await idx.search({
+			query: "widget",
+			sort: [{ price: { order: "desc" } }],
+		});
+		expect(result.hits.map((h) => h.docId)).toEqual(["1", "3", "2"]);
+		await idx.close();
+	});
+
+	it("sorts by bare string shorthand (defaults to ascending)", async () => {
+		const idx = await priced();
+		const result = await idx.search({ query: "widget", sort: ["price"] });
+		expect(result.hits.map((h) => h.docId)).toEqual(["2", "3", "1"]);
+		await idx.close();
+	});
+
+	it("rejects multi-key shorthand at validation", async () => {
+		const idx = await priced();
+		await expect(
+			idx.search({ query: "widget", sort: [{ price: "asc", other: "desc" }] }),
+		).rejects.toThrow();
+		await idx.close();
+	});
+});
+
+// =============================================================================
+// candidateSize / bmwBlockSize — native round-trip
+// =============================================================================
+//
+// Regression: these fields were undeclared in `SearchRequestSchema`, so
+// Zod's default strip mode silently dropped them before they could reach
+// the native binding. Users could not tune the WAND candidate pool size
+// or BMW block size. These tests verify the fields now flow through.
+
+describe("tuning knobs", () => {
+	it("accepts candidateSize without error", async () => {
+		const idx = createIndex();
+		await idx.addMany([
+			{ _id: "1", body: "alpha" },
+			{ _id: "2", body: "alpha beta" },
+		]);
+		await idx.commit();
+		const result = await idx.search({ query: "alpha", candidateSize: 50 });
+		expect(result.totalHits).toBe(2);
+		await idx.close();
+	});
+
+	it("accepts bmwBlockSize with bmw execution strategy", async () => {
+		const idx = createIndex();
+		await idx.addMany([
+			{ _id: "1", body: "alpha" },
+			{ _id: "2", body: "alpha beta" },
+		]);
+		await idx.commit();
+		const result = await idx.search({
+			query: "alpha",
+			execution: "bmw",
+			bmwBlockSize: 16,
+		});
+		expect(result.totalHits).toBe(2);
+		await idx.close();
+	});
+});
+
+// =============================================================================
 // Structured queries
 // =============================================================================
 
