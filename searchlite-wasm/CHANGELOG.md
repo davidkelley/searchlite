@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/davidkelley/searchlite/compare/searchlite-wasm-v0.1.7...searchlite-wasm-v0.1.8) - 2026-04-24
+
+### Added
+
+- *(wasm)* harden browser runtime and production workflows ([#179](https://github.com/davidkelley/searchlite/pull/179))
+
+### Fixed
+
+- *(wasm)* release cached IndexedDB connections at end of each lib test ([#444](https://github.com/davidkelley/searchlite/pull/444))
+
 ## [0.1.7](https://github.com/davidkelley/searchlite/compare/searchlite-wasm-v0.1.6...searchlite-wasm-v0.1.7) - 2026-04-23
 
 ### Added

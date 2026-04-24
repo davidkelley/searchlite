@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.2.3...searchlite-http-v0.2.4) - 2026-04-24
+
+### Fixed
+
+- *(http)* classify write-key errors via typed downcast (BUG-406) ([#407](https://github.com/davidkelley/searchlite/pull/407))
+- *(http)* drop path from /indexes response (BUG-219) ([#220](https://github.com/davidkelley/searchlite/pull/220))
+- *(http)* redact internal error detail from client responses (BUG-016) ([#197](https://github.com/davidkelley/searchlite/pull/197))
+- *(http)* drop index_path from /stats response (BUG-015) ([#178](https://github.com/davidkelley/searchlite/pull/178))
+
+### Other
+
+- *(http)* share IndexReader pool across parallel multi_search ([#282](https://github.com/davidkelley/searchlite/pull/282))
+
 ## [0.2.3](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.2.2...searchlite-http-v0.2.3) - 2026-04-13
 
 ### Other
