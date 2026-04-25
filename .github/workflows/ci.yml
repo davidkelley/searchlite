@@ -44,13 +44,12 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
-  # Lib tests pass (fixed by closing cached IDB connections). Integration
-  # tests still flake on headless Chrome in current runner images (likely
-  # setTimeout throttling in lifecycle.rs); Firefox gates correctness.
+  # Chrome runs lib tests only — integration tests in tests/*.rs hang in
+  # headless Chrome on current hosted runner images (looks like setTimeout
+  # throttling in lifecycle.rs). Firefox runs the full suite below.
   test-wasm-browser:
     name: WASM Browser
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,11 +62,11 @@ jobs:
         run: cargo install wasm-pack --locked
       - name: Build WASM package
         run: wasm-pack build searchlite-wasm --target web --release
-      - name: Run browser tests
+      - name: Run lib tests
         env:
           RUST_TEST_THREADS: "1"
           WASM_BINDGEN_TEST_TIMEOUT: "120"
-        run: wasm-pack test --headless --chrome searchlite-wasm
+        run: wasm-pack test --headless --chrome searchlite-wasm --lib
 
   test-wasm-browser-firefox:
     name: WASM Browser (Firefox)
