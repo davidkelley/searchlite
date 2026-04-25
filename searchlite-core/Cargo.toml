@@ -57,7 +57,7 @@ js-sys = "0.3.69"
 [dev-dependencies]
 rand = { workspace = true }
 criterion = { workspace = true }
-tempfile = "3.8.1"
+tempfile = "3.27.0"
 
 [lib]
 name = "searchlite_core"

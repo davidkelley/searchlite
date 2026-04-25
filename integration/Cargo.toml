@@ -17,12 +17,12 @@ anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.11.27", features = ["json", "rustls-tls", "blocking"] }
 portpicker = "0.1.1"
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core" }
 searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
 
 [dev-dependencies]
-assert_cmd = "2.0.16"
+assert_cmd = "2.2.1"
 predicates = "3.1.2"
