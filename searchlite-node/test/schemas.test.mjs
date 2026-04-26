@@ -237,6 +237,20 @@ describe("SearchRequestSchema", () => {
 		it("rejects non-positive bmwBlockSize", () => {
 			expect(() => SearchRequestSchema.parse({ query: "x", bmwBlockSize: 0 })).toThrow();
 		});
+
+		// The wire schema declares `candidate_size` and `bmw_block_size` as
+		// `["integer", "null"]`. Some callers round-trip payloads where the
+		// override has been cleared by sending `null`; the Rust `Option<usize>`
+		// accepts that too, so the camelCase fields must as well.
+		it("accepts explicit null for candidateSize and bmwBlockSize", () => {
+			const parsed = SearchRequestSchema.parse({
+				query: "x",
+				candidateSize: null,
+				bmwBlockSize: null,
+			});
+			expect(parsed.candidateSize).toBeNull();
+			expect(parsed.bmwBlockSize).toBeNull();
+		});
 	});
 });
 
@@ -273,6 +287,32 @@ describe("SearchRequestSchema.sort", () => {
 	it("normalizes single-key {field: 'asc'} shorthand to canonical", () => {
 		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ price: "asc" }] });
 		expect(parsed.sort).toEqual([{ field: "price", order: "asc" }]);
+	});
+
+	// The shorthand-order variant is tried before the canonical variant in
+	// the union so that `{field: "asc"}` reads as "sort by the field named
+	// `field`, ascending" — the natural shorthand interpretation — rather
+	// than as canonical `{field: "asc"}` which would mean "sort by a field
+	// literally named 'asc'". Users with a field whose name happens to
+	// equal "asc"/"desc" must use the explicit canonical form (with an
+	// `order`) to disambiguate; this is documented intentional behavior.
+	it("treats {field: 'asc'} as shorthand for sort by 'field' ascending", () => {
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ field: "asc" }] });
+		expect(parsed.sort).toEqual([{ field: "field", order: "asc" }]);
+	});
+
+	it("treats {field: 'desc'} as shorthand for sort by 'field' descending", () => {
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ field: "desc" }] });
+		expect(parsed.sort).toEqual([{ field: "field", order: "desc" }]);
+	});
+
+	it("falls through to canonical when the value is not asc/desc", () => {
+		// `{field: "name"}` cannot match the shorthand-order variant
+		// because "name" isn't a valid order, so it falls through to the
+		// canonical variant and means "sort by the field named 'name', no
+		// explicit order".
+		const parsed = SearchRequestSchema.parse({ query: "x", sort: [{ field: "name" }] });
+		expect(parsed.sort).toEqual([{ field: "name" }]);
 	});
 
 	it("normalizes single-key {field: {order}} shorthand to canonical", () => {
