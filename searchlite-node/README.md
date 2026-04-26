@@ -171,7 +171,7 @@ console.log(results.hits[0].score);       // BM25 relevance score
 | **Use when** | Search runs in-process | Index lives on another server |
 | **Latency** | Microseconds (native) | Network round-trip |
 | **Write support** | Full (add, commit, compact) | Full (via HTTP API) |
-| **Dependencies** | Native binary (.node) | `fetch` (Node 18+) |
+| **Dependencies** | Native binary (.node) | `fetch` (Node 20+) |
 | **Constructor** | `new EmbeddedIndex(path, opts?)` | `new RemoteIndex(baseUrl, indexName, opts?)` |
 
 Both implement the `SearchIndex` interface — all methods return Promises.
