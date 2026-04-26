@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.11...searchlite-cli-v0.1.12) - 2026-04-26
+
+### Other
+
+- *(deps)* bump the rust-minor-patch group across 1 directory with 16 updates ([#448](https://github.com/davidkelley/searchlite/pull/448))
+
 ## [0.1.11](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.10...searchlite-cli-v0.1.11) - 2026-04-25
 
 ### Fixed
