@@ -44,6 +44,51 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
+  # Chrome runs lib tests only — integration tests in tests/*.rs hang in
+  # headless Chrome on current hosted runner images (looks like setTimeout
+  # throttling in lifecycle.rs). Firefox runs the full suite below.
+  test-wasm-browser:
+    name: WASM Browser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+      - name: Build WASM package
+        run: wasm-pack build searchlite-wasm --target web --release
+      - name: Run lib tests
+        env:
+          RUST_TEST_THREADS: "1"
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
+        run: wasm-pack test --headless --chrome searchlite-wasm --lib
+
+  test-wasm-browser-firefox:
+    name: WASM Browser (Firefox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+      - name: Build WASM package
+        run: wasm-pack build searchlite-wasm --target web --release
+      - name: Run browser tests
+        env:
+          RUST_TEST_THREADS: "1"
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
+        run: wasm-pack test --headless --firefox searchlite-wasm
+
   # Full toolchain coverage — only on main
   lint-test-extended:
     name: Extended / ${{ matrix.toolchain }}

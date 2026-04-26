@@ -62,6 +62,45 @@ Use `"memory"` instead of `"indexeddb"` for ephemeral indexes that don't persist
 
 ---
 
+## Schema mini-reference
+
+The WASM binding accepts the same schema format as `searchlite-core`. The
+shape below is enough for most WASM use cases; the [core schema docs](schema.md)
+cover the full surface (nested objects, fast fields, analyzers, vectors).
+
+```json
+{
+  "doc_id_field": "_id",
+  "text_fields": [
+    { "name": "title", "analyzer": "default", "stored": true, "indexed": true },
+    { "name": "body",  "analyzer": "default", "stored": false, "indexed": true }
+  ],
+  "keyword_fields": [
+    { "name": "tag", "stored": true, "indexed": true, "fast": true }
+  ],
+  "numeric_fields": [
+    { "name": "year", "i64": true, "fast": true, "stored": true }
+  ]
+}
+```
+
+Notes:
+
+- `doc_id_field` names the string field on each document that uniquely
+  identifies it. Convention is `_id`.
+- `text_fields` are tokenised and indexed for full-text search. Set
+  `stored: true` to be able to return the original value in hits.
+- `keyword_fields` are indexed as exact-match tokens. Use `fast: true` to make
+  them available for filters, sort, and aggregations.
+- `numeric_fields` support `i64` / `u64` / `f64`. Use `fast: true` for range
+  filters and sort.
+- JSON-schema style (`type: "object"`, `properties: { ... }`) also works — see
+  the `Quick start` example above.
+
+Pass the schema as a JSON string to `Searchlite.init(name, schemaJson, storage)`.
+
+---
+
 ## Build targets
 
 | Target | Command | Use case |
@@ -165,14 +204,109 @@ RUST_TEST_THREADS=1 wasm-pack test --headless --chrome \
   aggregations, highlighting).
 - See [bindings.md](bindings.md) for a reference of binding behaviors.
 
-All WASM errors are returned as structured payloads:
+All WASM errors are returned as structured payloads of the shape
+`{ type: string, reason: string }`. Dispatch on `err.type` and log `err.reason`.
 
-```json
-{
-  "type": "quota_exceeded",
-  "reason": "indexeddb quota exceeded while committing index data; run compact(), remove stale indexes with Searchlite.cleanup_indexes(...), or clear/drop unused indexes before retrying. detail: ..."
+```javascript
+try {
+  await db.commit();
+} catch (err) {
+  if (err.type === "quota_exceeded") {
+    await db.compact();
+  }
+  console.error(err.type, err.reason);
 }
 ```
+
+See [**docs/wasm-errors.md**](wasm-errors.md) for the full reference of every
+typed error code, when it's emitted, and the recommended recovery action.
+
+---
+
+## TypeScript
+
+`wasm-pack build --target web` emits `pkg/searchlite_wasm.d.ts` alongside the
+compiled module. Import the typed `Searchlite` class directly:
+
+```typescript
+import init, { Searchlite } from "./pkg/searchlite_wasm.js";
+
+await init();
+const db: Searchlite = await Searchlite.init(
+  "typed-demo",
+  JSON.stringify(schema),
+  "indexeddb",
+);
+```
+
+For the `--target bundler` output, type definitions live in the generated
+`pkg/` package and are picked up automatically by bundlers and `tsc` via the
+package's `types` field.
+
+---
+
+## Migration walkthrough
+
+Schemas evolve. The WASM binding exposes two static methods for safe migration:
+
+```javascript
+// 1. Ask what would happen. Read-only — does not touch IndexedDB.
+const plan = await Searchlite.plan_migration("articles", JSON.stringify(newSchema));
+// plan.status is one of:
+//   "missing"           — no index with that name exists
+//   "compatible"        — existing schema matches; no rebuild needed
+//   "rebuild_required"  — schema differs; init() would refuse, migrate_index() will rebuild
+
+// 2. Execute the plan. Rebuilds with rollback to the previous snapshot on failure.
+const result = await Searchlite.migrate_index("articles", JSON.stringify(newSchema));
+// result.status is one of:
+//   "created"    — new index created
+//   "compatible" — existing index was already compatible; nothing changed
+//   "rebuilt"    — index was dropped and recreated under the new schema
+
+console.log(result.schema_version, result.existing_schema_hash, result.requested_schema_hash);
+```
+
+On rebuild failure, `migrate_index` restores the previous snapshot and returns
+a typed `migration_rebuild_failed` error — the old schema remains usable. See
+[docs/wasm-errors.md § Migration](wasm-errors.md#migration).
+
+---
+
+## Maintenance & storage operations
+
+IndexedDB quotas are finite and segments accumulate. A periodic maintenance
+routine keeps things predictable:
+
+```javascript
+// 1. How are we doing on storage?
+const usage = await Searchlite.storage_usage();
+if (usage.supported) {
+  console.log(`${usage.usage_bytes} / ${usage.quota_bytes} bytes`);
+}
+
+// 2. Preview which indexes would be dropped by the cleanup.
+const ThirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+const preview = await Searchlite.cleanup_indexes(ThirtyDaysMs, true); // dry_run
+console.log("would drop:", preview.dropped);
+console.log("would keep:", preview.kept);
+
+// 3. Actually drop stale indexes.
+await Searchlite.cleanup_indexes(ThirtyDaysMs);
+
+// 4. Compact the indexes you want to keep and prune orphaned blobs.
+await db.compact();                   // merges segments within one index
+await db.cleanup_orphaned_files();    // removes blobs not referenced by the manifest
+
+// 5. Spot-check the index state.
+const stats = await db.stats();
+console.log(stats.document_count, stats.segment_count);
+```
+
+Run this (or a subset) on app start or on an idle timer. `cleanup_indexes`
+with a `dry_run` flag is safe to call interactively to preview the impact
+before committing.
+
 
 ---
 
@@ -189,6 +323,65 @@ IndexedDB mode this is transparent (state is reopened from persistence). For mem
 worker restarts lose state, so the demo falls back to main-thread execution.
 The worker client validates `timeoutMs`/`delayMs` as non-negative finite numbers and surfaces
 typed `invalid_timeout`/`invalid_argument` errors for invalid values.
+
+### Worker client end-to-end
+
+```javascript
+import { SearchliteWorkerClient, supportsModuleWorkers }
+  from "./searchlite-worker-client.mjs";
+
+if (!supportsModuleWorkers()) {
+  // Fall back to main-thread APIs (`idx.search_request_controlled(...)`).
+  throw new Error("module workers unavailable in this runtime");
+}
+
+const client = new SearchliteWorkerClient();
+
+// 1. Initialise the index inside the worker.
+await client.initIndex("worker-demo", JSON.stringify(schema), "indexeddb");
+
+// 2. Ingest. addDocuments resolves after the worker has committed.
+await client.addDocuments([
+  { _id: "1", title: "Hello, world", body: "A first document." },
+  { _id: "2", title: "Workers keep UIs snappy", body: "Non-blocking search." },
+]);
+
+// 3. Search with cancellation + timeout.
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5_000);
+
+try {
+  const result = await client.searchRequest(
+    { query: "workers", limit: 10, return_stored: true },
+    { signal: controller.signal, timeoutMs: 2_000 },
+  );
+  console.log(result.hits);
+} catch (err) {
+  // `err.type` will be "aborted", "timeout", or another typed code.
+  console.error(err.type, err.reason);
+}
+
+// 4. Other maintenance ops are available:
+await client.flushStorage();
+const usage = await client.storageUsage();
+
+// 5. Tear down. Terminates the worker and rejects any in-flight requests.
+await client.dispose();
+```
+
+The worker client's method surface:
+
+| Method | Purpose |
+| --- | --- |
+| `new SearchliteWorkerClient(workerUrl?)` | Construct a client. Defaults to `./searchlite-demo-worker.mjs` resolved relative to the module. |
+| `initIndex(dbName, schemaJson, storage?)` | Initialise the worker-side index. `storage` defaults to `"indexeddb"`. |
+| `addDocuments(docs)` | Ingest an array of docs. Returns `{ added: number }` after commit. |
+| `searchRequest(request, { signal?, timeoutMs?, delayMs? }?)` | Execute a `SearchRequest`. Returns the response payload. |
+| `resetIndex()` | Delete everything in the current index (worker-side). |
+| `flushStorage()` | Drain pending writes. |
+| `storageUsage()` | Query browser storage usage (same shape as `Searchlite.storage_usage`). |
+| `dispose()` | Terminate the worker and reject pending calls. |
+
 
 ### Runtime fallback matrix
 

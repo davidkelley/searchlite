@@ -104,6 +104,7 @@ async function handleMessage(message) {
       if (!currentConfig) {
         throw { type: "index_not_initialized", reason: "worker index is not initialized" };
       }
+      await Searchlite.clear_index(currentConfig.dbName);
       index = await Searchlite.init(
         currentConfig.dbName,
         currentConfig.schemaJson,

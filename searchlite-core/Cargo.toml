@@ -1,6 +1,6 @@
 [package]
 name = "searchlite-core"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
@@ -57,7 +57,7 @@ js-sys = "0.3.69"
 [dev-dependencies]
 rand = { workspace = true }
 criterion = { workspace = true }
-tempfile = "3.8.1"
+tempfile = "3.27.0"
 
 [lib]
 name = "searchlite_core"
