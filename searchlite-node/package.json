@@ -21,7 +21,15 @@
 	},
 	"homepage": "https://github.com/davidkelley/searchlite/tree/main/searchlite-node#readme",
 	"bugs": "https://github.com/davidkelley/searchlite/issues",
-	"keywords": ["search", "full-text", "index", "native", "rust", "napi", "embedded"],
+	"keywords": [
+		"search",
+		"full-text",
+		"index",
+		"native",
+		"rust",
+		"napi",
+		"embedded"
+	],
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
@@ -39,7 +47,7 @@
 	},
 	"devDependencies": {
 		"zod": "^4.3.6",
-		"@biomejs/biome": "^1",
+		"@biomejs/biome": "^2",
 		"@napi-rs/cli": "^3",
 		"@swc/cli": "^0.8",
 		"@swc/core": "^1",
@@ -65,5 +73,9 @@
 		"lint": "biome check .",
 		"lint:fix": "biome check --write ."
 	},
-	"files": ["dist", "LICENSE", "*.node"]
+	"files": [
+		"dist",
+		"LICENSE",
+		"*.node"
+	]
 }

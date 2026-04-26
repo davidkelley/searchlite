@@ -1,15 +1,15 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ZodType } from "zod";
+import type { SchemaDefinition, SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 import {
 	DocumentSchema,
 	DocumentsSchema,
+	expandSchema,
 	OpenOptionsSchema,
 	SearchRequestSchema,
 	SearchResultSchema,
-	expandSchema,
 } from "./schemas";
-import type { SchemaDefinition, SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 import type { SearchIndex } from "./search-index";
 import {
 	type RawSearchResult,
@@ -19,10 +19,10 @@ import {
 	validateTypedResult,
 } from "./transform";
 import {
-	type ZodIndexSchema,
 	compileZodSchema,
 	deriveResponseSchema,
 	isZodIndexSchema,
+	type ZodIndexSchema,
 } from "./zod/compile";
 import { SearchliteIndexRegistry } from "./zod/registries";
 
