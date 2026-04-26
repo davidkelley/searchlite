@@ -1,5 +1,4 @@
-import type { SearchliteFieldMetadata } from "./registries";
-import type { SearchliteFieldRegistry } from "./registries";
+import type { SearchliteFieldMetadata, SearchliteFieldRegistry } from "./registries";
 
 // ── Auto-promotion rules ─────────────────────────────────────────────────────
 

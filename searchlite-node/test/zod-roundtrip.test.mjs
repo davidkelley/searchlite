@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { EmbeddedIndex, compileZodSchema, expandSchema, sl } from "../dist/index.js";
+import { compileZodSchema, EmbeddedIndex, expandSchema, sl } from "../dist/index.js";
 
 // Round-trip parity tests.
 //
