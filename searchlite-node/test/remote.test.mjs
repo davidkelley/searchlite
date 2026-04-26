@@ -140,6 +140,79 @@ describe("request formatting", () => {
 		expect(body.returnStored).toBeUndefined();
 	});
 
+	// Regression: candidateSize and bmwBlockSize appeared in the snake-case
+	// mapping but were undeclared in SearchRequestSchema, so Zod's default
+	// strip mode silently dropped them before they could be mapped. Users
+	// could not tune these from the Node client. These tests lock in the
+	// round-trip to the server.
+	it("forwards candidateSize as candidate_size", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({ query: "hello", candidateSize: 250 });
+		const body = fetch._calls[0].body;
+		expect(body.candidate_size).toBe(250);
+		expect(body.candidateSize).toBeUndefined();
+	});
+
+	it("forwards bmwBlockSize as bmw_block_size", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({ query: "hello", bmwBlockSize: 32 });
+		const body = fetch._calls[0].body;
+		expect(body.bmw_block_size).toBe(32);
+		expect(body.bmwBlockSize).toBeUndefined();
+	});
+
+	// Regression: SortSpecSchema previously accepted shorthand forms that
+	// the Rust `SortSpec` struct rejects, and rejected the canonical
+	// `{field, order}` shape that actually works on the wire. These tests
+	// assert that every accepted form lands on the server as the canonical
+	// shape defined by `search-request.schema.json`.
+	it("sends canonical sort {field, order} unchanged", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({
+			query: "hello",
+			sort: [{ field: "price", order: "asc" }],
+		});
+		expect(fetch._calls[0].body.sort).toEqual([{ field: "price", order: "asc" }]);
+	});
+
+	it("normalizes string sort shorthand to canonical", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({ query: "hello", sort: ["price"] });
+		expect(fetch._calls[0].body.sort).toEqual([{ field: "price" }]);
+	});
+
+	it("normalizes {field: 'asc'} sort shorthand to canonical", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({ query: "hello", sort: [{ price: "desc" }] });
+		expect(fetch._calls[0].body.sort).toEqual([{ field: "price", order: "desc" }]);
+	});
+
+	it("normalizes {field: {order}} sort shorthand to canonical", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({ query: "hello", sort: [{ price: { order: "asc" } }] });
+		expect(fetch._calls[0].body.sort).toEqual([{ field: "price", order: "asc" }]);
+	});
+
+	it("normalizes mixed sort forms within a single request", async () => {
+		const fetch = mockFetch({ body: SEARCH_RESULT });
+		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });
+		await idx.search({
+			query: "hello",
+			sort: [{ field: "price", order: "desc" }, "title", { year: "asc" }],
+		});
+		expect(fetch._calls[0].body.sort).toEqual([
+			{ field: "price", order: "desc" },
+			{ field: "title" },
+			{ field: "year", order: "asc" },
+		]);
+	});
+
 	it("wraps single doc in bulk format for add()", async () => {
 		const fetch = mockFetch({ body: { queued: 1 } });
 		const idx = new RemoteIndex("http://host:9200", "idx", { fetch });

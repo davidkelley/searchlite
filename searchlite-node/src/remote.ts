@@ -1,11 +1,11 @@
 import type { ZodType } from "zod";
+import type { SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 import {
 	DocumentSchema,
 	DocumentsSchema,
 	SearchRequestSchema,
 	SearchResultSchema,
 } from "./schemas";
-import type { SearchRequest, SearchResult, TypedSearchResult } from "./schemas";
 import type { SearchIndex } from "./search-index";
 import {
 	type RawSearchResult,
@@ -14,7 +14,7 @@ import {
 	validate,
 	validateTypedResult,
 } from "./transform";
-import { type ZodIndexSchema, deriveResponseSchema, isZodIndexSchema } from "./zod/compile";
+import { deriveResponseSchema, isZodIndexSchema, type ZodIndexSchema } from "./zod/compile";
 import { SearchliteIndexRegistry } from "./zod/registries";
 
 export interface RemoteIndexOptions<T = Record<string, unknown>> {

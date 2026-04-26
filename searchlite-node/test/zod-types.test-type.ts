@@ -9,7 +9,7 @@ import { expectTypeOf } from "vitest";
 import { z } from "zod";
 
 import type { Hit, SearchResult, TypedSearchResult, ZodIndexSchema } from "../src";
-import { EmbeddedIndex, RemoteIndex, compileZodSchema, isZodIndexSchema, sl } from "../src";
+import { compileZodSchema, EmbeddedIndex, isZodIndexSchema, RemoteIndex, sl } from "../src";
 
 // ── sl.* helper return types ─────────────────────────────────────────────────
 // biome-ignore lint/complexity/noUselessLoneBlockStatements: scoping tests

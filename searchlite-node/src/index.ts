@@ -1,8 +1,6 @@
-export type { SearchIndex } from "./search-index";
 export { EmbeddedIndex } from "./embedded";
-export { RemoteIndex } from "./remote";
 export type { RemoteIndexOptions } from "./remote";
-
+export { RemoteIndex } from "./remote";
 export type {
 	FieldDefinition,
 	FieldShorthand,
@@ -17,34 +15,32 @@ export type {
 	TypedHit,
 	TypedSearchResult,
 } from "./schemas";
-
 export { expandSchema } from "./schemas";
+export type { SearchIndex } from "./search-index";
 
 // --- Zod-native authoring ---
 //
 // Define your index once with Zod and the same schema will validate documents
 // on insert, drive the native index definition, and type-check search results.
 
-export { sl } from "./zod/helpers";
-export type {
-	TextOpts,
-	KeywordOpts,
-	NumericOpts,
-	VectorOpts,
-	IndexOpts,
-} from "./zod/helpers";
 export {
 	compileZodSchema,
 	deriveResponseSchema,
+	InvalidZodSchemaError,
 	isZodIndexSchema,
+	type SearchliteFieldMetadata,
+	SearchliteFieldRegistry,
+	type SearchliteIndexMetadata,
+	SearchliteIndexRegistry,
+	UnsupportedZodTypeError,
 	type ZodCompiledJsonSchema,
 	type ZodIndexSchema,
 } from "./zod";
-export {
-	SearchliteFieldRegistry,
-	SearchliteIndexRegistry,
-	type SearchliteFieldMetadata,
-	type SearchliteIndexMetadata,
-	UnsupportedZodTypeError,
-	InvalidZodSchemaError,
-} from "./zod";
+export type {
+	IndexOpts,
+	KeywordOpts,
+	NumericOpts,
+	TextOpts,
+	VectorOpts,
+} from "./zod/helpers";
+export { sl } from "./zod/helpers";
