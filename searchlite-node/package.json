@@ -45,10 +45,10 @@
 		"@swc/core": "^1",
 		"@types/node": "^25.6.0",
 		"typescript": "^5",
-		"vitest": "^3"
+		"vitest": "^4"
 	},
 	"engines": {
-		"node": ">= 18"
+		"node": ">= 20"
 	},
 	"scripts": {
 		"artifacts": "napi artifacts",
