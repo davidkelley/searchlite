@@ -197,10 +197,55 @@ const FilterSchema: z.ZodType = z.union([
 	z.object({ Not: z.lazy(() => FilterSchema) }),
 ]);
 
+// The canonical wire format (see `search-request.schema.json`'s `sort_spec`)
+// is `{field: string, order?: "asc" | "desc"}`. The three shorthand forms
+// are normalized to the canonical shape by the `SortSpec*` schema
+// `.transform()`s below — `requestToSnake` only remaps top-level request
+// keys and does not touch `sort` — so users can pick whichever style reads
+// best without hitting a deserialization failure on the Rust side.
+const SortOrderEnum = z.enum(["asc", "desc"]);
+
+const SortSpecCanonical = z.object({
+	field: z.string(),
+	order: SortOrderEnum.optional(),
+});
+
+const SortSpecShorthandString = z.string().transform((field) => ({ field }));
+
+const SortSpecShorthandOrder = z
+	.record(z.string(), SortOrderEnum)
+	.refine((rec) => Object.keys(rec).length === 1, {
+		message: "sort shorthand must have exactly one field key",
+	})
+	.transform((rec) => {
+		const [field] = Object.keys(rec);
+		return { field, order: rec[field] };
+	});
+
+const SortSpecShorthandNested = z
+	.record(z.string(), z.object({ order: SortOrderEnum }))
+	.refine((rec) => Object.keys(rec).length === 1, {
+		message: "sort shorthand must have exactly one field key",
+	})
+	.transform((rec) => {
+		const [field] = Object.keys(rec);
+		return { field, order: rec[field].order };
+	});
+
+// Variant order matters because the canonical and shorthand-order forms
+// share the input shape `{<key>: <string>}`. We try the shorthand variants
+// first so an input like `{field: "asc"}` is interpreted as "sort by the
+// field named 'field', ascending" — the natural shorthand reading — rather
+// than as canonical "sort by the field named 'asc' with no order". The
+// shorthand variants only match single-key records whose value is `asc` /
+// `desc` (or `{order}`), so any record that doesn't fit the shorthand
+// pattern (e.g. `{field: "price", order: "asc"}` or `{field: "name"}`)
+// cleanly falls through to the canonical variant.
 const SortSpecSchema = z.union([
-	z.string(),
-	z.record(z.string(), z.union([z.literal("asc"), z.literal("desc")])),
-	z.record(z.string(), z.object({ order: z.enum(["asc", "desc"]) })),
+	SortSpecShorthandOrder,
+	SortSpecShorthandNested,
+	SortSpecCanonical,
+	SortSpecShorthandString,
 ]);
 
 export const SearchRequestSchema = z.object({
@@ -210,6 +255,13 @@ export const SearchRequestSchema = z.object({
 	limit: z.number().int().positive().max(10000).optional(),
 	from: z.number().int().nonnegative().optional(),
 	returnHits: z.boolean().optional(),
+	// Both fields are nullable in the wire schema (`["integer", "null"]`,
+	// see `search-request.schema.json`). `.nullish()` accepts both an
+	// explicit `null` (to clear an override in callers that round-trip
+	// payloads) and `undefined` (the field absent), matching the Rust
+	// `Option<usize>` semantics.
+	candidateSize: z.number().int().positive().nullish(),
+	bmwBlockSize: z.number().int().positive().nullish(),
 	sort: z.array(SortSpecSchema).optional(),
 	cursor: z.string().optional(),
 	searchAfter: z.array(z.unknown()).optional(),
