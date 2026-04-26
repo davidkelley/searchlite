@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SearchRequestSchema, expandSchema } from "../dist/schemas.js";
+import { expandSchema, SearchRequestSchema } from "../dist/schemas.js";
 
 describe("expandSchema", () => {
 	describe("shorthand strings", () => {
