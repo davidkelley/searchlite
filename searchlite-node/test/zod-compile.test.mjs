@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { expandSchema } from "../dist/schemas.js";
 import {
-	InvalidZodSchemaError,
-	UnsupportedZodTypeError,
 	compileZodSchema,
 	deriveResponseSchema,
+	InvalidZodSchemaError,
 	isZodIndexSchema,
 	sl,
+	UnsupportedZodTypeError,
 } from "../dist/zod/index.js";
 
 // ── Root / sl.index() ────────────────────────────────────────────────────────

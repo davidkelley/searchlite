@@ -6,11 +6,11 @@ import {
 	SearchliteIndexRegistry,
 } from "./registries";
 import {
-	type InferredKind,
-	type WrapperState,
 	getDefType,
+	type InferredKind,
 	inferKind,
 	resolveFieldMetadata,
+	type WrapperState,
 	wrapperState,
 } from "./rules";
 
@@ -580,4 +580,4 @@ function zodTypeName(defType: string): string {
 
 // Keep `WrapperState` and `InferredKind` re-exports so consumers of this module
 // don't need to reach into `./rules`.
-export type { WrapperState, InferredKind };
+export type { InferredKind, WrapperState };
