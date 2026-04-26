@@ -49,8 +49,8 @@ fn build_bench_index(doc_count: usize, cardinality: usize) -> BenchIndex {
   let mut writer = idx.writer().unwrap();
   let mut rng = StdRng::seed_from_u64(42);
   for i in 0..doc_count {
-    let tag_id = rng.gen_range(0..cardinality);
-    let score = rng.gen_range(0..10_000i64);
+    let tag_id = rng.random_range(0..cardinality);
+    let score = rng.random_range(0..10_000i64);
     writer
       .add_document(&Document {
         fields: [
@@ -120,10 +120,10 @@ fn build_nested_bench_index(
   let mut rng = StdRng::seed_from_u64(1337);
   for i in 0..doc_count {
     let mut metadata = Vec::with_capacity(3);
-    let category_seed = rng.gen_range(0..category_count);
+    let category_seed = rng.random_range(0..category_count);
     for slot in 0..3 {
       let category = (category_seed + slot) % category_count;
-      let value_id = rng.gen_range(0..value_cardinality);
+      let value_id = rng.random_range(0..value_cardinality);
       metadata.push(serde_json::json!({
         "key": format!("Category_{category}"),
         "value": format!("Value_{value_id}")

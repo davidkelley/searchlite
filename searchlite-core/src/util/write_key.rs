@@ -42,10 +42,10 @@ pub fn default_kdf_params() -> KdfParams {
 #[cfg(feature = "write-key")]
 mod crypto {
   use anyhow::{anyhow, Result};
+  use argon2::password_hash::rand_core::OsRng;
   use argon2::{password_hash::SaltString, Argon2, Params, PasswordHasher};
   use base64::{engine::general_purpose::STANDARD, Engine as _};
   use hmac::{Hmac, Mac};
-  use rand::rngs::OsRng;
   use sha2::Sha256;
   use subtle::ConstantTimeEq;
 

@@ -2278,6 +2278,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "getrandom 0.2.16",
+ "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "hmac",
  "js-sys",
