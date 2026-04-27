@@ -13,8 +13,8 @@ zstd = ["searchlite-core/zstd"]
 
 [dependencies]
 searchlite-core = { path = "../searchlite-core", features = ["write-key"] }
-napi = { version = "2", features = ["serde-json", "napi9"] }
-napi-derive = "2"
+napi = { version = "3", features = ["serde-json", "napi9"] }
+napi-derive = "3"
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 

@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use napi::bindgen_prelude::*;
-use napi::JsUnknown;
 use napi_derive::napi;
 use std::collections::BTreeMap;
 
@@ -98,7 +97,7 @@ impl Index {
   }
 
   #[napi]
-  pub fn add(&self, env: Env, doc: JsUnknown) -> napi::Result<()> {
+  pub fn add(&self, env: Env, doc: Unknown) -> napi::Result<()> {
     catch_panic("Index::add", || {
       let value: serde_json::Value = env.from_js_value(doc)?;
       let document = value_to_document(value)?;
@@ -113,7 +112,7 @@ impl Index {
   }
 
   #[napi(js_name = "addMany")]
-  pub fn add_many(&self, env: Env, docs: JsUnknown) -> napi::Result<u32> {
+  pub fn add_many(&self, env: Env, docs: Unknown) -> napi::Result<u32> {
     catch_panic("Index::addMany", || {
       let value: serde_json::Value = env.from_js_value(docs)?;
       let documents = value_to_documents(value)?;
@@ -142,7 +141,7 @@ impl Index {
   }
 
   #[napi]
-  pub fn search(&self, env: Env, query: JsUnknown) -> napi::Result<JsUnknown> {
+  pub fn search(&self, env: Env, query: Unknown) -> napi::Result<Unknown<'_>> {
     catch_panic("Index::search", || {
       self.with_index(|index| {
         let value: serde_json::Value = env.from_js_value(query)?;
