@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Document, ExecutionStrategy, IndexOptions, KeywordField, NestedField, NestedProperty,
