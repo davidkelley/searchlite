@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.8.1...searchlite-core-v0.8.2) - 2026-04-27
+
+### Other
+
+- *(deps)* bump criterion from 0.5.1 to 0.8.2 ([#433](https://github.com/davidkelley/searchlite/pull/433))
+- *(deps)* bump rand from 0.8.6 to 0.9.4 ([#461](https://github.com/davidkelley/searchlite/pull/461))
+- *(deps)* bump the rust-minor-patch group across 1 directory with 16 updates ([#448](https://github.com/davidkelley/searchlite/pull/448))
+
 ## [0.8.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.8.0...searchlite-core-v0.8.1) - 2026-04-25
 
 ### Other
