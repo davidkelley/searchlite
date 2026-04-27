@@ -24,7 +24,7 @@ fn add_random_docs(idx: &Index, vocab: &[&str], doc_count: usize, rng: &mut StdR
   let mut writer = idx.writer().unwrap();
   for i in 0..doc_count {
     let body_tokens: Vec<&str> = (0..6)
-      .map(|_| vocab[rng.gen_range(0..vocab.len())])
+      .map(|_| vocab[rng.random_range(0..vocab.len())])
       .collect();
     let body = body_tokens.join(" ");
     writer

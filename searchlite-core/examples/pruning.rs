@@ -32,11 +32,11 @@ fn main() -> Result<()> {
 
   let idx = Index::create(&path, Schema::default_text_body(), opts.clone())?;
   {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut writer = idx.writer()?;
     for i in 0..docs {
       let body_tokens: Vec<&str> = (0..12)
-        .map(|_| vocab[rng.gen_range(0..vocab.len())])
+        .map(|_| vocab[rng.random_range(0..vocab.len())])
         .collect();
       let body = body_tokens.join(" ");
       writer.add_document(&Document {
@@ -60,11 +60,11 @@ fn main() -> Result<()> {
     .map(|f| f.name.clone())
     .collect();
   let queries: Vec<String> = {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..query_count)
       .map(|_| {
         let tokens: Vec<&str> = (0..3)
-          .map(|_| vocab[rng.gen_range(0..vocab.len())])
+          .map(|_| vocab[rng.random_range(0..vocab.len())])
           .collect();
         tokens.join(" ")
       })

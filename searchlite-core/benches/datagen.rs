@@ -289,7 +289,7 @@ fn zipfian_pick(rng: &mut impl Rng, n: usize) -> usize {
     return 0;
   }
   let harmonic: f64 = (1..=n).map(|r| 1.0 / r as f64).sum();
-  let u: f64 = rng.gen::<f64>() * harmonic;
+  let u: f64 = rng.random::<f64>() * harmonic;
   let mut cumulative = 0.0;
   for rank in 1..=n {
     cumulative += 1.0 / rank as f64;
@@ -302,10 +302,10 @@ fn zipfian_pick(rng: &mut impl Rng, n: usize) -> usize {
 
 /// Generate a random text string with `min_words..=max_words` words from the vocabulary.
 fn random_text(rng: &mut impl Rng, min_words: usize, max_words: usize) -> String {
-  let count = rng.gen_range(min_words..=max_words);
+  let count = rng.random_range(min_words..=max_words);
   let mut words = Vec::with_capacity(count);
   for _ in 0..count {
-    let idx = rng.gen_range(0..VOCABULARY.len());
+    let idx = rng.random_range(0..VOCABULARY.len());
     words.push(VOCABULARY[idx]);
   }
   words.join(" ")
@@ -315,7 +315,7 @@ fn random_text(rng: &mut impl Rng, min_words: usize, max_words: usize) -> String
 fn random_date(rng: &mut impl Rng) -> String {
   // Span: ~730 days in seconds
   let seconds_in_2_years: u64 = 2 * 365 * 24 * 3600;
-  let offset = rng.gen_range(0..seconds_in_2_years);
+  let offset = rng.random_range(0..seconds_in_2_years);
   // Base: 2024-01-01T00:00:00Z
   let base_epoch: u64 = 1_704_067_200;
   let ts = base_epoch + offset;
@@ -357,8 +357,8 @@ pub fn generate_docs(count: usize, seed: u64) -> Vec<Document> {
     let body = random_text(&mut rng, 20, 100);
     let category_idx = zipfian_pick(&mut rng, CATEGORIES.len());
     let category = CATEGORIES[category_idx];
-    let price = rng.gen_range(1..=10000i64);
-    let rating = 1.0 + rng.gen::<f64>() * 4.0; // 1.0..5.0
+    let price = rng.random_range(1..=10000i64);
+    let rating = 1.0 + rng.random::<f64>() * 4.0; // 1.0..5.0
     let created_at = random_date(&mut rng);
 
     let mut fields = std::collections::BTreeMap::new();
@@ -441,10 +441,10 @@ pub fn generate_schema() -> Schema {
 
 /// Sample a few query terms from the vocabulary for use in benchmark queries.
 pub fn sample_query_terms(rng: &mut impl Rng) -> Vec<String> {
-  let count = rng.gen_range(2..=4);
+  let count = rng.random_range(2..=4);
   let mut terms = Vec::with_capacity(count);
   for _ in 0..count {
-    let idx = rng.gen_range(0..VOCABULARY.len());
+    let idx = rng.random_range(0..VOCABULARY.len());
     terms.push(VOCABULARY[idx].to_string());
   }
   terms
