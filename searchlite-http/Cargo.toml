@@ -13,7 +13,7 @@ zstd = ["searchlite-core/zstd"]
 
 [dependencies]
 anyhow = { workspace = true }
-axum = "0.7.9"
+axum = "0.8.9"
 clap = { workspace = true, features = ["derive", "env"] }
 futures-util = "0.3.32"
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core", features = ["write-key"] }
