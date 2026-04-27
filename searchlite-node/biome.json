@@ -19,6 +19,6 @@
 		}
 	},
 	"files": {
-		"includes": ["**", "!**/node_modules", "!**/dist", "!**/*.node"]
+		"includes": ["**", "!**/node_modules", "!**/dist", "!**/*.node", "!index.js", "!index.d.ts"]
 	}
 }
