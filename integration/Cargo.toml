@@ -22,6 +22,7 @@ reqwest = { version = "0.12.28", features = ["json", "rustls-tls", "blocking"] }
 portpicker = "0.1.1"
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core" }
 searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
+searchlite-adapter-elastic = { path = "../searchlite-adapter-elastic", package = "searchlite-adapter-elastic" }
 
 [dev-dependencies]
 assert_cmd = "2.2.1"
