@@ -206,7 +206,7 @@ fn bench_terms_aggregation(c: &mut Criterion) {
       || req.clone(),
       |req| {
         let resp = reader.search(&req).unwrap();
-        criterion::black_box(resp);
+        std::hint::black_box(resp);
       },
       BatchSize::SmallInput,
     );
@@ -269,7 +269,7 @@ fn bench_histogram_aggregation(c: &mut Criterion) {
       || req.clone(),
       |req| {
         let resp = reader.search(&req).unwrap();
-        criterion::black_box(resp);
+        std::hint::black_box(resp);
       },
       BatchSize::SmallInput,
     );
@@ -353,7 +353,7 @@ fn bench_nested_terms_aggregation(c: &mut Criterion) {
       || req.clone(),
       |req| {
         let resp = reader.search(&req).unwrap();
-        criterion::black_box(resp);
+        std::hint::black_box(resp);
       },
       BatchSize::SmallInput,
     );

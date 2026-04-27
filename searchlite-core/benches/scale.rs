@@ -3,7 +3,9 @@ mod datagen;
 
 use std::collections::BTreeMap;
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, ExecutionStrategy, HistogramAggregation, IndexOptions, SearchRequest, StorageType,
