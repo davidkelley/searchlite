@@ -1,6 +1,12 @@
 use searchlite_adapter_elastic::translate::translate_search_response;
 use serde_json::json;
 
+fn translate(sl: &serde_json::Value) -> serde_json::Value {
+  // Default-tracking helper for legacy tests that don't care about
+  // track_total_hits semantics (treated as unset).
+  translate_search_response("idx", sl, 0, None)
+}
+
 #[test]
 fn empty_result_has_zero_hits_and_shards_envelope() {
   let sl = json!({
@@ -8,7 +14,7 @@ fn empty_result_has_zero_hits_and_shards_envelope() {
     "hits": [],
     "aggregations": {},
   });
-  let es = translate_search_response("books", &sl, 12);
+  let es = translate_search_response("books", &sl, 12, None);
   assert_eq!(es.get("took").unwrap(), &json!(12));
   assert_eq!(es.get("timed_out").unwrap(), &json!(false));
   assert_eq!(
@@ -23,6 +29,58 @@ fn empty_result_has_zero_hits_and_shards_envelope() {
   assert_eq!(hits.get("hits").unwrap(), &json!([]));
 }
 
+// --- track_total_hits semantics ---------------------------------------------
+
+#[test]
+fn track_total_hits_true_emits_relation_eq() {
+  // Regression: response always emitted relation:"gte" regardless of the
+  // request's track_total_hits. When the caller asked for exact totals,
+  // ES emits relation:"eq".
+  let sl = json!({
+    "total_hits_estimate": 42,
+    "hits": [],
+  });
+  let es = translate_search_response("idx", &sl, 0, Some(true));
+  assert_eq!(
+    es.pointer("/hits/total").unwrap(),
+    &json!({"value": 42, "relation": "eq"})
+  );
+}
+
+#[test]
+fn track_total_hits_false_omits_total() {
+  // ES omits hits.total entirely when track_total_hits=false, signaling
+  // that totals were not computed. Clients that rely on the presence of
+  // `total` to distinguish exact-vs-approximate must not see a fabricated
+  // value here.
+  let sl = json!({
+    "total_hits_estimate": 17,
+    "hits": [],
+  });
+  let es = translate_search_response("idx", &sl, 0, Some(false));
+  assert!(
+    es.pointer("/hits/total").is_none(),
+    "hits.total should be omitted when track_total_hits=false; got: {es}"
+  );
+  // The hits array should still be present.
+  assert!(es.pointer("/hits/hits").is_some());
+}
+
+#[test]
+fn track_total_hits_unset_keeps_relation_gte() {
+  // No explicit signal from the caller → preserve historical default
+  // (lower-bound semantics).
+  let sl = json!({
+    "total_hits_estimate": 9,
+    "hits": [],
+  });
+  let es = translate_search_response("idx", &sl, 0, None);
+  assert_eq!(
+    es.pointer("/hits/total").unwrap(),
+    &json!({"value": 9, "relation": "gte"})
+  );
+}
+
 #[test]
 fn hits_have_index_id_score_source_fields() {
   let sl = json!({
@@ -32,7 +90,7 @@ fn hits_have_index_id_score_source_fields() {
       { "doc_id": "b", "score": 0.9, "fields": {"title": "search"} },
     ],
   });
-  let es = translate_search_response("books", &sl, 0);
+  let es = translate_search_response("books", &sl, 0, None);
   let hits_arr = es
     .get("hits")
     .unwrap()
@@ -72,7 +130,7 @@ fn keyed_range_aggregation_emits_object_buckets() {
       }
     }
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let buckets = es.pointer("/aggregations/by_price/buckets").unwrap();
   assert!(
     buckets.is_object(),
@@ -104,7 +162,7 @@ fn unkeyed_range_aggregation_emits_array_buckets() {
       }
     }
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let buckets = es.pointer("/aggregations/by_price/buckets").unwrap();
   assert!(
     buckets.is_array(),
@@ -127,7 +185,7 @@ fn keyed_date_range_aggregation_emits_object_buckets() {
       }
     }
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let buckets = es.pointer("/aggregations/by_month/buckets").unwrap();
   assert!(buckets.is_object(), "got: {buckets}");
   assert_eq!(buckets.pointer("/2024-Q1/doc_count").unwrap(), &json!(100));
@@ -148,7 +206,7 @@ fn aggregations_terms_buckets_translated() {
       }
     }
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let aggs = es.get("aggregations").unwrap();
   let by_cat = aggs.get("by_cat").unwrap();
   let buckets = by_cat.get("buckets").unwrap().as_array().unwrap();
@@ -164,7 +222,7 @@ fn hit_with_only_snippet_emits_snippet_under_sentinel_key() {
     "total_hits_estimate": 1,
     "hits": [{ "doc_id": "a", "score": 1.0, "snippet": "rust …safety" }],
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let hits = es.pointer("/hits/hits").unwrap().as_array().unwrap();
   assert_eq!(
     hits[0].get("highlight").unwrap(),
@@ -182,7 +240,7 @@ fn hit_with_only_highlights_emits_highlights_verbatim() {
       "highlights": { "title": ["<em>rust</em> safety"] }
     }],
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let hits = es.pointer("/hits/hits").unwrap().as_array().unwrap();
   assert_eq!(
     hits[0].get("highlight").unwrap(),
@@ -206,7 +264,7 @@ fn hit_with_both_snippet_and_highlights_prefers_highlights_without_dropping_snip
       "highlights": { "title": ["<em>rust</em> safety"] }
     }],
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let highlight = es.pointer("/hits/hits").unwrap().as_array().unwrap()[0]
     .get("highlight")
     .unwrap();
@@ -228,7 +286,7 @@ fn hit_without_highlight_omits_highlight_field() {
     "total_hits_estimate": 1,
     "hits": [{ "doc_id": "a", "score": 1.0 }],
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let hit = &es.pointer("/hits/hits").unwrap().as_array().unwrap()[0];
   assert!(hit.get("highlight").is_none());
 }
@@ -249,7 +307,7 @@ fn stats_aggregation_translates_to_es_envelope() {
       }
     }
   });
-  let es = translate_search_response("idx", &sl, 0);
+  let es = translate(&sl);
   let aggs = es.get("aggregations").unwrap();
   assert_eq!(
     aggs.get("p").unwrap(),

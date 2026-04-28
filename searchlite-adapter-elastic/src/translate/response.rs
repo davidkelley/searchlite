@@ -2,7 +2,20 @@ use serde_json::{json, Map, Value};
 
 /// Translate a SearchLite SearchResult into an Elasticsearch search response
 /// envelope. `took_ms` is computed by the route handler.
-pub fn translate_search_response(index: &str, sl: &Value, took_ms: u64) -> Value {
+///
+/// `track_total_hits` reflects the original ES request's flag so the response
+/// reports total semantics correctly:
+///   * `Some(true)`  → emit `hits.total = { value, relation: "eq" }` (exact)
+///   * `Some(false)` → omit `hits.total` entirely (matches ES behaviour when
+///     totals are explicitly disabled)
+///   * `None`        → emit `hits.total = { value, relation: "gte" }` (lower
+///     bound — historical default for callers that don't set the flag)
+pub fn translate_search_response(
+  index: &str,
+  sl: &Value,
+  took_ms: u64,
+  track_total_hits: Option<bool>,
+) -> Value {
   let mut env = Map::new();
   env.insert("took".into(), Value::from(took_ms));
   env.insert("timed_out".into(), Value::Bool(false));
@@ -32,14 +45,25 @@ pub fn translate_search_response(index: &str, sl: &Value, took_ms: u64) -> Value
     })
     .collect();
 
-  env.insert(
-    "hits".into(),
-    json!({
-      "total": { "value": total, "relation": "gte" },
-      "max_score": max_score.map(Value::from).unwrap_or(Value::Null),
-      "hits": translated_hits,
-    }),
+  let mut hits = Map::new();
+  match track_total_hits {
+    Some(true) => {
+      hits.insert("total".into(), json!({ "value": total, "relation": "eq" }));
+    }
+    Some(false) => {
+      // Omit `total` entirely — matches ES, which signals "totals disabled"
+      // by not emitting the field rather than fabricating a value.
+    }
+    None => {
+      hits.insert("total".into(), json!({ "value": total, "relation": "gte" }));
+    }
+  }
+  hits.insert(
+    "max_score".into(),
+    max_score.map(Value::from).unwrap_or(Value::Null),
   );
+  hits.insert("hits".into(), Value::Array(translated_hits));
+  env.insert("hits".into(), Value::Object(hits));
 
   if let Some(aggs) = sl.get("aggregations").and_then(Value::as_object) {
     if !aggs.is_empty() {

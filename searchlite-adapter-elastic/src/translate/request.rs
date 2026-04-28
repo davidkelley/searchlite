@@ -129,12 +129,37 @@ fn apply_source(source: &Value, out: &mut Map<String, Value>) -> Result<(), Unsu
       out.insert("return_stored".into(), Value::Bool(true));
     }
     Value::Object(opts) => {
-      if let Some(includes) = opts.get("includes").and_then(Value::as_array) {
-        let fields: Vec<Value> = includes
-          .iter()
-          .filter_map(Value::as_str)
-          .map(|s| Value::String(s.to_string()))
-          .collect();
+      if let Some(includes) = opts.get("includes") {
+        // ES accepts both the single-string form (`"includes": "title"`) and
+        // the array form (`"includes": ["title", "category"]`). Previously
+        // we only handled the array case via `filter_map(Value::as_str)`,
+        // which silently dropped non-string entries (widening the payload)
+        // and ignored the string form entirely (also widening). Validate
+        // both shapes and reject invalid elements with a clear error.
+        let fields = match includes {
+          Value::String(s) => vec![Value::String(s.clone())],
+          Value::Array(items) => {
+            let mut fields = Vec::with_capacity(items.len());
+            for item in items {
+              match item.as_str() {
+                Some(s) => fields.push(Value::String(s.to_string())),
+                None => {
+                  return Err(Unsupported::with_detail(
+                    "_source.includes",
+                    format!("array element must be a string, got {item}"),
+                  ));
+                }
+              }
+            }
+            fields
+          }
+          _ => {
+            return Err(Unsupported::with_detail(
+              "_source.includes",
+              "must be a string or array of strings",
+            ));
+          }
+        };
         if !fields.is_empty() {
           out.insert("fields".into(), Value::Array(fields));
         }

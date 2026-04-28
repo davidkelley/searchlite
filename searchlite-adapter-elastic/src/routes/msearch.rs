@@ -64,8 +64,12 @@ pub async fn msearch(
         ),
       ));
     }
-    for ((position, _), result) in group.into_iter().zip(results.into_iter()) {
-      let translated = translate_search_response(&index, &result, 0);
+    for ((position, body), result) in group.into_iter().zip(results.into_iter()) {
+      // Each msearch entry can carry its own track_total_hits. Extract it
+      // from the original ES body so per-response total semantics match
+      // what the caller asked for.
+      let track = extract_track_total_hits(&body);
+      let translated = translate_search_response(&index, &result, 0, track);
       by_position.insert(position, translated);
     }
   }
@@ -81,6 +85,18 @@ pub async fn msearch(
 struct MSearchEntry {
   index: String,
   body: Value,
+}
+
+/// Per-entry equivalent of the search route's helper. Maps the ES request's
+/// `track_total_hits` flag to the Some/None contract used by the response
+/// translator.
+fn extract_track_total_hits(body: &Value) -> Option<bool> {
+  let value = body.as_object()?.get("track_total_hits")?;
+  match value {
+    Value::Bool(b) => Some(*b),
+    Value::Number(n) => n.as_u64().map(|cap| cap > 0),
+    _ => None,
+  }
 }
 
 fn parse_msearch_ndjson(body: &[u8], default_index: Option<&str>) -> ESResult<Vec<MSearchEntry>> {

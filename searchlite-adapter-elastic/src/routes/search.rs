@@ -35,6 +35,9 @@ pub async fn search(
   body: Option<Json<Value>>,
 ) -> ESResult<Json<Value>> {
   let merged = merge_query_params_into_body(body.map(|Json(v)| v), &params)?;
+  // Capture the caller's track_total_hits intent before translation so the
+  // response can report exact-vs-approximate semantics correctly.
+  let track = extract_track_total_hits(&merged);
   let sl_body = translate_search_body(&merged)?;
   let started = Instant::now();
   let sl_response = state.client().search(&index, &sl_body).await?;
@@ -43,6 +46,7 @@ pub async fn search(
     &index,
     &sl_response,
     took_ms,
+    track,
   )))
 }
 
@@ -67,6 +71,20 @@ pub async fn count(
     "count": total,
     "_shards": { "total": 1, "successful": 1, "skipped": 0, "failed": 0 },
   })))
+}
+
+/// Resolve the request's `track_total_hits` to the Some/None contract that
+/// `translate_search_response` expects:
+/// - boolean → that bool
+/// - integer N: > 0 → `Some(true)` (exact totals); 0 → `Some(false)`
+/// - missing or non-numeric/bool → `None` (default lower-bound semantics)
+fn extract_track_total_hits(body: &Value) -> Option<bool> {
+  let value = body.as_object()?.get("track_total_hits")?;
+  match value {
+    Value::Bool(b) => Some(*b),
+    Value::Number(n) => n.as_u64().map(|cap| cap > 0),
+    _ => None,
+  }
 }
 
 fn merge_query_params_into_body(body: Option<Value>, params: &SearchParams) -> ESResult<Value> {
