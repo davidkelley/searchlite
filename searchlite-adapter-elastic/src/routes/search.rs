@@ -20,8 +20,12 @@ pub struct SearchParams {
   default_field: Option<String>,
   #[serde(rename = "_source")]
   source: Option<String>,
+  // String rather than bool so we accept ES's integer-cap form
+  // (e.g. `?track_total_hits=10000`) alongside `true`/`false`. Parsing into
+  // a JSON value happens in `merge_query_params_into_body`; downstream
+  // pagination already handles bool vs integer.
   #[serde(rename = "track_total_hits")]
-  track_total_hits: Option<bool>,
+  track_total_hits: Option<String>,
 }
 
 pub async fn search(
@@ -109,10 +113,24 @@ fn merge_query_params_into_body(body: Option<Value>, params: &SearchParams) -> E
       .collect();
     map.entry("sort".to_string()).or_insert(Value::Array(parts));
   }
-  if let Some(track) = params.track_total_hits {
-    map
-      .entry("track_total_hits".to_string())
-      .or_insert(Value::Bool(track));
+  if let Some(track) = &params.track_total_hits {
+    let trimmed = track.trim();
+    let value = match trimmed.to_ascii_lowercase().as_str() {
+      "true" => Value::Bool(true),
+      "false" => Value::Bool(false),
+      other => match other.parse::<u64>() {
+        Ok(n) => Value::from(n),
+        Err(_) => {
+          return Err(ESError::bad_request(
+            "x_content_parse_exception",
+            format!(
+              "track_total_hits must be `true`, `false`, or a non-negative integer, got `{trimmed}`"
+            ),
+          ));
+        }
+      },
+    };
+    map.entry("track_total_hits".to_string()).or_insert(value);
   }
   if let Some(source) = &params.source {
     let trimmed = source.trim();

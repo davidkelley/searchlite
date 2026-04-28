@@ -521,6 +521,82 @@ fn settings_on_unknown_index_returns_404() {
 }
 
 #[test]
+fn global_mget_with_source_false_omits_source_field() {
+  // Regression: the global `_mget` handler always forwarded
+  // `return_stored: true` to upstream, ignoring `_source: false` on the
+  // request. The index-scoped handler honors it; this brings the global
+  // form into parity.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post(
+      "/_mget",
+      &json!({
+        "_source": false,
+        "docs": [
+          { "_index": INDEX, "_id": "a" },
+          { "_index": INDEX, "_id": "c" },
+        ]
+      }),
+    )
+    .expect("mget");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let docs = body.get("docs").unwrap().as_array().unwrap();
+  assert_eq!(docs.len(), 2);
+  for doc in docs {
+    assert!(
+      doc.get("_source").is_none(),
+      "_source should be omitted when _source:false is requested; got {doc}"
+    );
+    assert_eq!(doc.get("found").unwrap(), &json!(true));
+  }
+}
+
+#[test]
+fn global_mget_with_source_true_includes_source_field() {
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post(
+      "/_mget",
+      &json!({
+        "_source": true,
+        "docs": [{ "_index": INDEX, "_id": "a" }]
+      }),
+    )
+    .expect("mget");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let docs = body.get("docs").unwrap().as_array().unwrap();
+  assert!(
+    docs[0].get("_source").is_some(),
+    "_source should be present when _source:true is requested"
+  );
+}
+
+#[test]
+fn search_get_with_integer_track_total_hits_query_param_is_accepted() {
+  // Regression: ES allows `?track_total_hits=10000` (integer cap). Previously
+  // the adapter typed the URL param as Option<bool> and rejected the integer
+  // form during query-string deserialization before the handler even ran.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_get(&format!("/{INDEX}/_search?q=*&track_total_hits=10000"))
+    .expect("get");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[test]
+fn search_get_with_boolean_track_total_hits_query_param_is_accepted() {
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, _) = h
+    .es_get(&format!("/{INDEX}/_search?q=*&track_total_hits=true"))
+    .expect("get");
+  assert_eq!(status, StatusCode::OK);
+}
+
+#[test]
 fn settings_on_known_index_returns_payload() {
   let h = ElasticHarness::new().expect("harness");
   seed_index(&h).expect("seed");

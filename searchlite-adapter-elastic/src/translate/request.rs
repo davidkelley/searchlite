@@ -11,7 +11,21 @@ use super::unsupported::Unsupported;
 /// `SearchRequest` body. Always sets `return_stored: true` so callers see
 /// `_source` in hits.
 pub fn translate_search_body(es_body: &Value) -> Result<Value, Unsupported> {
-  let map = es_body.as_object().cloned().unwrap_or_default();
+  // Accept only an object body or a literal `null`. Previously any non-object
+  // value was silently coerced into an empty map and run as `match_all` —
+  // for `_msearch` that meant a malformed body line scanned the whole index
+  // instead of returning a parse error. ES treats a missing/null body as
+  // match-all, so we keep that behaviour for `null` only.
+  let map = match es_body {
+    Value::Object(map) => map.clone(),
+    Value::Null => Map::new(),
+    _ => {
+      return Err(Unsupported::with_detail(
+        "body",
+        "search body must be a JSON object",
+      ))
+    }
+  };
 
   if map.contains_key("script_fields") {
     return Err(Unsupported::feature("script_fields"));

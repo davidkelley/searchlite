@@ -41,6 +41,11 @@ pub async fn mget_global(
     .ok_or_else(|| ESError::bad_request("x_content_parse_exception", "missing `docs` array"))?
     .clone();
 
+  // Honor top-level `_source` so global `_mget` matches the index-scoped
+  // form's behaviour. Without this the upstream always returned stored
+  // fields even when the caller asked for `_source: false`.
+  let return_stored = wants_source(&body);
+
   // Track requested order so we re-emit in the original sequence.
   let mut grouped: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
   for (idx, doc) in docs.iter().enumerate() {
@@ -73,7 +78,10 @@ pub async fn mget_global(
     let ids: Vec<String> = entries.iter().map(|(_, id)| id.clone()).collect();
     let upstream = state
       .client()
-      .mget(&index, &json!({ "ids": &ids, "return_stored": true }))
+      .mget(
+        &index,
+        &json!({ "ids": &ids, "return_stored": return_stored }),
+      )
       .await?;
     let translated = translate_mget_response(&index, &upstream);
     let docs_arr = translated
