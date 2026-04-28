@@ -54,8 +54,17 @@ impl EsContainer {
   fn start() -> Result<Self> {
     pull_image(ES_IMAGE)?;
     let port = portpicker::pick_unused_port().ok_or_else(|| anyhow!("no free port for ES"))?;
-    // Container name needs to be unique per test process to avoid collisions.
-    let name = format!("searchlite-es-parity-{}", std::process::id());
+    // Container name needs to be unique per test process to avoid
+    // collisions. PID alone isn't enough — `cargo test` reuses PIDs across
+    // runs, and on CI a stale container with the same PID-derived name from
+    // a previous job could exist. Append nanosecond-precision time so two
+    // concurrent test processes (or a fresh run racing a slow `docker rm`)
+    // get distinct names.
+    let nanos = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.subsec_nanos())
+      .unwrap_or(0);
+    let name = format!("searchlite-es-parity-{}-{}", std::process::id(), nanos);
     // Best-effort cleanup if a previous run left a stale container around.
     let _ = Command::new("docker")
       .args(["rm", "-f", &name])

@@ -2281,6 +2281,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

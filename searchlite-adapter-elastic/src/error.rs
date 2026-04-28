@@ -78,6 +78,12 @@ impl ESError {
     )
   }
 
+  /// Override the HTTP status returned to the client. The body's `status`
+  /// field is rebuilt from `self.status` at render time
+  /// (see `IntoResponse for ESError`), so callers always get the new status
+  /// reflected in both the HTTP envelope and the JSON body. The error
+  /// `type`/`reason` strings are NOT rebuilt — set those via the constructor
+  /// before calling `with_status` to keep the body coherent.
   pub fn with_status(mut self, status: StatusCode) -> Self {
     self.status = status;
     self

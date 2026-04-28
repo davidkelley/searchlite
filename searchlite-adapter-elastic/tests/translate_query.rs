@@ -108,21 +108,49 @@ fn regexp_translates_to_regex() {
 }
 
 #[test]
-fn match_phrase_string_form() {
+fn match_phrase_string_form_uses_query_string_for_analyzer_aware_tokenization() {
+  // Slop=0 (default) is delegated to `query_string` with a quoted phrase so
+  // SearchLite's per-field analyzer drives tokenization. Previously we split
+  // on whitespace and emitted a `phrase` query — that diverged from ES on
+  // any input with punctuation, contractions, or non-ASCII text.
   let es = json!({"match_phrase": {"title": "to be or not to be"}});
   let sl = translate_query(&es).unwrap();
   assert_eq!(
     sl,
     json!({
-      "type": "phrase",
-      "field": "title",
-      "terms": ["to", "be", "or", "not", "to", "be"],
+      "type": "query_string",
+      "query": "\"to be or not to be\"",
+      "fields": ["title"],
     })
   );
 }
 
 #[test]
-fn match_phrase_object_form_with_slop() {
+fn match_phrase_with_punctuation_is_quoted_intact_for_analyzer() {
+  let es = json!({"match_phrase": {"title": "U.S.A. today"}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "query_string",
+      "query": "\"U.S.A. today\"",
+      "fields": ["title"],
+    })
+  );
+}
+
+#[test]
+fn match_phrase_escapes_quote_and_backslash() {
+  let es = json!({"match_phrase": {"title": "say \"hi\" \\here"}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("query").unwrap(), &json!(r#""say \"hi\" \\here""#));
+}
+
+#[test]
+fn match_phrase_with_slop_keeps_phrase_form_for_token_proximity() {
+  // Slop > 0 controls token proximity, which `query_string` quoted phrases
+  // don't model. Fall back to the literal-token `phrase` translation; the
+  // tokenization-divergence limitation is documented for this path.
   let es = json!({"match_phrase": {"title": {"query": "rust safety", "slop": 2}}});
   let sl = translate_query(&es).unwrap();
   assert_eq!(
@@ -252,6 +280,30 @@ fn unsupported_clause_returns_error() {
   let es = json!({"geo_distance": {"point": {"lat": 0.0, "lon": 0.0}}});
   let err = translate_query(&es).unwrap_err();
   assert!(err.feature.contains("geo_distance"), "got {err:?}");
+}
+
+#[test]
+fn multi_match_phrase_type_rejection_does_not_recommend_a_substitute_with_different_semantics() {
+  // Regression: previously the error said "use best_fields/most_fields/cross_fields",
+  // but those are bag-of-words match modes — copying the suggestion would silently
+  // change phrase semantics and return wrong results without warning.
+  let es = json!({
+    "multi_match": {
+      "query": "exact phrase",
+      "fields": ["title", "description"],
+      "type": "phrase"
+    }
+  });
+  let err = translate_query(&es).unwrap_err();
+  let detail = err.detail.to_lowercase();
+  assert!(
+    !detail.contains("best_fields"),
+    "rejection should not suggest a substitute that changes match semantics: {err:?}"
+  );
+  assert!(
+    !detail.contains("most_fields") && !detail.contains("cross_fields"),
+    "rejection should not suggest a substitute that changes match semantics: {err:?}"
+  );
 }
 
 #[test]
@@ -446,4 +498,115 @@ fn terms_filter_single_integer_emits_bare_filter() {
     sl,
     json!({ "I64Range": { "field": "price", "min": 42, "max": 42 } })
   );
+}
+
+#[test]
+fn terms_with_field_literally_named_boost_is_queryable() {
+  // Regression for review: `terms` translation filtered out any key named
+  // `boost` so a schema field literally named `boost` was unqueryable. The
+  // filter should only treat `boost` as the meta-key when its value is a
+  // numeric boost — when it's an array it's a field selector.
+  let es = json!({"terms": {"boost": ["a", "b"]}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "bool",
+      "should": [
+        {"type": "term", "field": "boost", "value": "a"},
+        {"type": "term", "field": "boost", "value": "b"},
+      ],
+      "minimum_should_match": 1,
+    })
+  );
+}
+
+#[test]
+fn terms_filter_with_field_literally_named_boost_is_queryable() {
+  let es = json!({"terms": {"boost": ["a"]}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({ "KeywordIn": { "field": "boost", "values": ["a"] } })
+  );
+}
+
+#[test]
+fn bool_minimum_should_match_percentage_resolves_to_floor() {
+  // Regression: previously ANY non-integer minimum_should_match was rejected,
+  // including ES's common `"75%"` form. Now we resolve it adapter-side
+  // (count should clauses, floor multiply) since core's Bool variant only
+  // accepts a usize.
+  let es = json!({
+    "bool": {
+      "should": [
+        {"term": {"a": "1"}},
+        {"term": {"b": "2"}},
+        {"term": {"c": "3"}},
+        {"term": {"d": "4"}},
+      ],
+      "minimum_should_match": "75%"
+    }
+  });
+  let sl = translate_query(&es).unwrap();
+  // 4 should-clauses * 0.75 = 3.0 → floor = 3
+  assert_eq!(sl.get("minimum_should_match").unwrap(), &json!(3));
+}
+
+#[test]
+fn bool_minimum_should_match_percentage_floors_fractional() {
+  // 3 clauses * 75% = 2.25 → floor = 2
+  let es = json!({
+    "bool": {
+      "should": [
+        {"term": {"a": "1"}},
+        {"term": {"b": "2"}},
+        {"term": {"c": "3"}},
+      ],
+      "minimum_should_match": "75%"
+    }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("minimum_should_match").unwrap(), &json!(2));
+}
+
+#[test]
+fn bool_minimum_should_match_integer_string_accepted() {
+  let es = json!({
+    "bool": {
+      "should": [{"term": {"a": "1"}}, {"term": {"b": "2"}}],
+      "minimum_should_match": "1"
+    }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("minimum_should_match").unwrap(), &json!(1));
+}
+
+#[test]
+fn bool_minimum_should_match_complex_syntax_rejected() {
+  // ES supports "3<90%" combinator syntax. We don't (yet) — reject loudly
+  // with a descriptive error rather than silently mis-translating.
+  let es = json!({
+    "bool": {
+      "should": [{"term": {"a": "1"}}],
+      "minimum_should_match": "3<90%"
+    }
+  });
+  let err = translate_query(&es).unwrap_err();
+  assert!(
+    err.feature.starts_with("bool.minimum_should_match"),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn terms_with_real_boost_meta_key_still_works() {
+  // Sanity check that the boost-as-meta-key path still works when boost is
+  // a number alongside a real field array.
+  let es = json!({"terms": {"category": ["books"], "boost": 2.0}});
+  let sl = translate_query(&es).unwrap();
+  // Bool.should should target `category`, not `boost`.
+  let shoulds = sl.get("should").unwrap().as_array().unwrap();
+  assert_eq!(shoulds.len(), 1);
+  assert_eq!(shoulds[0].get("field").unwrap(), &json!("category"));
 }

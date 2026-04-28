@@ -191,6 +191,29 @@ fn translate_match_phrase(body: &Value, _prefix: bool) -> Result<Value, Unsuppor
     }
   };
 
+  // Slop=0 (the default) → emit a `query_string` with a quoted phrase so
+  // tokenization runs through the field's analyzer (matching ES behaviour
+  // for punctuation, contractions, non-ASCII). For slop > 0 we fall back
+  // to the literal-token `phrase` translation since `query_string` quoted
+  // phrases don't model token proximity.
+  let slop_value = slop.unwrap_or(0);
+  if slop_value == 0 {
+    let mut out = Map::new();
+    out.insert("type".into(), Value::String("query_string".into()));
+    out.insert(
+      "query".into(),
+      Value::String(quote_phrase_for_query_string(&text)),
+    );
+    out.insert(
+      "fields".into(),
+      Value::Array(vec![Value::String(field.clone())]),
+    );
+    if let Some(b) = boost {
+      out.insert("boost".into(), Value::from(b));
+    }
+    return Ok(Value::Object(out));
+  }
+
   let terms: Vec<Value> = text
     .split_whitespace()
     .map(|t| Value::String(t.to_string()))
@@ -199,13 +222,26 @@ fn translate_match_phrase(body: &Value, _prefix: bool) -> Result<Value, Unsuppor
   out.insert("type".into(), Value::String("phrase".into()));
   out.insert("field".into(), Value::String(field.clone()));
   out.insert("terms".into(), Value::Array(terms));
-  if let Some(s) = slop {
-    out.insert("slop".into(), Value::from(s));
-  }
+  out.insert("slop".into(), Value::from(slop_value));
   if let Some(b) = boost {
     out.insert("boost".into(), Value::from(b));
   }
   Ok(Value::Object(out))
+}
+
+/// Wrap text in quotes for `query_string` syntax, escaping the only two
+/// characters that have meaning inside a quoted phrase: `\` and `"`.
+fn quote_phrase_for_query_string(text: &str) -> String {
+  let mut out = String::with_capacity(text.len() + 2);
+  out.push('"');
+  for ch in text.chars() {
+    if ch == '"' || ch == '\\' {
+      out.push('\\');
+    }
+    out.push(ch);
+  }
+  out.push('"');
+  out
 }
 
 // --- multi_match ---------------------------------------------------------
@@ -236,10 +272,16 @@ fn translate_multi_match(body: &Value) -> Result<Value, Unsupported> {
     let t_norm = match t {
       "best_fields" | "most_fields" | "cross_fields" => t.to_string(),
       "phrase" | "phrase_prefix" | "bool_prefix" => {
+        // Don't recommend best_fields/most_fields/cross_fields here — they
+        // are bag-of-words modes with different matching semantics. Phrase
+        // intent is closer to `match_phrase` per field; we surface that
+        // hint without claiming an exact equivalent.
         return Err(Unsupported::with_detail(
           "multi_match.type",
-          format!("`{t}` not supported; use best_fields/most_fields/cross_fields"),
-        ))
+          format!(
+            "`{t}` not supported in v1; consider issuing `match_phrase` per field combined under `dis_max`"
+          ),
+        ));
       }
       other => {
         return Err(Unsupported::with_detail(
@@ -431,7 +473,12 @@ fn translate_terms(body: &Value) -> Result<Value, Unsupported> {
   let map = body
     .as_object()
     .ok_or_else(|| Unsupported::with_detail("terms", "expected an object"))?;
-  let mut field_iter = map.iter().filter(|(k, _)| *k != "boost");
+  // Only treat `boost` as the meta-key when its value is numeric (the only
+  // shape ES documents). Otherwise it's a legitimate field name — silently
+  // filtering it would make any schema with a `boost` column unqueryable.
+  let mut field_iter = map
+    .iter()
+    .filter(|(k, v)| !(*k == "boost" && v.is_number()));
   let (field, spec) = field_iter
     .next()
     .ok_or_else(|| Unsupported::with_detail("terms", "missing field entry"))?;
@@ -737,6 +784,9 @@ fn translate_bool(body: &Value) -> Result<Value, Unsupported> {
     .map(translate_to_filter)
     .collect::<Result<Vec<_>, _>>()?;
 
+  // Capture the should-clause count before moving `should_translated` into
+  // the output, since `resolve_bool_msm` needs it for percentage resolution.
+  let should_count = should_translated.len();
   let mut out = Map::new();
   out.insert("type".into(), Value::String("bool".into()));
   out.insert("must".into(), Value::Array(must_translated));
@@ -745,15 +795,87 @@ fn translate_bool(body: &Value) -> Result<Value, Unsupported> {
   out.insert("filter".into(), Value::Array(filter_translated));
 
   if let Some(msm) = map.get("minimum_should_match") {
-    let n = msm.as_u64().ok_or_else(|| {
-      Unsupported::with_detail("bool.minimum_should_match", "must be unsigned int")
-    })?;
-    out.insert("minimum_should_match".into(), Value::from(n));
+    // Core's `Bool.minimum_should_match` is `Option<usize>` only — it doesn't
+    // accept ES's `"75%"` percentage form like `multi_match` does. Resolve
+    // the percentage adapter-side against the should-clause count so the
+    // common Kibana shape works.
+    let resolved = resolve_bool_msm(msm, should_count)?;
+    out.insert("minimum_should_match".into(), Value::from(resolved as u64));
   }
   if let Some(boost) = map.get("boost") {
     out.insert("boost".into(), boost.clone());
   }
   Ok(Value::Object(out))
+}
+
+/// Resolve a `bool.minimum_should_match` value against the count of `should`
+/// clauses. Accepts:
+///
+/// - non-negative integer (`3`)
+/// - integer-as-string (`"3"`)
+/// - whole or fractional percentage (`"75%"`) → `floor(should_count * pct / 100)`
+///
+/// Rejects negatives, ES's combinator syntax (`"3<90%"`, `"-25%"`), and any
+/// other shape with a clear error.
+fn resolve_bool_msm(value: &Value, should_count: usize) -> Result<usize, Unsupported> {
+  match value {
+    Value::Number(n) => n
+      .as_u64()
+      .map(|n| (n as usize).min(should_count))
+      .ok_or_else(|| {
+        Unsupported::with_detail(
+          "bool.minimum_should_match",
+          "must be a non-negative integer",
+        )
+      }),
+    Value::String(s) => parse_msm_string(s.trim(), should_count),
+    _ => Err(Unsupported::with_detail(
+      "bool.minimum_should_match",
+      "must be an integer or a percentage string like \"75%\"",
+    )),
+  }
+}
+
+fn parse_msm_string(s: &str, should_count: usize) -> Result<usize, Unsupported> {
+  if let Some(stripped) = s.strip_suffix('%') {
+    // Reject combinator syntax (`3<90%`) and signed forms — supporting them
+    // properly is non-trivial and silently mis-translating is worse than
+    // returning a clear error.
+    if stripped.contains('<') || stripped.starts_with('-') || stripped.starts_with('+') {
+      return Err(Unsupported::with_detail(
+        "bool.minimum_should_match",
+        "combinator and signed percentage syntax (e.g. `3<90%`, `-25%`) is not supported",
+      ));
+    }
+    let pct: f64 = stripped.parse().map_err(|_| {
+      Unsupported::with_detail(
+        "bool.minimum_should_match",
+        format!("invalid percentage `{s}`"),
+      )
+    })?;
+    if !(0.0..=100.0).contains(&pct) {
+      return Err(Unsupported::with_detail(
+        "bool.minimum_should_match",
+        "percentage must be between 0 and 100",
+      ));
+    }
+    let resolved = ((should_count as f64) * pct / 100.0).floor() as usize;
+    return Ok(resolved.min(should_count));
+  }
+  // Bare integer string — accept defensively (some ES clients send "3").
+  let n: i64 = s.parse().map_err(|_| {
+    Unsupported::with_detail(
+      "bool.minimum_should_match",
+      format!("must be an integer or percentage, got `{s}`"),
+    )
+  })?;
+  if n < 0 {
+    return Err(Unsupported::with_detail(
+      "bool.minimum_should_match",
+      "negative integers are not supported (use a percentage instead)",
+    ));
+  }
+  Ok((n as usize).min(should_count))
 }
 
 fn collect_clause_array(value: Option<&Value>) -> Result<Vec<Value>, Unsupported> {
@@ -813,7 +935,12 @@ fn terms_to_filter(body: &Value) -> Result<Value, Unsupported> {
   let map = body
     .as_object()
     .ok_or_else(|| Unsupported::with_detail("terms", "expected an object"))?;
-  let mut field_iter = map.iter().filter(|(k, _)| *k != "boost");
+  // Only treat `boost` as the meta-key when its value is numeric (the only
+  // shape ES documents). Otherwise it's a legitimate field name — silently
+  // filtering it would make any schema with a `boost` column unqueryable.
+  let mut field_iter = map
+    .iter()
+    .filter(|(k, v)| !(*k == "boost" && v.is_number()));
   let (field, spec) = field_iter
     .next()
     .ok_or_else(|| Unsupported::with_detail("terms", "missing field entry"))?;

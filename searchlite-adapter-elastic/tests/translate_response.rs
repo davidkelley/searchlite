@@ -78,6 +78,81 @@ fn aggregations_terms_buckets_translated() {
 }
 
 #[test]
+fn hit_with_only_snippet_emits_snippet_under_sentinel_key() {
+  let sl = json!({
+    "total_hits_estimate": 1,
+    "hits": [{ "doc_id": "a", "score": 1.0, "snippet": "rust …safety" }],
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let hits = es.pointer("/hits/hits").unwrap().as_array().unwrap();
+  assert_eq!(
+    hits[0].get("highlight").unwrap(),
+    &json!({ "_snippet": ["rust …safety"] })
+  );
+}
+
+#[test]
+fn hit_with_only_highlights_emits_highlights_verbatim() {
+  let sl = json!({
+    "total_hits_estimate": 1,
+    "hits": [{
+      "doc_id": "a",
+      "score": 1.0,
+      "highlights": { "title": ["<em>rust</em> safety"] }
+    }],
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let hits = es.pointer("/hits/hits").unwrap().as_array().unwrap();
+  assert_eq!(
+    hits[0].get("highlight").unwrap(),
+    &json!({ "title": ["<em>rust</em> safety"] })
+  );
+}
+
+#[test]
+fn hit_with_both_snippet_and_highlights_prefers_highlights_without_dropping_snippet() {
+  // Regression for review feedback: previously the second `out.insert("highlight", …)`
+  // silently overwrote the snippet entry. Either the structured `highlights` or the
+  // legacy `snippet` is informative on its own; if both are present we keep the
+  // structured one (richer) and surface the snippet alongside it under `_snippet`
+  // so neither field is silently lost.
+  let sl = json!({
+    "total_hits_estimate": 1,
+    "hits": [{
+      "doc_id": "a",
+      "score": 1.0,
+      "snippet": "rust …safety",
+      "highlights": { "title": ["<em>rust</em> safety"] }
+    }],
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let highlight = es.pointer("/hits/hits").unwrap().as_array().unwrap()[0]
+    .get("highlight")
+    .unwrap();
+  assert_eq!(
+    highlight.get("title").unwrap(),
+    &json!(["<em>rust</em> safety"]),
+    "structured highlights should be preserved"
+  );
+  assert_eq!(
+    highlight.get("_snippet").unwrap(),
+    &json!(["rust …safety"]),
+    "legacy snippet should also be preserved alongside structured highlights"
+  );
+}
+
+#[test]
+fn hit_without_highlight_omits_highlight_field() {
+  let sl = json!({
+    "total_hits_estimate": 1,
+    "hits": [{ "doc_id": "a", "score": 1.0 }],
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let hit = &es.pointer("/hits/hits").unwrap().as_array().unwrap()[0];
+  assert!(hit.get("highlight").is_none());
+}
+
+#[test]
 fn stats_aggregation_translates_to_es_envelope() {
   let sl = json!({
     "total_hits_estimate": 5,

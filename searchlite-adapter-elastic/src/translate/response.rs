@@ -71,11 +71,26 @@ fn translate_hit(index: &str, hit: &Value) -> Value {
   if let Some(f) = fields {
     out.insert("_source".into(), f.clone());
   }
-  if let Some(snippet) = map.and_then(|m| m.get("snippet")) {
-    out.insert("highlight".into(), json!({ "_snippet": [snippet] }));
-  }
-  if let Some(highlights) = map.and_then(|m| m.get("highlights")) {
-    out.insert("highlight".into(), highlights.clone());
+  // Precedence: prefer structured `highlights` (per-field map) over the legacy
+  // single-field `snippet`. When both are present we keep `highlights` as the
+  // primary payload but surface the snippet under `_snippet` so neither field
+  // is silently dropped — the previous unconditional double-insert overwrote
+  // the snippet.
+  let snippet = map.and_then(|m| m.get("snippet")).cloned();
+  let highlights = map.and_then(|m| m.get("highlights")).cloned();
+  match (highlights, snippet) {
+    (Some(h), Some(s)) => {
+      let mut merged = h.as_object().cloned().unwrap_or_default();
+      merged.insert("_snippet".to_string(), json!([s]));
+      out.insert("highlight".into(), Value::Object(merged));
+    }
+    (Some(h), None) => {
+      out.insert("highlight".into(), h);
+    }
+    (None, Some(s)) => {
+      out.insert("highlight".into(), json!({ "_snippet": [s] }));
+    }
+    (None, None) => {}
   }
   if let Some(sort_key) = map.and_then(|m| m.get("sort_key")) {
     out.insert("sort".into(), sort_key.clone());

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::http::StatusCode;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
@@ -11,6 +12,36 @@ use crate::error::ESError;
 use crate::AdapterArgs;
 
 const WRITE_KEY_HEADER: &str = "x-searchlite-write-key";
+
+/// Characters that must be percent-encoded inside a URL path segment.
+/// `/`, `?`, `#` are structural; `%` needs encoding to avoid double-decode;
+/// space and `<`, `>`, `"`, `\\`, `^`, `\`` are unsafe in path syntax. Also
+/// percent-encode all controls. Most legitimate index name characters
+/// (alphanumerics, `-`, `_`, `.`, `:`) pass through unchanged.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+  .add(b' ')
+  .add(b'/')
+  .add(b'?')
+  .add(b'#')
+  .add(b'%')
+  .add(b'<')
+  .add(b'>')
+  .add(b'"')
+  .add(b'\\')
+  .add(b'^')
+  .add(b'`')
+  .add(b'{')
+  .add(b'}')
+  .add(b'|');
+
+/// Build a relative path under `indexes/<index>/<suffix>` with the index name
+/// percent-encoded as a single path segment. Without this, an index name
+/// containing `/`, `?`, `#`, or whitespace would be parsed structurally by
+/// `Url::join` and route to the wrong endpoint upstream.
+pub(crate) fn upstream_path(index: &str, suffix: &str) -> String {
+  let encoded = utf8_percent_encode(index, PATH_SEGMENT);
+  format!("indexes/{encoded}/{suffix}")
+}
 
 pub struct SearchliteClient {
   http: reqwest::Client,
@@ -30,6 +61,17 @@ impl SearchliteClient {
     }
     let base =
       Url::parse(&raw).with_context(|| format!("parsing upstream URL `{}`", args.upstream_url))?;
+    // Reject non-HTTP schemes at startup so misconfiguration surfaces as a
+    // clear error instead of a cryptic reqwest failure on the first request.
+    match base.scheme() {
+      "http" | "https" => {}
+      other => {
+        return Err(anyhow!(
+          "upstream URL scheme must be http or https, got `{other}` from `{}`",
+          args.upstream_url
+        ))
+      }
+    }
     let http = reqwest::Client::builder()
       .timeout(Duration::from_secs(args.request_timeout_secs))
       .build()
@@ -42,18 +84,16 @@ impl SearchliteClient {
   }
 
   pub async fn search(&self, index: &str, body: &Value) -> Result<Value, ClientError> {
-    self
-      .post_json(&format!("indexes/{index}/search"), body)
-      .await
+    self.post_json(&upstream_path(index, "search"), body).await
   }
 
   pub async fn mget(&self, index: &str, body: &Value) -> Result<Value, ClientError> {
-    self.post_json(&format!("indexes/{index}/mget"), body).await
+    self.post_json(&upstream_path(index, "mget"), body).await
   }
 
   pub async fn multi_search(&self, index: &str, body: &Value) -> Result<Value, ClientError> {
     self
-      .post_json(&format!("indexes/{index}/multi_search"), body)
+      .post_json(&upstream_path(index, "multi_search"), body)
       .await
   }
 
@@ -62,7 +102,7 @@ impl SearchliteClient {
   }
 
   pub async fn inspect(&self, index: &str) -> Result<Value, ClientError> {
-    self.get_json(&format!("indexes/{index}/inspect")).await
+    self.get_json(&upstream_path(index, "inspect")).await
   }
 
   pub async fn healthz(&self) -> Result<Value, ClientError> {
@@ -207,5 +247,90 @@ impl From<ClientError> for ESError {
         format!("could not decode upstream response: {body}"),
       ),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::AdapterArgs;
+  use clap::Parser;
+
+  fn args(upstream_url: &str) -> AdapterArgs {
+    // Construct AdapterArgs by parsing only the URL flag; clap fills the rest
+    // with defaults. We only care about `upstream_url` here.
+    AdapterArgs::parse_from(["searchlite-elastic", "--upstream-url", upstream_url])
+  }
+
+  #[test]
+  fn upstream_path_passes_through_simple_index_name() {
+    assert_eq!(
+      upstream_path("simple-name.v1", "search"),
+      "indexes/simple-name.v1/search"
+    );
+  }
+
+  #[test]
+  fn upstream_path_encodes_slash_in_index_name() {
+    // Without encoding, `format!("indexes/{index}/search")` with index=`a/b`
+    // would create a 4-segment path that Url::join parses structurally,
+    // routing to the wrong endpoint upstream.
+    assert_eq!(upstream_path("a/b", "search"), "indexes/a%2Fb/search");
+  }
+
+  #[test]
+  fn upstream_path_encodes_query_and_fragment_chars() {
+    assert_eq!(upstream_path("a?b", "search"), "indexes/a%3Fb/search");
+    assert_eq!(upstream_path("a#b", "search"), "indexes/a%23b/search");
+  }
+
+  #[test]
+  fn upstream_path_encodes_whitespace_and_percent() {
+    assert_eq!(upstream_path("a b", "search"), "indexes/a%20b/search");
+    assert_eq!(upstream_path("a%b", "search"), "indexes/a%25b/search");
+  }
+
+  #[test]
+  fn client_new_rejects_file_scheme_url() {
+    // Regression: file:// (or any non-HTTP scheme) used to be accepted at
+    // startup and only fail later at request time with a cryptic reqwest
+    // error. Reject loudly instead.
+    let result = SearchliteClient::new(&args("file:///etc/passwd"));
+    assert!(
+      result.is_err(),
+      "expected file:// to be rejected at startup"
+    );
+    let msg = result.err().unwrap().to_string();
+    assert!(msg.contains("scheme"), "got: {msg}");
+    assert!(msg.contains("file"), "got: {msg}");
+  }
+
+  #[test]
+  fn client_new_accepts_http_and_https() {
+    assert!(SearchliteClient::new(&args("http://127.0.0.1:8080")).is_ok());
+    assert!(SearchliteClient::new(&args("https://example.com")).is_ok());
+  }
+
+  #[test]
+  fn client_new_normalizes_missing_trailing_slash_for_path_prefix() {
+    // Prefix base URLs without a trailing slash would have `Url::join` drop
+    // the prefix segment. Verify we patch the base before parsing.
+    let client =
+      SearchliteClient::new(&args("http://example.com/prefix")).expect("parse with prefix");
+    let url = client
+      .url(&upstream_path("foo", "search"))
+      .expect("build url");
+    assert_eq!(url.path(), "/prefix/indexes/foo/search");
+  }
+
+  #[test]
+  fn client_url_construction_with_encoded_index_name_produces_3_path_segments() {
+    let client = SearchliteClient::new(&args("http://example.com")).expect("parse simple base");
+    let url = client
+      .url(&upstream_path("a/b", "search"))
+      .expect("build url");
+    // Index `a/b` should be a single segment, encoded — total path is
+    // /indexes/a%2Fb/search (3 segments), not /indexes/a/b/search (4).
+    assert_eq!(url.path(), "/indexes/a%2Fb/search");
   }
 }
