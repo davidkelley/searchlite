@@ -506,3 +506,54 @@ fn cross_index_search_path_is_rejected() {
     .expect("post");
   assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[test]
+fn settings_on_unknown_index_returns_404() {
+  let h = ElasticHarness::new().expect("harness");
+  let (status, body) = h.es_get("/no-such-index/_settings").expect("get");
+  assert_eq!(status, StatusCode::NOT_FOUND);
+  let kind = body
+    .get("error")
+    .and_then(|e| e.get("type"))
+    .and_then(Value::as_str)
+    .unwrap_or("");
+  assert_eq!(kind, "index_not_found_exception");
+}
+
+#[test]
+fn settings_on_known_index_returns_payload() {
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_get(&format!("/{INDEX}/_settings"))
+    .expect("get settings");
+  assert_eq!(status, StatusCode::OK);
+  assert!(body.get(INDEX).is_some(), "expected `{INDEX}` key in body");
+}
+
+#[test]
+fn aliases_for_index_with_no_aliases_returns_empty_entry() {
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_get(&format!("/{INDEX}/_aliases"))
+    .expect("get aliases");
+  assert_eq!(status, StatusCode::OK);
+  // Existing index with no aliases configured → ES returns
+  // `{<index>: {aliases: {}}}`. Verifies the handler is path-scoped (would
+  // return all indexes if it weren't) and that empty-alias indexes don't 404.
+  assert_eq!(body, json!({ INDEX: { "aliases": {} } }), "got {body}",);
+}
+
+#[test]
+fn aliases_for_unknown_index_returns_404() {
+  let h = ElasticHarness::new().expect("harness");
+  let (status, body) = h.es_get("/no-such-index/_aliases").expect("get");
+  assert_eq!(status, StatusCode::NOT_FOUND);
+  let kind = body
+    .get("error")
+    .and_then(|e| e.get("type"))
+    .and_then(Value::as_str)
+    .unwrap_or("");
+  assert_eq!(kind, "index_not_found_exception");
+}

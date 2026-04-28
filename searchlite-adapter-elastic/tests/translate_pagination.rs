@@ -50,6 +50,25 @@ fn track_total_hits_invalid_type_rejected() {
 }
 
 #[test]
+fn track_total_hits_negative_int_rejected() {
+  let mut out = Map::new();
+  let body = json!({ "track_total_hits": -1 });
+  let map = body.as_object().unwrap().clone();
+  let err = apply_pagination(&map, &mut out).unwrap_err();
+  assert_eq!(err.feature, "track_total_hits");
+  assert!(err.detail.contains("non-negative"), "got {err:?}");
+}
+
+#[test]
+fn track_total_hits_float_rejected() {
+  let mut out = Map::new();
+  let body = json!({ "track_total_hits": 1.5 });
+  let map = body.as_object().unwrap().clone();
+  let err = apply_pagination(&map, &mut out).unwrap_err();
+  assert_eq!(err.feature, "track_total_hits");
+}
+
+#[test]
 fn scroll_is_rejected() {
   let mut out = Map::new();
   let body = json!({ "scroll": "1m" });

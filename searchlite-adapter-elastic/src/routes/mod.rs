@@ -44,8 +44,8 @@ pub fn router(state: Arc<AppState>) -> Router {
       get(indices::get_mapping).put(reject::write_not_supported),
     )
     .route("/{index}/_settings", get(indices::get_settings))
-    .route("/{index}/_aliases", get(indices::aliases))
-    .route("/{index}/_alias", get(indices::aliases))
+    .route("/{index}/_aliases", get(indices::aliases_for_index))
+    .route("/{index}/_alias", get(indices::aliases_for_index))
     .route("/{index}/_search", post(search::search).get(search::search))
     .route("/{index}/_count", post(search::count).get(search::count))
     .route("/{index}/_mget", post(mget::mget))

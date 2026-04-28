@@ -30,22 +30,20 @@ pub fn apply_pagination(
     // explicitly request exact totals get them.
     let normalized = match track {
       Value::Bool(b) => Value::Bool(*b),
+      // ES allows an integer cap (track up to N exactly, then return a
+      // lower bound). SearchLite has no lower-bound mode, so map any
+      // positive cap to `true` and 0 to `false` — closer to user intent
+      // than silently dropping it. `as_u64` returns `None` for negative
+      // integers and floats, so both classes get rejected here instead of
+      // being silently coerced to `false`.
       Value::Number(n) => {
-        // ES allows an integer cap (track up to N exactly, then return a
-        // lower bound). SearchLite has no lower-bound mode, so map any
-        // positive cap to `true` and 0 to `false` — closer to user intent
-        // than silently dropping it.
-        let positive = n
-          .as_i64()
-          .map(|i| i > 0)
-          .or_else(|| n.as_u64().map(|u| u > 0))
-          .ok_or_else(|| {
-            Unsupported::with_detail(
-              "track_total_hits",
-              "must be a boolean or non-negative integer",
-            )
-          })?;
-        Value::Bool(positive)
+        let cap = n.as_u64().ok_or_else(|| {
+          Unsupported::with_detail(
+            "track_total_hits",
+            "must be a boolean or non-negative integer",
+          )
+        })?;
+        Value::Bool(cap > 0)
       }
       _ => {
         return Err(Unsupported::with_detail(

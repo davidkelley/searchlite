@@ -80,14 +80,71 @@ pub async fn mapping_all(State(state): State<Arc<AppState>>) -> ESResult<Json<Va
 }
 
 pub async fn get_settings(
-  State(_state): State<Arc<AppState>>,
+  State(state): State<Arc<AppState>>,
   Path(index): Path<String>,
-) -> Json<Value> {
-  Json(settings_payload(&index))
+) -> ESResult<Json<Value>> {
+  if !index_exists(&state, &index).await? {
+    return Err(ESError::not_found(
+      "index_not_found_exception",
+      format!("no such index [{index}]"),
+    ));
+  }
+  Ok(Json(settings_payload(&index)))
 }
 
 pub async fn aliases(State(state): State<Arc<AppState>>) -> ESResult<Json<Value>> {
-  // Best-effort: resolve aliases from upstream listing if available.
+  Ok(Json(Value::Object(aliases_by_index(&state).await?)))
+}
+
+/// Index-scoped alias endpoint (`GET /{index}/_aliases`,
+/// `GET /{index}/_alias`). Three cases, matching Elasticsearch:
+///
+/// 1. `{index}` is an index with aliases pointing at it → return that entry
+/// 2. `{index}` is an index with no aliases → return `{<index>: {aliases: {}}}`
+/// 3. `{index}` is an alias name → return `{<target>: {aliases: {<index>: {}}}}`
+///
+/// 404 only when `{index}` resolves neither as an index nor as an alias.
+pub async fn aliases_for_index(
+  State(state): State<Arc<AppState>>,
+  Path(index): Path<String>,
+) -> ESResult<Json<Value>> {
+  if !index_exists(&state, &index).await? {
+    return Err(ESError::not_found(
+      "index_not_found_exception",
+      format!("no such index [{index}]"),
+    ));
+  }
+  let all = aliases_by_index(&state).await?;
+  let mut filtered = serde_json::Map::new();
+
+  if let Some(entry) = all.get(&index) {
+    filtered.insert(index.clone(), entry.clone());
+    return Ok(Json(Value::Object(filtered)));
+  }
+
+  // `{index}` may be an alias name itself — find the index it targets.
+  let mut found_as_alias = false;
+  for (target, entry) in &all {
+    if let Some(aliases) = entry.get("aliases").and_then(Value::as_object) {
+      if aliases.contains_key(&index) {
+        let mut narrowed = serde_json::Map::new();
+        narrowed.insert(index.clone(), json!({}));
+        filtered.insert(target.clone(), json!({ "aliases": narrowed }));
+        found_as_alias = true;
+      }
+    }
+  }
+
+  if !found_as_alias {
+    // Index exists but has no aliases — ES returns an empty alias entry.
+    filtered.insert(index.clone(), json!({ "aliases": {} }));
+  }
+  Ok(Json(Value::Object(filtered)))
+}
+
+/// Build the `{ <index>: { aliases: { <alias>: {} } } }` map from upstream's
+/// alias listing. Shared between the global and index-scoped handlers.
+async fn aliases_by_index(state: &Arc<AppState>) -> ESResult<serde_json::Map<String, Value>> {
   let listing = state.client().list_indexes().await?;
   let aliases = listing
     .get("aliases")
@@ -116,7 +173,7 @@ pub async fn aliases(State(state): State<Arc<AppState>>) -> ESResult<Json<Value>
       map.insert(alias_name, json!({}));
     }
   }
-  Ok(Json(Value::Object(by_index)))
+  Ok(by_index)
 }
 
 pub fn settings_payload(index: &str) -> Value {
