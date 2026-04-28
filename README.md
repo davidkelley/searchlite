@@ -191,6 +191,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | **C FFI** | [`searchlite-ffi`](searchlite-ffi/) | Stable &mdash; shared library + C header |
 | **Node.js** | [`searchlite-js`](searchlite-node/) | Stable &mdash; native bindings + HTTP client, TypeScript + Zod |
 | **WASM** | [`searchlite-wasm`](searchlite-wasm/README.md) | Pre-1.0 &mdash; IndexedDB-backed browser search with worker runtime, migrations, quota handling |
+| **Elasticsearch adapter** | [`searchlite-adapter-elastic`](searchlite-adapter-elastic/README.md) | Pre-1.0 &mdash; read-only Elasticsearch HTTP-API compatibility for existing ES clients (Kibana, official SDKs) |
 
 ---
 
@@ -243,6 +244,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | Schema and fields | [docs/schema.md](docs/schema.md) |
 | CLI reference | [docs/cli.md](docs/cli.md) |
 | HTTP service | [docs/http.md](docs/http.md) |
+| Elasticsearch adapter | [docs/adapters/elasticsearch.md](docs/adapters/elasticsearch.md) |
 | Query DSL | [docs/queries.md](docs/queries.md) |
 | Filters | [docs/filters.md](docs/filters.md) |
 | Aggregations | [docs/aggregations.md](docs/aggregations.md) |
