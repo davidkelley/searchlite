@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
@@ -29,14 +29,6 @@ pub use client::SearchliteClient;
 pub use error::ESError;
 pub use state::AppState;
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnsupportedPolicy {
-  /// Reject the request with HTTP 400 when an unsupported feature is encountered.
-  Reject,
-  /// Log a warning and translate as best as possible (may produce empty/partial results).
-  Warn,
-}
-
 #[derive(Parser, Debug, Clone)]
 #[command(
   name = "searchlite-elastic",
@@ -47,7 +39,11 @@ pub struct AdapterArgs {
   /// Bind address for the Elasticsearch-compatible HTTP server.
   /// WARNING: Binding to 0.0.0.0 or any non-localhost address exposes this
   /// unauthenticated service to the network; front it with a proxy or firewall.
-  #[arg(long, env = "SEARCHLITE_ELASTIC_BIND_ADDR", default_value = "127.0.0.1:9200")]
+  #[arg(
+    long,
+    env = "SEARCHLITE_ELASTIC_BIND_ADDR",
+    default_value = "127.0.0.1:9200"
+  )]
   pub bind: SocketAddr,
 
   /// Base URL of the upstream searchlite-http instance.
@@ -70,17 +66,12 @@ pub struct AdapterArgs {
   )]
   pub version_banner: String,
 
-  /// Policy when a request uses an Elasticsearch feature SearchLite cannot model.
+  /// Per-request timeout in seconds for upstream calls.
   #[arg(
     long,
-    value_enum,
-    env = "SEARCHLITE_ELASTIC_ON_UNSUPPORTED",
-    default_value = "reject"
+    env = "SEARCHLITE_ELASTIC_REQUEST_TIMEOUT_SECS",
+    default_value_t = 30
   )]
-  pub on_unsupported: UnsupportedPolicy,
-
-  /// Per-request timeout in seconds for upstream calls.
-  #[arg(long, env = "SEARCHLITE_ELASTIC_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
   pub request_timeout_secs: u64,
 
   /// Maximum allowed request body size in bytes.

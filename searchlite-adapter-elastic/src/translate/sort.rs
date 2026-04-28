@@ -5,7 +5,8 @@ use super::unsupported::Unsupported;
 /// Translate the ES `sort` field into SearchLite's `[{field, order}]` shape.
 ///
 /// Accepted forms:
-/// - `"field"` → `[{field, order: "asc"}]`
+/// - `"field"` → `[{field, order: "asc"}]` (but `_score` defaults to `desc`,
+///   matching Elasticsearch — score-sorting is normally relevance-descending)
 /// - `["field", {field2: "desc"}]`
 /// - `[{field: {order: "desc", missing: "_last"}}]`
 /// - `"_score"` translates verbatim
@@ -30,7 +31,7 @@ pub fn translate_sort(es_sort: &Value) -> Result<Vec<Value>, Unsupported> {
 
 fn translate_sort_entry(entry: &Value) -> Result<Value, Unsupported> {
   match entry {
-    Value::String(field) => Ok(json!({ "field": field, "order": "asc" })),
+    Value::String(field) => Ok(json!({ "field": field, "order": default_order(field) })),
     Value::Object(map) => {
       if map.len() != 1 {
         return Err(Unsupported::with_detail(
@@ -47,7 +48,7 @@ fn translate_sort_entry(entry: &Value) -> Result<Value, Unsupported> {
             .and_then(Value::as_str)
             .map(normalize_order)
             .transpose()?
-            .unwrap_or_else(|| "asc".to_string());
+            .unwrap_or_else(|| default_order(field).to_string());
 
           if opts.contains_key("mode") {
             return Err(Unsupported::with_detail("sort.mode", "not implemented"));
@@ -74,6 +75,17 @@ fn translate_sort_entry(entry: &Value) -> Result<Value, Unsupported> {
       "sort",
       "sort entry must be a string or object",
     )),
+  }
+}
+
+/// Elasticsearch defaults `_score` sorting to `desc` (relevance high → low) and
+/// other fields to `asc`. Mirror that so `sort: "_score"` and `sort: {"_score": {}}`
+/// behave like ES.
+fn default_order(field: &str) -> &'static str {
+  if field == "_score" {
+    "desc"
+  } else {
+    "asc"
   }
 }
 

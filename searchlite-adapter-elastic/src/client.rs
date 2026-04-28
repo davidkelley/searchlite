@@ -20,8 +20,16 @@ pub struct SearchliteClient {
 
 impl SearchliteClient {
   pub fn new(args: &AdapterArgs) -> Result<Self> {
-    let base = Url::parse(&args.upstream_url)
-      .with_context(|| format!("parsing upstream URL `{}`", args.upstream_url))?;
+    // RFC 3986 `Url::join` drops the last path segment when the base URL has
+    // no trailing slash — so `http://host/prefix` + "indexes/foo" becomes
+    // `http://host/indexes/foo`, silently breaking deployments behind a path
+    // prefix. Force the base to end with `/` so prefixes are preserved.
+    let mut raw = args.upstream_url.clone();
+    if !raw.ends_with('/') {
+      raw.push('/');
+    }
+    let base =
+      Url::parse(&raw).with_context(|| format!("parsing upstream URL `{}`", args.upstream_url))?;
     let http = reqwest::Client::builder()
       .timeout(Duration::from_secs(args.request_timeout_secs))
       .build()
@@ -40,9 +48,7 @@ impl SearchliteClient {
   }
 
   pub async fn mget(&self, index: &str, body: &Value) -> Result<Value, ClientError> {
-    self
-      .post_json(&format!("indexes/{index}/mget"), body)
-      .await
+    self.post_json(&format!("indexes/{index}/mget"), body).await
   }
 
   pub async fn multi_search(&self, index: &str, body: &Value) -> Result<Value, ClientError> {
@@ -138,8 +144,8 @@ async fn parse_response(resp: reqwest::Response) -> Result<Value, ClientError> {
     .await
     .map_err(|err| ClientError::Connection(err.to_string()))?;
 
-  let status_code = StatusCode::from_u16(status.as_u16())
-    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+  let status_code =
+    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
   if status.is_success() {
     if bytes.is_empty() {

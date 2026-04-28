@@ -293,3 +293,75 @@ fn bool_filter_context_with_must_not_emits_not() {
     })
   );
 }
+
+// ── Numeric `term` handling ─────────────────────────────────────────────
+
+#[test]
+fn term_with_integer_emits_constant_score_with_i64range() {
+  let es = json!({"term": {"price": 25}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "constant_score",
+      "filter": { "I64Range": { "field": "price", "min": 25, "max": 25 } }
+    })
+  );
+}
+
+#[test]
+fn term_with_float_emits_constant_score_with_f64range() {
+  let es = json!({"term": {"rating": 4.5}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "constant_score",
+      "filter": { "F64Range": { "field": "rating", "min": 4.5, "max": 4.5 } }
+    })
+  );
+}
+
+#[test]
+fn term_with_integer_in_filter_context_emits_i64range() {
+  let es = json!({"term": {"price": 25}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({ "I64Range": { "field": "price", "min": 25, "max": 25 } })
+  );
+}
+
+#[test]
+fn term_with_float_in_filter_context_emits_f64range() {
+  let es = json!({"term": {"rating": 4.5}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({ "F64Range": { "field": "rating", "min": 4.5, "max": 4.5 } })
+  );
+}
+
+#[test]
+fn term_with_object_integer_value_carries_boost() {
+  let es = json!({"term": {"price": {"value": 25, "boost": 2.0}}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "constant_score",
+      "filter": { "I64Range": { "field": "price", "min": 25, "max": 25 } },
+      "boost": 2.0
+    })
+  );
+}
+
+// ── Validation: terms filter rejects multi-field input ─────────────────
+
+#[test]
+fn terms_in_filter_context_rejects_multiple_field_entries() {
+  let es = json!({"terms": {"a": ["x"], "b": ["y"]}});
+  let err = translate_to_filter(&es).unwrap_err();
+  assert!(err.feature == "terms", "got {err:?}");
+  assert!(err.detail.contains("exactly one"), "got {err:?}");
+}

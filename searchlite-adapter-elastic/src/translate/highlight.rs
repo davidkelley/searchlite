@@ -7,9 +7,9 @@ use super::unsupported::Unsupported;
 /// SearchLite uses singular `pre_tag`/`post_tag`; ES allows arrays. We pick the
 /// first element if a list is supplied.
 pub fn translate_highlight(es_highlight: &Value) -> Result<Value, Unsupported> {
-  let map = es_highlight.as_object().ok_or_else(|| {
-    Unsupported::with_detail("highlight", "expected an object with `fields`")
-  })?;
+  let map = es_highlight
+    .as_object()
+    .ok_or_else(|| Unsupported::with_detail("highlight", "expected an object with `fields`"))?;
   let global_pre = pick_first_tag(map.get("pre_tags"));
   let global_post = pick_first_tag(map.get("post_tags"));
   let fields_in = map

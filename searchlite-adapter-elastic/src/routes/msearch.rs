@@ -45,7 +45,10 @@ pub async fn msearch(
       "searches": searches,
       "parallel": true,
     });
-    let upstream = state.client().multi_search(&index, &upstream_request).await?;
+    let upstream = state
+      .client()
+      .multi_search(&index, &upstream_request)
+      .await?;
     let results = upstream
       .get("results")
       .and_then(Value::as_array)
@@ -106,7 +109,10 @@ fn parse_msearch_ndjson(body: &[u8], default_index: Option<&str>) -> ESResult<Ve
       )
     })?;
     let index = pick_index(&header_value, default_index)?;
-    entries.push(MSearchEntry { index, body: body_value });
+    entries.push(MSearchEntry {
+      index,
+      body: body_value,
+    });
   }
   Ok(entries)
 }
@@ -132,7 +138,7 @@ fn pick_index(header: &Value, default_index: Option<&str>) -> ESResult<String> {
       }
     }
   }
-  default_index
-    .map(str::to_string)
-    .ok_or_else(|| ESError::bad_request("x_content_parse_exception", "msearch entry missing `index`"))
+  default_index.map(str::to_string).ok_or_else(|| {
+    ESError::bad_request("x_content_parse_exception", "msearch entry missing `index`")
+  })
 }

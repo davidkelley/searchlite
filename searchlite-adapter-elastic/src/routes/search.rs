@@ -35,7 +35,11 @@ pub async fn search(
   let started = Instant::now();
   let sl_response = state.client().search(&index, &sl_body).await?;
   let took_ms = started.elapsed().as_millis() as u64;
-  Ok(Json(translate_search_response(&index, &sl_response, took_ms)))
+  Ok(Json(translate_search_response(
+    &index,
+    &sl_response,
+    took_ms,
+  )))
 }
 
 pub async fn count(
@@ -61,10 +65,7 @@ pub async fn count(
   })))
 }
 
-fn merge_query_params_into_body(
-  body: Option<Value>,
-  params: &SearchParams,
-) -> ESResult<Value> {
+fn merge_query_params_into_body(body: Option<Value>, params: &SearchParams) -> ESResult<Value> {
   let mut map = match body {
     Some(Value::Object(map)) => map,
     Some(Value::Null) | None => Map::new(),
@@ -85,10 +86,14 @@ fn merge_query_params_into_body(
     map.insert("query".into(), json!({ "query_string": Value::Object(qs) }));
   }
   if let Some(from) = params.from {
-    map.entry("from".to_string()).or_insert(Value::from(from as u64));
+    map
+      .entry("from".to_string())
+      .or_insert(Value::from(from as u64));
   }
   if let Some(size) = params.size {
-    map.entry("size".to_string()).or_insert(Value::from(size as u64));
+    map
+      .entry("size".to_string())
+      .or_insert(Value::from(size as u64));
   }
   if let Some(sort) = &params.sort {
     let parts: Vec<Value> = sort
@@ -105,17 +110,40 @@ fn merge_query_params_into_body(
     map.entry("sort".to_string()).or_insert(Value::Array(parts));
   }
   if let Some(track) = params.track_total_hits {
-    map.entry("track_total_hits".to_string())
+    map
+      .entry("track_total_hits".to_string())
       .or_insert(Value::Bool(track));
   }
   if let Some(source) = &params.source {
-    let parts: Vec<Value> = source
-      .split(',')
-      .filter(|s| !s.is_empty())
-      .map(|s| Value::String(s.trim().to_string()))
-      .collect();
-    if !parts.is_empty() {
-      map.entry("_source".to_string()).or_insert(Value::Array(parts));
+    let trimmed = source.trim();
+    // Match Elasticsearch's URL semantics for ?_source: bare booleans
+    // turn the source on/off entirely; otherwise treat as a comma-separated
+    // includes list. Without this, `?_source=false` would be interpreted as
+    // requesting a field literally called `false`.
+    match trimmed.to_ascii_lowercase().as_str() {
+      "true" => {
+        map
+          .entry("_source".to_string())
+          .or_insert(Value::Bool(true));
+      }
+      "false" => {
+        map
+          .entry("_source".to_string())
+          .or_insert(Value::Bool(false));
+      }
+      _ => {
+        let parts: Vec<Value> = trimmed
+          .split(',')
+          .map(str::trim)
+          .filter(|s| !s.is_empty())
+          .map(|s| Value::String(s.to_string()))
+          .collect();
+        if !parts.is_empty() {
+          map
+            .entry("_source".to_string())
+            .or_insert(Value::Array(parts));
+        }
+      }
     }
   }
   Ok(Value::Object(map))

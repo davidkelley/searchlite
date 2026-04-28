@@ -114,6 +114,12 @@ fn nested_array_translates_to_es_nested_with_properties() {
     .unwrap();
   assert_eq!(comments.get("type").unwrap(), &json!("nested"));
   let inner = comments.get("properties").unwrap();
-  assert_eq!(inner.get("author").unwrap().get("type").unwrap(), &json!("keyword"));
-  assert_eq!(inner.get("votes").unwrap().get("type").unwrap(), &json!("long"));
+  assert_eq!(
+    inner.get("author").unwrap().get("type").unwrap(),
+    &json!("keyword")
+  );
+  assert_eq!(
+    inner.get("votes").unwrap().get("type").unwrap(),
+    &json!("long")
+  );
 }

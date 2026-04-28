@@ -45,13 +45,19 @@ pub async fn mget_global(
   let mut grouped: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
   for (idx, doc) in docs.iter().enumerate() {
     let map = doc.as_object().ok_or_else(|| {
-      ESError::bad_request("x_content_parse_exception", "each `docs` entry must be an object")
+      ESError::bad_request(
+        "x_content_parse_exception",
+        "each `docs` entry must be an object",
+      )
     })?;
     let index = map
       .get("_index")
       .and_then(Value::as_str)
       .ok_or_else(|| {
-        ESError::bad_request("x_content_parse_exception", "missing `_index` in docs entry")
+        ESError::bad_request(
+          "x_content_parse_exception",
+          "missing `_index` in docs entry",
+        )
       })?
       .to_string();
     let id = map
@@ -67,10 +73,7 @@ pub async fn mget_global(
     let ids: Vec<String> = entries.iter().map(|(_, id)| id.clone()).collect();
     let upstream = state
       .client()
-      .mget(
-        &index,
-        &json!({ "ids": &ids, "return_stored": true }),
-      )
+      .mget(&index, &json!({ "ids": &ids, "return_stored": true }))
       .await?;
     let translated = translate_mget_response(&index, &upstream);
     let docs_arr = translated
@@ -100,7 +103,10 @@ fn collect_ids(body: &Value, default_index: &str) -> ESResult<Vec<String>> {
     let mut ids = Vec::with_capacity(docs.len());
     for doc in docs {
       let map = doc.as_object().ok_or_else(|| {
-        ESError::bad_request("x_content_parse_exception", "each `docs` entry must be an object")
+        ESError::bad_request(
+          "x_content_parse_exception",
+          "each `docs` entry must be an object",
+        )
       })?;
       if let Some(idx) = map.get("_index").and_then(Value::as_str) {
         if idx != default_index {
@@ -140,10 +146,7 @@ fn translate_mget_response(index: &str, upstream: &Value) -> Value {
     .and_then(Value::as_array)
     .cloned()
     .unwrap_or_default();
-  let translated: Vec<Value> = docs
-    .iter()
-    .map(|doc| translate_doc(index, doc))
-    .collect();
+  let translated: Vec<Value> = docs.iter().map(|doc| translate_doc(index, doc)).collect();
   json!({ "docs": translated })
 }
 

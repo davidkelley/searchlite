@@ -11,10 +11,7 @@ use super::unsupported::Unsupported;
 /// `SearchRequest` body. Always sets `return_stored: true` so callers see
 /// `_source` in hits.
 pub fn translate_search_body(es_body: &Value) -> Result<Value, Unsupported> {
-  let map = es_body
-    .as_object()
-    .cloned()
-    .unwrap_or_default();
+  let map = es_body.as_object().cloned().unwrap_or_default();
 
   if map.contains_key("script_fields") {
     return Err(Unsupported::feature("script_fields"));
@@ -71,10 +68,7 @@ pub fn translate_search_body(es_body: &Value) -> Result<Value, Unsupported> {
     out.insert("return_stored".into(), Value::Bool(true));
   }
 
-  let aggs_value = map
-    .get("aggs")
-    .or_else(|| map.get("aggregations"))
-    .cloned();
+  let aggs_value = map.get("aggs").or_else(|| map.get("aggregations")).cloned();
   if let Some(aggs_value) = aggs_value {
     let aggs_map = aggs_value
       .as_object()

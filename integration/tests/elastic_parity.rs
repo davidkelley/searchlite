@@ -39,9 +39,7 @@ fn skip_unless_docker(test_name: &str) -> Option<()> {
   if docker_available() {
     return Some(());
   }
-  eprintln!(
-    "[skip] {test_name}: docker is not available — start Docker to run this test"
-  );
+  eprintln!("[skip] {test_name}: docker is not available — start Docker to run this test");
   None
 }
 
@@ -465,7 +463,9 @@ fn ingest_into_es(client: &reqwest::blocking::Client, base: &str, docs: &[Value]
     let id = doc.get("_id").and_then(Value::as_str).unwrap();
     let mut body = doc.clone();
     body.as_object_mut().unwrap().remove("_id");
-    bulk.push_str(&format!(r#"{{"index":{{"_index":"{INDEX}","_id":"{id}"}}}}"#));
+    bulk.push_str(&format!(
+      r#"{{"index":{{"_index":"{INDEX}","_id":"{id}"}}}}"#
+    ));
     bulk.push('\n');
     bulk.push_str(&serde_json::to_string(&body)?);
     bulk.push('\n');
@@ -482,9 +482,7 @@ fn ingest_into_es(client: &reqwest::blocking::Client, base: &str, docs: &[Value]
   if body.get("errors").and_then(Value::as_bool).unwrap_or(false) {
     bail!("ES bulk reported errors: {body}");
   }
-  let resp = client
-    .post(format!("{base}/{INDEX}/_refresh"))
-    .send()?;
+  let resp = client.post(format!("{base}/{INDEX}/_refresh")).send()?;
   if !resp.status().is_success() {
     bail!("ES refresh failed: {} {}", resp.status(), resp.text()?);
   }
@@ -501,11 +499,7 @@ fn ingest_into_searchlite(
     .json(&searchlite_schema())
     .send()?;
   if !resp.status().is_success() {
-    bail!(
-      "searchlite init failed: {} {}",
-      resp.status(),
-      resp.text()?
-    );
+    bail!("searchlite init failed: {} {}", resp.status(), resp.text()?);
   }
   let mut ndjson = String::new();
   for doc in docs {
@@ -518,11 +512,7 @@ fn ingest_into_searchlite(
     .body(ndjson)
     .send()?;
   if !resp.status().is_success() {
-    bail!(
-      "searchlite add failed: {} {}",
-      resp.status(),
-      resp.text()?
-    );
+    bail!("searchlite add failed: {} {}", resp.status(), resp.text()?);
   }
   let resp = client
     .post(format!("{base}/indexes/{INDEX}/commit"))
@@ -981,7 +971,9 @@ fn evaluate(parity: &Parity, es: &Value, adapter: &Value) -> Vec<String> {
       a.sort();
       b.sort();
       if a != b {
-        vec![format!("hit id sets differ:\n    es      = {a:?}\n    adapter = {b:?}")]
+        vec![format!(
+          "hit id sets differ:\n    es      = {a:?}\n    adapter = {b:?}"
+        )]
       } else {
         vec![]
       }
@@ -1104,7 +1096,11 @@ fn total(response: &Value) -> u64 {
   response
     .get("count")
     .and_then(Value::as_u64)
-    .or_else(|| response.pointer("/hits/total/value").and_then(Value::as_u64))
+    .or_else(|| {
+      response
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
+    })
     .unwrap_or(0)
 }
 

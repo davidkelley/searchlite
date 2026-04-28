@@ -68,11 +68,7 @@ fn translate_one_agg(name: &str, spec: &Map<String, Value>) -> Result<Value, Uns
         "use `stats` and read the corresponding field from the response",
       ))
     }
-    other => {
-      return Err(Unsupported::feature(format!(
-        "aggregations.{name}.{other}"
-      )))
-    }
+    other => return Err(Unsupported::feature(format!("aggregations.{name}.{other}"))),
   };
   Ok(translated)
 }
@@ -98,7 +94,10 @@ fn merge_sub(mut out: Map<String, Value>, sub: Option<Value>) -> Map<String, Val
 
 // --- terms ---------------------------------------------------------------
 
-fn translate_terms_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result<Value, Unsupported> {
+fn translate_terms_agg(
+  body: &Map<String, Value>,
+  sub: Option<Value>,
+) -> Result<Value, Unsupported> {
   let field = require_field(body, "terms")?;
   let mut out = Map::new();
   out.insert("type".into(), Value::String("terms".into()));
@@ -160,7 +159,10 @@ fn translate_rare_terms_agg(
 
 // --- range / date_range -------------------------------------------------
 
-fn translate_range_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result<Value, Unsupported> {
+fn translate_range_agg(
+  body: &Map<String, Value>,
+  sub: Option<Value>,
+) -> Result<Value, Unsupported> {
   let field = require_field(body, "range")?;
   let ranges = body
     .get("ranges")
@@ -195,7 +197,10 @@ fn translate_range_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result<
   out.insert("field".into(), Value::String(field));
   out.insert("keyed".into(), Value::Bool(keyed));
   out.insert("ranges".into(), Value::Array(translated_ranges));
-  out.insert("missing".into(), body.get("missing").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "missing".into(),
+    body.get("missing").cloned().unwrap_or(Value::Null),
+  );
   Ok(Value::Object(merge_sub(out, sub)))
 }
 
@@ -215,8 +220,14 @@ fn translate_date_range_agg(
         Unsupported::with_detail("date_range.ranges", "each entry must be an object")
       })?;
       let mut entry = Map::new();
-      entry.insert("key".into(), r_obj.get("key").cloned().unwrap_or(Value::Null));
-      entry.insert("from".into(), r_obj.get("from").cloned().unwrap_or(Value::Null));
+      entry.insert(
+        "key".into(),
+        r_obj.get("key").cloned().unwrap_or(Value::Null),
+      );
+      entry.insert(
+        "from".into(),
+        r_obj.get("from").cloned().unwrap_or(Value::Null),
+      );
       entry.insert("to".into(), r_obj.get("to").cloned().unwrap_or(Value::Null));
       Ok(Value::Object(entry))
     })
@@ -226,9 +237,15 @@ fn translate_date_range_agg(
   out.insert("type".into(), Value::String("date_range".into()));
   out.insert("field".into(), Value::String(field));
   out.insert("keyed".into(), Value::Bool(keyed));
-  out.insert("format".into(), body.get("format").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "format".into(),
+    body.get("format").cloned().unwrap_or(Value::Null),
+  );
   out.insert("ranges".into(), Value::Array(translated_ranges));
-  out.insert("missing".into(), body.get("missing").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "missing".into(),
+    body.get("missing").cloned().unwrap_or(Value::Null),
+  );
   Ok(Value::Object(merge_sub(out, sub)))
 }
 
@@ -247,7 +264,10 @@ fn translate_histogram_agg(
   out.insert("type".into(), Value::String("histogram".into()));
   out.insert("field".into(), Value::String(field));
   out.insert("interval".into(), Value::from(interval));
-  out.insert("offset".into(), body.get("offset").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "offset".into(),
+    body.get("offset").cloned().unwrap_or(Value::Null),
+  );
   out.insert(
     "min_doc_count".into(),
     body.get("min_doc_count").cloned().unwrap_or(Value::Null),
@@ -260,7 +280,10 @@ fn translate_histogram_agg(
     "hard_bounds".into(),
     body.get("hard_bounds").cloned().unwrap_or(Value::Null),
   );
-  out.insert("missing".into(), body.get("missing").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "missing".into(),
+    body.get("missing").cloned().unwrap_or(Value::Null),
+  );
   Ok(Value::Object(merge_sub(out, sub)))
 }
 
@@ -274,14 +297,23 @@ fn translate_date_histogram_agg(
   out.insert("field".into(), Value::String(field));
   out.insert(
     "calendar_interval".into(),
-    body.get("calendar_interval").cloned().unwrap_or(Value::Null),
+    body
+      .get("calendar_interval")
+      .cloned()
+      .unwrap_or(Value::Null),
   );
   out.insert(
     "fixed_interval".into(),
     body.get("fixed_interval").cloned().unwrap_or(Value::Null),
   );
-  out.insert("offset".into(), body.get("offset").cloned().unwrap_or(Value::Null));
-  out.insert("format".into(), body.get("format").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "offset".into(),
+    body.get("offset").cloned().unwrap_or(Value::Null),
+  );
+  out.insert(
+    "format".into(),
+    body.get("format").cloned().unwrap_or(Value::Null),
+  );
   out.insert(
     "min_doc_count".into(),
     body.get("min_doc_count").cloned().unwrap_or(Value::Null),
@@ -294,7 +326,10 @@ fn translate_date_histogram_agg(
     "hard_bounds".into(),
     body.get("hard_bounds").cloned().unwrap_or(Value::Null),
   );
-  out.insert("missing".into(), body.get("missing").cloned().unwrap_or(Value::Null));
+  out.insert(
+    "missing".into(),
+    body.get("missing").cloned().unwrap_or(Value::Null),
+  );
   Ok(Value::Object(merge_sub(out, sub)))
 }
 
@@ -311,7 +346,10 @@ fn translate_metric_agg(body: &Map<String, Value>, kind: &str) -> Result<Value, 
 
 fn translate_cardinality_agg(body: &Map<String, Value>) -> Result<Value, Unsupported> {
   let field = require_field(body, "cardinality")?;
-  let precision = body.get("precision_threshold").cloned().unwrap_or(Value::Null);
+  let precision = body
+    .get("precision_threshold")
+    .cloned()
+    .unwrap_or(Value::Null);
   Ok(json!({
     "type": "cardinality",
     "field": field,
@@ -321,9 +359,10 @@ fn translate_cardinality_agg(body: &Map<String, Value>) -> Result<Value, Unsuppo
 
 fn translate_percentiles_agg(body: &Map<String, Value>) -> Result<Value, Unsupported> {
   let field = require_field(body, "percentiles")?;
-  let percents = body.get("percents").cloned().unwrap_or_else(|| {
-    json!([1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0])
-  });
+  let percents = body
+    .get("percents")
+    .cloned()
+    .unwrap_or_else(|| json!([1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]));
   Ok(json!({
     "type": "percentiles",
     "field": field,
@@ -351,7 +390,10 @@ fn translate_top_hits_agg(body: &Map<String, Value>) -> Result<Value, Unsupporte
   out.insert("type".into(), Value::String("top_hits".into()));
   out.insert("size".into(), Value::from(size));
   out.insert("from".into(), Value::from(from));
-  if let Some(fields) = body.get("_source").and_then(|v| v.as_object().and_then(|o| o.get("includes"))) {
+  if let Some(fields) = body
+    .get("_source")
+    .and_then(|v| v.as_object().and_then(|o| o.get("includes")))
+  {
     out.insert("fields".into(), fields.clone());
   } else if let Some(fields) = body.get("fields") {
     out.insert("fields".into(), fields.clone());
@@ -364,7 +406,10 @@ fn translate_top_hits_agg(body: &Map<String, Value>) -> Result<Value, Unsupporte
 
 // --- structural buckets --------------------------------------------------
 
-fn translate_filter_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result<Value, Unsupported> {
+fn translate_filter_agg(
+  body: &Map<String, Value>,
+  sub: Option<Value>,
+) -> Result<Value, Unsupported> {
   let filter = translate_to_filter(&Value::Object(body.clone()))?;
   let mut out = Map::new();
   out.insert("type".into(), Value::String("filter".into()));
@@ -372,7 +417,10 @@ fn translate_filter_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result
   Ok(Value::Object(merge_sub(out, sub)))
 }
 
-fn translate_nested_agg(body: &Map<String, Value>, sub: Option<Value>) -> Result<Value, Unsupported> {
+fn translate_nested_agg(
+  body: &Map<String, Value>,
+  sub: Option<Value>,
+) -> Result<Value, Unsupported> {
   let path = body
     .get("path")
     .and_then(Value::as_str)
@@ -452,17 +500,26 @@ fn translate_composite_agg(
 fn translate_bucket_sort_agg(body: &Map<String, Value>) -> Result<Value, Unsupported> {
   let mut out = Map::new();
   out.insert("type".into(), Value::String("bucket_sort".into()));
-  out.insert("from".into(), body.get("from").cloned().unwrap_or(Value::from(0u64)));
+  out.insert(
+    "from".into(),
+    body.get("from").cloned().unwrap_or(Value::from(0u64)),
+  );
   if let Some(size) = body.get("size") {
     out.insert("size".into(), size.clone());
   }
   if let Some(sort) = body.get("sort") {
-    out.insert("sort".into(), Value::Array(super::sort::translate_sort(sort)?));
+    out.insert(
+      "sort".into(),
+      Value::Array(super::sort::translate_sort(sort)?),
+    );
   }
   Ok(Value::Object(out))
 }
 
-fn translate_bucket_metric_agg(body: &Map<String, Value>, kind: &str) -> Result<Value, Unsupported> {
+fn translate_bucket_metric_agg(
+  body: &Map<String, Value>,
+  kind: &str,
+) -> Result<Value, Unsupported> {
   let buckets_path = body
     .get("buckets_path")
     .and_then(Value::as_str)

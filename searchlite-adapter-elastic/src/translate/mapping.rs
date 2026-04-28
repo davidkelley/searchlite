@@ -29,9 +29,9 @@ pub fn schema_to_es(index: &str, schema: &Value) -> Result<Value, Unsupported> {
 fn translate_properties(props: &Map<String, Value>) -> Result<Map<String, Value>, Unsupported> {
   let mut out = Map::new();
   for (name, value) in props {
-    let prop = value
-      .as_object()
-      .ok_or_else(|| Unsupported::with_detail("mapping", format!("property `{name}` must be an object")))?;
+    let prop = value.as_object().ok_or_else(|| {
+      Unsupported::with_detail("mapping", format!("property `{name}` must be an object"))
+    })?;
     out.insert(name.clone(), translate_field(prop)?);
   }
   Ok(out)
@@ -55,8 +55,9 @@ fn translate_field(prop: &Map<String, Value>) -> Result<Value, Unsupported> {
         if let Some(analyzer) = prop.get("searchlite:analyzer").and_then(Value::as_str) {
           out.insert("analyzer".into(), Value::String(analyzer.to_string()));
         }
-        if let Some(search_analyzer) =
-          prop.get("searchlite:searchAnalyzer").and_then(Value::as_str)
+        if let Some(search_analyzer) = prop
+          .get("searchlite:searchAnalyzer")
+          .and_then(Value::as_str)
         {
           out.insert(
             "search_analyzer".into(),

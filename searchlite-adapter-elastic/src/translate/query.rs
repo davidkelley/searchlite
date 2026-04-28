@@ -141,8 +141,14 @@ fn parse_match_spec(spec: &Value) -> Result<MatchSpec, Unsupported> {
       Ok(MatchSpec {
         query,
         boost: map.get("boost").and_then(Value::as_f64),
-        fuzziness: map.get("fuzziness").and_then(Value::as_str).map(str::to_string),
-        operator: map.get("operator").and_then(Value::as_str).map(str::to_string),
+        fuzziness: map
+          .get("fuzziness")
+          .and_then(Value::as_str)
+          .map(str::to_string),
+        operator: map
+          .get("operator")
+          .and_then(Value::as_str)
+          .map(str::to_string),
       })
     }
     _ => Err(Unsupported::with_detail(
@@ -185,7 +191,10 @@ fn translate_match_phrase(body: &Value, _prefix: bool) -> Result<Value, Unsuppor
     }
   };
 
-  let terms: Vec<Value> = text.split_whitespace().map(|t| Value::String(t.to_string())).collect();
+  let terms: Vec<Value> = text
+    .split_whitespace()
+    .map(|t| Value::String(t.to_string()))
+    .collect();
   let mut out = Map::new();
   out.insert("type".into(), Value::String("phrase".into()));
   out.insert("field".into(), Value::String(field.clone()));
@@ -264,9 +273,9 @@ fn translate_field_spec(spec: &Value) -> Result<Value, Unsupported> {
   match spec {
     Value::String(s) => {
       if let Some((name, boost)) = s.split_once('^') {
-        let boost: f64 = boost.parse().map_err(|_| {
-          Unsupported::with_detail("fields", format!("invalid boost in `{s}`"))
-        })?;
+        let boost: f64 = boost
+          .parse()
+          .map_err(|_| Unsupported::with_detail("fields", format!("invalid boost in `{s}`")))?;
         Ok(json!({ "field": name, "boost": boost }))
       } else {
         Ok(json!({ "field": s }))
@@ -294,9 +303,9 @@ fn translate_fuzziness(value: &Value) -> Result<Value, Unsupported> {
       )),
     },
     Value::Number(n) => {
-      let edits = n.as_u64().ok_or_else(|| {
-        Unsupported::with_detail("fuzziness", "must be a non-negative integer")
-      })?;
+      let edits = n
+        .as_u64()
+        .ok_or_else(|| Unsupported::with_detail("fuzziness", "must be a non-negative integer"))?;
       if edits > 2 {
         return Err(Unsupported::with_detail(
           "fuzziness",
@@ -305,11 +314,69 @@ fn translate_fuzziness(value: &Value) -> Result<Value, Unsupported> {
       }
       Ok(json!({ "max_edits": edits }))
     }
-    _ => Err(Unsupported::with_detail("fuzziness", "must be string or number")),
+    _ => Err(Unsupported::with_detail(
+      "fuzziness",
+      "must be string or number",
+    )),
   }
 }
 
 // --- term / terms --------------------------------------------------------
+
+/// Classified ES `term`/`terms` value, preserving numeric type so we can route
+/// integer/float terms to SearchLite's I64Range/F64Range filters instead of
+/// stringifying them as keywords (which never matches a numeric field).
+enum TermValue {
+  Keyword(String),
+  I64(i64),
+  F64(f64),
+}
+
+fn classify_term_value(
+  spec: &Value,
+  clause: &str,
+) -> Result<(TermValue, Option<f64>), Unsupported> {
+  match spec {
+    Value::String(s) => Ok((TermValue::Keyword(s.clone()), None)),
+    Value::Bool(b) => Ok((TermValue::Keyword(b.to_string()), None)),
+    Value::Number(n) => {
+      let value = numeric_term(n, clause)?;
+      Ok((value, None))
+    }
+    Value::Object(opts) => {
+      let inner = opts
+        .get("value")
+        .or_else(|| opts.get("query"))
+        .ok_or_else(|| Unsupported::with_detail(clause, "missing `value`"))?;
+      let (value, _) = classify_term_value(inner, clause)?;
+      let boost = opts.get("boost").and_then(Value::as_f64);
+      Ok((value, boost))
+    }
+    _ => Err(Unsupported::with_detail(
+      clause,
+      "spec must be primitive or object",
+    )),
+  }
+}
+
+fn numeric_term(n: &serde_json::Number, clause: &str) -> Result<TermValue, Unsupported> {
+  if let Some(i) = n.as_i64() {
+    return Ok(TermValue::I64(i));
+  }
+  if let Some(u) = n.as_u64() {
+    return match i64::try_from(u) {
+      Ok(i) => Ok(TermValue::I64(i)),
+      Err(_) => Ok(TermValue::F64(u as f64)),
+    };
+  }
+  if let Some(f) = n.as_f64() {
+    return Ok(TermValue::F64(f));
+  }
+  Err(Unsupported::with_detail(
+    clause,
+    "numeric value not representable as i64 or f64",
+  ))
+}
 
 fn translate_term(body: &Value) -> Result<Value, Unsupported> {
   let map = body
@@ -322,15 +389,42 @@ fn translate_term(body: &Value) -> Result<Value, Unsupported> {
     ));
   }
   let (field, spec) = map.iter().next().unwrap();
-  let (value, boost) = parse_value_or_object(spec, "term")?;
+  let (value, boost) = classify_term_value(spec, "term")?;
+  match value {
+    TermValue::Keyword(s) => {
+      let mut out = Map::new();
+      out.insert("type".into(), Value::String("term".into()));
+      out.insert("field".into(), Value::String(field.clone()));
+      out.insert("value".into(), Value::String(s));
+      if let Some(b) = boost {
+        out.insert("boost".into(), Value::from(b));
+      }
+      Ok(Value::Object(out))
+    }
+    TermValue::I64(n) => Ok(numeric_term_query(
+      field,
+      json!({ "I64Range": { "field": field, "min": n, "max": n } }),
+      boost,
+    )),
+    TermValue::F64(f) => Ok(numeric_term_query(
+      field,
+      json!({ "F64Range": { "field": field, "min": f, "max": f } }),
+      boost,
+    )),
+  }
+}
+
+/// ES `term` against a numeric field is constant-score scoping to a single
+/// value. SearchLite has no native numeric `term`, so wrap an equality range
+/// (min == max) in `constant_score` to preserve scoring semantics.
+fn numeric_term_query(_field: &str, filter: Value, boost: Option<f64>) -> Value {
   let mut out = Map::new();
-  out.insert("type".into(), Value::String("term".into()));
-  out.insert("field".into(), Value::String(field.clone()));
-  out.insert("value".into(), Value::String(value));
+  out.insert("type".into(), Value::String("constant_score".into()));
+  out.insert("filter".into(), filter);
   if let Some(b) = boost {
     out.insert("boost".into(), Value::from(b));
   }
-  Ok(Value::Object(out))
+  Value::Object(out)
 }
 
 fn translate_terms(body: &Value) -> Result<Value, Unsupported> {
@@ -395,7 +489,10 @@ fn parse_value_or_object(spec: &Value, clause: &str) -> Result<(String, Option<f
       let boost = opts.get("boost").and_then(Value::as_f64);
       Ok((primitive, boost))
     }
-    _ => Err(Unsupported::with_detail(clause, "spec must be primitive or object")),
+    _ => Err(Unsupported::with_detail(
+      clause,
+      "spec must be primitive or object",
+    )),
   }
 }
 
@@ -571,22 +668,15 @@ fn f64_upper(lte: Option<&Value>, lt: Option<&Value>) -> Result<f64, Unsupported
   Ok(f64::INFINITY)
 }
 
+// Use the standard library's IEEE-754 next/prev helpers (stable since Rust 1.86).
+// These handle ±0.0, subnormals, and infinities correctly, unlike the previous
+// hand-rolled bit-twiddling.
 fn next_up(x: f64) -> f64 {
-  if x.is_nan() || x == f64::INFINITY {
-    return x;
-  }
-  let bits = x.to_bits();
-  let next = if x >= 0.0 { bits + 1 } else { bits - 1 };
-  f64::from_bits(next)
+  f64::next_up(x)
 }
 
 fn next_down(x: f64) -> f64 {
-  if x.is_nan() || x == f64::NEG_INFINITY {
-    return x;
-  }
-  let bits = x.to_bits();
-  let next = if x > 0.0 { bits - 1 } else { bits + 1 };
-  f64::from_bits(next)
+  f64::next_down(x)
 }
 
 // --- exists --------------------------------------------------------------
@@ -635,9 +725,9 @@ fn translate_bool(body: &Value) -> Result<Value, Unsupported> {
   out.insert("filter".into(), Value::Array(filter_translated));
 
   if let Some(msm) = map.get("minimum_should_match") {
-    let n = msm
-      .as_u64()
-      .ok_or_else(|| Unsupported::with_detail("bool.minimum_should_match", "must be unsigned int"))?;
+    let n = msm.as_u64().ok_or_else(|| {
+      Unsupported::with_detail("bool.minimum_should_match", "must be unsigned int")
+    })?;
     out.insert("minimum_should_match".into(), Value::from(n));
   }
   if let Some(boost) = map.get("boost") {
@@ -691,8 +781,12 @@ fn term_to_filter(body: &Value) -> Result<Value, Unsupported> {
     ));
   }
   let (field, spec) = map.iter().next().unwrap();
-  let (value, _boost) = parse_value_or_object(spec, "term")?;
-  Ok(json!({ "KeywordEq": { "field": field, "value": value } }))
+  let (value, _boost) = classify_term_value(spec, "term")?;
+  match value {
+    TermValue::Keyword(s) => Ok(json!({ "KeywordEq": { "field": field, "value": s } })),
+    TermValue::I64(n) => Ok(json!({ "I64Range": { "field": field, "min": n, "max": n } })),
+    TermValue::F64(f) => Ok(json!({ "F64Range": { "field": field, "min": f, "max": f } })),
+  }
 }
 
 fn terms_to_filter(body: &Value) -> Result<Value, Unsupported> {
@@ -703,6 +797,12 @@ fn terms_to_filter(body: &Value) -> Result<Value, Unsupported> {
   let (field, spec) = field_iter
     .next()
     .ok_or_else(|| Unsupported::with_detail("terms", "missing field entry"))?;
+  if field_iter.next().is_some() {
+    return Err(Unsupported::with_detail(
+      "terms",
+      "expected exactly one field entry",
+    ));
+  }
   let values: Vec<String> = spec
     .as_array()
     .ok_or_else(|| Unsupported::with_detail("terms", "field value must be array"))?

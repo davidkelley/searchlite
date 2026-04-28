@@ -137,7 +137,11 @@ impl ElasticHarness {
     let url = format!("{}/indexes/{INDEX}/refresh", self.upstream_base);
     let resp = self.client.post(url).send()?;
     if !resp.status().is_success() {
-      return Err(anyhow!("refresh failed {}: {}", resp.status(), resp.text()?));
+      return Err(anyhow!(
+        "refresh failed {}: {}",
+        resp.status(),
+        resp.text()?
+      ));
     }
     Ok(())
   }
@@ -208,11 +212,7 @@ impl Drop for ElasticHarness {
   }
 }
 
-fn wait_for_path(
-  client: &reqwest::blocking::Client,
-  url: &str,
-  child: &mut Child,
-) -> Result<()> {
+fn wait_for_path(client: &reqwest::blocking::Client, url: &str, child: &mut Child) -> Result<()> {
   for _ in 0..200 {
     if let Some(status) = child.try_wait()? {
       return Err(anyhow!("process exited early with status {status}"));
@@ -331,12 +331,18 @@ fn get_mapping_returns_es_shape() {
   assert_eq!(status, StatusCode::OK);
   let mappings = body.get(INDEX).unwrap().get("mappings").unwrap();
   let props = mappings.get("properties").unwrap();
-  assert_eq!(props.get("title").unwrap().get("type").unwrap(), &json!("text"));
+  assert_eq!(
+    props.get("title").unwrap().get("type").unwrap(),
+    &json!("text")
+  );
   assert_eq!(
     props.get("category").unwrap().get("type").unwrap(),
     &json!("keyword")
   );
-  assert_eq!(props.get("price").unwrap().get("type").unwrap(), &json!("long"));
+  assert_eq!(
+    props.get("price").unwrap().get("type").unwrap(),
+    &json!("long")
+  );
 }
 
 #[test]
@@ -416,15 +422,15 @@ fn mget_by_ids() {
   let h = ElasticHarness::new().expect("harness");
   seed_index(&h).expect("seed");
   let (status, body) = h
-    .es_post(
-      &format!("/{INDEX}/_mget"),
-      &json!({ "ids": ["a", "c"] }),
-    )
+    .es_post(&format!("/{INDEX}/_mget"), &json!({ "ids": ["a", "c"] }))
     .expect("mget");
   assert_eq!(status, StatusCode::OK, "body: {body}");
   let docs = body.get("docs").unwrap().as_array().unwrap();
   assert_eq!(docs.len(), 2);
-  let a = docs.iter().find(|d| d.get("_id") == Some(&json!("a"))).unwrap();
+  let a = docs
+    .iter()
+    .find(|d| d.get("_id") == Some(&json!("a")))
+    .unwrap();
   assert_eq!(a.get("found").unwrap(), &json!(true));
   assert_eq!(a.get("_index").unwrap(), &json!(INDEX));
 }
@@ -440,9 +446,7 @@ fn msearch_runs_two_searches() {
     json!({"index": INDEX}),
     json!({"query": {"term": {"category": "music"}}}),
   );
-  let (status, body) = h
-    .es_post_ndjson("/_msearch", &ndjson)
-    .expect("msearch");
+  let (status, body) = h.es_post_ndjson("/_msearch", &ndjson).expect("msearch");
   assert_eq!(status, StatusCode::OK, "body: {body}");
   let responses = body.get("responses").unwrap().as_array().unwrap();
   assert_eq!(responses.len(), 2);
@@ -498,10 +502,7 @@ fn unsupported_geo_query_is_rejected() {
 fn cross_index_search_path_is_rejected() {
   let h = ElasticHarness::new().expect("harness");
   let (status, _) = h
-    .es_post(
-      "/_search",
-      &json!({ "query": { "match_all": {} } }),
-    )
+    .es_post("/_search", &json!({ "query": { "match_all": {} } }))
     .expect("post");
   assert_eq!(status, StatusCode::BAD_REQUEST);
 }

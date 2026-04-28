@@ -11,7 +11,10 @@ pub fn translate_search_response(index: &str, sl: &Value, took_ms: u64) -> Value
     json!({ "total": 1, "successful": 1, "skipped": 0, "failed": 0 }),
   );
 
-  let total = sl.get("total_hits_estimate").and_then(Value::as_u64).unwrap_or(0);
+  let total = sl
+    .get("total_hits_estimate")
+    .and_then(Value::as_u64)
+    .unwrap_or(0);
   let hits_arr = sl
     .get("hits")
     .and_then(Value::as_array)
@@ -69,10 +72,7 @@ fn translate_hit(index: &str, hit: &Value) -> Value {
     out.insert("_source".into(), f.clone());
   }
   if let Some(snippet) = map.and_then(|m| m.get("snippet")) {
-    out.insert(
-      "highlight".into(),
-      json!({ "_snippet": [snippet] }),
-    );
+    out.insert("highlight".into(), json!({ "_snippet": [snippet] }));
   }
   if let Some(highlights) = map.and_then(|m| m.get("highlights")) {
     out.insert("highlight".into(), highlights.clone());
@@ -172,8 +172,7 @@ fn translate_aggregation(agg: &Value) -> Value {
         }
       })
     }
-    "bucket_sort" | "avg_bucket" | "sum_bucket" | "derivative" | "moving_avg"
-    | "bucket_script" => {
+    "bucket_sort" | "avg_bucket" | "sum_bucket" | "derivative" | "moving_avg" | "bucket_script" => {
       let mut out = Map::new();
       copy_field(map, "value", &mut out);
       copy_field(map, "from", &mut out);

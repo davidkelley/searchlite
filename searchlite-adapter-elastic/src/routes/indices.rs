@@ -96,8 +96,16 @@ pub async fn aliases(State(state): State<Arc<AppState>>) -> ESResult<Json<Value>
     .unwrap_or_default();
   let mut by_index: serde_json::Map<String, Value> = serde_json::Map::new();
   for alias in aliases {
-    let alias_name = alias.get("alias").and_then(Value::as_str).unwrap_or("").to_string();
-    let target = alias.get("target").and_then(Value::as_str).unwrap_or("").to_string();
+    let alias_name = alias
+      .get("alias")
+      .and_then(Value::as_str)
+      .unwrap_or("")
+      .to_string();
+    let target = alias
+      .get("target")
+      .and_then(Value::as_str)
+      .unwrap_or("")
+      .to_string();
     if alias_name.is_empty() || target.is_empty() {
       continue;
     }
@@ -167,4 +175,3 @@ async fn index_exists(state: &Arc<AppState>, index: &str) -> ESResult<bool> {
     .unwrap_or(false);
   Ok(alias_match)
 }
-
