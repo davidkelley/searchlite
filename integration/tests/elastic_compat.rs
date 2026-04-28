@@ -521,6 +521,36 @@ fn settings_on_unknown_index_returns_404() {
 }
 
 #[test]
+fn msearch_with_non_string_in_index_array_is_rejected() {
+  // Regression: the index-array parser dropped non-string elements via
+  // filter_map, so a malformed header like {"index":["demo",42]} was
+  // silently accepted as a single-index ("demo") request, possibly
+  // routing queries to an unintended index.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let ndjson = format!(
+    "{}\n{}\n",
+    json!({"index": [INDEX, 42]}),
+    json!({"query": {"match_all": {}}}),
+  );
+  let (status, body) = h.es_post_ndjson("/_msearch", &ndjson).expect("post");
+  assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[test]
+fn msearch_with_single_string_in_index_array_still_works() {
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let ndjson = format!(
+    "{}\n{}\n",
+    json!({"index": [INDEX]}),
+    json!({"query": {"match_all": {}}}),
+  );
+  let (status, body) = h.es_post_ndjson("/_msearch", &ndjson).expect("post");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[test]
 fn global_mget_with_source_false_omits_source_field() {
   // Regression: the global `_mget` handler always forwarded
   // `return_stored: true` to upstream, ignoring `_source: false` on the

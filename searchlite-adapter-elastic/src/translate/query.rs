@@ -655,6 +655,14 @@ pub fn translate_range_to_filter(body: &Value) -> Result<Value, Unsupported> {
   if is_int {
     let min = i64_lower(gte, gt)?;
     let max = i64_upper(lte, lt)?;
+    // `gt: i64::MAX` and `lt: i64::MIN` are exclusive bounds with no
+    // representable integer satisfying them; either bound returning `None`
+    // means the range is impossible. Emit a deliberately-empty range
+    // (`min > max`) so the upstream filter matches zero documents.
+    let (min, max) = match (min, max) {
+      (Some(min), Some(max)) => (min, max),
+      _ => (i64::MAX, i64::MIN),
+    };
     Ok(json!({ "I64Range": { "field": field, "min": min, "max": max } }))
   } else {
     let min = f64_lower(gte, gt)?;
@@ -670,38 +678,46 @@ fn is_integer_value(v: &Value) -> bool {
   }
 }
 
-fn i64_lower(gte: Option<&Value>, gt: Option<&Value>) -> Result<i64, Unsupported> {
+/// Returns the inclusive lower bound, or `None` when the bound is
+/// representable in input but unrepresentable in i64 after the exclusive
+/// adjustment (e.g. `gt: i64::MAX` has no integer satisfying it).
+fn i64_lower(gte: Option<&Value>, gt: Option<&Value>) -> Result<Option<i64>, Unsupported> {
   if let Some(v) = gte {
-    return v
+    let n = v
       .as_i64()
       .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
-      .ok_or_else(|| Unsupported::with_detail("range.gte", "must fit in i64"));
+      .ok_or_else(|| Unsupported::with_detail("range.gte", "must fit in i64"))?;
+    return Ok(Some(n));
   }
   if let Some(v) = gt {
     let n = v
       .as_i64()
       .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
       .ok_or_else(|| Unsupported::with_detail("range.gt", "must fit in i64"))?;
-    return Ok(n.saturating_add(1));
+    // checked_add returns None for `gt: i64::MAX` since no integer is > i64::MAX.
+    return Ok(n.checked_add(1));
   }
-  Ok(i64::MIN)
+  Ok(Some(i64::MIN))
 }
 
-fn i64_upper(lte: Option<&Value>, lt: Option<&Value>) -> Result<i64, Unsupported> {
+/// Returns the inclusive upper bound, or `None` when `lt` is set to
+/// `i64::MIN` (no integer satisfies the predicate).
+fn i64_upper(lte: Option<&Value>, lt: Option<&Value>) -> Result<Option<i64>, Unsupported> {
   if let Some(v) = lte {
-    return v
+    let n = v
       .as_i64()
       .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
-      .ok_or_else(|| Unsupported::with_detail("range.lte", "must fit in i64"));
+      .ok_or_else(|| Unsupported::with_detail("range.lte", "must fit in i64"))?;
+    return Ok(Some(n));
   }
   if let Some(v) = lt {
     let n = v
       .as_i64()
       .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
       .ok_or_else(|| Unsupported::with_detail("range.lt", "must fit in i64"))?;
-    return Ok(n.saturating_sub(1));
+    return Ok(n.checked_sub(1));
   }
-  Ok(i64::MAX)
+  Ok(Some(i64::MAX))
 }
 
 fn f64_lower(gte: Option<&Value>, gt: Option<&Value>) -> Result<f64, Unsupported> {

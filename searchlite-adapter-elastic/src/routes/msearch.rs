@@ -127,9 +127,24 @@ fn pick_index(header: &Value, default_index: Option<&str>) -> ESResult<String> {
       match value {
         Value::String(s) => return Ok(s.clone()),
         Value::Array(items) => {
-          let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+          // Validate every element. Silently dropping non-strings via
+          // filter_map could turn a malformed `["demo", 42]` into a
+          // single-index ("demo") request and route queries to an
+          // unintended index — fail loudly instead.
+          let mut names = Vec::with_capacity(items.len());
+          for item in items {
+            match item.as_str() {
+              Some(s) => names.push(s.to_string()),
+              None => {
+                return Err(ESError::bad_request(
+                  "x_content_parse_exception",
+                  format!("msearch entry `index` array contains non-string element: {item}"),
+                ));
+              }
+            }
+          }
           if names.len() == 1 {
-            return Ok(names[0].to_string());
+            return Ok(names.into_iter().next().unwrap());
           }
           if names.len() > 1 {
             return Err(ESError::bad_request(

@@ -178,6 +178,46 @@ fn range_wraps_in_constant_score() {
 }
 
 #[test]
+fn range_gt_at_i64_max_emits_impossible_range() {
+  // Regression: previously `gt: i64::MAX` saturated to i64::MAX and the
+  // resulting range matched documents at i64::MAX, even though the ES
+  // predicate should match nothing. Verify the translated range is empty.
+  let es = json!({"range": {"f": {"gt": i64::MAX}}});
+  let sl = translate_query(&es).unwrap();
+  let i64_filter = sl
+    .pointer("/filter/I64Range")
+    .expect("expected I64Range filter");
+  let min = i64_filter.get("min").unwrap().as_i64().unwrap();
+  let max = i64_filter.get("max").unwrap().as_i64().unwrap();
+  assert!(
+    min > max,
+    "gt: i64::MAX should produce an empty range (min > max); got min={min} max={max}"
+  );
+}
+
+#[test]
+fn range_lt_at_i64_min_emits_impossible_range() {
+  let es = json!({"range": {"f": {"lt": i64::MIN}}});
+  let sl = translate_query(&es).unwrap();
+  let i64_filter = sl.pointer("/filter/I64Range").unwrap();
+  let min = i64_filter.get("min").unwrap().as_i64().unwrap();
+  let max = i64_filter.get("max").unwrap().as_i64().unwrap();
+  assert!(
+    min > max,
+    "lt: i64::MIN should produce an empty range (min > max); got min={min} max={max}"
+  );
+}
+
+#[test]
+fn range_gt_at_normal_value_still_works() {
+  let es = json!({"range": {"f": {"gt": 10}}});
+  let sl = translate_query(&es).unwrap();
+  let i64_filter = sl.pointer("/filter/I64Range").unwrap();
+  assert_eq!(i64_filter.get("min").unwrap(), &json!(11));
+  assert_eq!(i64_filter.get("max").unwrap(), &json!(i64::MAX));
+}
+
+#[test]
 fn range_picks_f64_when_floats() {
   let es = json!({"range": {"score": {"gte": 0.5, "lte": 0.9}}});
   let sl = translate_query(&es).unwrap();

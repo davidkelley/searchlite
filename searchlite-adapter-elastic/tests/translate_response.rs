@@ -53,6 +53,87 @@ fn hits_have_index_id_score_source_fields() {
 }
 
 #[test]
+fn keyed_range_aggregation_emits_object_buckets() {
+  // Regression: ES returns range/date_range buckets as an object map keyed
+  // by each bucket's `key` when `keyed: true` is requested. Previously the
+  // adapter always emitted an array, breaking clients that destructure the
+  // keyed shape.
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "by_price": {
+        "type": "range",
+        "keyed": true,
+        "buckets": [
+          {"key": "cheap", "doc_count": 5},
+          {"key": "premium", "doc_count": 3},
+        ]
+      }
+    }
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let buckets = es.pointer("/aggregations/by_price/buckets").unwrap();
+  assert!(
+    buckets.is_object(),
+    "keyed range should emit object buckets, got: {buckets}"
+  );
+  assert_eq!(
+    buckets.pointer("/cheap/doc_count").unwrap(),
+    &json!(5),
+    "got: {buckets}"
+  );
+  assert_eq!(buckets.pointer("/premium/doc_count").unwrap(), &json!(3));
+  // The key should NOT appear inside the value (it's the outer map key).
+  assert!(
+    buckets.pointer("/cheap/key").is_none(),
+    "key should not be duplicated inside the keyed bucket value"
+  );
+}
+
+#[test]
+fn unkeyed_range_aggregation_emits_array_buckets() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "by_price": {
+        "type": "range",
+        "keyed": false,
+        "buckets": [{"key": "cheap", "doc_count": 5}]
+      }
+    }
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let buckets = es.pointer("/aggregations/by_price/buckets").unwrap();
+  assert!(
+    buckets.is_array(),
+    "non-keyed range should emit array buckets"
+  );
+}
+
+#[test]
+fn keyed_date_range_aggregation_emits_object_buckets() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "by_month": {
+        "type": "date_range",
+        "keyed": true,
+        "buckets": [
+          {"key": "2024-Q1", "doc_count": 100},
+        ]
+      }
+    }
+  });
+  let es = translate_search_response("idx", &sl, 0);
+  let buckets = es.pointer("/aggregations/by_month/buckets").unwrap();
+  assert!(buckets.is_object(), "got: {buckets}");
+  assert_eq!(buckets.pointer("/2024-Q1/doc_count").unwrap(), &json!(100));
+}
+
+#[test]
 fn aggregations_terms_buckets_translated() {
   let sl = json!({
     "total_hits_estimate": 10,

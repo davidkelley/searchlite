@@ -112,6 +112,34 @@ fn translate_aggregation(agg: &Value) -> Value {
   };
   let kind = map.get("type").and_then(Value::as_str).unwrap_or("");
   match kind {
+    // Range / date_range honor the `keyed` flag on the SL response. ES
+    // returns an object map (key → bucket) when keyed, an array otherwise.
+    // Other bucket types (terms, histogram, etc.) always emit arrays.
+    "range" | "date_range" if map.get("keyed").and_then(Value::as_bool) == Some(true) => {
+      let mut out = Map::new();
+      if let Some(buckets) = map.get("buckets").and_then(Value::as_array) {
+        let mut keyed = Map::new();
+        for bucket in buckets {
+          let key = bucket
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| bucket.get("key").map(|v| v.to_string()).unwrap_or_default());
+          if key.is_empty() {
+            continue;
+          }
+          // Drop `key`/`key_as_string` from the inner value — the outer map
+          // key IS the key in ES's keyed shape.
+          let translated = translate_bucket(bucket);
+          let mut entry = translated.as_object().cloned().unwrap_or_default();
+          entry.remove("key");
+          entry.remove("key_as_string");
+          keyed.insert(key, Value::Object(entry));
+        }
+        out.insert("buckets".into(), Value::Object(keyed));
+      }
+      Value::Object(out)
+    }
     "terms" | "rare_terms" | "range" | "date_range" | "histogram" | "date_histogram"
     | "composite" | "significant_terms" => {
       let mut out = Map::new();
