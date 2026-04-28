@@ -23,10 +23,38 @@ pub fn apply_pagination(
   if let Some(search_after) = es_body.get("search_after") {
     out.insert("search_after".to_string(), search_after.clone());
   }
-  if let Some(track_total_hits) = es_body.get("track_total_hits") {
-    // SearchLite always returns total_hits_estimate; the request flag is
-    // accepted but informational only.
-    let _ = track_total_hits;
+  if let Some(track) = es_body.get("track_total_hits") {
+    // SearchLite's `track_total_hits` (Option<bool>) actually changes
+    // execution: when true it disables WAND/BMW pruning so `total_hits` is
+    // exact rather than an estimate. Forward it so `_count` and clients that
+    // explicitly request exact totals get them.
+    let normalized = match track {
+      Value::Bool(b) => Value::Bool(*b),
+      Value::Number(n) => {
+        // ES allows an integer cap (track up to N exactly, then return a
+        // lower bound). SearchLite has no lower-bound mode, so map any
+        // positive cap to `true` and 0 to `false` — closer to user intent
+        // than silently dropping it.
+        let positive = n
+          .as_i64()
+          .map(|i| i > 0)
+          .or_else(|| n.as_u64().map(|u| u > 0))
+          .ok_or_else(|| {
+            Unsupported::with_detail(
+              "track_total_hits",
+              "must be a boolean or non-negative integer",
+            )
+          })?;
+        Value::Bool(positive)
+      }
+      _ => {
+        return Err(Unsupported::with_detail(
+          "track_total_hits",
+          "must be a boolean or non-negative integer",
+        ))
+      }
+    };
+    out.insert("track_total_hits".to_string(), normalized);
   }
   Ok(())
 }

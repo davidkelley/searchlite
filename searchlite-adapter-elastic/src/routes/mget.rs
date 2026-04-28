@@ -92,12 +92,21 @@ pub async fn mget_global(
 
 fn collect_ids(body: &Value, default_index: &str) -> ESResult<Vec<String>> {
   if let Some(ids) = body.get("ids").and_then(Value::as_array) {
-    return Ok(
-      ids
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect(),
-    );
+    // Reject non-string entries explicitly. Silently filtering them out makes
+    // malformed requests look like partial successes (fewer docs returned
+    // than requested), which violates the one-response-per-id contract that
+    // ES clients rely on.
+    return ids
+      .iter()
+      .map(|v| {
+        v.as_str().map(str::to_string).ok_or_else(|| {
+          ESError::bad_request(
+            "x_content_parse_exception",
+            "every entry in `ids` must be a string",
+          )
+        })
+      })
+      .collect::<Result<Vec<_>, _>>();
   }
   if let Some(docs) = body.get("docs").and_then(Value::as_array) {
     let mut ids = Vec::with_capacity(docs.len());

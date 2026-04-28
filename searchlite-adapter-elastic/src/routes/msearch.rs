@@ -86,7 +86,11 @@ struct MSearchEntry {
 fn parse_msearch_ndjson(body: &[u8], default_index: Option<&str>) -> ESResult<Vec<MSearchEntry>> {
   let text = std::str::from_utf8(body)
     .map_err(|_| ESError::bad_request("x_content_parse_exception", "msearch body must be UTF-8"))?;
-  let lines: Vec<&str> = text.split('\n').filter(|l| !l.trim().is_empty()).collect();
+  // `str::lines()` strips both `\n` and `\r\n` per line, so CRLF-delimited
+  // NDJSON (common from Windows clients and some HTTP proxies) parses
+  // correctly. Plain `split('\n')` would leave a trailing `\r` that breaks
+  // serde_json::from_str on every line.
+  let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
   if !lines.len().is_multiple_of(2) {
     return Err(ESError::bad_request(
       "x_content_parse_exception",

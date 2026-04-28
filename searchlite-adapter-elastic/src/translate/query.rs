@@ -444,18 +444,12 @@ fn translate_terms(body: &Value) -> Result<Value, Unsupported> {
   let values = spec
     .as_array()
     .ok_or_else(|| Unsupported::with_detail("terms", "field value must be an array"))?;
+  // Per-value dispatch by type so numeric inputs route to range filters
+  // (which match numeric fields upstream) instead of being stringified into
+  // keyword `term` queries that never match.
   let shoulds: Vec<Value> = values
     .iter()
-    .map(|v| {
-      let term = v
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| v.as_i64().map(|n| n.to_string()))
-        .or_else(|| v.as_u64().map(|n| n.to_string()))
-        .or_else(|| v.as_f64().map(|n| n.to_string()))
-        .ok_or_else(|| Unsupported::with_detail("terms", "values must be primitives"))?;
-      Ok(json!({ "type": "term", "field": field, "value": term }))
-    })
+    .map(|v| terms_value_to_query_node(field, v))
     .collect::<Result<Vec<_>, Unsupported>>()?;
 
   Ok(json!({
@@ -463,6 +457,32 @@ fn translate_terms(body: &Value) -> Result<Value, Unsupported> {
     "should": shoulds,
     "minimum_should_match": 1,
   }))
+}
+
+fn terms_value_to_query_node(field: &str, value: &Value) -> Result<Value, Unsupported> {
+  match classify_terms_element(value)? {
+    TermValue::Keyword(s) => Ok(json!({ "type": "term", "field": field, "value": s })),
+    TermValue::I64(n) => Ok(json!({
+      "type": "constant_score",
+      "filter": { "I64Range": { "field": field, "min": n, "max": n } },
+    })),
+    TermValue::F64(f) => Ok(json!({
+      "type": "constant_score",
+      "filter": { "F64Range": { "field": field, "min": f, "max": f } },
+    })),
+  }
+}
+
+fn classify_terms_element(value: &Value) -> Result<TermValue, Unsupported> {
+  match value {
+    Value::String(s) => Ok(TermValue::Keyword(s.clone())),
+    Value::Bool(b) => Ok(TermValue::Keyword(b.to_string())),
+    Value::Number(n) => numeric_term(n, "terms"),
+    _ => Err(Unsupported::with_detail(
+      "terms",
+      "values must be primitives (string, boolean, or number)",
+    )),
+  }
 }
 
 fn parse_value_or_object(spec: &Value, clause: &str) -> Result<(String, Option<f64>), Unsupported> {
@@ -803,20 +823,47 @@ fn terms_to_filter(body: &Value) -> Result<Value, Unsupported> {
       "expected exactly one field entry",
     ));
   }
-  let values: Vec<String> = spec
+  let array = spec
     .as_array()
-    .ok_or_else(|| Unsupported::with_detail("terms", "field value must be array"))?
+    .ok_or_else(|| Unsupported::with_detail("terms", "field value must be array"))?;
+  let classified: Vec<TermValue> = array
     .iter()
-    .map(|v| {
-      v.as_str()
-        .map(str::to_string)
-        .or_else(|| v.as_i64().map(|n| n.to_string()))
-        .or_else(|| v.as_u64().map(|n| n.to_string()))
-        .or_else(|| v.as_f64().map(|n| n.to_string()))
-        .ok_or_else(|| Unsupported::with_detail("terms", "values must be primitives"))
-    })
+    .map(classify_terms_element)
     .collect::<Result<Vec<_>, _>>()?;
-  Ok(json!({ "KeywordIn": { "field": field, "values": values } }))
+
+  // All-string fast path keeps the more compact `KeywordIn` filter shape.
+  // Mixed or numeric values fall through to per-value equality filters
+  // wrapped in `Or`, since SearchLite has no native "numeric in" filter.
+  if classified
+    .iter()
+    .all(|v| matches!(v, TermValue::Keyword(_)))
+  {
+    let values: Vec<String> = classified
+      .into_iter()
+      .map(|v| match v {
+        TermValue::Keyword(s) => s,
+        _ => unreachable!(),
+      })
+      .collect();
+    return Ok(json!({ "KeywordIn": { "field": field, "values": values } }));
+  }
+
+  let filters: Vec<Value> = classified
+    .into_iter()
+    .map(|v| match v {
+      TermValue::Keyword(s) => json!({ "KeywordEq": { "field": field, "value": s } }),
+      TermValue::I64(n) => json!({ "I64Range": { "field": field, "min": n, "max": n } }),
+      TermValue::F64(f) => json!({ "F64Range": { "field": field, "min": f, "max": f } }),
+    })
+    .collect();
+  match filters.len() {
+    0 => Err(Unsupported::with_detail(
+      "terms",
+      "values array must be non-empty",
+    )),
+    1 => Ok(filters.into_iter().next().unwrap()),
+    _ => Ok(json!({ "Or": filters })),
+  }
 }
 
 fn bool_to_filter(body: &Value) -> Result<Value, Unsupported> {

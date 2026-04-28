@@ -365,3 +365,85 @@ fn terms_in_filter_context_rejects_multiple_field_entries() {
   assert!(err.feature == "terms", "got {err:?}");
   assert!(err.detail.contains("exactly one"), "got {err:?}");
 }
+
+// ── Numeric `terms` handling (mainline + filter) ───────────────────────
+
+#[test]
+fn terms_with_integer_values_emits_constant_score_should_clauses() {
+  let es = json!({"terms": {"price": [10, 20]}});
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "type": "bool",
+      "should": [
+        { "type": "constant_score", "filter": { "I64Range": { "field": "price", "min": 10, "max": 10 } } },
+        { "type": "constant_score", "filter": { "I64Range": { "field": "price", "min": 20, "max": 20 } } },
+      ],
+      "minimum_should_match": 1,
+    })
+  );
+}
+
+#[test]
+fn terms_with_float_values_emits_f64range_should_clauses() {
+  let es = json!({"terms": {"rating": [4.5, 4.8]}});
+  let sl = translate_query(&es).unwrap();
+  let shoulds = sl.get("should").unwrap().as_array().unwrap();
+  assert_eq!(shoulds.len(), 2);
+  assert_eq!(
+    shoulds[0],
+    json!({"type": "constant_score", "filter": {"F64Range": {"field": "rating", "min": 4.5, "max": 4.5}}})
+  );
+}
+
+#[test]
+fn terms_with_mixed_string_and_number_dispatches_per_value() {
+  let es = json!({"terms": {"f": ["a", 1]}});
+  let sl = translate_query(&es).unwrap();
+  let shoulds = sl.get("should").unwrap().as_array().unwrap();
+  assert_eq!(shoulds.len(), 2);
+  assert_eq!(
+    shoulds[0],
+    json!({"type": "term", "field": "f", "value": "a"})
+  );
+  assert_eq!(
+    shoulds[1],
+    json!({"type": "constant_score", "filter": {"I64Range": {"field": "f", "min": 1, "max": 1}}})
+  );
+}
+
+#[test]
+fn terms_filter_all_strings_uses_keyword_in() {
+  let es = json!({"terms": {"category": ["books", "music"]}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({ "KeywordIn": { "field": "category", "values": ["books", "music"] } })
+  );
+}
+
+#[test]
+fn terms_filter_all_integers_uses_or_of_i64ranges() {
+  let es = json!({"terms": {"price": [10, 20]}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({
+      "Or": [
+        { "I64Range": { "field": "price", "min": 10, "max": 10 } },
+        { "I64Range": { "field": "price", "min": 20, "max": 20 } },
+      ]
+    })
+  );
+}
+
+#[test]
+fn terms_filter_single_integer_emits_bare_filter() {
+  let es = json!({"terms": {"price": [42]}});
+  let sl = translate_to_filter(&es).unwrap();
+  assert_eq!(
+    sl,
+    json!({ "I64Range": { "field": "price", "min": 42, "max": 42 } })
+  );
+}
