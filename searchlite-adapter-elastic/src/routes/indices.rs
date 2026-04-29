@@ -274,7 +274,10 @@ async fn get_mapping_for(state: &Arc<AppState>, index: &str) -> ESResult<Value> 
 /// - If `name` is a real index, returns `Some(name)`.
 /// - If `name` is an alias, returns `Some(<target index name>)`.
 /// - Otherwise returns `None`.
-async fn resolve_index_or_alias(state: &Arc<AppState>, name: &str) -> ESResult<Option<String>> {
+pub(crate) async fn resolve_index_or_alias(
+  state: &Arc<AppState>,
+  name: &str,
+) -> ESResult<Option<String>> {
   let listing = state.client().list_indexes().await?;
   let is_real_index = listing
     .get("indexes")

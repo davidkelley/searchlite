@@ -553,6 +553,127 @@ fn mapping_all_returns_every_mounted_index() {
 }
 
 #[test]
+fn aggregation_meta_field_is_round_tripped_in_response() {
+  // Regression: ES preserves and echoes the `meta` blob on each agg verbatim,
+  // and Kibana visualizations rely on this for correlation IDs. The adapter
+  // used to silently drop `meta` because the type-key filter excluded it.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post(
+      &format!("/{INDEX}/_search"),
+      &json!({
+        "size": 0,
+        "aggs": {
+          "by_cat": {
+            "terms": { "field": "category" },
+            "meta": { "kibana_id": "abc-123", "type": "facet" }
+          }
+        }
+      }),
+    )
+    .expect("search");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  assert_eq!(
+    body.pointer("/aggregations/by_cat/meta").unwrap(),
+    &json!({"kibana_id": "abc-123", "type": "facet"})
+  );
+}
+
+#[test]
+fn search_via_alias_returns_target_index_in_hit_index_field() {
+  // Regression: search responses stamped `_index` from the URL path token,
+  // so requests via an alias returned hits with `_index: "<alias>"`. ES
+  // returns the resolved target index name. Downstream tooling that
+  // round-trips `_index` from a hit into a write request would otherwise
+  // hit the wrong index.
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post(
+      "/demo_alias/_search",
+      &json!({ "query": { "match_all": {} }, "size": 5 }),
+    )
+    .expect("search");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let hits = body.pointer("/hits/hits").unwrap().as_array().unwrap();
+  assert!(!hits.is_empty(), "expected hits; got: {body}");
+  for hit in hits {
+    assert_eq!(
+      hit.get("_index").unwrap(),
+      &json!(INDEX),
+      "_index should be the resolved target, not the alias; got: {hit}"
+    );
+  }
+}
+
+#[test]
+fn mget_via_alias_returns_target_index_in_each_doc_index_field() {
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post("/demo_alias/_mget", &json!({ "ids": ["a"] }))
+    .expect("mget");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let docs = body.get("docs").unwrap().as_array().unwrap();
+  for doc in docs {
+    assert_eq!(
+      doc.get("_index").unwrap(),
+      &json!(INDEX),
+      "_index should be the target, not the alias; got: {doc}"
+    );
+  }
+}
+
+#[test]
+fn mget_global_with_alias_in_doc_index_returns_target_in_response() {
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_post(
+      "/_mget",
+      &json!({
+        "docs": [{ "_index": "demo_alias", "_id": "a" }]
+      }),
+    )
+    .expect("mget global");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let docs = body.get("docs").unwrap().as_array().unwrap();
+  assert_eq!(docs.len(), 1);
+  assert_eq!(
+    docs[0].get("_index").unwrap(),
+    &json!(INDEX),
+    "_index should be the target, not the alias; got: {body}"
+  );
+}
+
+#[test]
+fn msearch_via_alias_path_returns_target_in_each_response_hit_index() {
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let ndjson = format!(
+    "{}\n{}\n",
+    json!({ "index": "demo_alias" }),
+    json!({ "query": { "match_all": {} }, "size": 2 }),
+  );
+  let (status, body) = h.es_post_ndjson("/_msearch", &ndjson).expect("msearch");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let hits = body
+    .pointer("/responses/0/hits/hits")
+    .unwrap()
+    .as_array()
+    .unwrap();
+  assert!(!hits.is_empty(), "expected hits; got: {body}");
+  for hit in hits {
+    assert_eq!(
+      hit.get("_index").unwrap(),
+      &json!(INDEX),
+      "_index should be the target, not the alias; got: {hit}"
+    );
+  }
+}
+
+#[test]
 fn mapping_for_alias_returns_target_index_mapping() {
   // Regression: get_mapping passed the raw path token to upstream `inspect`.
   // Calling with an alias name returned 404 even though HEAD /<alias> and

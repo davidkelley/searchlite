@@ -316,7 +316,7 @@ All errors return `{"error": {"type": "...", "reason": "...", "root_cause": [...
 | `query_string`, `simple_query_string` | ✓ | Forwarded; SearchLite's parser supports the common subset |
 | `constant_score` | ✓ | Filter context |
 | `dis_max` | ✓ | With tie-breaker |
-| `function_score`, `script_score` | partial | Limited to SearchLite's whitelist |
+| `function_score`, `script_score` | ✗ | Rejected for v1; SearchLite has the underlying query types but the adapter doesn't translate them yet |
 | `exists` | ✗ | No SearchLite equivalent |
 | `geo_*`, `more_like_this`, `terms_set`, `combined_fields`, `intervals`, `pinned`, `parent/child`, `has_child`, `has_parent`, `nested` (query form) | ✗ | Rejected with `x_content_parse_exception` |
 

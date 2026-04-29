@@ -119,7 +119,8 @@ For the supported subset of the query DSL and aggregations, see the [compatibili
 - `_refresh`, scroll API, runtime mappings
 - Cross-index search via `POST /_search` (path must specify exactly one index)
 - ES authentication / security plugin / ILM / snapshots / transforms / watcher
-- Painless scripting beyond a small `script_score` whitelist
+- `function_score` and `script_score` queries (rejected in v1 — SearchLite has the underlying query types, the adapter just doesn't translate them yet)
+- Painless scripting
 - `geo_*` queries and aggregations, `more_like_this`, parent/child, nested-as-query
 
 The adapter is intended primarily for **read traffic from existing ES tooling**. Writes still go through the SearchLite native HTTP API on port 8080.

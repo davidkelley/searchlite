@@ -8,8 +8,11 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::error::{ESError, ESResult};
+use crate::routes::indices::resolve_index_or_alias;
 use crate::state::AppState;
-use crate::translate::{translate_search_body, translate_search_response};
+use crate::translate::{
+  extract_agg_meta, inject_agg_meta, translate_search_body, translate_search_response,
+};
 
 /// `POST /_msearch` (and `POST /{index}/_msearch`) — NDJSON of alternating
 /// header + body lines. Header may include `index` (string or array);
@@ -25,11 +28,21 @@ pub async fn msearch(
     return Ok(Json(json!({ "took": 0, "responses": [] })));
   }
 
-  // Group by index, preserving the original request order.
+  // Group by RESOLVED index name. Each entry's `index` may be an alias —
+  // resolving it here means downstream calls (and the `_index` stamping in
+  // the response via translate_search_response) use the concrete target.
   let mut grouped: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
   for (idx, entry) in entries.iter().enumerate() {
+    let resolved = resolve_index_or_alias(&state, &entry.index)
+      .await?
+      .ok_or_else(|| {
+        ESError::not_found(
+          "index_not_found_exception",
+          format!("no such index [{}]", entry.index),
+        )
+      })?;
     grouped
-      .entry(entry.index.clone())
+      .entry(resolved)
       .or_default()
       .push((idx, entry.body.clone()));
   }
@@ -65,11 +78,18 @@ pub async fn msearch(
       ));
     }
     for ((position, body), result) in group.into_iter().zip(results.into_iter()) {
-      // Each msearch entry can carry its own track_total_hits. Extract it
-      // from the original ES body so per-response total semantics match
-      // what the caller asked for.
+      // Each msearch entry can carry its own track_total_hits and per-agg
+      // meta. Extract both before translation and re-inject meta after, so
+      // per-response semantics match what the caller asked for.
       let track = extract_track_total_hits(&body);
-      let translated = translate_search_response(&index, &result, 0, track);
+      let agg_meta = body
+        .get("aggs")
+        .or_else(|| body.get("aggregations"))
+        .and_then(Value::as_object)
+        .map(extract_agg_meta)
+        .unwrap_or_default();
+      let mut translated = translate_search_response(&index, &result, 0, track);
+      inject_agg_meta(&mut translated, &agg_meta);
       by_position.insert(position, translated);
     }
   }

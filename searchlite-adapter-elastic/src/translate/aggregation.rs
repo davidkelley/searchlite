@@ -5,6 +5,42 @@ use super::unsupported::Unsupported;
 
 const AGG_KEYS: [&str; 2] = ["aggs", "aggregations"];
 
+/// Walk a top-level ES `aggs`/`aggregations` map and collect each agg's
+/// `meta` blob keyed by the agg name. SearchLite has no `meta` plumbing, so
+/// the route handler stashes these and re-injects them into the response
+/// after translation. Only top-level agg metadata is captured in v1 — nested
+/// aggs would require recursive walking on both sides; tracked as a known
+/// limitation.
+pub fn extract_agg_meta(es_aggs: &Map<String, Value>) -> std::collections::BTreeMap<String, Value> {
+  let mut out = std::collections::BTreeMap::new();
+  for (name, spec) in es_aggs {
+    if let Some(meta) = spec.as_object().and_then(|m| m.get("meta")) {
+      out.insert(name.clone(), meta.clone());
+    }
+  }
+  out
+}
+
+/// Inject collected agg `meta` entries back into a translated ES response.
+/// Mutates `response.aggregations.<name>.meta` for each name in `meta`.
+pub fn inject_agg_meta(response: &mut Value, meta: &std::collections::BTreeMap<String, Value>) {
+  if meta.is_empty() {
+    return;
+  }
+  let Some(aggs) = response
+    .as_object_mut()
+    .and_then(|m| m.get_mut("aggregations"))
+    .and_then(Value::as_object_mut)
+  else {
+    return;
+  };
+  for (name, value) in meta {
+    if let Some(entry) = aggs.get_mut(name).and_then(Value::as_object_mut) {
+      entry.insert("meta".to_string(), value.clone());
+    }
+  }
+}
+
 /// Translate an ES `aggs`/`aggregations` map (name → spec) into SearchLite's
 /// agg map (name → tagged Aggregation JSON). Sub-aggregations recurse.
 pub fn translate_aggs(es_aggs: &Map<String, Value>) -> Result<Map<String, Value>, Unsupported> {

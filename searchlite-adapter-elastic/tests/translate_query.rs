@@ -254,6 +254,67 @@ fn bool_translates_recursively() {
 }
 
 #[test]
+fn multi_match_translates_tie_breaker_verbatim() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "tie_breaker": 0.3 }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("tie_breaker").unwrap(), &json!(0.3));
+}
+
+#[test]
+fn multi_match_translates_operator_lowercased() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "operator": "AND" }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("operator").unwrap(), &json!("and"));
+}
+
+#[test]
+fn multi_match_translates_fuzziness_auto_to_max_edits_2() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "fuzziness": "AUTO" }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("fuzziness").unwrap(), &json!({ "max_edits": 2 }));
+}
+
+#[test]
+fn multi_match_translates_fuzziness_numeric_string() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "fuzziness": "1" }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("fuzziness").unwrap(), &json!({ "max_edits": 1 }));
+}
+
+#[test]
+fn multi_match_forwards_minimum_should_match_verbatim_for_percentage_form() {
+  // Unlike `bool.minimum_should_match` (resolved adapter-side because
+  // SearchLite's Bool variant only accepts a usize), `multi_match` keeps
+  // the percentage form on the wire — core's MultiMatch field accepts
+  // both shapes via an untagged enum.
+  let es = json!({
+    "multi_match": {
+      "query": "x", "fields": ["a"],
+      "minimum_should_match": "75%"
+    }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("minimum_should_match").unwrap(), &json!("75%"));
+}
+
+#[test]
+fn multi_match_translates_boost() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "boost": 2.5 }
+  });
+  let sl = translate_query(&es).unwrap();
+  assert_eq!(sl.get("boost").unwrap(), &json!(2.5));
+}
+
+#[test]
 fn multi_match_translates_with_field_boost_parsing() {
   let es = json!({
     "multi_match": {
@@ -313,6 +374,94 @@ fn dis_max_translates() {
       "tie_breaker": 0.3,
     })
   );
+}
+
+// --- match / multi_match: well-known options with semantic implications ----
+//
+// These options change matching semantics in ways SearchLite has no
+// equivalent for. Silent drops would let a request succeed but diverge from
+// ES intent without any signal — match the project pattern of rejecting
+// loudly (per `bool.minimum_should_match` combinator handling).
+
+#[test]
+fn match_with_zero_terms_query_is_rejected() {
+  let es = json!({ "match": { "title": { "query": "the", "zero_terms_query": "all" } } });
+  let err = translate_query(&es).unwrap_err();
+  assert!(
+    err.feature.starts_with("match.zero_terms_query"),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn match_with_lenient_is_rejected() {
+  let es = json!({ "match": { "title": { "query": "x", "lenient": true } } });
+  let err = translate_query(&es).unwrap_err();
+  assert!(err.feature.starts_with("match.lenient"), "got {err:?}");
+}
+
+#[test]
+fn match_with_analyzer_override_is_rejected() {
+  let es = json!({ "match": { "title": { "query": "x", "analyzer": "english" } } });
+  let err = translate_query(&es).unwrap_err();
+  assert!(err.feature.starts_with("match.analyzer"), "got {err:?}");
+}
+
+#[test]
+fn multi_match_with_zero_terms_query_is_rejected() {
+  let es = json!({
+    "multi_match": { "query": "the", "fields": ["a"], "zero_terms_query": "all" }
+  });
+  let err = translate_query(&es).unwrap_err();
+  assert!(
+    err.feature.starts_with("multi_match.zero_terms_query"),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn multi_match_with_analyzer_override_is_rejected() {
+  let es = json!({
+    "multi_match": { "query": "x", "fields": ["a"], "analyzer": "english" }
+  });
+  let err = translate_query(&es).unwrap_err();
+  assert!(
+    err.feature.starts_with("multi_match.analyzer"),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn multi_match_with_slop_prefix_length_max_expansions_is_rejected() {
+  for opt in ["slop", "prefix_length", "max_expansions", "lenient"] {
+    let es = json!({
+      "multi_match": { "query": "x", "fields": ["a"], opt: 2 }
+    });
+    let err = translate_query(&es).unwrap_err();
+    assert!(
+      err.feature.starts_with(&format!("multi_match.{opt}")),
+      "option `{opt}` should be rejected; got {err:?}"
+    );
+  }
+}
+
+#[test]
+fn function_score_clause_is_rejected_with_clear_error() {
+  // Docs<>code contract: the compatibility matrix used to claim
+  // function_score was "partial / Limited to SearchLite's whitelist", but
+  // the dispatcher had no arm for it and silently fell through to a
+  // generic Unsupported error. Now docs say "rejected" — pin the rejection
+  // here so future support is added deliberately.
+  let es = json!({"function_score": {"query": {"match_all": {}}, "functions": []}});
+  let err = translate_query(&es).unwrap_err();
+  assert!(err.feature.contains("function_score"), "got {err:?}");
+}
+
+#[test]
+fn script_score_clause_is_rejected_with_clear_error() {
+  let es = json!({"script_score": {"query": {"match_all": {}}, "script": "_score * 2"}});
+  let err = translate_query(&es).unwrap_err();
+  assert!(err.feature.contains("script_score"), "got {err:?}");
 }
 
 #[test]

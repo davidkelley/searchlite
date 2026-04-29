@@ -291,6 +291,110 @@ fn hit_without_highlight_omits_highlight_field() {
   assert!(hit.get("highlight").is_none());
 }
 
+// --- pipeline-aggregation response translation -----------------------------
+//
+// These pin the field-copying behavior in translate_aggregation's pipeline
+// branch so a refactor that drops `value`/`predictions`/`from`/`size`
+// silently doesn't ship.
+
+#[test]
+fn avg_bucket_response_carries_value_field() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "avg_per_day": { "type": "avg_bucket", "value": 12.5 }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/avg_per_day/value").unwrap(),
+    &json!(12.5)
+  );
+}
+
+#[test]
+fn sum_bucket_response_carries_value_field() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "sum_per_day": { "type": "sum_bucket", "value": 100.0 }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/sum_per_day/value").unwrap(),
+    &json!(100.0)
+  );
+}
+
+#[test]
+fn derivative_response_carries_value_field() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "deriv": { "type": "derivative", "value": 5.0 }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/deriv/value").unwrap(),
+    &json!(5.0)
+  );
+}
+
+#[test]
+fn moving_avg_response_carries_value_and_predictions() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "smoothed": {
+        "type": "moving_avg",
+        "value": 7.5,
+        "predictions": [8.0, 8.5, 9.0]
+      }
+    }
+  });
+  let es = translate(&sl);
+  let agg = es.pointer("/aggregations/smoothed").unwrap();
+  assert_eq!(agg.get("value").unwrap(), &json!(7.5));
+  assert_eq!(agg.get("predictions").unwrap(), &json!([8.0, 8.5, 9.0]));
+}
+
+#[test]
+fn bucket_script_response_carries_value_field() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "ratio": { "type": "bucket_script", "value": 0.42 }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/ratio/value").unwrap(),
+    &json!(0.42)
+  );
+}
+
+#[test]
+fn bucket_sort_response_carries_from_size_when_present() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "sorted": { "type": "bucket_sort", "from": 10, "size": 5 }
+    }
+  });
+  let es = translate(&sl);
+  let agg = es.pointer("/aggregations/sorted").unwrap();
+  assert_eq!(agg.get("from").unwrap(), &json!(10));
+  assert_eq!(agg.get("size").unwrap(), &json!(5));
+}
+
 #[test]
 fn stats_aggregation_translates_to_es_envelope() {
   let sl = json!({

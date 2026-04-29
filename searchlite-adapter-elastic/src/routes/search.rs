@@ -7,8 +7,11 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::error::{ESError, ESResult};
+use crate::routes::indices::resolve_index_or_alias;
 use crate::state::AppState;
-use crate::translate::{translate_search_body, translate_search_response};
+use crate::translate::{
+  extract_agg_meta, inject_agg_meta, translate_search_body, translate_search_response,
+};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct SearchParams {
@@ -34,20 +37,37 @@ pub async fn search(
   Query(params): Query<SearchParams>,
   body: Option<Json<Value>>,
 ) -> ESResult<Json<Value>> {
+  // Resolve aliases up front so hits are stamped with the concrete target
+  // index name, matching ES. Without this, `_index` on each hit echoes the
+  // alias the caller used — and ES SDKs round-trip `_index` from search
+  // hits back into write requests, so the wrong-index drift is real.
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
   let merged = merge_query_params_into_body(body.map(|Json(v)| v), &params)?;
   // Capture the caller's track_total_hits intent before translation so the
   // response can report exact-vs-approximate semantics correctly.
   let track = extract_track_total_hits(&merged);
+  // Capture each top-level agg's `meta` blob before translation so we can
+  // re-inject it into the response — SearchLite has no `meta` plumbing.
+  let agg_meta = merged
+    .get("aggs")
+    .or_else(|| merged.get("aggregations"))
+    .and_then(Value::as_object)
+    .map(extract_agg_meta)
+    .unwrap_or_default();
   let sl_body = translate_search_body(&merged)?;
   let started = Instant::now();
-  let sl_response = state.client().search(&index, &sl_body).await?;
+  let sl_response = state.client().search(&resolved, &sl_body).await?;
   let took_ms = started.elapsed().as_millis() as u64;
-  Ok(Json(translate_search_response(
-    &index,
-    &sl_response,
-    took_ms,
-    track,
-  )))
+  let mut response = translate_search_response(&resolved, &sl_response, took_ms, track);
+  inject_agg_meta(&mut response, &agg_meta);
+  Ok(Json(response))
 }
 
 pub async fn count(
@@ -56,13 +76,21 @@ pub async fn count(
   Query(params): Query<SearchParams>,
   body: Option<Json<Value>>,
 ) -> ESResult<Json<Value>> {
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
   let mut merged = merge_query_params_into_body(body.map(|Json(v)| v), &params)?;
   if let Some(map) = merged.as_object_mut() {
     map.insert("size".into(), Value::from(0u64));
     map.insert("track_total_hits".into(), Value::Bool(true));
   }
   let sl_body = translate_search_body(&merged)?;
-  let sl_response = state.client().search(&index, &sl_body).await?;
+  let sl_response = state.client().search(&resolved, &sl_body).await?;
   let total = sl_response
     .get("total_hits_estimate")
     .and_then(Value::as_u64)

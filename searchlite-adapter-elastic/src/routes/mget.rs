@@ -6,6 +6,7 @@ use axum::Json;
 use serde_json::{json, Map, Value};
 
 use crate::error::{ESError, ESResult};
+use crate::routes::indices::resolve_index_or_alias;
 use crate::state::AppState;
 
 /// `POST /{index}/_mget` — accepts `{ ids: [...] }` or `{ docs: [{_id, _source?}] }`.
@@ -14,6 +15,16 @@ pub async fn mget(
   Path(index): Path<String>,
   Json(body): Json<Value>,
 ) -> ESResult<Json<Value>> {
+  // Resolve aliases so each returned doc carries `_index = <target>`,
+  // matching ES; previously responses echoed the alias path token.
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
   let ids = collect_ids(&body, &index)?;
   if ids.is_empty() {
     return Ok(Json(json!({ "docs": [] })));
@@ -22,11 +33,11 @@ pub async fn mget(
   let upstream = state
     .client()
     .mget(
-      &index,
+      &resolved,
       &json!({ "ids": ids, "return_stored": return_stored }),
     )
     .await?;
-  Ok(Json(translate_mget_response(&index, &upstream)))
+  Ok(Json(translate_mget_response(&resolved, &upstream)))
 }
 
 /// `POST /_mget` — body has `docs: [{_index, _id}]`. We group by index and
@@ -46,7 +57,10 @@ pub async fn mget_global(
   // fields even when the caller asked for `_source: false`.
   let return_stored = wants_source(&body);
 
-  // Track requested order so we re-emit in the original sequence.
+  // Track requested order so we re-emit in the original sequence. Each
+  // doc's `_index` is resolved through the alias table so groups (and the
+  // `_index` stamping in the response) use the concrete target index, not
+  // whatever path token the caller supplied.
   let mut grouped: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
   for (idx, doc) in docs.iter().enumerate() {
     let map = doc.as_object().ok_or_else(|| {
@@ -55,16 +69,20 @@ pub async fn mget_global(
         "each `docs` entry must be an object",
       )
     })?;
-    let index = map
-      .get("_index")
-      .and_then(Value::as_str)
+    let raw_index = map.get("_index").and_then(Value::as_str).ok_or_else(|| {
+      ESError::bad_request(
+        "x_content_parse_exception",
+        "missing `_index` in docs entry",
+      )
+    })?;
+    let index = resolve_index_or_alias(&state, raw_index)
+      .await?
       .ok_or_else(|| {
-        ESError::bad_request(
-          "x_content_parse_exception",
-          "missing `_index` in docs entry",
+        ESError::not_found(
+          "index_not_found_exception",
+          format!("no such index [{raw_index}]"),
         )
-      })?
-      .to_string();
+      })?;
     let id = map
       .get("_id")
       .and_then(Value::as_str)

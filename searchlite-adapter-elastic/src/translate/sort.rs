@@ -62,7 +62,16 @@ fn translate_sort_entry(entry: &Value) -> Result<Value, Unsupported> {
               "not implemented",
             ));
           }
-          // `missing` accepted but ignored (SearchLite default behavior applies).
+          if opts.contains_key("missing") {
+            // ES `missing` controls where docs without the sort field land
+            // (`_first` / `_last` / a literal value). SearchLite has no
+            // equivalent knob — silently accepting would diverge from ES
+            // ordering with no signal. Reject loudly.
+            return Err(Unsupported::with_detail(
+              "sort.missing",
+              "not implemented; SearchLite has no equivalent missing-value placement directive",
+            ));
+          }
           Ok(json!({ "field": field, "order": order }))
         }
         _ => Err(Unsupported::with_detail(

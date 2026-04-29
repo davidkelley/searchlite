@@ -8,7 +8,7 @@ pub mod response;
 pub mod sort;
 pub mod unsupported;
 
-pub use aggregation::translate_aggs;
+pub use aggregation::{extract_agg_meta, inject_agg_meta, translate_aggs};
 pub use highlight::translate_highlight;
 pub use mapping::schema_to_es;
 pub use pagination::apply_pagination;

@@ -71,6 +71,26 @@ fn translate_match(body: &Value) -> Result<Value, Unsupported> {
     ));
   }
   let (field, spec) = map.iter().next().unwrap();
+  // Reject ES `match` options that change matching semantics in ways
+  // SearchLite has no equivalent for. Silent drops would let a request
+  // succeed but diverge from caller intent without any signal — match the
+  // project pattern of rejecting loudly.
+  if let Some(opts) = spec.as_object() {
+    for opt in [
+      "zero_terms_query",
+      "lenient",
+      "cutoff_frequency",
+      "analyzer",
+      "auto_generate_synonyms_phrase_query",
+    ] {
+      if opts.contains_key(opt) {
+        return Err(Unsupported::with_detail(
+          format!("match.{opt}"),
+          "no SearchLite equivalent",
+        ));
+      }
+    }
+  }
   let parsed = parse_match_spec(spec)?;
 
   let mut out = Map::new();
@@ -250,6 +270,25 @@ fn translate_multi_match(body: &Value) -> Result<Value, Unsupported> {
   let map = body
     .as_object()
     .ok_or_else(|| Unsupported::with_detail("multi_match", "expected an object"))?;
+  // Same loud-rejection policy as `match` for options that change matching
+  // semantics with no SearchLite equivalent.
+  for opt in [
+    "zero_terms_query",
+    "lenient",
+    "cutoff_frequency",
+    "analyzer",
+    "slop",
+    "prefix_length",
+    "max_expansions",
+    "auto_generate_synonyms_phrase_query",
+  ] {
+    if map.contains_key(opt) {
+      return Err(Unsupported::with_detail(
+        format!("multi_match.{opt}"),
+        "no SearchLite equivalent",
+      ));
+    }
+  }
   let query = map
     .get("query")
     .and_then(Value::as_str)

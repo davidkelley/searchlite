@@ -43,6 +43,17 @@ fn explicit_order_overrides_field_default() {
 }
 
 #[test]
+fn sort_with_missing_directive_is_explicitly_rejected() {
+  // Regression: `sort: { field: { missing: "_first" } }` used to be silently
+  // accepted-and-ignored, leading to ranking divergence from ES with no
+  // signal. Reject loudly per the project pattern of "silent drops are
+  // worse than loud rejections."
+  let es = json!([{ "price": { "missing": "_first" } }]);
+  let err = translate_sort(&es).unwrap_err();
+  assert!(err.feature.starts_with("sort.missing"), "got {err:?}");
+}
+
+#[test]
 fn array_form_with_mixed_entries() {
   let es = json!(["price", "_score"]);
   let sl = translate_sort(&es).unwrap();

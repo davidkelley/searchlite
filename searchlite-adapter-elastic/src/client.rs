@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use axum::http::StatusCode;
@@ -7,11 +8,18 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::error::ESError;
 use crate::AdapterArgs;
 
 const WRITE_KEY_HEADER: &str = "x-searchlite-write-key";
+
+/// TTL for the cached `list_indexes` response. Aliases and index membership
+/// rarely change at high frequency, but every alias-resolving request would
+/// otherwise hit upstream — Kibana / SDKs probe these endpoints repeatedly.
+/// 5 seconds is short enough that a deleted index still surfaces quickly.
+const LIST_INDEXES_TTL: Duration = Duration::from_secs(5);
 
 /// Characters that must be percent-encoded inside a URL path segment.
 /// `/`, `?`, `#` are structural; `%` needs encoding to avoid double-decode;
@@ -47,6 +55,13 @@ pub struct SearchliteClient {
   http: reqwest::Client,
   base: Url,
   write_key: Option<String>,
+  // Cached upstream `list_indexes` response. Every alias-resolving handler
+  // (`_settings`, `_mapping`, `_aliases`, HEAD `/{index}`, `GET /{index}`,
+  // and the alias resolution before search/mget/msearch) hits this once
+  // per request — without the cache that's one upstream round-trip per
+  // call. The cache is read-mostly and protected by a Mutex; on miss we
+  // refetch under the lock.
+  list_cache: Arc<Mutex<Option<(Instant, Value)>>>,
 }
 
 impl SearchliteClient {
@@ -80,6 +95,7 @@ impl SearchliteClient {
       http,
       base,
       write_key: args.write_key.clone(),
+      list_cache: Arc::new(Mutex::new(None)),
     })
   }
 
@@ -98,7 +114,22 @@ impl SearchliteClient {
   }
 
   pub async fn list_indexes(&self) -> Result<Value, ClientError> {
-    self.get_json("indexes").await
+    let mut guard = self.list_cache.lock().await;
+    if let Some((stamped_at, value)) = guard.as_ref() {
+      if stamped_at.elapsed() < LIST_INDEXES_TTL {
+        return Ok(value.clone());
+      }
+    }
+    let fresh = self.get_json("indexes").await?;
+    *guard = Some((Instant::now(), fresh.clone()));
+    Ok(fresh)
+  }
+
+  /// Test/debug helper: drop any cached `list_indexes` response so the next
+  /// call goes upstream. Not used in production code paths.
+  #[cfg(test)]
+  pub async fn invalidate_list_indexes_cache(&self) {
+    *self.list_cache.lock().await = None;
   }
 
   pub async fn inspect(&self, index: &str) -> Result<Value, ClientError> {
@@ -227,11 +258,12 @@ impl From<ClientError> for ESError {
         } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
           ESError::new(status, "security_exception", reason)
         } else {
-          ESError::new(
-            status,
-            "internal_server_error",
-            format!("upstream {kind}: {reason}"),
-          )
+          // Preserve the upstream's `kind` as the ESError type for 5xx so
+          // callers branching on `error.type` keep their discriminator
+          // (e.g. `index_locked_exception`, `vector_dimension_mismatch`).
+          // Previously these collapsed into a generic
+          // `internal_server_error` and the kind was buried in `reason`.
+          ESError::new(status, kind, reason)
         }
       }
       ClientError::Connection(reason) => ESError::bad_gateway("connection_exception", reason),
