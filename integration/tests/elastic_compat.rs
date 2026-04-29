@@ -553,6 +553,65 @@ fn mapping_all_returns_every_mounted_index() {
 }
 
 #[test]
+fn mapping_for_alias_returns_target_index_mapping() {
+  // Regression: get_mapping passed the raw path token to upstream `inspect`.
+  // Calling with an alias name returned 404 even though HEAD /<alias> and
+  // GET /<alias>/_settings already resolve aliases. Should resolve the alias
+  // and return the target's mapping keyed by the target index name.
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h.es_get("/demo_alias/_mapping").expect("get mapping");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  assert!(
+    body.get(INDEX).is_some(),
+    "mapping should be keyed by the target `{INDEX}`, got: {body}"
+  );
+  assert!(
+    body.get("demo_alias").is_none(),
+    "mapping must not be keyed by the alias name; got: {body}"
+  );
+}
+
+#[test]
+fn get_index_includes_real_aliases_in_payload() {
+  // Regression: GET /{index} hard-coded `"aliases": {}` regardless of what
+  // aliases actually point at the index. Should reflect the upstream alias
+  // listing so management/discovery flows see the correct topology.
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h.es_get(&format!("/{INDEX}")).expect("get index");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let aliases = body
+    .pointer(&format!("/{INDEX}/aliases"))
+    .expect("aliases key");
+  assert!(
+    aliases.get("demo_alias").is_some(),
+    "expected the configured alias to appear in /{INDEX} aliases; got: {body}"
+  );
+}
+
+#[test]
+fn get_index_called_with_alias_resolves_to_target_with_aliases_listed() {
+  // Combined alias-resolution test: GET /<alias> should return the response
+  // keyed by the concrete target with the alias listed in the aliases map.
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h.es_get("/demo_alias").expect("get alias as index");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  assert!(
+    body.get(INDEX).is_some(),
+    "GET /<alias> should be keyed by the target `{INDEX}`, got: {body}"
+  );
+  let aliases = body
+    .pointer(&format!("/{INDEX}/aliases"))
+    .expect("aliases key");
+  assert!(
+    aliases.get("demo_alias").is_some(),
+    "aliases map should contain the requested alias; got: {body}"
+  );
+}
+
+#[test]
 fn settings_for_alias_returns_target_index_payload() {
   // Regression: get_settings used to fabricate a settings payload keyed by
   // the request path token, even when that token was an alias name.

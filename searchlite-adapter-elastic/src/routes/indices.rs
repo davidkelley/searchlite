@@ -31,24 +31,45 @@ pub async fn get_index(
   State(state): State<Arc<AppState>>,
   Path(index): Path<String>,
 ) -> ESResult<Json<Value>> {
-  let mapping = get_mapping_for(&state, &index).await?;
-  let settings = settings_payload(&index);
+  // Resolve aliases up front so the response is keyed by the concrete
+  // target index, matching ES semantics for alias-based requests.
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
+
+  let mapping = get_mapping_for(&state, &resolved).await?;
   let mappings = mapping
-    .get(&index)
+    .get(&resolved)
     .and_then(|v| v.get("mappings"))
     .cloned()
     .unwrap_or_else(|| json!({ "properties": {} }));
+  let settings = settings_payload(&resolved);
   let settings_value = settings
-    .get(&index)
+    .get(&resolved)
     .and_then(|v| v.get("settings"))
+    .cloned()
+    .unwrap_or_else(|| json!({}));
+
+  // Surface the actual aliases pointing at the resolved target instead of
+  // a hard-coded empty object, so management / discovery flows see the
+  // real topology.
+  let aliases_map = aliases_by_index(&state).await?;
+  let aliases_for_target = aliases_map
+    .get(&resolved)
+    .and_then(|entry| entry.get("aliases"))
     .cloned()
     .unwrap_or_else(|| json!({}));
 
   let mut payload = serde_json::Map::new();
   payload.insert(
-    index,
+    resolved,
     json!({
-      "aliases": {},
+      "aliases": aliases_for_target,
       "mappings": mappings,
       "settings": settings_value,
     }),
@@ -60,7 +81,18 @@ pub async fn get_mapping(
   State(state): State<Arc<AppState>>,
   Path(index): Path<String>,
 ) -> ESResult<Json<Value>> {
-  Ok(Json(get_mapping_for(&state, &index).await?))
+  // Resolve aliases here for parity with HEAD /{index} and
+  // GET /{index}/_settings — calling with an alias name should return the
+  // target's mapping keyed by the target.
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
+  Ok(Json(get_mapping_for(&state, &resolved).await?))
 }
 
 pub async fn mapping_all(State(state): State<Arc<AppState>>) -> ESResult<Json<Value>> {
