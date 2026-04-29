@@ -330,6 +330,29 @@ fn cluster_health_returns_green() {
 }
 
 #[test]
+fn cluster_health_advertises_one_active_shard_consistent_with_green() {
+  // Regression: previously the response carried `status: green` alongside
+  // `active_primary_shards: 0` and `active_shards: 0`. That combination
+  // tripped Kibana / SDK probes that warn on green-with-no-active-shards.
+  // SearchLite's single-node single-shard model should advertise exactly
+  // that — one primary, one active.
+  let h = ElasticHarness::new().expect("harness");
+  let (status, body) = h.es_get("/_cluster/health").expect("get health");
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(body.get("status").unwrap(), &json!("green"));
+  assert_eq!(
+    body.get("active_primary_shards").unwrap(),
+    &json!(1),
+    "expected 1 active primary shard for single-node single-shard model"
+  );
+  assert_eq!(
+    body.get("active_shards").unwrap(),
+    &json!(1),
+    "expected 1 active shard for single-node single-shard model"
+  );
+}
+
+#[test]
 fn head_index_finds_known_index() {
   let h = ElasticHarness::new().expect("harness");
   seed_index(&h).expect("seed");

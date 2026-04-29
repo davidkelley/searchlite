@@ -110,8 +110,8 @@ fn translate_match(body: &Value) -> Result<Value, Unsupported> {
     ));
   }
   if let Some(op) = parsed.operator {
-    let upper = op.to_ascii_lowercase();
-    if upper != "or" {
+    let normalized = op.to_ascii_lowercase();
+    if normalized != "or" {
       return Err(Unsupported::with_detail(
         "match.operator",
         "only `or` is supported for `match`",

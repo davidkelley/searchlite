@@ -1,5 +1,5 @@
 use searchlite_adapter_elastic::translate::translate_search_response;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn translate(sl: &serde_json::Value) -> serde_json::Value {
   // Default-tracking helper for legacy tests that don't care about
@@ -416,5 +416,78 @@ fn stats_aggregation_translates_to_es_envelope() {
   assert_eq!(
     aggs.get("p").unwrap(),
     &json!({"count": 5, "min": 1.0, "max": 10.0, "sum": 25.0, "avg": 5.0})
+  );
+}
+
+// --- top_hits aggregation --------------------------------------------------
+//
+// Regression: previously hard-coded `max_score: null` regardless of inner hit
+// scores. ES populates this with the maximum `_score` across the inner hits
+// (or null when there are none / none are scored) — so SDKs that branch on
+// `aggregations.<name>.hits.max_score` to short-circuit empty buckets were
+// reading a stale signal.
+
+#[test]
+fn top_hits_aggregation_max_score_is_max_of_inner_hit_scores() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "best": {
+        "type": "top_hits",
+        "total": 2,
+        "hits": [
+          { "doc_id": "b", "score": 1.5 },
+          { "doc_id": "a", "score": 0.5 }
+        ]
+      }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/best/hits/max_score").unwrap(),
+    &json!(1.5)
+  );
+}
+
+#[test]
+fn top_hits_aggregation_max_score_null_when_no_inner_hits() {
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "best": {
+        "type": "top_hits",
+        "total": 0,
+        "hits": []
+      }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/best/hits/max_score").unwrap(),
+    &Value::Null
+  );
+}
+
+#[test]
+fn top_hits_aggregation_max_score_null_when_hits_lack_scores() {
+  // Sort-only inner queries don't carry a `score` field per hit; ES emits
+  // null in that case rather than fabricating a value.
+  let sl = json!({
+    "total_hits_estimate": 0,
+    "hits": [],
+    "aggregations": {
+      "best": {
+        "type": "top_hits",
+        "total": 1,
+        "hits": [{ "doc_id": "a" }]
+      }
+    }
+  });
+  let es = translate(&sl);
+  assert_eq!(
+    es.pointer("/aggregations/best/hits/max_score").unwrap(),
+    &Value::Null
   );
 }

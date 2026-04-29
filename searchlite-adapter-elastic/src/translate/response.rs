@@ -231,10 +231,22 @@ fn translate_aggregation(agg: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
       let translated_hits: Vec<Value> = hits.iter().map(top_hit_to_es).collect();
+      // Compute max_score from inner hits — ES populates this with the largest
+      // `_score` across the bucket's hits (or null when there are none / none
+      // carry a score). Previously hard-coded to null, which made SDKs that
+      // branch on this signal think every bucket was empty.
+      let max_score = translated_hits
+        .iter()
+        .filter_map(|hit| hit.get("_score").and_then(Value::as_f64))
+        .fold(None, |acc: Option<f64>, score| {
+          Some(acc.map_or(score, |m| m.max(score)))
+        })
+        .map(Value::from)
+        .unwrap_or(Value::Null);
       json!({
         "hits": {
           "total": { "value": total, "relation": "eq" },
-          "max_score": Value::Null,
+          "max_score": max_score,
           "hits": translated_hits,
         }
       })

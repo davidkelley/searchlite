@@ -22,17 +22,22 @@ pub fn version_banner(version: &str) -> Value {
   })
 }
 
-/// `GET /_cluster/health` — always green; SearchLite is single-shard.
+/// `GET /_cluster/health` — green when upstream is reachable; advertises one
+/// active primary so the response is internally consistent (Kibana / SDK
+/// probes warn on green-with-zero-shards). When the upstream is unhealthy we
+/// return red and keep the shard counts at zero so callers can distinguish
+/// "fine but empty" from "broken".
 pub fn cluster_health(upstream_healthy: bool) -> Value {
   let status = if upstream_healthy { "green" } else { "red" };
+  let active = if upstream_healthy { 1 } else { 0 };
   json!({
     "cluster_name": "searchlite",
     "status": status,
     "timed_out": false,
     "number_of_nodes": 1,
     "number_of_data_nodes": 1,
-    "active_primary_shards": 0,
-    "active_shards": 0,
+    "active_primary_shards": active,
+    "active_shards": active,
     "relocating_shards": 0,
     "initializing_shards": 0,
     "unassigned_shards": 0,

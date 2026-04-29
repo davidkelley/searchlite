@@ -107,21 +107,7 @@ pub async fn mget_global(
       .and_then(Value::as_array)
       .cloned()
       .unwrap_or_default();
-    // Defense-in-depth: ES `_mget` guarantees one response entry per
-    // requested id. If the upstream ever returns a different number we'd
-    // silently drop trailing entries (or extras) when zipping; surface that
-    // as a 502 so clients see the protocol violation instead of a malformed
-    // response. Mirrors the equivalent check in `msearch` upstream-results.
-    if docs_arr.len() != entries.len() {
-      return Err(ESError::bad_gateway(
-        "internal_server_error",
-        format!(
-          "upstream mget for index `{index}` returned {} docs for {} requested ids",
-          docs_arr.len(),
-          entries.len()
-        ),
-      ));
-    }
+    validate_mget_order(&index, &entries, &docs_arr)?;
     for ((position, _), translated_doc) in entries.into_iter().zip(docs_arr.into_iter()) {
       by_position.insert(position, translated_doc);
     }
@@ -200,6 +186,48 @@ fn translate_mget_response(index: &str, upstream: &Value) -> Value {
   json!({ "docs": translated })
 }
 
+/// Validate that an upstream mget response lines up with the requested
+/// positional batch.
+///
+/// Two checks, each surfaced as a 502 so callers see a clear protocol
+/// violation rather than receiving a wrong-doc-at-wrong-slot response:
+///
+/// 1. Length parity — ES `_mget` (and our upstream) guarantees one response
+///    entry per requested id; a mismatch would silently zip-truncate.
+/// 2. Per-position `_id` parity — even with matching length, an upstream
+///    that reordered docs would route the wrong source to each slot.
+///    `searchlite-core`'s `Reader::mget` preserves order today (and there's
+///    a regression test for it), but we don't want to bake that contract
+///    into the adapter without a verifier.
+fn validate_mget_order(
+  index: &str,
+  entries: &[(usize, String)],
+  docs_arr: &[Value],
+) -> ESResult<()> {
+  if docs_arr.len() != entries.len() {
+    return Err(ESError::bad_gateway(
+      "internal_server_error",
+      format!(
+        "upstream mget for index `{index}` returned {} docs for {} requested ids",
+        docs_arr.len(),
+        entries.len()
+      ),
+    ));
+  }
+  for (i, ((_, requested_id), doc)) in entries.iter().zip(docs_arr.iter()).enumerate() {
+    let actual = doc.get("_id").and_then(Value::as_str).unwrap_or("");
+    if actual != requested_id {
+      return Err(ESError::bad_gateway(
+        "internal_server_error",
+        format!(
+          "upstream mget for index `{index}` returned out-of-order docs at position {i}: requested `{requested_id}`, got `{actual}`"
+        ),
+      ));
+    }
+  }
+  Ok(())
+}
+
 fn translate_doc(index: &str, doc: &Value) -> Value {
   let map = doc.as_object();
   let id = map
@@ -221,4 +249,81 @@ fn translate_doc(index: &str, doc: &Value) -> Value {
     out.insert("_source".into(), src.clone());
   }
   Value::Object(out)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use axum::http::StatusCode;
+
+  fn entries(ids: &[&str]) -> Vec<(usize, String)> {
+    ids
+      .iter()
+      .enumerate()
+      .map(|(i, id)| (i, (*id).to_string()))
+      .collect()
+  }
+
+  fn doc(id: &str) -> Value {
+    json!({ "_index": "demo", "_id": id, "found": true })
+  }
+
+  #[test]
+  fn validate_mget_order_accepts_matching_length_and_order() {
+    let req = entries(&["a", "b", "c"]);
+    let resp = vec![doc("a"), doc("b"), doc("c")];
+    assert!(validate_mget_order("demo", &req, &resp).is_ok());
+  }
+
+  #[test]
+  fn validate_mget_order_rejects_length_mismatch_with_502() {
+    // Pre-existing length check; pinned here so a refactor of the helper
+    // can't silently regress to a positional zip without parity.
+    let req = entries(&["a", "b", "c"]);
+    let resp = vec![doc("a"), doc("b")];
+    let err = validate_mget_order("demo", &req, &resp).expect_err("should fail");
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(
+      err.reason.contains("returned 2 docs for 3 requested"),
+      "reason: {}",
+      err.reason
+    );
+  }
+
+  #[test]
+  fn validate_mget_order_rejects_per_position_id_mismatch_with_502() {
+    // Defense-in-depth: even when lengths match, a reordered upstream
+    // response would route the wrong document into each requested slot.
+    // Surface as a clear 502 so the caller doesn't act on misrouted data.
+    let req = entries(&["a", "b", "c"]);
+    let resp = vec![doc("a"), doc("c"), doc("b")];
+    let err = validate_mget_order("demo", &req, &resp).expect_err("should fail");
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(
+      err.reason.contains("position 1"),
+      "reason should pinpoint the slot, got: {}",
+      err.reason
+    );
+    assert!(
+      err.reason.contains("requested `b`"),
+      "reason should name the requested id, got: {}",
+      err.reason
+    );
+    assert!(
+      err.reason.contains("got `c`"),
+      "reason should name the returned id, got: {}",
+      err.reason
+    );
+  }
+
+  #[test]
+  fn validate_mget_order_rejects_doc_with_missing_id_field() {
+    // A doc missing `_id` (e.g. an upstream that drops the field on a
+    // not-found doc) should fail validation — the `_id` is what we use to
+    // verify positional routing, so an absent value can't be trusted.
+    let req = entries(&["a"]);
+    let resp = vec![json!({ "_index": "demo", "found": false })];
+    let err = validate_mget_order("demo", &req, &resp).expect_err("should fail");
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+  }
 }

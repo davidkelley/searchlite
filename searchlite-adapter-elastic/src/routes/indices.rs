@@ -274,6 +274,16 @@ async fn get_mapping_for(state: &Arc<AppState>, index: &str) -> ESResult<Value> 
 /// - If `name` is a real index, returns `Some(name)`.
 /// - If `name` is an alias, returns `Some(<target index name>)`.
 /// - Otherwise returns `None`.
+///
+/// Returns a single target deliberately. The upstream `searchlite-http`
+/// stores aliases as a `HashMap<String, String>` and rejects duplicate
+/// alias names at startup (`searchlite-http/src/lib.rs::IndexRegistry::from_args`),
+/// so an alias can refer to at most one target index. The `find_map` over
+/// `aliases[*]` below is correct under that contract — at most one entry
+/// can match a given alias name. If the upstream ever loosens to N:1
+/// fan-out (matching real Elasticsearch's alias semantics), `_mapping`,
+/// `_settings`, and `get_index` would need to fan out across all targets
+/// rather than picking one.
 pub(crate) async fn resolve_index_or_alias(
   state: &Arc<AppState>,
   name: &str,
