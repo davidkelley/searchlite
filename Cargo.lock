@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "integration"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2275,7 +2275,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "searchlite-adapter-elastic"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-http"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-node"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "napi",

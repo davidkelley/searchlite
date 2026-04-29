@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/davidkelley/searchlite/compare/integration-v0.2.5...integration-v0.2.6) - 2026-04-29
+
+### Added
+
+- add Elasticsearch HTTP-API compatibility adapter ([#465](https://github.com/davidkelley/searchlite/pull/465))
+
 ## [0.2.5](https://github.com/davidkelley/searchlite/compare/integration-v0.2.4...integration-v0.2.5) - 2026-04-27
 
 ### Other

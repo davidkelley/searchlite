@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/davidkelley/searchlite/compare/searchlite-node-v0.2.5...searchlite-node-v0.2.6) - 2026-04-29
+
+### Other
+
+- *(deps-dev)* bump @swc/core from 1.15.30 to 1.15.32 in /searchlite-node in the npm-minor-patch group ([#466](https://github.com/davidkelley/searchlite/pull/466))
+
 ## [0.2.5](https://github.com/davidkelley/searchlite/compare/searchlite-node-v0.2.4...searchlite-node-v0.2.5) - 2026-04-27
 
 ### Fixed
