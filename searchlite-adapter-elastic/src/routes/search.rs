@@ -118,12 +118,22 @@ fn merge_query_params_into_body(body: Option<Value>, params: &SearchParams) -> E
       .or_insert(Value::from(size as u64));
   }
   if let Some(sort) = &params.sort {
+    // Trim each comma-separated chunk, then trim around the optional `:`
+    // separator. Without this, common forms like `?sort=foo:desc, _score`
+    // produce a field literally named " _score" (leading space) and
+    // `?sort=foo : desc` carries trailing/leading whitespace into both
+    // field and order — both round-trip incorrectly to upstream.
     let parts: Vec<Value> = sort
       .split(',')
+      .map(str::trim)
       .filter(|s| !s.is_empty())
       .map(|chunk| {
         if let Some((field, order)) = chunk.split_once(':') {
-          json!({ field: { "order": order } })
+          let field = field.trim();
+          let order = order.trim();
+          let mut obj = serde_json::Map::new();
+          obj.insert(field.to_string(), json!({ "order": order }));
+          Value::Object(obj)
         } else {
           Value::String(chunk.to_string())
         }

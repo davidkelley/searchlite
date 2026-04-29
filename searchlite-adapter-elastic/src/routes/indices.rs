@@ -3,11 +3,18 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
 use crate::error::{ESError, ESResult};
 use crate::state::AppState;
 use crate::translate::schema_to_es;
+
+/// Maximum number of concurrent upstream `inspect` calls fired by
+/// `mapping_all`. Bounded so a `_mapping` request against a cluster with
+/// many indexes doesn't open an unbounded number of connections to the
+/// upstream all at once.
+const MAPPING_ALL_CONCURRENCY: usize = 8;
 
 pub async fn head_index(
   State(state): State<Arc<AppState>>,
@@ -69,9 +76,26 @@ pub async fn mapping_all(State(state): State<Arc<AppState>>) -> ESResult<Json<Va
     })
     .unwrap_or_default();
 
+  // Run upstream `inspect` calls concurrently with bounded parallelism.
+  // The previous serialized loop made `_mapping` latency proportional to
+  // the index count and was a real problem on clusters with many indexes
+  // (Kibana, ES SDKs hit it on every connect). `buffer_unordered` keeps
+  // at most MAPPING_ALL_CONCURRENCY in flight at a time.
+  let results: Vec<(String, ESResult<Value>)> = stream::iter(names.into_iter())
+    .map(|name| {
+      let state = state.clone();
+      async move {
+        let result = get_mapping_for(&state, &name).await;
+        (name, result)
+      }
+    })
+    .buffer_unordered(MAPPING_ALL_CONCURRENCY)
+    .collect()
+    .await;
+
   let mut out = serde_json::Map::new();
-  for name in names {
-    let single = get_mapping_for(&state, &name).await?;
+  for (name, result) in results {
+    let single = result?;
     if let Some(entry) = single.get(&name) {
       out.insert(name, entry.clone());
     }
@@ -83,13 +107,19 @@ pub async fn get_settings(
   State(state): State<Arc<AppState>>,
   Path(index): Path<String>,
 ) -> ESResult<Json<Value>> {
-  if !index_exists(&state, &index).await? {
-    return Err(ESError::not_found(
-      "index_not_found_exception",
-      format!("no such index [{index}]"),
-    ));
-  }
-  Ok(Json(settings_payload(&index)))
+  // Resolve the path token through the alias listing so the response is
+  // keyed by the concrete target index, not by the alias name. ES does
+  // the same — alias requests return `{<target>: {settings: ...}}`, never
+  // `{<alias>: ...}`.
+  let resolved = resolve_index_or_alias(&state, &index)
+    .await?
+    .ok_or_else(|| {
+      ESError::not_found(
+        "index_not_found_exception",
+        format!("no such index [{index}]"),
+      )
+    })?;
+  Ok(Json(settings_payload(&resolved)))
 }
 
 pub async fn aliases(State(state): State<Arc<AppState>>) -> ESResult<Json<Value>> {
@@ -205,6 +235,43 @@ async fn get_mapping_for(state: &Arc<AppState>, index: &str) -> ESResult<Value> 
       )
     })?;
   Ok(schema_to_es(index, schema)?)
+}
+
+/// Resolve `name` to the concrete target index it refers to.
+///
+/// - If `name` is a real index, returns `Some(name)`.
+/// - If `name` is an alias, returns `Some(<target index name>)`.
+/// - Otherwise returns `None`.
+async fn resolve_index_or_alias(state: &Arc<AppState>, name: &str) -> ESResult<Option<String>> {
+  let listing = state.client().list_indexes().await?;
+  let is_real_index = listing
+    .get("indexes")
+    .and_then(Value::as_array)
+    .map(|items| {
+      items
+        .iter()
+        .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
+    })
+    .unwrap_or(false);
+  if is_real_index {
+    return Ok(Some(name.to_string()));
+  }
+  let target = listing
+    .get("aliases")
+    .and_then(Value::as_array)
+    .and_then(|items| {
+      items.iter().find_map(|item| {
+        if item.get("alias").and_then(Value::as_str) == Some(name) {
+          item
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        } else {
+          None
+        }
+      })
+    });
+  Ok(target)
 }
 
 async fn index_exists(state: &Arc<AppState>, index: &str) -> ESResult<bool> {

@@ -25,6 +25,13 @@ struct ElasticHarness {
 
 impl ElasticHarness {
   fn new() -> Result<Self> {
+    Self::with_config(&[], &[])
+  }
+
+  /// Boot the harness with the default `demo` index plus extra index mounts
+  /// and aliases. Used by tests that need to exercise alias resolution or
+  /// multi-index endpoints.
+  fn with_config(extra_indexes: &[&str], aliases: &[(&str, &str)]) -> Result<Self> {
     let upstream_bin = common::searchlite_bin();
     let adapter_bin = elastic_bin();
     let index_dir = tempfile::tempdir().context("creating temp index dir")?;
@@ -44,16 +51,29 @@ impl ElasticHarness {
     let adapter_log_file = std::fs::File::create(&adapter_log)
       .with_context(|| format!("creating log {}", adapter_log.display()))?;
 
-    let mut upstream = Command::new(&upstream_bin)
-      .arg("http")
+    let mut spawn = Command::new(&upstream_bin);
+    spawn.arg("http");
+    spawn
       .arg("--index")
-      .arg(format!("{INDEX}:{}", index_path.display()))
+      .arg(format!("{INDEX}:{}", index_path.display()));
+    for extra in extra_indexes {
+      spawn.arg("--index").arg(format!(
+        "{extra}:{}",
+        index_dir.path().join(extra).display()
+      ));
+    }
+    for (alias, target) in aliases {
+      spawn.arg("--alias").arg(format!("{alias}:{target}"));
+    }
+    spawn
       .arg("--bind")
       .arg(&upstream_bind)
       .arg("--shutdown-grace-secs")
       .arg("0")
       .stdout(Stdio::null())
-      .stderr(Stdio::from(upstream_log_file))
+      .stderr(Stdio::from(upstream_log_file));
+
+    let mut upstream = spawn
       .spawn()
       .with_context(|| format!("spawning upstream via {}", upstream_bin.display()))?;
 
@@ -100,12 +120,16 @@ impl ElasticHarness {
   }
 
   fn init_index(&self, schema: &Value) -> Result<()> {
-    let url = format!("{}/indexes/{INDEX}/init", self.upstream_base);
+    self.init_named(INDEX, schema)
+  }
+
+  fn init_named(&self, name: &str, schema: &Value) -> Result<()> {
+    let url = format!("{}/indexes/{name}/init", self.upstream_base);
     let resp = self.client.post(url).json(schema).send()?;
     let status = resp.status();
     let text = resp.text()?;
     if !status.is_success() {
-      return Err(anyhow!("init failed {status}: {text}"));
+      return Err(anyhow!("init {name} failed {status}: {text}"));
     }
     Ok(())
   }
@@ -508,6 +532,47 @@ fn cross_index_search_path_is_rejected() {
 }
 
 #[test]
+fn mapping_all_returns_every_mounted_index() {
+  // Smoke test for the all-index mapping endpoint after parallelizing the
+  // per-index inspect calls. Verifies cardinality and key-naming for two
+  // mounted indexes.
+  let h = ElasticHarness::with_config(&["secondary"], &[]).expect("harness");
+  let schema = json!({
+    "type": "object",
+    "searchlite:docIdField": "_id",
+    "properties": { "title": { "type": "string" } }
+  });
+  h.init_named(INDEX, &schema).expect("init demo");
+  h.init_named("secondary", &schema).expect("init secondary");
+  let (status, body) = h.es_get("/_mapping").expect("get all mappings");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  let map = body.as_object().expect("object body");
+  assert!(map.contains_key(INDEX), "missing demo: {body}");
+  assert!(map.contains_key("secondary"), "missing secondary: {body}");
+  assert_eq!(map.len(), 2, "expected exactly two index entries: {body}");
+}
+
+#[test]
+fn settings_for_alias_returns_target_index_payload() {
+  // Regression: get_settings used to fabricate a settings payload keyed by
+  // the request path token, even when that token was an alias name.
+  // Per ES, alias requests should resolve to the concrete target index and
+  // key the response by the target — not the alias.
+  let h = ElasticHarness::with_config(&[], &[("demo_alias", INDEX)]).expect("harness with alias");
+  seed_index(&h).expect("seed");
+  let (status, body) = h.es_get("/demo_alias/_settings").expect("get settings");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  assert!(
+    body.get(INDEX).is_some(),
+    "settings should be keyed by the target index `{INDEX}`, got: {body}"
+  );
+  assert!(
+    body.get("demo_alias").is_none(),
+    "settings must not be keyed by the alias name; got: {body}"
+  );
+}
+
+#[test]
 fn settings_on_unknown_index_returns_404() {
   let h = ElasticHarness::new().expect("harness");
   let (status, body) = h.es_get("/no-such-index/_settings").expect("get");
@@ -601,6 +666,36 @@ fn global_mget_with_source_true_includes_source_field() {
     docs[0].get("_source").is_some(),
     "_source should be present when _source:true is requested"
   );
+}
+
+#[test]
+fn search_get_sort_param_with_spaces_after_commas_is_parsed_cleanly() {
+  // Regression: previously `?sort=foo:desc, _score` produced a field literally
+  // named " _score" (leading space) because tokens were not trimmed after the
+  // comma split. Both human-typed URLs and some SDKs emit spaces after commas.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_get(&format!("/{INDEX}/_search?sort=price:desc, _score&size=3"))
+    .expect("get");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
+  // Top hit should be the most expensive doc per the price:desc sort ordering.
+  let first_id = body
+    .pointer("/hits/hits/0/_id")
+    .and_then(Value::as_str)
+    .unwrap_or("");
+  assert!(!first_id.is_empty(), "expected a top hit; got: {body}");
+}
+
+#[test]
+fn search_get_sort_param_with_space_after_colon_is_parsed_cleanly() {
+  // Both `field` and `order` should be trimmed.
+  let h = ElasticHarness::new().expect("harness");
+  seed_index(&h).expect("seed");
+  let (status, body) = h
+    .es_get(&format!("/{INDEX}/_search?sort=price : desc&size=3"))
+    .expect("get");
+  assert_eq!(status, StatusCode::OK, "body: {body}");
 }
 
 #[test]

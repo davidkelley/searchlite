@@ -89,6 +89,21 @@ pub async fn mget_global(
       .and_then(Value::as_array)
       .cloned()
       .unwrap_or_default();
+    // Defense-in-depth: ES `_mget` guarantees one response entry per
+    // requested id. If the upstream ever returns a different number we'd
+    // silently drop trailing entries (or extras) when zipping; surface that
+    // as a 502 so clients see the protocol violation instead of a malformed
+    // response. Mirrors the equivalent check in `msearch` upstream-results.
+    if docs_arr.len() != entries.len() {
+      return Err(ESError::bad_gateway(
+        "internal_server_error",
+        format!(
+          "upstream mget for index `{index}` returned {} docs for {} requested ids",
+          docs_arr.len(),
+          entries.len()
+        ),
+      ));
+    }
     for ((position, _), translated_doc) in entries.into_iter().zip(docs_arr.into_iter()) {
       by_position.insert(position, translated_doc);
     }
