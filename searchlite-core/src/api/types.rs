@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,81 @@ pub enum ExecutionStrategy {
   Bmw,
 }
 
+/// Policy controlling how a segment's whole-file checksums are validated
+/// against the values recorded in its `SegmentMeta`.
+///
+/// The recorded checksums are computed over each segment file at write time
+/// and stored in the manifest. They are independent of any *internal* CRCs
+/// some files carry (e.g. `read_terms`'s payload CRC), which always run
+/// regardless of policy because they protect format-level integrity rather
+/// than cross-file manifest consistency.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksumPolicy {
+  /// Existing behavior: verify every segment file's checksum on every
+  /// `SegmentCore::load`. Catches on-disk bit rot and out-of-process
+  /// tampering at the cost of reading postings + docstore in full.
+  #[default]
+  Strict,
+  /// Skip whole-file checksum verification at load time. The manifest's
+  /// recorded checksums are trusted as-is; format-level internal CRCs
+  /// (e.g. on the terms file payload) still run. Designed for object-
+  /// storage backends where the manifest itself is the trust anchor and
+  /// postings/docstore reads are expensive enough that a verification-
+  /// only full read is unaffordable. **Not appropriate** if external
+  /// processes can mutate segment files without updating the manifest.
+  TrustManifest,
+  /// Skip synchronous verification (like `TrustManifest`) but dispatch a
+  /// background task that performs the full verification asynchronously.
+  /// Failures are surfaced to `IndexOptions::checksum_audit_failure_hook`
+  /// (or `log::error!` if the hook is `None`). Suited to deployments that
+  /// want low-latency opens without giving up on bit-rot detection.
+  Audit,
+}
+
+impl ChecksumPolicy {
+  /// Used by `serde(skip_serializing_if = ...)` to keep existing serialized
+  /// `IndexOptions` byte-for-byte stable when callers don't touch the new
+  /// field.
+  fn is_strict(&self) -> bool {
+    matches!(self, ChecksumPolicy::Strict)
+  }
+}
+
+/// Closure type underlying `ChecksumAuditFailureHook`. Aliased to keep the
+/// trait-object signature out of structural type positions where Clippy's
+/// `type_complexity` lint would otherwise fire.
+type ChecksumAuditFailureFn = dyn Fn(&str, &anyhow::Error) + Send + Sync + 'static;
+
+/// Hook invoked when a `ChecksumPolicy::Audit` background verification
+/// detects a checksum mismatch (or any other I/O error during the audit).
+///
+/// Wraps an `Arc<dyn Fn>` so the type is `Clone + Send + Sync` and provides
+/// a manual `Debug` impl so `IndexOptions` can keep `#[derive(Debug)]`.
+/// `Option<ChecksumAuditFailureHook>` on `IndexOptions` is `#[serde(skip)]`
+/// because closures don't serialize.
+#[derive(Clone)]
+pub struct ChecksumAuditFailureHook(Arc<ChecksumAuditFailureFn>);
+
+impl ChecksumAuditFailureHook {
+  pub fn new<F>(f: F) -> Self
+  where
+    F: Fn(&str, &anyhow::Error) + Send + Sync + 'static,
+  {
+    Self(Arc::new(f))
+  }
+
+  pub fn invoke(&self, segment_id: &str, err: &anyhow::Error) {
+    (self.0)(segment_id, err);
+  }
+}
+
+impl std::fmt::Debug for ChecksumAuditFailureHook {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChecksumAuditFailureHook").finish()
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexOptions {
   pub path: PathBuf,
@@ -22,8 +98,49 @@ pub struct IndexOptions {
   pub bm25_b: f32,
   #[serde(default)]
   pub storage: StorageType,
+  /// How to verify segment whole-file checksums on load. Defaults to
+  /// `Strict` (existing behavior); skipped during serialization when
+  /// `Strict` to keep older serialized `IndexOptions` byte-stable.
+  #[serde(default, skip_serializing_if = "ChecksumPolicy::is_strict")]
+  pub checksum_policy: ChecksumPolicy,
+  /// Optional callback invoked when an `Audit`-policy background
+  /// verification detects a failure. Not serializable; defaults to `None`,
+  /// in which case audit failures are reported via `log::error!`.
+  #[serde(skip)]
+  pub checksum_audit_failure_hook: Option<ChecksumAuditFailureHook>,
   #[cfg(feature = "vectors")]
   pub vector_defaults: Option<VectorOptions>,
+}
+
+impl Default for IndexOptions {
+  /// Conservative defaults: empty path (caller sets it), refuse to auto-
+  /// create indexes that don't exist, position-bearing postings, the
+  /// canonical BM25 parameters, on-disk storage, and `Strict` checksum
+  /// verification. Public-API examples and tests can use this with the
+  /// `..Default::default()` struct-update syntax so future field
+  /// additions don't require touching every literal:
+  ///
+  /// ```ignore
+  /// let opts = IndexOptions {
+  ///     path: "/tmp/myindex".into(),
+  ///     create_if_missing: true,
+  ///     ..IndexOptions::default()
+  /// };
+  /// ```
+  fn default() -> Self {
+    Self {
+      path: PathBuf::new(),
+      create_if_missing: false,
+      enable_positions: true,
+      bm25_k1: 1.2,
+      bm25_b: 0.75,
+      storage: StorageType::default(),
+      checksum_policy: ChecksumPolicy::default(),
+      checksum_audit_failure_hook: None,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

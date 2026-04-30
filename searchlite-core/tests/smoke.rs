@@ -65,6 +65,8 @@ fn build_index_with_docs(docs: Vec<Document>) -> (tempfile::TempDir, Index) {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -107,6 +109,8 @@ fn index_and_search() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -426,6 +430,8 @@ fn compact_removes_old_segments() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -482,6 +488,8 @@ fn upsert_and_delete_by_id() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -567,6 +575,8 @@ fn cursor_paginates_ordered_hits() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -762,6 +772,8 @@ fn cursor_rejects_invalid_hex() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -822,6 +834,8 @@ fn cursor_rejects_when_limit_zero() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -884,6 +898,8 @@ fn cursor_rejects_excessive_advance() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -951,6 +967,8 @@ fn cursor_rejects_mismatched_position() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1025,6 +1043,8 @@ fn cursor_orders_stably_across_segments() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1162,6 +1182,8 @@ fn in_memory_storage_keeps_disk_clean() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::InMemory,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1256,6 +1278,8 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1401,6 +1425,8 @@ fn nested_numeric_filters_bind_to_object_values() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1552,6 +1578,8 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1657,6 +1685,8 @@ fn highlight_configuration_applies_tags() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

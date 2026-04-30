@@ -32,6 +32,8 @@ fn build_index(count: usize, segments: usize, seed: u64) -> (Index, tempfile::Te
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::InMemory,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -104,6 +106,8 @@ fn bench_index_10k(c: &mut Criterion) {
           bm25_k1: 0.9,
           bm25_b: 0.4,
           storage: StorageType::InMemory,
+          checksum_policy: Default::default(),
+          checksum_audit_failure_hook: None,
           #[cfg(feature = "vectors")]
           vector_defaults: None,
         };
@@ -137,6 +141,8 @@ fn bench_index_100k(c: &mut Criterion) {
           bm25_k1: 0.9,
           bm25_b: 0.4,
           storage: StorageType::InMemory,
+          checksum_policy: Default::default(),
+          checksum_audit_failure_hook: None,
           #[cfg(feature = "vectors")]
           vector_defaults: None,
         };

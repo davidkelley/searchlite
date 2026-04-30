@@ -64,6 +64,8 @@ fn create_index(path: &std::path::Path) -> Index {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

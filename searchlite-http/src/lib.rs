@@ -300,6 +300,8 @@ impl ManagedIndex {
       bm25_k1: DEFAULT_K1,
       bm25_b: DEFAULT_B,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
@@ -3003,6 +3005,8 @@ mod tests {
       bm25_k1: DEFAULT_K1,
       bm25_b: DEFAULT_B,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

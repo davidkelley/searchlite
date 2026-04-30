@@ -46,6 +46,8 @@ impl Index {
         bm25_k1: BM25_K1,
         bm25_b: BM25_B,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       };

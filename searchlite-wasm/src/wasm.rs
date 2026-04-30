@@ -1490,6 +1490,8 @@ fn open_opts(path: PathBuf) -> IndexOptions {
     bm25_k1: BM25_K1,
     bm25_b: BM25_B,
     storage: StorageType::InMemory,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }
@@ -1767,6 +1769,8 @@ impl Searchlite {
       // The wasm Index always uses in-memory storage; JsStorage persists to IndexedDB when enabled.
       // Do not mix storage modes for the same db_name; use a fresh name or clear stored data.
       storage: StorageType::InMemory,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
@@ -2710,6 +2714,8 @@ mod tests {
       bm25_k1: BM25_K1,
       bm25_b: BM25_B,
       storage: StorageType::InMemory,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

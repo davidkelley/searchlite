@@ -87,12 +87,9 @@ let path = PathBuf::from("/tmp/example_idx");
 let opts = IndexOptions {
     path: path.clone(),
     create_if_missing: true,
-    enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
-    storage: StorageType::Filesystem,
-    #[cfg(feature = "vectors")]
-    vector_defaults: None,
+    ..Default::default()
 };
 let index = IndexBuilder::create(&path, schema, opts)?;
 

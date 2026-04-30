@@ -36,12 +36,9 @@ let path = PathBuf::from("/tmp/products");
 let opts = IndexOptions {
     path: path.clone(),
     create_if_missing: true,
-    enable_positions: true,   // required for phrase queries and highlighting
     bm25_k1: 0.9,
     bm25_b: 0.4,
-    storage: StorageType::Filesystem,
-    #[cfg(feature = "vectors")]
-    vector_defaults: None,
+    ..Default::default()
 };
 
 let index = IndexBuilder::create(&path, schema, opts)?;
@@ -67,11 +64,9 @@ let opts = IndexOptions {
     path: PathBuf::from("unused"),  // path is ignored for in-memory
     storage: StorageType::InMemory,
     create_if_missing: true,
-    enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
-    #[cfg(feature = "vectors")]
-    vector_defaults: None,
+    ..Default::default()
 };
 
 let index = IndexBuilder::create(Path::new("unused"), schema, opts)?;

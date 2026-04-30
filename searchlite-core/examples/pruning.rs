@@ -26,6 +26,8 @@ fn main() -> Result<()> {
     bm25_k1: 1.2,
     bm25_b: 0.75,
     storage: StorageType::InMemory,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

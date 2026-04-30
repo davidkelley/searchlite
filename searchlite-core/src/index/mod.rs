@@ -394,14 +394,13 @@ impl Index {
     // segment that was just opened by a query thread isn't re-loaded from
     // storage here. Cache misses (first time a segment is touched) still go
     // through the full `SegmentCore::load` path.
+    let load_ctx = crate::index::segment::SegmentLoadCtx::from_options(&inner.options);
     let readers: Vec<crate::index::segment::SegmentReader> = merge_metas
       .iter()
       .map(|seg| -> Result<_> {
-        let core = inner.segment_cache.get_or_load(
-          seg,
-          inner.options.enable_positions,
-          inner.storage.clone(),
-        )?;
+        let core = inner
+          .segment_cache
+          .get_or_load(seg, &load_ctx, inner.storage.clone())?;
         crate::index::segment::SegmentReader::from_core(
           core,
           (*seg).clone(),
@@ -591,6 +590,8 @@ mod tests {
       bm25_k1: 1.2,
       bm25_b: 0.75,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
@@ -1307,11 +1308,12 @@ mod tests {
 
     let cache = SegmentCache::with_capacity(2);
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+    let ctx = crate::index::segment::SegmentLoadCtx::from_options(&idx.inner.options);
 
     // Load segment 0 and clone an Arc out of the cache so we can verify the
     // core stays usable after it's evicted from the cache itself.
     let core_0 = cache
-      .get_or_load(&metas[0], idx.inner.options.enable_positions, storage.clone())
+      .get_or_load(&metas[0], &ctx, storage.clone())
       .unwrap();
     assert_eq!(cache.len(), 1);
     assert_eq!(cache.loads(), 1);
@@ -1319,10 +1321,10 @@ mod tests {
     // Load segment 1 and segment 2. After the third insert the cache is over
     // capacity (cap=2) and segment 0 — the LRU — must have been evicted.
     let _core_1 = cache
-      .get_or_load(&metas[1], idx.inner.options.enable_positions, storage.clone())
+      .get_or_load(&metas[1], &ctx, storage.clone())
       .unwrap();
     let _core_2 = cache
-      .get_or_load(&metas[2], idx.inner.options.enable_positions, storage.clone())
+      .get_or_load(&metas[2], &ctx, storage.clone())
       .unwrap();
     assert_eq!(cache.len(), 2, "cache must respect its capacity bound");
     assert_eq!(cache.loads(), 3, "each distinct meta must have caused one load");
@@ -1345,12 +1347,257 @@ mod tests {
     // it really was evicted, not just hidden by a hash collision.
     let loads_before = cache.loads();
     let _core_0_again = cache
-      .get_or_load(&metas[0], idx.inner.options.enable_positions, storage.clone())
+      .get_or_load(&metas[0], &ctx, storage.clone())
       .unwrap();
     assert_eq!(
       cache.loads() - loads_before,
       1,
       "evicted entry must be reloaded on next request"
+    );
+  }
+
+  /// Build an index with a single committed doc and return the on-disk path
+  /// of its (only) segment's postings file. Used by the Stage 3 checksum
+  /// tests to corrupt a segment AFTER the manifest has been written.
+  fn build_index_and_postings_path(dir: &std::path::Path) -> (Index, std::path::PathBuf) {
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir, schema, opts(dir)).unwrap();
+    let mut writer = idx.writer().unwrap();
+    writer
+      .add_document(&Document {
+        fields: [
+          ("_id".into(), serde_json::json!("1")),
+          ("body".into(), serde_json::json!("alpha")),
+        ]
+        .into_iter()
+        .collect(),
+      })
+      .unwrap();
+    writer.commit().unwrap();
+    let postings_path =
+      std::path::PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+    (idx, postings_path)
+  }
+
+  /// Corrupt a segment file by appending a trailing byte. The reader-side
+  /// postings decoder stops at the encoded `doc_freq` count (and similarly
+  /// the inner postings-entry counts), so a trailing byte changes the
+  /// manifest checksum without affecting any structural read — exactly the
+  /// bit-rot signature `verify_checksums` is designed to catch. (Flipping
+  /// an in-payload byte would also fail verification but might additionally
+  /// change a varint or `f32` value mid-decode, producing wrong query
+  /// results that obscure what we're actually trying to test.)
+  fn append_trailing_byte(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes.push(0xAB);
+    std::fs::write(path, bytes).unwrap();
+  }
+
+  /// Stage 3 P1 fix: under `Strict`, a cache hit must re-verify the
+  /// on-disk segment files against the manifest's recorded checksums.
+  /// Pre-Stage-1, every `Index::reader()` open re-verified; Stage 1's
+  /// caching silently regressed that guarantee. Codex flagged it; this
+  /// test pins the restored behavior.
+  ///
+  /// Scenario: open a reader (populates the cache), mutate `postings.bin`
+  /// in-place WITHOUT touching the manifest, open a second reader against
+  /// the same `Index`. Under `Strict` the second open must fail with a
+  /// checksum mismatch — even though the cache holds a valid parsed core.
+  #[test]
+  fn checksum_policy_strict_re_verifies_on_cache_hit() {
+    let dir = tempdir().unwrap();
+    let (idx, postings_path) = build_index_and_postings_path(dir.path());
+
+    // First reader: populates the cache via a fresh load (which also runs
+    // synchronous verification under Strict). Capture loads counter.
+    let _r1 = idx.reader().unwrap();
+    let loads_before = idx.segment_core_loads();
+    assert_eq!(loads_before, 1);
+
+    // Mutate the segment file AFTER the cache is populated. Simulates
+    // external bit rot or out-of-process tampering between reader opens.
+    append_trailing_byte(&postings_path);
+
+    // Second reader open under the (default) Strict policy must re-verify
+    // on the cache hit. Without the P1 fix this would silently succeed
+    // and serve queries against the corrupted file.
+    let err = match idx.reader() {
+      Ok(_) => panic!(
+        "Strict cache hit must re-verify and reject the externally-mutated segment"
+      ),
+      Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("checksum") && msg.contains("postings"),
+      "expected checksum/postings failure, got: {msg}"
+    );
+
+    // No new SegmentCore was loaded — the re-verify path doesn't bump the
+    // loads counter. We re-read bytes for verification only; the cached
+    // parsed structures stay intact and reused for the next attempt.
+    assert_eq!(
+      idx.segment_core_loads(),
+      loads_before,
+      "Strict re-verify must not trigger a fresh load on cache hit"
+    );
+  }
+
+  /// Stage 3, default policy: `Strict` is the default for a freshly-built
+  /// `IndexOptions`, and a corrupted segment must fail to open with a
+  /// checksum error. This is the load-bearing safety guarantee that the
+  /// new policy enum must NOT silently regress.
+  #[test]
+  fn checksum_policy_strict_default_rejects_corrupted_segment() {
+    let dir = tempdir().unwrap();
+    let (idx, postings_path) = build_index_and_postings_path(dir.path());
+    drop(idx); // release the cache so the next open is a fresh load
+    append_trailing_byte(&postings_path);
+
+    let mut reopen_opts = opts(dir.path());
+    reopen_opts.create_if_missing = false;
+    assert_eq!(
+      reopen_opts.checksum_policy,
+      crate::api::types::ChecksumPolicy::Strict,
+      "Strict must be the default policy"
+    );
+    let reopened = Index::open(reopen_opts).unwrap();
+    let err = match reopened.reader() {
+      Ok(_) => panic!("corrupted segment under Strict must fail at reader open"),
+      Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("checksum") && msg.contains("postings"),
+      "expected checksum/postings failure, got: {msg}"
+    );
+  }
+
+  /// Stage 3: under `TrustManifest`, a corrupted segment opens without
+  /// error because whole-file verification is skipped. Format-level reads
+  /// (term-dict CRC, fast-fields self-check) still fire — those protect
+  /// structural integrity, not cross-file manifest consistency. Postings
+  /// and docstore are NOT touched at load time.
+  #[test]
+  fn checksum_policy_trust_manifest_skips_whole_file_verification() {
+    use crate::api::types::ChecksumPolicy;
+
+    let dir = tempdir().unwrap();
+    let (idx, postings_path) = build_index_and_postings_path(dir.path());
+    drop(idx);
+    append_trailing_byte(&postings_path);
+
+    let mut reopen_opts = opts(dir.path());
+    reopen_opts.create_if_missing = false;
+    reopen_opts.checksum_policy = ChecksumPolicy::TrustManifest;
+    let reopened = Index::open(reopen_opts).unwrap();
+    // The reader open succeeds despite the postings-file corruption.
+    let reader = reopened
+      .reader()
+      .expect("TrustManifest must open without verifying postings");
+    // And basic queries still produce correct results because the encoded
+    // postings list is intact through its declared length; only the
+    // trailing byte (irrelevant to read_at) was flipped.
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": "alpha",
+      "limit": 10,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+    let result = reader.search(&req).unwrap();
+    assert_eq!(result.total_hits_estimate, 1);
+  }
+
+  /// Stage 3: `Audit` opens segments synchronously (like `TrustManifest`)
+  /// but dispatches a background verification. A corrupted segment under
+  /// `Audit` must (a) open without error and (b) cause the audit hook to
+  /// fire with a failure within a reasonable timeout.
+  #[test]
+  fn checksum_policy_audit_fires_hook_on_corrupted_segment() {
+    use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let (idx, postings_path) = build_index_and_postings_path(dir.path());
+    let expected_segment_id = idx.manifest().segments[0].id.clone();
+    drop(idx);
+    append_trailing_byte(&postings_path);
+
+    let (tx, rx) = mpsc::sync_channel::<(String, String)>(4);
+    let hook = ChecksumAuditFailureHook::new(move |segment_id, err| {
+      // `try_send` so the channel saturating doesn't block the rayon worker.
+      let _ = tx.try_send((segment_id.to_string(), format!("{err:#}")));
+    });
+
+    let mut reopen_opts = opts(dir.path());
+    reopen_opts.create_if_missing = false;
+    reopen_opts.checksum_policy = ChecksumPolicy::Audit;
+    reopen_opts.checksum_audit_failure_hook = Some(hook);
+    let reopened = Index::open(reopen_opts).unwrap();
+    let _reader = reopened
+      .reader()
+      .expect("Audit must open without synchronous verification");
+
+    // Wait for the rayon worker to complete the background verification.
+    let (got_segment_id, err_msg) = rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("audit hook should fire within 5s on a corrupted segment");
+    assert_eq!(got_segment_id, expected_segment_id);
+    assert!(
+      err_msg.contains("checksum") && err_msg.contains("postings"),
+      "hook should report a checksum-postings error, got: {err_msg}"
+    );
+  }
+
+  /// Stage 3: cache-aware audit. Successive `Index::reader()` calls against
+  /// the same manifest hit the cache and must NOT re-dispatch the audit —
+  /// otherwise opening N readers against M segments produces N*M audit
+  /// runs and defeats Stage 1's caching win for the `Audit` policy.
+  #[test]
+  fn checksum_policy_audit_does_not_refire_on_cache_hits() {
+    use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let (idx, postings_path) = build_index_and_postings_path(dir.path());
+    drop(idx);
+    append_trailing_byte(&postings_path);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let (tx, rx) = mpsc::sync_channel::<()>(4);
+    let hook = ChecksumAuditFailureHook::new(move |_segment_id, _err| {
+      counter_clone.fetch_add(1, Ordering::SeqCst);
+      let _ = tx.try_send(());
+    });
+
+    let mut reopen_opts = opts(dir.path());
+    reopen_opts.create_if_missing = false;
+    reopen_opts.checksum_policy = ChecksumPolicy::Audit;
+    reopen_opts.checksum_audit_failure_hook = Some(hook);
+    let reopened = Index::open(reopen_opts).unwrap();
+
+    // First reader open: triggers an audit dispatch (cache miss).
+    let _r1 = reopened.reader().unwrap();
+    rx.recv_timeout(Duration::from_secs(5))
+      .expect("first audit should fire");
+
+    // Subsequent reader opens hit the cache; no new audit dispatches.
+    for _ in 0..5 {
+      let _r = reopened.reader().unwrap();
+    }
+    // Give any (incorrect) extra dispatches a chance to surface.
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+      counter.load(Ordering::SeqCst),
+      1,
+      "audit hook must fire exactly once across N cache-hit reader opens; \
+       observed {} firings",
+      counter.load(Ordering::SeqCst)
     );
   }
 }

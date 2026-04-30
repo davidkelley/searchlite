@@ -201,11 +201,10 @@ schema.vector_fields.push(VectorField {
 let opts = IndexOptions {
     path: Path::new("/tmp/hybrid_idx").to_path_buf(),
     create_if_missing: true,
-    enable_positions:  true,
     bm25_k1: 0.9,
     bm25_b:  0.4,
     storage: StorageType::InMemory,       // swap for Filesystem to persist
-    vector_defaults: None,
+    ..Default::default()
 };
 let index = IndexBuilder::create(Path::new("/tmp/hybrid_idx"), schema, opts)?;
 

@@ -53,12 +53,10 @@ let schema = Schema::default_text_body();
 let opts = IndexOptions {
     path: PathBuf::from("unused"), // path is ignored for in-memory storage
     create_if_missing: true,
-    enable_positions: true,
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::InMemory,
-    #[cfg(feature = "vectors")]
-    vector_defaults: None,
+    ..Default::default()
 };
 
 let index = IndexBuilder::create(Path::new("unused"), schema, opts)?;
@@ -88,12 +86,10 @@ mod tests {
         let opts = IndexOptions {
             path: PathBuf::from("test"),
             create_if_missing: true,
-            enable_positions: true,
             bm25_k1: 0.9,
             bm25_b: 0.4,
             storage: StorageType::InMemory,
-            #[cfg(feature = "vectors")]
-            vector_defaults: None,
+            ..Default::default()
         };
         IndexBuilder::create(Path::new("test"), schema, opts).unwrap()
     }

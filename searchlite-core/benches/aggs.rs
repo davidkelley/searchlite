@@ -41,6 +41,8 @@ fn build_bench_index(doc_count: usize, cardinality: usize) -> BenchIndex {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -111,6 +113,8 @@ fn build_nested_bench_index(
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

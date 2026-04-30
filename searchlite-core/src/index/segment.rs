@@ -15,7 +15,7 @@ use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::types::Document;
+use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy, Document, IndexOptions};
 #[cfg(feature = "vectors")]
 use crate::api::types::VectorMetric as ApiVectorMetric;
 use crate::index::directory;
@@ -1316,10 +1316,51 @@ pub struct SegmentCore {
   vectors: HashMap<String, VectorFieldReader>,
 }
 
+/// Bundle of per-load options threaded through `SegmentCore::load` and
+/// `SegmentCache::get_or_load`. Cheap to clone (one bool, one enum, one
+/// `Option<Arc<…>>`).
+#[derive(Clone)]
+pub struct SegmentLoadCtx {
+  pub keep_positions: bool,
+  pub checksum_policy: ChecksumPolicy,
+  pub audit_hook: Option<ChecksumAuditFailureHook>,
+}
+
+impl SegmentLoadCtx {
+  pub fn from_options(options: &IndexOptions) -> Self {
+    Self {
+      keep_positions: options.enable_positions,
+      checksum_policy: options.checksum_policy,
+      audit_hook: options.checksum_audit_failure_hook.clone(),
+    }
+  }
+
+  /// Strict-policy default with no audit hook. Used by the legacy
+  /// `SegmentReader::open(storage, meta, keep_positions)` convenience
+  /// constructor (which existing tests depend on) so callers that don't
+  /// care about checksum policy keep the strictest behavior.
+  fn strict(keep_positions: bool) -> Self {
+    Self {
+      keep_positions,
+      checksum_policy: ChecksumPolicy::Strict,
+      audit_hook: None,
+    }
+  }
+}
+
 impl SegmentCore {
-  /// Load a segment's immutable data from storage. This performs the full
-  /// per-segment work that previously ran on every `SegmentReader::open`:
-  /// checksum verification, term-dict load, fast-field parse, vector load.
+  /// Load a segment's immutable data from storage. Performs term-dict load,
+  /// fast-field parse, and vector load unconditionally; whole-file checksum
+  /// verification is gated by `ctx.checksum_policy`:
+  /// - `Strict`: verify all five segment files synchronously (existing
+  ///   behavior); fails the load on mismatch.
+  /// - `TrustManifest`: skip whole-file verification entirely. Postings and
+  ///   docstore are NOT read during load — they're opened lazily by
+  ///   per-view handles in `SegmentReader::from_core`.
+  /// - `Audit`: skip synchronous verification but dispatch a background
+  ///   task (via `rayon::spawn`) that re-runs `verify_checksums` and
+  ///   surfaces failures via `ctx.audit_hook` (or `log::error!` if none).
+  ///
   /// The returned `Arc` does not retain `storage` — view-level handles in
   /// `SegmentReader::from_core` are opened against the manifest-current
   /// storage, so a later manifest that relocates files (Stage 9) can still
@@ -1327,7 +1368,7 @@ impl SegmentCore {
   pub fn load(
     storage: Arc<dyn Storage>,
     meta: &SegmentMeta,
-    keep_positions: bool,
+    ctx: &SegmentLoadCtx,
   ) -> Result<Arc<Self>> {
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
     let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
@@ -1338,7 +1379,29 @@ impl SegmentCore {
         meta.id
       );
     }
-    verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes)?;
+    match ctx.checksum_policy {
+      ChecksumPolicy::Strict => {
+        verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes)?;
+      }
+      ChecksumPolicy::TrustManifest => {
+        // Manifest is the trust anchor. No whole-file reads beyond what
+        // the data path itself requires (terms / fast fields / vectors).
+        // Postings and docstore are not touched during load.
+      }
+      ChecksumPolicy::Audit => {
+        // Open succeeds immediately; a background task re-runs the same
+        // verification and surfaces any mismatch via the audit hook (or
+        // `log::error!`). Captures clones of the inputs because the
+        // foreground load must not block on this.
+        dispatch_checksum_audit(
+          storage.clone(),
+          meta.clone(),
+          seg_meta.clone(),
+          seg_meta_bytes.clone(),
+          ctx.audit_hook.clone(),
+        );
+      }
+    }
     let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
       bail!(
@@ -1411,11 +1474,61 @@ impl SegmentCore {
       terms: TinyTerms(terms),
       doc_ids,
       fast_fields,
-      keep_positions,
+      keep_positions: ctx.keep_positions,
       #[cfg(feature = "vectors")]
       vectors: vector_fields,
     }))
   }
+}
+
+/// Re-verify a cached `SegmentCore`'s on-disk segment files against the
+/// manifest's recorded checksums. Called on every `Strict` cache hit so
+/// the policy's pre-Stage-1 guarantee holds: a second `Index::reader()`
+/// against the same `Index` detects external mutation that happened
+/// between the first reader open and the second.
+///
+/// The cached core's parsed structures (terms, fast fields, doc-id table)
+/// are reused — verification re-reads the files but does not re-parse
+/// them. The bytes are dropped after CRC computation.
+fn verify_cached_core(
+  storage: &dyn Storage,
+  meta: &SegmentMeta,
+  core: &SegmentCore,
+) -> Result<()> {
+  // `seg_meta_bytes` is not retained on the cached core (the parsed
+  // `SegmentFileMeta` is). Re-read it so `verify_checksums` can compare
+  // the live meta-file bytes against the manifest's recorded checksum;
+  // this catches the "external mutation invalidated the meta file"
+  // case as well as the postings/docstore/fast/terms cases.
+  let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
+  verify_checksums(storage, meta, &core.seg_meta, &seg_meta_bytes)
+}
+
+/// Background checksum audit dispatched by `ChecksumPolicy::Audit`. Runs on
+/// the global `rayon` thread pool (bounded to roughly `num_cpus` workers by
+/// default), so opening an index with hundreds of segments under `Audit`
+/// won't fan out to hundreds of OS threads.
+///
+/// Re-runs `verify_checksums` against the same storage with the segment
+/// metadata that the foreground load already parsed. On failure, invokes
+/// `audit_hook` if provided; otherwise emits a `log::error!`. Successes are
+/// silent (no allocation, no log noise).
+fn dispatch_checksum_audit(
+  storage: Arc<dyn Storage>,
+  meta: SegmentMeta,
+  seg_meta: SegmentFileMeta,
+  seg_meta_bytes: Vec<u8>,
+  audit_hook: Option<ChecksumAuditFailureHook>,
+) {
+  rayon::spawn(move || {
+    let segment_id = meta.id.clone();
+    if let Err(err) = verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes) {
+      match audit_hook {
+        Some(hook) => hook.invoke(&segment_id, &err),
+        None => log::error!("checksum audit failed for segment {segment_id}: {err:#}"),
+      }
+    }
+  });
 }
 
 /// Cache key for `SegmentCore`. The fingerprint hashes `SegmentMeta.checksums`
@@ -1524,7 +1637,7 @@ impl SegmentCache {
   pub fn get_or_load(
     &self,
     meta: &SegmentMeta,
-    keep_positions: bool,
+    ctx: &SegmentLoadCtx,
     storage: Arc<dyn Storage>,
   ) -> Result<Arc<SegmentCore>> {
     let key = SegmentCacheKey::from_meta(meta);
@@ -1533,13 +1646,32 @@ impl SegmentCache {
       inner.next_seq = inner.next_seq.saturating_add(1);
       let seq = inner.next_seq;
       if let Some(entry) = inner.entries.get_mut(&key) {
+        let core = entry.core.clone();
         entry.seq = seq;
-        return Ok(entry.core.clone());
+        // Drop the cache lock before any I/O.
+        drop(inner);
+        // Cache-hit semantics by policy:
+        // - `Strict`: re-verify the on-disk bytes against the manifest's
+        //   recorded checksums. The cached `SegmentCore` (parsed terms,
+        //   fast fields, etc.) is reused — we don't re-allocate or re-
+        //   parse — but the file contents must still match what the
+        //   manifest says they should. This restores the pre-Stage-1
+        //   guarantee that two `Index::reader()` calls within a single
+        //   process detect external mutation between opens.
+        // - `TrustManifest`: return immediately. The manifest is the
+        //   trust anchor by definition.
+        // - `Audit`: return immediately. Audit is a per-fresh-load
+        //   concern; re-firing on every cache hit would produce N*M
+        //   audit runs and defeat the bounded-execution model.
+        if matches!(ctx.checksum_policy, ChecksumPolicy::Strict) {
+          verify_cached_core(storage.as_ref(), meta, &core)?;
+        }
+        return Ok(core);
       }
     }
     // Slow path: load outside the lock so concurrent misses for *different*
     // keys aren't serialized on this load's I/O.
-    let core = SegmentCore::load(storage, meta, keep_positions)?;
+    let core = SegmentCore::load(storage, meta, ctx)?;
     self
       .loads
       .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1637,11 +1769,13 @@ impl SegmentReader {
     })
   }
 
-  /// Convenience constructor that loads a fresh `SegmentCore` and immediately
-  /// builds a view from it. Bypasses any reader-side cache; callers that want
-  /// caching should go through `Index::reader()`.
+  /// Convenience constructor that loads a fresh `SegmentCore` under the
+  /// strict checksum policy and immediately builds a view from it. Bypasses
+  /// any reader-side cache; callers that want caching or a non-strict
+  /// policy should go through `Index::reader()`.
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
-    let core = SegmentCore::load(storage.clone(), &meta, keep_positions)?;
+    let ctx = SegmentLoadCtx::strict(keep_positions);
+    let core = SegmentCore::load(storage.clone(), &meta, &ctx)?;
     Self::from_core(core, meta, storage)
   }
 

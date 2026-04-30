@@ -377,19 +377,20 @@ impl IndexReader {
   pub(crate) fn open(inner: Arc<InnerIndex>) -> Result<Self> {
     let manifest = inner.manifest.read().clone();
     let analysis = manifest.schema.build_analyzers()?;
+    let ctx = crate::index::segment::SegmentLoadCtx::from_options(&inner.options);
     let mut segments = Vec::new();
     for seg in manifest.segments.iter() {
       // Consult the per-`InnerIndex` cache for an already-loaded `SegmentCore`
       // matching this segment's `(id, fingerprint)`. On cache hit the
-      // expensive open work (checksum verification, term-dict / fast-field
-      // parse) is skipped — we just open per-view file handles against the
-      // manifest-current paths and storage, and derive the current
-      // `deleted_docs` set from the manifest.
-      let core = inner.segment_cache.get_or_load(
-        seg,
-        inner.options.enable_positions,
-        inner.storage.clone(),
-      )?;
+      // expensive open work (checksum verification under `Strict`, term-dict
+      // / fast-field parse) is skipped — we just open per-view file handles
+      // against the manifest-current paths and storage, and derive the
+      // current `deleted_docs` set from the manifest. The audit hook
+      // (under `ChecksumPolicy::Audit`) only fires on fresh loads, never
+      // on cache hits.
+      let core = inner
+        .segment_cache
+        .get_or_load(seg, &ctx, inner.storage.clone())?;
       segments.push(SegmentReader::from_core(
         core,
         seg.clone(),
@@ -407,6 +408,8 @@ impl IndexReader {
         bm25_k1: inner.options.bm25_k1,
         bm25_b: inner.options.bm25_b,
         storage: inner.options.storage.clone(),
+        checksum_policy: inner.options.checksum_policy,
+        checksum_audit_failure_hook: inner.options.checksum_audit_failure_hook.clone(),
         #[cfg(feature = "vectors")]
         vector_defaults: inner.options.vector_defaults.clone(),
       },
@@ -3439,6 +3442,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3573,6 +3578,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3688,6 +3695,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3801,6 +3810,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3914,6 +3925,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3971,6 +3984,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4229,6 +4244,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4295,6 +4312,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4384,6 +4403,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4468,6 +4489,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4543,6 +4566,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4610,6 +4635,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4679,6 +4706,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4755,6 +4784,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4834,6 +4865,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4914,6 +4947,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4989,6 +5024,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5063,6 +5100,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5120,6 +5159,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         vector_defaults: None,
       },
     )
@@ -5211,6 +5252,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5263,6 +5306,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5456,6 +5501,8 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
