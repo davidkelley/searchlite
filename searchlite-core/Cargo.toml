@@ -18,6 +18,8 @@ write-key = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:subtle"]
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc32fast = { workspace = true }

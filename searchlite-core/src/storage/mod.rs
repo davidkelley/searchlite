@@ -9,6 +9,12 @@ use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
+pub mod blob;
+pub use blob::{
+  ArtifactIdentity, BlobStore, Capabilities, ContentHash, Object, ObjectStat, ObjectWriter,
+  ProviderChecksum, PutIfMatchError,
+};
+
 pub trait StorageFile: Read + Write + Seek + Send {
   fn set_len(&mut self, len: u64) -> Result<()>;
   fn sync_all(&mut self) -> Result<()>;

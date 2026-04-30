@@ -2298,10 +2298,12 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "base64",
  "bincode",
  "bytemuck",
  "byteorder",
+ "bytes",
  "chrono",
  "crc32fast",
  "criterion",
