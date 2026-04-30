@@ -52,6 +52,7 @@ zstd = { version = "0.13.1", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
 fs2 = "0.4"
+moka = { version = "0.12", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }

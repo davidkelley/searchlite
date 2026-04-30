@@ -10,13 +10,16 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 pub mod blob;
-// LocalBlobStore and the adapter pull in local-FS-specific deps (fs2 for
-// per-key flock CAS, futures::executor for the sync→async bridge). Both
-// are native-only conveniences; wasm32 builds get the trait/type surface
+// LocalBlobStore, the adapter, and the RAM-tier cache pull in native-
+// only deps (fs2 for per-key flock CAS, futures::executor for the
+// sync→async bridge, moka for byte-weighted LRU+TinyLFU eviction).
+// They are gated to non-wasm32; wasm builds get the trait/type surface
 // from `blob.rs` and would supply their own backend (e.g. via Stage 9's
 // S3-over-fetch impl, or a direct OPFS/IndexedDB BlobStore).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod blob_adapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cached_blob;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local_blob;
 pub use blob::{
@@ -25,6 +28,8 @@ pub use blob::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use blob_adapter::BlobStoreAdapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use cached_blob::{ByteRange, CacheStats, CachedBlobStore, DEFAULT_CACHE_CAPACITY_BYTES};
 #[cfg(not(target_arch = "wasm32"))]
 pub use local_blob::LocalBlobStore;
 
