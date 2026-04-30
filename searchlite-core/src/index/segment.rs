@@ -2232,4 +2232,103 @@ mod tests {
       );
     }
   }
+
+  /// Stage 2 round-trip: for every term in a real segment's term dictionary,
+  /// `TinyFst::range_for(term, postings_len)` must return exactly the byte
+  /// range that `PostingsReader::read_at` consumes when decoding that term's
+  /// postings list. This is the load-bearing correctness contract for
+  /// future bounded `get_range` reads against an object-storage backend.
+  #[test]
+  fn range_for_matches_postings_reader_consumption_for_every_term() {
+    use std::io::Seek;
+
+    let dir = tempdir().unwrap();
+    let schema = sample_schema();
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+
+    // Multiple docs with overlapping and disjoint terms so the resulting FST
+    // exercises both common-prefix and isolated-term layouts. Position-bearing
+    // postings (`keep_positions=true`) maximize per-term byte length so the
+    // test catches off-by-one errors in `read_at`'s inner loops, not just the
+    // outer doc-freq varint.
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone(), None);
+    let meta = writer
+      .write_segment(
+        &[
+          doc("rust search engine fast", "news", 2024),
+          doc("rust language tooling", "tech", 2023),
+          doc("search engine indexing fast", "news", 2024),
+          doc("indexing pipeline", "infra", 2025),
+          doc("rust async tooling", "tech", 2024),
+        ],
+        1,
+      )
+      .unwrap();
+
+    let reader = SegmentReader::open(storage.clone(), meta.clone(), true).unwrap();
+    let postings_path = std::path::PathBuf::from(&meta.paths.postings);
+    let postings_len = std::fs::metadata(&postings_path).unwrap().len();
+    assert!(
+      postings_len > 0,
+      "test prerequisite: segment must have a non-empty postings file"
+    );
+
+    // Walk the term dictionary in sorted order and check each term's range.
+    // Iterating with an empty prefix yields every term; the existing
+    // `terms_with_prefix` already binary-searches into the sorted vec.
+    let all_terms: Vec<String> = reader
+      .terms_with_prefix("")
+      .map(|t| t.to_string())
+      .collect();
+    assert!(
+      all_terms.len() >= 4,
+      "test prerequisite: schema + corpus must produce several distinct terms; got {}",
+      all_terms.len()
+    );
+
+    let mut last_term_seen = false;
+    for term in &all_terms {
+      let computed = reader
+        .core
+        .terms
+        .0
+        .range_for(term, postings_len)
+        .unwrap_or_else(|| panic!("range_for returned None for present term {term:?}"));
+
+      // What did the postings reader actually consume? `read_at` seeks to
+      // `offset` and decodes one postings list; the file's stream position
+      // afterwards is the first byte past this term's payload.
+      // Use `&mut file` (= `&mut Box<dyn StorageFile>`, which is `Sized`)
+      // rather than `&mut *file` (which would give a `&mut dyn StorageFile`
+      // unsized borrow that `PostingsReader::read_at`'s `R: Read + Seek`
+      // bound rejects).
+      let mut file = storage.open_read(&postings_path).unwrap();
+      let _decoded = PostingsReader::read_at(&mut file, computed.start, true)
+        .unwrap_or_else(|e| panic!("read_at failed for term {term:?} at offset {}: {e}", computed.start));
+      let consumed_end = file.stream_position().unwrap();
+
+      assert_eq!(
+        computed.start,
+        reader.core.terms.0.get(term).unwrap(),
+        "range_for({term:?}) start must equal the FST's recorded offset"
+      );
+      assert_eq!(
+        computed.end, consumed_end,
+        "range_for({term:?}) end ({}) must equal bytes consumed by read_at ({}); \
+         wrong end means an object-store range read would either truncate the \
+         postings list or overshoot into the next term",
+        computed.end, consumed_end
+      );
+
+      if computed.end == postings_len {
+        last_term_seen = true;
+      }
+    }
+
+    assert!(
+      last_term_seen,
+      "test must exercise the last-term branch (where range.end == postings_len); \
+       did the loop iterate over the lexicographically-greatest term?"
+    );
+  }
 }
