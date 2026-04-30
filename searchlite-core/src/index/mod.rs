@@ -41,6 +41,12 @@ pub(crate) struct InnerIndex {
   pub manifest: RwLock<Manifest>,
   pub writer_lock: Mutex<()>,
   pub storage: Arc<dyn Storage>,
+  /// Cache of immutable `SegmentCore`s keyed by `(segment_id, fingerprint)`.
+  /// `IndexReader::open` consults this cache when materializing per-manifest
+  /// `SegmentReader` views, so the expensive segment-open work (checksum
+  /// verification, term-dict load, fast-field parse) runs at most once per
+  /// `(id, fingerprint)` per process — not once per reader open.
+  pub(crate) segment_cache: crate::index::segment::SegmentCache,
   /// Monotonic count of successful `Index::reader()` calls. Exposed via
   /// `Index::reader_open_count` so pooling/caching layers can be regression-
   /// tested without relying on wall-clock heuristics.
@@ -102,6 +108,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
@@ -135,6 +142,7 @@ impl Index {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: AtomicUsize::new(0),
     });
     Ok(Self { inner })
@@ -165,6 +173,16 @@ impl Index {
   #[doc(hidden)]
   pub fn reader_open_count(&self) -> usize {
     self.inner.reader_opens.load(Ordering::Relaxed)
+  }
+
+  /// Number of times a `SegmentCore` was loaded from storage in this index's
+  /// lifetime. Cache hits do not increment this counter, so two
+  /// `Index::reader()` calls over a stable manifest should leave it
+  /// unchanged after the first. Used by Stage 1 regression tests to assert
+  /// segment caching is effective.
+  #[doc(hidden)]
+  pub fn segment_core_loads(&self) -> usize {
+    self.inner.segment_cache.loads()
   }
 
   pub fn compact(&self) -> Result<()> {
@@ -372,13 +390,22 @@ impl Index {
     // Open segment readers for the merge set only.
     let inner = &self.inner;
     let schema = manifest_snapshot.schema.clone();
+    // Compaction reads through the same cache as `IndexReader::open` so a
+    // segment that was just opened by a query thread isn't re-loaded from
+    // storage here. Cache misses (first time a segment is touched) still go
+    // through the full `SegmentCore::load` path.
     let readers: Vec<crate::index::segment::SegmentReader> = merge_metas
       .iter()
-      .map(|seg| {
-        crate::index::segment::SegmentReader::open(
-          inner.storage.clone(),
-          (*seg).clone(),
+      .map(|seg| -> Result<_> {
+        let core = inner.segment_cache.get_or_load(
+          seg,
           inner.options.enable_positions,
+          inner.storage.clone(),
+        )?;
+        crate::index::segment::SegmentReader::from_core(
+          core,
+          (*seg).clone(),
+          inner.storage.clone(),
         )
       })
       .collect::<Result<Vec<_>>>()?;
@@ -1006,6 +1033,324 @@ mod tests {
       result.total_hits_estimate, 13,
       "expected all 13 docs after merge, got {}",
       result.total_hits_estimate
+    );
+  }
+
+  /// Stage 1, P1 invariant: the *typical* sequential reader pattern — open
+  /// reader, serve a query, drop the reader, open another reader for the next
+  /// request — must hit the cache. The previous Weak-only cache failed this
+  /// because dropping the only reader released the last strong ref to each
+  /// `SegmentCore`, so the next open reloaded everything. The bounded-LRU
+  /// strong-ref cache fixes that.
+  #[test]
+  fn segment_cache_hits_for_sequential_non_overlapping_readers() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Three independent commits → three segments.
+    for (i, word) in ["alpha", "bravo", "charlie"].iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 3);
+
+    let baseline = idx.segment_core_loads();
+    // First reader: loads all three segments. Drop it before opening any
+    // others so the only path that keeps cores alive is the cache itself.
+    {
+      let _r1 = idx.reader().unwrap();
+    }
+    let after_first = idx.segment_core_loads();
+    assert_eq!(
+      after_first - baseline,
+      3,
+      "first reader open must load all three segments"
+    );
+
+    // Five subsequent reader opens, each dropped immediately. With strong
+    // refs in the cache these must all hit; with the prior Weak design they
+    // would each reload all three segments (3 + 3*5 = 18 total loads).
+    for _ in 0..5 {
+      let _r = idx.reader().unwrap();
+    }
+    assert_eq!(
+      idx.segment_core_loads(),
+      after_first,
+      "sequential non-overlapping reader opens must hit the cache; \
+       observed {} extra loads",
+      idx.segment_core_loads() - after_first
+    );
+
+    // Sanity: queries against a fresh reader still produce correct results.
+    let r = idx.reader().unwrap();
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": { "type": "match_all" },
+      "limit": 10,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+    let result = r.search(&req).unwrap();
+    assert_eq!(result.total_hits_estimate, 3);
+  }
+
+  /// Stage 1: a tombstone-only commit (upsert / delete) does not change any
+  /// segment's file checksums, so the cache fingerprint stays the same and a
+  /// post-commit reader reuses the original `SegmentCore`. The new
+  /// `SegmentReader` view must still pick up the new manifest's
+  /// `deleted_docs`. This test asserts both: that the core is reused (no
+  /// new load) AND that the tombstoned doc is no longer findable.
+  #[test]
+  fn segment_cache_reuses_core_on_tombstone_only_commit() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Use non-overlapping single-word bodies so a string query unambiguously
+    // matches exactly one doc.
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [("1", "alpha"), ("2", "stable")] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 1);
+
+    // Materialize the original segment core in the cache.
+    let r0 = idx.reader().unwrap();
+    let search = |reader: &crate::api::reader::IndexReader, q: &str| {
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": q.to_string(),
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      reader.search(&req).unwrap().total_hits_estimate
+    };
+    assert_eq!(search(&r0, "alpha"), 1);
+    let loads_after_first_open = idx.segment_core_loads();
+    assert_eq!(loads_after_first_open, 1);
+    drop(r0);
+
+    // Upsert: re-add doc "1" with a new body. The original segment's
+    // `deleted_docs` gains the old doc-id (manifest-only change, no segment
+    // file mutation). A new segment is written for the new doc.
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("bravo")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 2);
+
+    // Open a new reader. The original segment core must be REUSED from the
+    // cache (its file checksums are unchanged → fingerprint unchanged → key
+    // unchanged → cache hit). Only the brand-new segment should incur a
+    // fresh load. Total loads delta = 1.
+    let r1 = idx.reader().unwrap();
+    let loads_after_upsert = idx.segment_core_loads();
+    assert_eq!(
+      loads_after_upsert - loads_after_first_open,
+      1,
+      "tombstone-only commit must reuse the original SegmentCore; \
+       observed {} new loads (expected 1, for the brand-new segment only)",
+      loads_after_upsert - loads_after_first_open
+    );
+
+    // The reused core must NOT surface stale `deleted_docs`: the new view
+    // built via `SegmentReader::from_core(reused_core, new_meta, storage)`
+    // derives `deleted` from `new_meta.deleted_docs`, which contains the
+    // tombstone for the old doc.
+    assert_eq!(
+      search(&r1, "alpha"),
+      0,
+      "stale deleted_docs leak: tombstoned doc resurrected from reused core"
+    );
+    assert_eq!(
+      search(&r1, "bravo"),
+      1,
+      "new version must be visible after upsert"
+    );
+  }
+
+  /// Stage 1: an in-flight reader must keep its snapshotted `SegmentCore`s
+  /// alive even when a concurrent `compact` removes those segments from the
+  /// manifest. With strong refs in the cache, compaction-orphaned cores stay
+  /// in the cache until the LRU evicts them; in-flight reader `Arc`s also
+  /// keep the cores live. Either way the in-flight reader's queries must
+  /// continue to return correct results from its snapshot.
+  #[test]
+  fn segment_cache_survives_compaction_for_in_flight_readers() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    let words = ["alpha", "bravo", "charlie"];
+    for (i, word) in words.iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 3);
+
+    // Open a reader holding all three segments. We deliberately do not
+    // consume `pre_compact_reader` until after the compaction completes.
+    let pre_compact_reader = idx.reader().unwrap();
+
+    // Compact all three segments into one. This rewrites the manifest and
+    // calls `cleanup_segments` on the originals — but the kernel keeps the
+    // file handles `pre_compact_reader` already opened valid (Unix unlink
+    // semantics), and the in-flight reader's `Arc<SegmentCore>` keeps each
+    // core alive even if a concurrent cache miss caused an LRU eviction.
+    let seg_ids: Vec<String> = idx
+      .manifest()
+      .segments
+      .iter()
+      .map(|s| s.id.clone())
+      .collect();
+    idx.merge_segments(&seg_ids, None).unwrap();
+    assert_eq!(idx.manifest().segments.len(), 1);
+
+    // The pre-compact reader must still serve queries correctly against its
+    // own snapshot of three segments — the merge doesn't yank cores out from
+    // under it.
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": { "type": "match_all" },
+      "limit": 10,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+    let result = pre_compact_reader.search(&req).unwrap();
+    assert_eq!(
+      result.total_hits_estimate, 3,
+      "in-flight reader must see its snapshotted segments after compaction"
+    );
+
+    // A new reader opened *after* the compaction sees the merged segment.
+    drop(pre_compact_reader);
+    let post = idx.reader().unwrap();
+    let result = post.search(&req).unwrap();
+    assert_eq!(result.total_hits_estimate, 3);
+    assert_eq!(post.manifest.segments.len(), 1);
+  }
+
+  /// Stage 1: bounded LRU eviction. With a small-capacity cache and more
+  /// distinct segments than the cache can hold, the oldest entry must be
+  /// evicted on each new insert. An `Arc<SegmentCore>` cloned out of the
+  /// cache before eviction must remain usable: only the cache's own strong
+  /// ref goes away on eviction; in-flight readers' refs keep the core alive.
+  #[test]
+  fn segment_cache_lru_evicts_oldest_and_keeps_in_flight_arcs_alive() {
+    use crate::index::segment::{SegmentCache, SegmentCacheKey};
+
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+
+    // Build three independent segments. Use the index only to produce real
+    // SegmentMetas with valid checksums and on-disk files; the eviction test
+    // itself runs against a fresh small-capacity cache so we don't have to
+    // make the production cache size configurable for this stage.
+    for (i, word) in ["alpha", "bravo", "charlie"].iter().enumerate() {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(format!("doc{i}"))),
+            ("body".into(), serde_json::json!(word)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    let metas = idx.manifest().segments.clone();
+    assert_eq!(metas.len(), 3);
+
+    let cache = SegmentCache::with_capacity(2);
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+
+    // Load segment 0 and clone an Arc out of the cache so we can verify the
+    // core stays usable after it's evicted from the cache itself.
+    let core_0 = cache
+      .get_or_load(&metas[0], idx.inner.options.enable_positions, storage.clone())
+      .unwrap();
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.loads(), 1);
+
+    // Load segment 1 and segment 2. After the third insert the cache is over
+    // capacity (cap=2) and segment 0 — the LRU — must have been evicted.
+    let _core_1 = cache
+      .get_or_load(&metas[1], idx.inner.options.enable_positions, storage.clone())
+      .unwrap();
+    let _core_2 = cache
+      .get_or_load(&metas[2], idx.inner.options.enable_positions, storage.clone())
+      .unwrap();
+    assert_eq!(cache.len(), 2, "cache must respect its capacity bound");
+    assert_eq!(cache.loads(), 3, "each distinct meta must have caused one load");
+    let key_0 = SegmentCacheKey::from_meta(&metas[0]);
+    assert!(
+      !cache.contains_key(&key_0),
+      "the oldest (LRU) entry must have been evicted"
+    );
+
+    // The Arc we cloned out earlier still works: its terms / fast fields /
+    // doc table are owned by the SegmentCore, which lives until the last
+    // strong ref drops. Eviction only removed the cache's own ref.
+    assert_eq!(
+      Arc::strong_count(&core_0),
+      1,
+      "after eviction, the only remaining Arc to segment 0 is `core_0`"
+    );
+
+    // Re-requesting segment 0 now causes a fresh load (cache miss) — proving
+    // it really was evicted, not just hidden by a hash collision.
+    let loads_before = cache.loads();
+    let _core_0_again = cache
+      .get_or_load(&metas[0], idx.inner.options.enable_positions, storage.clone())
+      .unwrap();
+    assert_eq!(
+      cache.loads() - loads_before,
+      1,
+      "evicted entry must be reloaded on next request"
     );
   }
 }

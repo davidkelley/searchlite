@@ -1295,22 +1295,40 @@ struct VectorFieldReader {
   index: HnswIndex,
 }
 
-pub struct SegmentReader {
-  pub meta: SegmentMeta,
+/// Immutable, parsed-once segment data shared across `IndexReader` instances.
+///
+/// `SegmentCore` is the cacheable half of a segment: terms dictionary, fast
+/// fields, doc-id table, vectors, and segment-level metadata. Once a core is
+/// loaded for a given (segment_id, content fingerprint), it can be reused by
+/// any number of `SegmentReader` views without re-reading or re-parsing the
+/// underlying files. Per-manifest mutable state (`deleted_docs`), the
+/// resolved file paths (which may move under a future portable-manifest
+/// scheme), and per-view stateful file handles all live on `SegmentReader`,
+/// not here, so the core stays safe to share via `Arc` and survives manifest
+/// rewrites that don't change segment file content.
+pub struct SegmentCore {
+  seg_meta: SegmentFileMeta,
   terms: TinyTerms,
-  postings: RefCell<Box<dyn StorageFile>>,
-  docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
   doc_ids: Vec<Arc<str>>,
-  deleted: FastHashSet<DocId>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
-  seg_meta: SegmentFileMeta,
   #[cfg(feature = "vectors")]
   vectors: HashMap<String, VectorFieldReader>,
 }
 
-impl SegmentReader {
-  pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
+impl SegmentCore {
+  /// Load a segment's immutable data from storage. This performs the full
+  /// per-segment work that previously ran on every `SegmentReader::open`:
+  /// checksum verification, term-dict load, fast-field parse, vector load.
+  /// The returned `Arc` does not retain `storage` — view-level handles in
+  /// `SegmentReader::from_core` are opened against the manifest-current
+  /// storage, so a later manifest that relocates files (Stage 9) can still
+  /// reuse this core without serving reads through stale paths.
+  pub fn load(
+    storage: Arc<dyn Storage>,
+    meta: &SegmentMeta,
+    keep_positions: bool,
+  ) -> Result<Arc<Self>> {
     let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
     let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     #[cfg(not(feature = "zstd"))]
@@ -1320,10 +1338,8 @@ impl SegmentReader {
         meta.id
       );
     }
-    verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes)?;
+    verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes)?;
     let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
-    let postings = storage.open_read(Path::new(&meta.paths.postings))?;
-    let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
       bail!(
         "segment {} is missing document ids; reindex or re-commit documents with doc_id support",
@@ -1336,9 +1352,7 @@ impl SegmentReader {
         "warning: index uses zstd-compressed docstore, but this binary was built without the `zstd` feature; stored fields may be unavailable"
       );
     }
-    let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
     let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
-    let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
     #[cfg(feature = "vectors")]
     let mut vector_fields = HashMap::new();
     #[cfg(feature = "vectors")]
@@ -1388,39 +1402,268 @@ impl SegmentReader {
       .into_iter()
       .map(Arc::<str>::from)
       .collect();
-    Ok(Self {
-      meta,
+    // `storage` was used above for the load reads but is intentionally not
+    // retained on the core: per-view file handles are opened against the
+    // manifest-current storage in `SegmentReader::from_core`.
+    let _ = storage;
+    Ok(Arc::new(Self {
+      seg_meta,
       terms: TinyTerms(terms),
-      postings: RefCell::new(postings),
-      docstore: RefCell::new(docstore),
       doc_ids,
-      deleted,
       fast_fields,
       keep_positions,
-      seg_meta,
       #[cfg(feature = "vectors")]
       vectors: vector_fields,
+    }))
+  }
+}
+
+/// Cache key for `SegmentCore`. The fingerprint hashes `SegmentMeta.checksums`
+/// deterministically; if any underlying segment file changes, its checksum
+/// changes, so the fingerprint changes and the cache misses. The segment id
+/// stays in the key so two segments that happen to collide on fingerprint
+/// (impossible in practice for `u64`-of-content-hashes, but defended against)
+/// don't share a core.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub(crate) struct SegmentCacheKey {
+  pub id: String,
+  pub fingerprint: u64,
+}
+
+impl SegmentCacheKey {
+  pub fn from_meta(meta: &SegmentMeta) -> Self {
+    Self {
+      id: meta.id.clone(),
+      fingerprint: fingerprint_checksums(&meta.checksums),
+    }
+  }
+}
+
+fn fingerprint_checksums(checksums: &HashMap<String, u32>) -> u64 {
+  use std::collections::hash_map::DefaultHasher;
+  use std::hash::{Hash, Hasher};
+  // `HashMap` iteration order is non-deterministic, so sort first to keep the
+  // fingerprint stable across processes and runs.
+  let mut entries: Vec<(&String, &u32)> = checksums.iter().collect();
+  entries.sort_by(|a, b| a.0.cmp(b.0));
+  let mut hasher = DefaultHasher::new();
+  for (k, v) in entries {
+    k.hash(&mut hasher);
+    v.hash(&mut hasher);
+  }
+  hasher.finish()
+}
+
+/// Default capacity of the per-`InnerIndex` segment-core cache. Sized to
+/// comfortably hold every segment in any reasonable working index without
+/// touching evictions in normal operation; capacity is shared across
+/// generations so compaction churn can push older entries out before a new
+/// reader's references protect them.
+const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 1024;
+
+/// Process-wide cache of immutable `SegmentCore`s, owned by `InnerIndex`.
+///
+/// Stores `Arc<SegmentCore>` (strong refs) under a bounded-LRU policy so that
+/// the *typical* sequential reader pattern — open `IndexReader`, serve a
+/// query, drop the reader, open another reader for the next request — hits
+/// the cache instead of reloading from storage. The previous `Weak`-only
+/// design only retained cores while at least one `SegmentReader` view was
+/// alive, which collapses to a no-op for non-overlapping reader lifecycles.
+///
+/// In-flight readers hold their own `Arc<SegmentCore>` strong refs, so an
+/// LRU eviction (or a manifest rewrite that drops a segment) doesn't yank
+/// the core out from under them: the core stays alive until the last reader
+/// drops. This is the property that makes the cache safe under
+/// `Index::compact` mid-search.
+pub struct SegmentCache {
+  inner: parking_lot::Mutex<SegmentCacheInner>,
+  loads: std::sync::atomic::AtomicUsize,
+}
+
+struct SegmentCacheInner {
+  capacity: usize,
+  entries: HashMap<SegmentCacheKey, CacheEntry>,
+  next_seq: u64,
+}
+
+struct CacheEntry {
+  core: Arc<SegmentCore>,
+  /// Monotonic recency tag, bumped on every hit and on insert. The entry
+  /// with the smallest `seq` is the LRU candidate for eviction.
+  seq: u64,
+}
+
+impl Default for SegmentCache {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl SegmentCache {
+  pub fn new() -> Self {
+    Self::with_capacity(DEFAULT_SEGMENT_CACHE_CAPACITY)
+  }
+
+  pub fn with_capacity(capacity: usize) -> Self {
+    let capacity = capacity.max(1);
+    Self {
+      inner: parking_lot::Mutex::new(SegmentCacheInner {
+        capacity,
+        entries: HashMap::with_capacity(capacity),
+        next_seq: 0,
+      }),
+      loads: std::sync::atomic::AtomicUsize::new(0),
+    }
+  }
+
+  /// Get an existing core or load a fresh one. Single-flight is best-effort:
+  /// under heavy concurrent contention for the same key, two loaders may both
+  /// load the same core, and the second insertion's core (equivalent to the
+  /// first because they share a fingerprint) is dropped in favor of the
+  /// already-cached one.
+  pub fn get_or_load(
+    &self,
+    meta: &SegmentMeta,
+    keep_positions: bool,
+    storage: Arc<dyn Storage>,
+  ) -> Result<Arc<SegmentCore>> {
+    let key = SegmentCacheKey::from_meta(meta);
+    {
+      let mut inner = self.inner.lock();
+      inner.next_seq = inner.next_seq.saturating_add(1);
+      let seq = inner.next_seq;
+      if let Some(entry) = inner.entries.get_mut(&key) {
+        entry.seq = seq;
+        return Ok(entry.core.clone());
+      }
+    }
+    // Slow path: load outside the lock so concurrent misses for *different*
+    // keys aren't serialized on this load's I/O.
+    let core = SegmentCore::load(storage, meta, keep_positions)?;
+    self
+      .loads
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut inner = self.inner.lock();
+    // Re-check: a peer may have inserted while we loaded.
+    inner.next_seq = inner.next_seq.saturating_add(1);
+    let seq = inner.next_seq;
+    if let Some(entry) = inner.entries.get_mut(&key) {
+      entry.seq = seq;
+      return Ok(entry.core.clone());
+    }
+    // Evict the LRU entry if at capacity. Any in-flight reader holding an
+    // `Arc<SegmentCore>` for the evicted key keeps that core alive in memory
+    // until the reader drops; only the cache's own strong ref goes away.
+    if inner.entries.len() >= inner.capacity {
+      if let Some(victim) = inner
+        .entries
+        .iter()
+        .min_by_key(|(_, e)| e.seq)
+        .map(|(k, _)| k.clone())
+      {
+        inner.entries.remove(&victim);
+      }
+    }
+    inner.entries.insert(
+      key,
+      CacheEntry {
+        core: core.clone(),
+        seq,
+      },
+    );
+    Ok(core)
+  }
+
+  /// Number of times a core was actually loaded from storage. Cache hits do
+  /// not increment this. Used by tests to assert that segments are loaded at
+  /// most once across N reader opens for a stable manifest, and that
+  /// tombstone-only commits reuse the existing cached core.
+  pub fn loads(&self) -> usize {
+    self.loads.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  #[cfg(test)]
+  pub(crate) fn len(&self) -> usize {
+    self.inner.lock().entries.len()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn contains_key(&self, key: &SegmentCacheKey) -> bool {
+    self.inner.lock().entries.contains_key(key)
+  }
+}
+
+/// Per-`IndexReader` view over an immutable `SegmentCore`, plus the
+/// manifest-specific state (`deleted_docs`) and per-view stateful file handles
+/// for postings/docstore reads.
+///
+/// Cheap to construct: opens two file handles against the manifest-current
+/// storage and paths, derives the deleted-doc set, and clones an `Arc` to
+/// the cached core. The expensive parsing has already happened on the core.
+pub struct SegmentReader {
+  pub(crate) core: Arc<SegmentCore>,
+  pub meta: SegmentMeta,
+  deleted: FastHashSet<DocId>,
+  postings: RefCell<Box<dyn StorageFile>>,
+  docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
+}
+
+impl SegmentReader {
+  /// Build a per-manifest view over an already-loaded `SegmentCore`. Opens
+  /// fresh per-view file handles for postings and docstore against the
+  /// manifest-current `meta.paths` and `storage`, so views remain safe to
+  /// use concurrently across threads despite the `RefCell`s — and a future
+  /// portable-manifest scheme that relocates files cannot accidentally read
+  /// through stale paths cached on the core.
+  pub fn from_core(
+    core: Arc<SegmentCore>,
+    meta: SegmentMeta,
+    storage: Arc<dyn Storage>,
+  ) -> Result<Self> {
+    let postings = storage.open_read(Path::new(&meta.paths.postings))?;
+    let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
+    let docstore = DocStoreReader::new(
+      doc_file,
+      core.seg_meta.doc_offsets.clone(),
+      core.seg_meta.use_zstd,
+    );
+    let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
+    Ok(Self {
+      core,
+      meta,
+      deleted,
+      postings: RefCell::new(postings),
+      docstore: RefCell::new(docstore),
     })
   }
 
+  /// Convenience constructor that loads a fresh `SegmentCore` and immediately
+  /// builds a view from it. Bypasses any reader-side cache; callers that want
+  /// caching should go through `Index::reader()`.
+  pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
+    let core = SegmentCore::load(storage.clone(), &meta, keep_positions)?;
+    Self::from_core(core, meta, storage)
+  }
+
   pub fn postings(&self, term: &str) -> Option<PostingsReader> {
-    let offset = self.terms.0.get(term)?;
+    let offset = self.core.terms.0.get(term)?;
     let mut file = self.postings.borrow_mut();
-    PostingsReader::read_at(&mut *file, offset, self.keep_positions).ok()
+    PostingsReader::read_at(&mut *file, offset, self.core.keep_positions).ok()
   }
 
   pub fn doc_freq(&self, term: &str) -> Option<u32> {
-    let offset = self.terms.0.get(term)?;
+    let offset = self.core.terms.0.get(term)?;
     let mut file = self.postings.borrow_mut();
     read_doc_freq(&mut *file, offset).ok()
   }
 
   pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    self.terms.0.iter_prefix(prefix).map(|(term, _)| term)
+    self.core.terms.0.iter_prefix(prefix).map(|(term, _)| term)
   }
 
   pub fn avg_field_length(&self, field: &str) -> f32 {
     self
+      .core
       .seg_meta
       .avg_field_lengths
       .get(field)
@@ -1433,11 +1676,12 @@ impl SegmentReader {
   }
 
   pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {
-    self.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
+    self.core.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
   }
 
   pub fn find_doc_id(&self, id: &str) -> Option<DocId> {
     self
+      .core
       .doc_ids
       .iter()
       .position(|d| d.as_ref() == id)
@@ -1445,7 +1689,7 @@ impl SegmentReader {
   }
 
   pub fn doc_ids(&self) -> &[Arc<str>] {
-    &self.doc_ids
+    &self.core.doc_ids
   }
 
   pub fn is_deleted(&self, doc_id: DocId) -> bool {
@@ -1460,12 +1704,13 @@ impl SegmentReader {
   }
 
   pub fn fast_fields(&self) -> &FastFieldsReader {
-    &self.fast_fields
+    &self.core.fast_fields
   }
 
   #[cfg(feature = "vectors")]
   pub fn vector(&self, field: &str, doc_id: DocId) -> Option<Vec<f32>> {
     self
+      .core
       .vectors
       .get(field)
       .and_then(|vf| vf.store.vector(doc_id).map(|v| v.to_vec()))
@@ -1474,6 +1719,7 @@ impl SegmentReader {
   #[cfg(feature = "vectors")]
   pub fn vector_components(&self, field: &str) -> Option<(&HnswIndex, Arc<VectorStore>)> {
     self
+      .core
       .vectors
       .get(field)
       .map(|vf| (&vf.index, vf.store.clone()))

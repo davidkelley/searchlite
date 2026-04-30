@@ -1215,6 +1215,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       storage: storage.clone(),
+      segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: std::sync::atomic::AtomicUsize::new(0),
     });
 
@@ -1285,6 +1286,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       storage: storage.clone(),
+      segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: std::sync::atomic::AtomicUsize::new(0),
     });
 

@@ -379,10 +379,21 @@ impl IndexReader {
     let analysis = manifest.schema.build_analyzers()?;
     let mut segments = Vec::new();
     for seg in manifest.segments.iter() {
-      segments.push(SegmentReader::open(
-        inner.storage.clone(),
-        seg.clone(),
+      // Consult the per-`InnerIndex` cache for an already-loaded `SegmentCore`
+      // matching this segment's `(id, fingerprint)`. On cache hit the
+      // expensive open work (checksum verification, term-dict / fast-field
+      // parse) is skipped — we just open per-view file handles against the
+      // manifest-current paths and storage, and derive the current
+      // `deleted_docs` set from the manifest.
+      let core = inner.segment_cache.get_or_load(
+        seg,
         inner.options.enable_positions,
+        inner.storage.clone(),
+      )?;
+      segments.push(SegmentReader::from_core(
+        core,
+        seg.clone(),
+        inner.storage.clone(),
       )?);
     }
     Ok(Self {
