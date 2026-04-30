@@ -1761,4 +1761,82 @@ mod tests {
       assert_eq!(s._source, a._source);
     }
   }
+
+  /// Stage 6 expressiveness gate: an Index opened via `open_with_storage`
+  /// against a `BlobStoreAdapter` wrapping `LocalBlobStore` runs an
+  /// end-to-end write + commit + reopen + search workflow indistinguishably
+  /// from one running on `FsStorage` directly. This is the load-bearing
+  /// proof that the BlobStore trait surface (Stage 5) is expressive
+  /// enough to back everything `Storage`-shaped index code does today.
+  ///
+  /// If this test fails, Stage 5's trait surface or Stage 6's adapter is
+  /// missing something the index code depends on.
+  #[test]
+  fn index_runs_end_to_end_through_blob_store_adapter() {
+    use crate::storage::{BlobStoreAdapter, LocalBlobStore};
+
+    let dir = tempdir().unwrap();
+
+    // Build the adapter chain: index → BlobStoreAdapter → Arc<dyn BlobStore>
+    // → LocalBlobStore → tempdir. The same path is shared as the
+    // adapter's "root" and the LocalBlobStore's root so resolved keys
+    // line up the way the index code expects.
+    let blob: Arc<dyn crate::storage::BlobStore> =
+      Arc::new(LocalBlobStore::new(dir.path().to_path_buf()));
+    let adapter: Arc<dyn Storage> =
+      Arc::new(BlobStoreAdapter::new(blob, dir.path().to_path_buf()));
+
+    let schema = Schema::default_text_body();
+    let idx = Index::create_with_storage(dir.path(), schema, opts(dir.path()), adapter.clone())
+      .unwrap();
+
+    // Two commits in two separate segments to exercise multi-segment
+    // reader open through the adapter as well.
+    for (id, body) in [("1", "alpha"), ("2", "bravo charlie"), ("3", "charlie")] {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!(id)),
+            ("body".into(), serde_json::json!(body)),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+    assert_eq!(idx.manifest().segments.len(), 3);
+
+    // Search through the adapter-backed index.
+    let reader = idx.reader().unwrap();
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": "charlie",
+      "limit": 10,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+    let result = reader.search(&req).unwrap();
+    assert_eq!(
+      result.total_hits_estimate, 2,
+      "search through BlobStoreAdapter must return correct results"
+    );
+
+    // Drop the index and reopen it via the same adapter chain. This
+    // exercises manifest read, segment open, and segment-cache rebuild
+    // through the BlobStore-only path.
+    drop(reader);
+    drop(idx);
+    let mut reopen_opts = opts(dir.path());
+    reopen_opts.create_if_missing = false;
+    let reopened =
+      Index::open_with_storage(reopen_opts, adapter).unwrap();
+    let reader = reopened.reader().unwrap();
+    let result = reader.search(&req).unwrap();
+    assert_eq!(
+      result.total_hits_estimate, 2,
+      "search after reopen-through-adapter must return correct results"
+    );
+    assert_eq!(reopened.manifest().segments.len(), 3);
+  }
 }

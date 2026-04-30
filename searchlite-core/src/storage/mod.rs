@@ -10,10 +10,23 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 pub mod blob;
+// LocalBlobStore and the adapter pull in local-FS-specific deps (fs2 for
+// per-key flock CAS, futures::executor for the sync→async bridge). Both
+// are native-only conveniences; wasm32 builds get the trait/type surface
+// from `blob.rs` and would supply their own backend (e.g. via Stage 9's
+// S3-over-fetch impl, or a direct OPFS/IndexedDB BlobStore).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod blob_adapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod local_blob;
 pub use blob::{
   ArtifactIdentity, BlobStore, Capabilities, ContentHash, Object, ObjectStat, ObjectWriter,
   ProviderChecksum, PutIfMatchError,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use blob_adapter::BlobStoreAdapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use local_blob::LocalBlobStore;
 
 pub trait StorageFile: Read + Write + Seek + Send {
   fn set_len(&mut self, len: u64) -> Result<()>;
