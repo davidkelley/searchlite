@@ -165,6 +165,19 @@ impl Index {
     Ok(reader)
   }
 
+  /// Async surface for `reader()`. In Stage 4 the body is the same sync work
+  /// behind an `async fn`; the future has no internal `.await` points and
+  /// resolves on first poll. Stage 8 replaces this body with real async I/O
+  /// against `BlobStore`, at which point callers in async contexts (Workers,
+  /// future migrations of `searchlite-http`) get genuine non-blocking opens.
+  ///
+  /// Sync callers should keep using `reader()` directly — wrapping this
+  /// future in `block_on` from inside an active Tokio runtime panics, and
+  /// today's body has no async work to begin with.
+  pub async fn reader_async(&self) -> Result<crate::api::reader::IndexReader> {
+    self.reader()
+  }
+
   /// Number of successful `reader()` calls issued against this `Index`.
   ///
   /// Exposed as an observability hook so reader-reuse behavior (e.g. the
@@ -1599,5 +1612,153 @@ mod tests {
        observed {} firings",
       counter.load(Ordering::SeqCst)
     );
+  }
+
+  /// Stage 4 helper: drive a `Future` to completion without depending on any
+  /// async runtime. The Stage 4 contract is that `*_async` futures contain
+  /// no internal `.await` points and resolve on first poll, so a noop waker
+  /// is sufficient. If a future ever returns `Pending` here, that signals
+  /// Stage 4's contract has been broken (something inside the async body
+  /// started awaiting real I/O before its stage was meant to).
+  fn block_on_immediate<F: std::future::Future>(fut: F) -> F::Output {
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Noop;
+    impl Wake for Noop {
+      fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+      Poll::Ready(out) => out,
+      Poll::Pending => panic!(
+        "Stage 4 *_async future returned Pending; bodies should be sync work \
+         until Stage 8 introduces real async I/O"
+      ),
+    }
+  }
+
+  /// Stage 4: `Index::reader_async` produces a future that resolves to the
+  /// same `IndexReader` as `Index::reader`, and bumps `reader_open_count`
+  /// the same way (so observability hooks behave identically). On Stage 4
+  /// the future is required to resolve on first poll, which `block_on_
+  /// immediate` enforces.
+  #[test]
+  fn reader_async_resolves_immediately_and_matches_sync() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+    }
+
+    let baseline = idx.reader_open_count();
+    let _r_sync = idx.reader().unwrap();
+    let after_sync = idx.reader_open_count();
+    assert_eq!(after_sync - baseline, 1);
+
+    let _r_async = block_on_immediate(idx.reader_async()).unwrap();
+    assert_eq!(
+      idx.reader_open_count() - after_sync,
+      1,
+      "reader_async must bump reader_open_count exactly the same way as reader()"
+    );
+  }
+
+  /// Stage 4: `IndexReader::search_async` produces results identical to
+  /// `IndexReader::search` for the same request. This locks in the API
+  /// shape so Stage 8's body change (async BlobStore reads) has a clear
+  /// equivalence target.
+  #[test]
+  fn search_async_returns_identical_results_to_sync() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [("1", "alpha"), ("2", "alpha bravo"), ("3", "bravo")] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+      "query": "alpha",
+      "limit": 10,
+      "track_total_hits": true,
+    }))
+    .unwrap();
+
+    let sync_result = reader.search(&req).unwrap();
+    let async_result = block_on_immediate(reader.search_async(&req)).unwrap();
+    assert_eq!(sync_result.total_hits_estimate, async_result.total_hits_estimate);
+    assert_eq!(sync_result.hits.len(), async_result.hits.len());
+    for (sync_hit, async_hit) in sync_result.hits.iter().zip(async_result.hits.iter()) {
+      assert_eq!(sync_hit.doc_id, async_hit.doc_id);
+      assert!(
+        (sync_hit.score - async_hit.score).abs() < f32::EPSILON,
+        "search_async score must match search score for the same request"
+      );
+    }
+  }
+
+  /// Stage 4: `IndexReader::mget_async` produces results identical to
+  /// `IndexReader::mget` for the same id list and `return_stored` flag.
+  #[test]
+  fn mget_async_returns_identical_results_to_sync() {
+    let dir = tempdir().unwrap();
+    let schema = Schema::default_text_body();
+    let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+    {
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [("1", "alpha"), ("2", "bravo"), ("3", "charlie")] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+    }
+    let reader = idx.reader().unwrap();
+    let ids = vec!["1".to_string(), "2".to_string(), "missing".to_string()];
+
+    let sync_result = reader.mget(&ids, true).unwrap();
+    let async_result = block_on_immediate(reader.mget_async(&ids, true)).unwrap();
+    assert_eq!(sync_result.len(), async_result.len());
+    for (s, a) in sync_result.iter().zip(async_result.iter()) {
+      assert_eq!(s.doc_id, a.doc_id);
+      assert_eq!(s.found, a.found);
+      assert_eq!(s._source, a._source);
+    }
   }
 }

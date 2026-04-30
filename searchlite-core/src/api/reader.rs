@@ -1137,6 +1137,20 @@ impl IndexReader {
     Ok(heap.into_iter().collect())
   }
 
+  /// Async surface for `search`. Stage 4 establishes the API shape; the body
+  /// is the same sync work behind an `async fn`, so the future has no
+  /// internal `.await` points and resolves on first poll. Stage 8 replaces
+  /// this body with `BlobStore::get_range`-driven postings/docstore reads,
+  /// at which point async callers get genuine non-blocking I/O.
+  ///
+  /// Sync callers should keep using `search()` directly — Stage 4 does not
+  /// install a sync→async bridge because HTTP and other current callers
+  /// already use `tokio::task::spawn_blocking(... reader.search(...))`,
+  /// which is incompatible with `block_on` inside an active runtime.
+  pub async fn search_async(&self, req: &SearchRequest) -> Result<SearchResult> {
+    self.search(req)
+  }
+
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
@@ -1657,6 +1671,18 @@ impl IndexReader {
         None
       },
     })
+  }
+
+  /// Async surface for `mget`. See `search_async` for the Stage 4 contract:
+  /// the body is sync work behind an `async fn`, future resolves on first
+  /// poll, Stage 8 replaces the body with `BlobStore::get_range`-driven
+  /// docstore reads.
+  pub async fn mget_async(
+    &self,
+    ids: &[String],
+    return_stored: bool,
+  ) -> Result<Vec<MgetDoc>> {
+    self.mget(ids, return_stored)
   }
 
   pub fn mget(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
