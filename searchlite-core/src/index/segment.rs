@@ -25,7 +25,7 @@ use crate::index::fastfields::{
   FastValue,
 };
 use crate::index::manifest::{
-  FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
+  FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta,
 };
 use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
@@ -645,7 +645,15 @@ impl<'a> SegmentWriter<'a> {
     I: IntoIterator<Item = Result<Cow<'doc, Document>>>,
   {
     let id = Uuid::new_v4().simple().to_string();
+    // Stage 9a: `paths` carries relative-to-root keys for the manifest;
+    // `resolved_paths` is the per-call absolute path bundle for actual
+    // file I/O. The `Storage` trait expects absolute paths (FsStorage
+    // doesn't auto-resolve), so we resolve here once and use
+    // `resolved_paths.X` below. (Named `resolved_paths` rather than
+    // `resolved` to avoid shadowing the schema-resolved-fields map a
+    // few lines down.)
     let paths = directory::segment_paths(self.root, &id);
+    let resolved_paths = paths.resolve(self.root);
     let analyzers = self.schema.build_analyzers()?;
 
     let mut postings_builder = InvertedIndexBuilder::new();
@@ -668,7 +676,7 @@ impl<'a> SegmentWriter<'a> {
       .map(|f| (f.path.as_str(), (f.numeric_i64.unwrap_or(false), f.fast)))
       .collect();
 
-    let mut docstore_file = self.storage.open_write(Path::new(&paths.docstore))?;
+    let mut docstore_file = self.storage.open_write(&resolved_paths.docstore)?;
     let mut doc_writer = DocStoreWriter::new(&mut *docstore_file, self.use_zstd);
 
     #[cfg(feature = "vectors")]
@@ -874,7 +882,7 @@ impl<'a> SegmentWriter<'a> {
     docstore_file.sync_all()?;
     drop(docstore_file);
 
-    let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
+    let mut postings_file = self.storage.open_write(&resolved_paths.postings)?;
     let mut postings_writer = PostingsWriter::new(&mut *postings_file, self.enable_positions);
     let mut term_offsets = Vec::new();
     for (term, postings) in postings_builder.into_terms() {
@@ -883,24 +891,20 @@ impl<'a> SegmentWriter<'a> {
     }
     postings_file.sync_all()?;
 
-    write_terms(
-      self.storage.as_ref(),
-      Path::new(&paths.terms),
-      &term_offsets,
-    )?;
+    write_terms(self.storage.as_ref(), &resolved_paths.terms, &term_offsets)?;
 
     let total_docs = doc_ids.len();
     let avg_field_lengths = compute_avg_lengths(&total_doc_lengths, total_docs as u64);
 
-    fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
+    fast_writer.write_to(self.storage.as_ref(), &resolved_paths.fast)?;
 
     #[cfg(feature = "vectors")]
     let mut vector_meta: HashMap<String, VectorFieldMeta> = HashMap::new();
     #[cfg(feature = "vectors")]
     {
       if !self.schema.vector_fields.is_empty() {
-        if let Some(dir) = paths.vector_dir.as_deref() {
-          self.storage.ensure_dir(Path::new(dir))?;
+        if let Some(dir) = resolved_paths.vector_dir.as_deref() {
+          self.storage.ensure_dir(dir)?;
         }
       }
       for vf in self.schema.vector_fields.iter() {
@@ -911,7 +915,7 @@ impl<'a> SegmentWriter<'a> {
           bail!("vector field {} missing values", vf.name);
         }
         let (store, present) = build_vector_store(vf, &field_vectors)?;
-        let (vec_path, hnsw_path) = vector_paths(&paths, &vf.name)?;
+        let (vec_path, hnsw_path) = vector_paths(&resolved_paths, &vf.name)?;
         write_vector_file(self.storage.as_ref(), &vec_path, &store)?;
         let params = vf.hnsw.unwrap_or_default();
         let store_arc = Arc::new(store);
@@ -952,19 +956,15 @@ impl<'a> SegmentWriter<'a> {
         .as_ref()
         .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
     };
-    write_segment_meta(
-      self.storage.as_ref(),
-      Path::new(&paths.meta),
-      &seg_file_meta,
-    )?;
+    write_segment_meta(self.storage.as_ref(), &resolved_paths.meta, &seg_file_meta)?;
 
     #[cfg(feature = "vectors")]
-    let mut checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    let mut checksums = collect_checksums(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(not(feature = "vectors"))]
-    let checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    let checksums = collect_checksums(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(feature = "vectors")]
     for (field, _meta) in vector_meta.iter() {
-      let (vec_path, hnsw_path) = vector_paths(&paths, field)?;
+      let (vec_path, hnsw_path) = vector_paths(&resolved_paths, field)?;
       let vec_buf = self.storage.read_to_end(&vec_path)?;
       let hnsw_buf = self.storage.read_to_end(&hnsw_path)?;
       checksums.insert(format!("vector_{field}_bin"), checksum(&vec_buf));
@@ -1020,14 +1020,13 @@ const VECTOR_FILE_VERSION: u32 = 1;
 
 #[cfg(feature = "vectors")]
 fn vector_paths(
-  paths: &SegmentPaths,
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
   field: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-  let dir = paths
+  let base = resolved
     .vector_dir
     .as_deref()
     .ok_or_else(|| anyhow!("segment missing vector directory path"))?;
-  let base = Path::new(dir);
   Ok((
     base.join(format!("{field}.bin")),
     base.join(format!("{field}.hnsw")),
@@ -1193,26 +1192,35 @@ fn read_vector_file(
   Ok(VectorStore::new(dim, metric, offsets, values))
 }
 
-fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
+/// Stage 9a: takes a [`ResolvedSegmentPaths`] (per-call resolution
+/// against the index root) so this works regardless of whether the
+/// manifest's `SegmentPaths` are v1 absolute or v2 relative keys.
+fn collect_checksums(
+  storage: &dyn Storage,
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
+) -> Result<HashMap<String, u32>> {
   let mut map = HashMap::new();
-  for (name, path_str) in [
-    ("terms", &paths.terms),
-    ("postings", &paths.postings),
-    ("docstore", &paths.docstore),
-    ("fast", &paths.fast),
-    ("meta", &paths.meta),
+  for (name, p) in [
+    ("terms", &resolved.terms),
+    ("postings", &resolved.postings),
+    ("docstore", &resolved.docstore),
+    ("fast", &resolved.fast),
+    ("meta", &resolved.meta),
   ] {
-    let buf = storage.read_to_end(Path::new(path_str))?;
+    let buf = storage.read_to_end(p)?;
     map.insert(name.to_string(), checksum(&buf));
   }
   Ok(map)
 }
 
+/// Stage 9a: takes a [`ResolvedSegmentPaths`] for the same reason as
+/// [`collect_checksums`].
 fn verify_checksums(
   storage: &dyn Storage,
   meta: &SegmentMeta,
   _seg_meta: &SegmentFileMeta,
   seg_meta_bytes: &[u8],
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
 ) -> Result<()> {
   let verify = |label: &str, path: &Path, expected: Option<&u32>, data: Option<&[u8]>| {
     if let Some(expected) = expected {
@@ -1235,54 +1243,47 @@ fn verify_checksums(
   };
   verify(
     "meta",
-    Path::new(&meta.paths.meta),
+    &resolved.meta,
     meta.checksums.get("meta"),
     Some(seg_meta_bytes),
   )?;
-  verify(
-    "terms",
-    Path::new(&meta.paths.terms),
-    meta.checksums.get("terms"),
-    None,
-  )?;
+  verify("terms", &resolved.terms, meta.checksums.get("terms"), None)?;
   verify(
     "postings",
-    Path::new(&meta.paths.postings),
+    &resolved.postings,
     meta.checksums.get("postings"),
     None,
   )?;
   verify(
     "docstore",
-    Path::new(&meta.paths.docstore),
+    &resolved.docstore,
     meta.checksums.get("docstore"),
     None,
   )?;
   verify(
     "fast fields",
-    Path::new(&meta.paths.fast),
+    &resolved.fast,
     meta.checksums.get("fast"),
     None,
   )?;
   #[cfg(feature = "vectors")]
   {
     let seg_meta = _seg_meta;
-    if let Some(dir) = meta.paths.vector_dir.as_deref() {
-      if !dir.is_empty() {
-        for field in seg_meta.vector_fields.keys() {
-          let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
-          verify(
-            &format!("vector {field} bin"),
-            &vec_path,
-            meta.checksums.get(&format!("vector_{field}_bin")),
-            None,
-          )?;
-          verify(
-            &format!("vector {field} hnsw"),
-            &hnsw_path,
-            meta.checksums.get(&format!("vector_{field}_hnsw")),
-            None,
-          )?;
-        }
+    if resolved.vector_dir.is_some() {
+      for field in seg_meta.vector_fields.keys() {
+        let (vec_path, hnsw_path) = vector_paths(resolved, field)?;
+        verify(
+          &format!("vector {field} bin"),
+          &vec_path,
+          meta.checksums.get(&format!("vector_{field}_bin")),
+          None,
+        )?;
+        verify(
+          &format!("vector {field} hnsw"),
+          &hnsw_path,
+          meta.checksums.get(&format!("vector_{field}_hnsw")),
+          None,
+        )?;
       }
     }
   }
@@ -1370,7 +1371,12 @@ impl SegmentCore {
     meta: &SegmentMeta,
     ctx: &SegmentLoadCtx,
   ) -> Result<Arc<Self>> {
-    let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
+    // Stage 9a: resolve segment paths once, against the storage root,
+    // and use the resolved bundle everywhere below. This works for v1
+    // (absolute keys passed through unchanged) and v2 (relative keys
+    // joined with the storage root).
+    let resolved = meta.paths.resolve(storage.root());
+    let seg_meta_bytes = storage.read_to_end(&resolved.meta)?;
     let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     #[cfg(not(feature = "zstd"))]
     if seg_meta.use_zstd {
@@ -1381,7 +1387,7 @@ impl SegmentCore {
     }
     match ctx.checksum_policy {
       ChecksumPolicy::Strict => {
-        verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes)?;
+        verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes, &resolved)?;
       }
       ChecksumPolicy::TrustManifest => {
         // Manifest is the trust anchor. No whole-file reads beyond what
@@ -1402,7 +1408,7 @@ impl SegmentCore {
         );
       }
     }
-    let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
+    let terms = read_terms(storage.as_ref(), &resolved.terms)?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
       bail!(
         "segment {} is missing document ids; reindex or re-commit documents with doc_id support",
@@ -1415,13 +1421,13 @@ impl SegmentCore {
         "warning: index uses zstd-compressed docstore, but this binary was built without the `zstd` feature; stored fields may be unavailable"
       );
     }
-    let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
+    let fast_fields = FastFieldsReader::open(storage.as_ref(), &resolved.fast)?;
     #[cfg(feature = "vectors")]
     let mut vector_fields = HashMap::new();
     #[cfg(feature = "vectors")]
     {
       for (field, vmeta) in seg_meta.vector_fields.iter() {
-        let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
+        let (vec_path, hnsw_path) = vector_paths(&resolved, field)?;
         let expected_metric: ApiVectorMetric = vmeta.metric.clone().into();
         let store = read_vector_file(
           storage.as_ref(),
@@ -1500,8 +1506,9 @@ fn verify_cached_core(
   // the live meta-file bytes against the manifest's recorded checksum;
   // this catches the "external mutation invalidated the meta file"
   // case as well as the postings/docstore/fast/terms cases.
-  let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
-  verify_checksums(storage, meta, &core.seg_meta, &seg_meta_bytes)
+  let resolved = meta.paths.resolve(storage.root());
+  let seg_meta_bytes = storage.read_to_end(&resolved.meta)?;
+  verify_checksums(storage, meta, &core.seg_meta, &seg_meta_bytes, &resolved)
 }
 
 /// Background checksum audit dispatched by `ChecksumPolicy::Audit`. Runs on
@@ -1522,7 +1529,10 @@ fn dispatch_checksum_audit(
 ) {
   rayon::spawn(move || {
     let segment_id = meta.id.clone();
-    if let Err(err) = verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes) {
+    let resolved = meta.paths.resolve(storage.root());
+    if let Err(err) =
+      verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes, &resolved)
+    {
       match audit_hook {
         Some(hook) => hook.invoke(&segment_id, &err),
         None => log::error!("checksum audit failed for segment {segment_id}: {err:#}"),
@@ -1774,13 +1784,19 @@ impl SegmentReader {
   /// Build a per-manifest view over an already-loaded `SegmentCore`.
   /// Opens fresh per-view handles against the manifest-current
   /// `meta.paths`: postings and docstore both via `BlobStore::open`
-  /// (Stages 8a + 8b). `Storage` is no longer needed here — both hot
-  /// reads now flow through `BlobStore`.
+  /// (Stages 8a + 8b).
+  ///
+  /// Stage 9a: `root` is the index root used to resolve v2 relative
+  /// segment keys to concrete `BlobStore` keys. v1 absolute paths are
+  /// passed through unchanged. `Storage` is not threaded through —
+  /// both hot reads now flow through `BlobStore`.
   pub fn from_core(
     core: Arc<SegmentCore>,
     meta: SegmentMeta,
     blob_store: Arc<dyn BlobStore>,
+    root: &Path,
   ) -> Result<Self> {
+    let resolved = meta.paths.resolve(root);
     // Stage 8a: postings is opened as an `Object` so `postings()` and
     // `doc_freq()` can issue bounded `read_range` calls using
     // `TinyFst::range_for`. We use `block_on` to bridge the
@@ -1788,18 +1804,14 @@ impl SegmentReader {
     // this is a transitional bridge documented in the module-level
     // comment of `storage_as_blob.rs` — Stage 8/9 may push async up
     // the call stack, but Stage 8a keeps the read path sync.
-    let postings = futures::executor::block_on(
-      blob_store.open(Path::new(&meta.paths.postings)),
-    )?;
+    let postings = futures::executor::block_on(blob_store.open(&resolved.postings))?;
     let postings_len = postings.stat().len;
 
     // Stage 8b: docstore now uses the same Object shape. `get_doc`
     // computes the per-doc byte range from the offsets table cached
     // in `SegmentCore::seg_meta.doc_offsets` and issues exactly one
     // `Object::read_range` per fetch.
-    let docstore = futures::executor::block_on(
-      blob_store.open(Path::new(&meta.paths.docstore)),
-    )?;
+    let docstore = futures::executor::block_on(blob_store.open(&resolved.docstore))?;
     let docstore_len = docstore.stat().len;
 
     let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
@@ -1823,8 +1835,9 @@ impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let ctx = SegmentLoadCtx::strict(keep_positions);
     let core = SegmentCore::load(storage.clone(), &meta, &ctx)?;
+    let root = storage.root().to_path_buf();
     let blob_store: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage));
-    Self::from_core(core, meta, blob_store)
+    Self::from_core(core, meta, blob_store, &root)
   }
 
   /// Stage 8a: bounded postings range read.
@@ -2160,7 +2173,11 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_fields: HashMap::new(),
     };
-    std::fs::write(&paths.meta, serde_json::to_vec(&seg_file_meta).unwrap()).unwrap();
+    std::fs::write(
+      dir.path().join(&paths.meta),
+      serde_json::to_vec(&seg_file_meta).unwrap(),
+    )
+    .unwrap();
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
     let meta = crate::index::manifest::SegmentMeta {
       id: "zstd".into(),
@@ -2555,7 +2572,7 @@ mod tests {
       .unwrap();
 
     let reader = SegmentReader::open(storage.clone(), meta.clone(), true).unwrap();
-    let postings_path = std::path::PathBuf::from(&meta.paths.postings);
+    let postings_path = dir.path().join(&meta.paths.postings);
     let postings_len = std::fs::metadata(&postings_path).unwrap().len();
     assert!(
       postings_len > 0,

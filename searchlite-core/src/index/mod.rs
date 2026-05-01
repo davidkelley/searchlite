@@ -270,10 +270,11 @@ impl Index {
       })
       .collect::<Result<Vec<_>>>()?;
     for seg in manifest_snapshot.segments.iter() {
+      let resolved = seg.paths.resolve(self.inner.storage.root());
       let bytes = self
         .inner
         .storage
-        .read_to_end(Path::new(&seg.paths.meta))
+        .read_to_end(&resolved.meta)
         .map_err(|e| anyhow!("failed to read segment meta {}: {e}", seg.id))?;
       let seg_meta: crate::index::segment::SegmentFileMeta = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow!("failed to parse segment meta {}: {e}", seg.id))?;
@@ -347,6 +348,14 @@ impl Index {
     let new_seg = writer.write_segment_from_iter(docs, generation)?;
     manifest_guard.segments = vec![new_seg];
     manifest_guard.committed_at = Utc::now().to_rfc3339();
+    // Stage 9a v3 [P2] (Codex review): if the in-memory manifest was
+    // loaded as legacy v1, upgrade it before publish — `Manifest::store`
+    // (via `serialize_for_write`) refuses to write below the latest
+    // version. Without this, compact on a legacy index would fail
+    // instead of upgrading the manifest to v2.
+    manifest_guard
+      .upgrade_to_latest(&inner.path)
+      .context("upgrading manifest to latest version before compact publish")?;
     manifest_guard.store(
       inner.storage.as_ref(),
       &Manifest::manifest_path(&inner.path),
@@ -414,10 +423,11 @@ impl Index {
       })
       .collect::<Result<Vec<_>>>()?;
     for seg in merge_metas.iter() {
+      let resolved = seg.paths.resolve(self.inner.storage.root());
       let bytes = self
         .inner
         .storage
-        .read_to_end(Path::new(&seg.paths.meta))
+        .read_to_end(&resolved.meta)
         .map_err(|e| anyhow!("failed to read segment meta {}: {e}", seg.id))?;
       let seg_meta: crate::index::segment::SegmentFileMeta = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow!("failed to parse segment meta {}: {e}", seg.id))?;
@@ -468,6 +478,7 @@ impl Index {
           core,
           (*seg).clone(),
           inner.blob_store.clone(),
+          inner.storage.root(),
         )
       })
       .collect::<Result<Vec<_>>>()?;
@@ -525,6 +536,13 @@ impl Index {
       .collect();
     manifest_guard.segments.push(new_seg);
     manifest_guard.committed_at = Utc::now().to_rfc3339();
+    // Stage 9a v3 [P2] (Codex review): same upgrade-before-store dance
+    // as `compact` — without this, `merge_segments` against a legacy
+    // v1 index would fail at `store()` since `serialize_for_write`
+    // refuses to write a v1 manifest.
+    manifest_guard
+      .upgrade_to_latest(&inner.path)
+      .context("upgrading manifest to latest version before merge_segments publish")?;
     manifest_guard.store(
       inner.storage.as_ref(),
       &Manifest::manifest_path(&inner.path),
@@ -616,8 +634,26 @@ fn reconcile_pending_manifest(
     let pending_data = storage
       .read_to_end(&pending_path)
       .with_context(|| format!("reading staged manifest at {pending_path:?}"))?;
+    // Stage 9a v3 [P1] (Codex review): legacy v1 `.pending` files
+    // produced by pre-Stage-9 builds are still valid recovery state
+    // (the WAL fence is durable; the pending bytes describe a
+    // committed batch). Upgrade them to v2 before validating, rather
+    // than rejecting them outright — a rejection here would leave the
+    // pending file in place and block recovery on the next open.
+    //
+    // The same `serialize_for_write` validator is applied **after**
+    // the upgrade so a malformed pending file (e.g. v2 with absolute
+    // paths) still gets rejected.
+    let mut pending_manifest: Manifest = serde_json::from_slice(&pending_data)
+      .with_context(|| format!("parsing staged manifest at {pending_path:?}"))?;
+    pending_manifest
+      .upgrade_to_latest(root)
+      .with_context(|| format!("upgrading staged manifest at {pending_path:?}"))?;
+    let validated = pending_manifest
+      .serialize_for_write()
+      .with_context(|| format!("validating staged manifest at {pending_path:?}"))?;
     storage
-      .atomic_write(manifest_path, &pending_data)
+      .atomic_write(manifest_path, &validated)
       .with_context(|| format!("promoting staged manifest to {manifest_path:?}"))?;
   }
   // Best-effort cleanup of the staging file in either branch.
@@ -630,18 +666,19 @@ pub(crate) fn cleanup_segments(
   segments: &[crate::index::manifest::SegmentMeta],
 ) -> Result<()> {
   for seg in segments {
+    let resolved = seg.paths.resolve(storage.root());
     for path in [
-      &seg.paths.terms,
-      &seg.paths.postings,
-      &seg.paths.docstore,
-      &seg.paths.fast,
-      &seg.paths.meta,
+      &resolved.terms,
+      &resolved.postings,
+      &resolved.docstore,
+      &resolved.fast,
+      &resolved.meta,
     ] {
-      let _ = storage.remove(Path::new(path));
+      let _ = storage.remove(path);
     }
     #[cfg(feature = "vectors")]
-    if let Some(dir) = seg.paths.vector_dir.as_ref() {
-      let _ = storage.remove_dir_all(Path::new(dir));
+    if let Some(dir) = resolved.vector_dir.as_ref() {
+      let _ = storage.remove_dir_all(dir);
     }
   }
   Ok(())
@@ -839,7 +876,7 @@ mod tests {
     // Ensure segment metadata contains a binding written at commit time.
     let manifest = idx.manifest();
     let seg = &manifest.segments[0];
-    let seg_meta_bytes = std::fs::read(&seg.paths.meta).unwrap();
+    let seg_meta_bytes = std::fs::read(dir.path().join(&seg.paths.meta)).unwrap();
     let seg_meta: crate::index::segment::SegmentFileMeta =
       serde_json::from_slice(&seg_meta_bytes).unwrap();
     assert!(
@@ -876,8 +913,8 @@ mod tests {
     let manifest_snapshot = idx_tampered.manifest();
     let mut seg_bindings = Vec::new();
     for seg in manifest_snapshot.segments.iter() {
-      let bytes =
-        std::fs::read(&seg.paths.meta).expect("segment meta readable for tampered manifest");
+      let bytes = std::fs::read(dir.path().join(&seg.paths.meta))
+        .expect("segment meta readable for tampered manifest");
       let seg_meta: crate::index::segment::SegmentFileMeta =
         serde_json::from_slice(&bytes).expect("parse segment meta");
       if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
@@ -1458,8 +1495,9 @@ mod tests {
       })
       .unwrap();
     writer.commit().unwrap();
-    let postings_path =
-      std::path::PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+    // Stage 9a: paths in v2 manifests are relative-to-root keys.
+    // Resolve against the test dir to recover an absolute path.
+    let postings_path = dir.join(&idx.manifest().segments[0].paths.postings);
     (idx, postings_path)
   }
 
@@ -2131,7 +2169,9 @@ mod tests {
         .unwrap();
       writer.commit().unwrap();
 
-      let postings_path = PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+      let postings_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.postings);
 
       // Snapshot the log AFTER the index is built (writes may have
       // their own range reads) so we measure only the search phase.
@@ -2202,7 +2242,7 @@ mod tests {
       writer.commit().unwrap();
 
       let segment = &idx.manifest().segments[0];
-      let postings_path = PathBuf::from(segment.paths.postings.clone());
+      let postings_path = dir.path().join(&segment.paths.postings);
       let postings_total_len = std::fs::metadata(&postings_path).unwrap().len();
       assert!(
         postings_total_len > 100,
@@ -2357,7 +2397,9 @@ mod tests {
         })
         .unwrap();
       writer.commit().unwrap();
-      let postings_path = PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+      let postings_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.postings);
 
       // Snapshot the call count so write-side reads don't pollute the
       // read-side measurement.
@@ -2426,7 +2468,9 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+      let docstore_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2475,7 +2519,9 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+      let docstore_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2531,7 +2577,9 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+      let docstore_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2592,7 +2640,7 @@ mod tests {
       }
       writer.commit().unwrap();
       let segment = &idx.manifest().segments[0];
-      let docstore_path = PathBuf::from(segment.paths.docstore.clone());
+      let docstore_path = dir.path().join(&segment.paths.docstore);
       let docstore_total_len = std::fs::metadata(&docstore_path).unwrap().len();
 
       let before = log.lock().unwrap().len();
@@ -2609,7 +2657,7 @@ mod tests {
 
       // Recover the offset table from the segment's *.meta.json
       // (the same file `SegmentCore::load` parses).
-      let seg_meta_bytes = std::fs::read(&segment.paths.meta).unwrap();
+      let seg_meta_bytes = std::fs::read(dir.path().join(&segment.paths.meta)).unwrap();
       let seg_meta: crate::index::segment::SegmentFileMeta =
         serde_json::from_slice(&seg_meta_bytes).unwrap();
       let offsets = seg_meta.doc_offsets;
@@ -2703,7 +2751,9 @@ mod tests {
         .as_str()
         .expect("manifest segment[0].paths.docstore present")
         .to_string();
-      let docstore_path = PathBuf::from(&docstore_str);
+      // Stage 9a: v2 manifests record relative keys, so resolve
+      // against the test dir to get the on-disk path.
+      let docstore_path = dir.path().join(&docstore_str);
 
       // Phase 2: sparsely extend the docstore so `docstore_len` at
       // next open exceeds `MAX_DOCSTORE_BYTES + 4`. `set_len` extends
@@ -2788,7 +2838,9 @@ mod tests {
         })
         .unwrap();
       writer.commit().unwrap();
-      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+      let docstore_path = dir
+        .path()
+        .join(&idx.manifest().segments[0].paths.docstore);
       drop(idx);
 
       // Append junk so docstore_len at next open exceeds the actual
@@ -2821,6 +2873,1047 @@ mod tests {
         msg.contains("length mismatch") || msg.contains("offset table") || msg.contains("corrupt"),
         "expected corruption error mentioning length mismatch / offset table / corrupt; got: {msg}"
       );
+    }
+  }
+
+  /// Stage 9a regression suite — portable manifest format. The
+  /// invariant is: v2 manifests record only relative-to-root segment
+  /// keys (no absolute paths, no `..`), so an index can be physically
+  /// moved to a new root and reopened without rewriting the manifest.
+  /// v1 manifests with absolute paths are still accepted in-place
+  /// (back-compat for existing on-disk indexes).
+  mod stage9a_portable_manifest {
+    use super::*;
+    use crate::index::manifest::{Manifest, MANIFEST_LATEST_VERSION};
+
+    /// Stage 9a: a freshly-committed manifest must be `version: 2`
+    /// and must record relative-to-root segment keys.
+    #[test]
+    fn fresh_commits_emit_v2_manifest_with_relative_keys() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+
+      let manifest = idx.manifest();
+      assert_eq!(manifest.version, MANIFEST_LATEST_VERSION);
+      assert_eq!(manifest.segments.len(), 1);
+      let seg = &manifest.segments[0];
+      // Each key is the bare filename, no embedded root.
+      assert_eq!(seg.paths.terms, format!("seg_{}.terms", seg.id));
+      assert_eq!(seg.paths.postings, format!("seg_{}.post", seg.id));
+      assert_eq!(seg.paths.docstore, format!("seg_{}.docs", seg.id));
+      assert_eq!(seg.paths.fast, format!("seg_{}.fast", seg.id));
+      assert_eq!(seg.paths.meta, format!("seg_{}.meta", seg.id));
+      // Validation passes because all keys are relative.
+      seg.paths.validate_v2_relative().unwrap();
+    }
+
+    /// Stage 9a (the load-bearing portability test): write an index
+    /// in dir A, physically move every file to dir B, open against
+    /// the new root, and verify every read path still works
+    /// end-to-end (search, mget with `_source: true`).
+    #[test]
+    fn v2_index_can_be_relocated_to_new_root_and_searched() {
+      let dir_a = tempdir().unwrap();
+      let dir_b = tempdir().unwrap();
+
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir_a.path(), schema, opts(dir_a.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [
+        ("1", "alpha bravo"),
+        ("2", "bravo charlie"),
+        ("3", "charlie delta"),
+      ] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Move every file from dir_a to dir_b.
+      for entry in std::fs::read_dir(dir_a.path()).unwrap() {
+        let entry = entry.unwrap();
+        let from = entry.path();
+        let to = dir_b.path().join(entry.file_name());
+        if from.is_dir() {
+          // For vectors-feature segment dirs (or any nested dir),
+          // walk recursively. Without `vectors` feature there are
+          // never any.
+          copy_dir_recursive(&from, &to).unwrap();
+        } else {
+          std::fs::rename(&from, &to).unwrap();
+        }
+      }
+
+      // Open against the new root. Every path-using read must
+      // resolve through the new root (no stale absolute paths).
+      let mut reopen_opts = opts(dir_b.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      let reader = reopened.reader().unwrap();
+
+      // Search (postings path).
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "bravo",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(
+        result.total_hits_estimate, 2,
+        "search at relocated root must return correct hits"
+      );
+
+      // mget with _source (docstore path).
+      let mget_results = reader
+        .mget(&["1".to_string(), "3".to_string()], true)
+        .unwrap();
+      assert_eq!(mget_results.len(), 2);
+      assert!(mget_results.iter().all(|r| r._source.is_some()));
+    }
+
+    fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+      std::fs::create_dir_all(to)?;
+      for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+          copy_dir_recursive(&src, &dst)?;
+        } else {
+          std::fs::rename(&src, &dst)?;
+        }
+      }
+      Ok(())
+    }
+
+    /// Stage 9a: a hand-authored v1 manifest with absolute paths
+    /// must still open in-place (legacy back-compat). We synthesize
+    /// such a manifest by writing a fresh v2 index, then rewriting
+    /// the manifest as v1 with absolute paths in the JSON.
+    #[test]
+    fn v1_absolute_path_manifest_opens_in_place() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Surgically rewrite the manifest: bump version 2 → 1 and
+      // expand each segment path to its absolute form. This mimics
+      // an on-disk manifest produced by an older searchlite build.
+      let manifest_path = dir.path().join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      value["version"] = serde_json::json!(1);
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        let paths = seg["paths"].as_object_mut().unwrap();
+        for key in ["terms", "postings", "docstore", "fast", "meta"] {
+          let rel = paths[key].as_str().unwrap().to_string();
+          let abs = dir.path().join(&rel).to_string_lossy().into_owned();
+          paths[key] = serde_json::json!(abs);
+        }
+        if let Some(serde_json::Value::String(rel)) = paths.get("vector_dir").cloned() {
+          let abs = dir.path().join(&rel).to_string_lossy().into_owned();
+          paths.insert("vector_dir".into(), serde_json::json!(abs));
+        }
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+      // Open against the (still-original) root. Absolute paths
+      // resolve through `SegmentPaths::resolve` unchanged, so reads
+      // succeed.
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert_eq!(reopened.manifest().version, 1);
+      let reader = reopened.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "alpha",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(result.total_hits_estimate, 1);
+    }
+
+    /// Stage 9a: after relocation, a compact run on the relocated
+    /// index must succeed without path failures. Compact reads every
+    /// segment's meta + checksums and writes new ones; if any path
+    /// resolution missed the relocation, this would fail.
+    #[test]
+    fn relocated_v2_index_supports_compact() {
+      let dir_a = tempdir().unwrap();
+      let dir_b = tempdir().unwrap();
+
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir_a.path(), schema, opts(dir_a.path())).unwrap();
+      // Two commits → two segments → eligible for compact.
+      for body in ["alpha", "bravo"] {
+        let mut writer = idx.writer().unwrap();
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(body)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+        writer.commit().unwrap();
+      }
+      drop(idx);
+
+      for entry in std::fs::read_dir(dir_a.path()).unwrap() {
+        let entry = entry.unwrap();
+        let from = entry.path();
+        let to = dir_b.path().join(entry.file_name());
+        if from.is_dir() {
+          copy_dir_recursive(&from, &to).unwrap();
+        } else {
+          std::fs::rename(&from, &to).unwrap();
+        }
+      }
+
+      let mut reopen_opts = opts(dir_b.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert_eq!(reopened.manifest().segments.len(), 2);
+      reopened.compact().unwrap();
+      assert_eq!(
+        reopened.manifest().segments.len(),
+        1,
+        "compact must produce a single merged segment after relocation"
+      );
+
+      // Re-search to prove the new merged segment is reachable.
+      let reader = reopened.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "alpha",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(result.total_hits_estimate, 1);
+    }
+
+    /// Stage 9a: `Manifest::store` must reject any v2 manifest whose
+    /// segment paths are absolute or contain `..` components, even
+    /// if hand-constructed in-process. Catches accidental
+    /// regressions in the writer that emit non-portable keys.
+    #[test]
+    fn manifest_store_rejects_v2_absolute_or_dotdot_paths() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let manifest_path = Manifest::manifest_path(dir.path());
+
+      // Build a minimal valid v2 manifest, then mutate one segment
+      // path into an absolute form and verify `store` rejects it.
+      let schema = Schema::default_text_body();
+      let mut manifest = Manifest::new(schema.clone());
+      manifest.segments.push(crate::index::manifest::SegmentMeta {
+        id: "abs".into(),
+        generation: 1,
+        paths: crate::index::manifest::SegmentPaths {
+          terms: "/abs/seg_abs.terms".into(),
+          postings: "seg_abs.post".into(),
+          docstore: "seg_abs.docs".into(),
+          fast: "seg_abs.fast".into(),
+          meta: "seg_abs.meta".into(),
+          #[cfg(feature = "vectors")]
+          vector_dir: None,
+        },
+        doc_count: 0,
+        max_doc_id: 0,
+        blockmax: true,
+        deleted_docs: Vec::new(),
+        avg_field_lengths: Default::default(),
+        checksums: Default::default(),
+        write_binding_b64: None,
+      });
+      let err = manifest.store(&storage, &manifest_path).expect_err(
+        "v2 manifest with absolute segment path must be rejected by Manifest::store",
+      );
+      assert!(format!("{err:#}").contains("absolute"));
+
+      // Now `..`.
+      manifest.segments[0].paths.terms = "../escape.terms".into();
+      let err = manifest
+        .store(&storage, &manifest_path)
+        .expect_err("v2 manifest with `..` segment path must be rejected by Manifest::store");
+      assert!(format!("{err:#}").contains(".."));
+    }
+
+    /// Stage 9a: `Manifest::load` must reject v2 manifests on disk
+    /// whose paths violate the relative-key invariant. Catches
+    /// corruption / hand-edits / older buggy writers.
+    #[test]
+    fn manifest_load_rejects_v2_absolute_paths() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let manifest_path = Manifest::manifest_path(dir.path());
+      let v2_with_abs = serde_json::json!({
+        "version": 2,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [{
+          "id": "abs",
+          "generation": 1,
+          "paths": {
+            "terms": "/abs/seg_abs.terms",
+            "postings": "seg_abs.post",
+            "docstore": "seg_abs.docs",
+            "fast": "seg_abs.fast",
+            "meta": "seg_abs.meta"
+          },
+          "doc_count": 0,
+          "max_doc_id": 0,
+          "blockmax": true,
+          "deleted_docs": [],
+          "avg_field_lengths": {},
+          "checksums": {}
+        }],
+        "committed_at": "2024-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&v2_with_abs).unwrap(),
+      )
+      .unwrap();
+
+      let err = Manifest::load(&storage, &manifest_path)
+        .expect_err("v2 manifest with absolute paths must be rejected on load");
+      assert!(format!("{err:#}").contains("absolute"));
+    }
+
+    // ───────────────────── Stage 9a v2 P2 regressions ─────────────────────
+
+    /// Stage 9a [P2] (Codex review): a legacy v1 manifest must be
+    /// upgraded in-place to v2 on the **first commit** after open.
+    /// Without this, the writer's clone-then-mutate flow keeps
+    /// `version: 1` and the new manifest mixes absolute legacy paths
+    /// with freshly-relative new-segment paths — the index never
+    /// becomes portable.
+    #[test]
+    fn legacy_v1_manifest_is_upgraded_to_v2_on_first_commit() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("seed")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Hand-roll a v1 manifest by rewriting the on-disk file.
+      let manifest_path = dir.path().join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      value["version"] = serde_json::json!(1);
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        let paths = seg["paths"].as_object_mut().unwrap();
+        for key in ["terms", "postings", "docstore", "fast", "meta"] {
+          let rel = paths[key].as_str().unwrap().to_string();
+          let abs = dir.path().join(&rel).to_string_lossy().into_owned();
+          paths[key] = serde_json::json!(abs);
+        }
+        if let Some(serde_json::Value::String(rel)) = paths.get("vector_dir").cloned() {
+          let abs = dir.path().join(&rel).to_string_lossy().into_owned();
+          paths.insert("vector_dir".into(), serde_json::json!(abs));
+        }
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+      // Open. The v1 manifest is accepted (legacy back-compat).
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert_eq!(reopened.manifest().version, 1);
+
+      // Commit a second doc → triggers `upgrade_to_latest` before
+      // staging.
+      let mut writer = reopened.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("post-upgrade")),
+            ("body".into(), serde_json::json!("bravo")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+
+      // Live manifest must now be v2 with all relative paths.
+      let upgraded_bytes = std::fs::read(&manifest_path).unwrap();
+      let upgraded: Manifest = serde_json::from_slice(&upgraded_bytes).unwrap();
+      assert_eq!(upgraded.version, MANIFEST_LATEST_VERSION);
+      assert_eq!(upgraded.segments.len(), 2);
+      for seg in &upgraded.segments {
+        seg
+          .paths
+          .validate_v2_relative()
+          .expect("every segment path must be relative after upgrade");
+      }
+    }
+
+    /// Stage 9a [P2] (Codex review): a malformed v1 manifest with
+    /// `..` segment paths must be rejected at load time.
+    /// `Manifest::load` historically skipped all v1 path validation,
+    /// so a hand-edited `../escape.terms` would resolve under the
+    /// current root and could drive reads outside the index.
+    ///
+    /// Stage 9a v4 update: relative paths are now LEGITIMATE for v1
+    /// (the old writer used `root.join(filename)` and `root` could be
+    /// relative). Only `..`-bearing or empty paths are rejected.
+    #[test]
+    fn manifest_load_rejects_v1_dotdot_paths() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let manifest_path = Manifest::manifest_path(dir.path());
+
+      // v1 + `..` path → rejected.
+      let v1_with_dotdot = serde_json::json!({
+        "version": 1,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [{
+          "id": "dotdot",
+          "generation": 1,
+          "paths": {
+            "terms": "/abs/../escape.terms",
+            "postings": "/abs/seg.post",
+            "docstore": "/abs/seg.docs",
+            "fast": "/abs/seg.fast",
+            "meta": "/abs/seg.meta"
+          },
+          "doc_count": 0,
+          "max_doc_id": 0,
+          "blockmax": true,
+          "deleted_docs": [],
+          "avg_field_lengths": {},
+          "checksums": {}
+        }],
+        "committed_at": "2024-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&v1_with_dotdot).unwrap(),
+      )
+      .unwrap();
+      let err = Manifest::load(&storage, &manifest_path)
+        .expect_err("v1 manifest with `..` must be rejected");
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains(".."),
+        "expected error mentioning ..; got: {msg}"
+      );
+    }
+
+    /// Stage 9a [P2] (Codex review): the recovery promote in
+    /// `reconcile_pending_manifest` and the leftover-pending promote
+    /// in `Writer::commit` MUST validate the staged bytes before
+    /// publishing them. Without this, a `.pending` file produced by
+    /// an older buggy writer could carry a v1 manifest with mixed
+    /// shape paths and we'd publish it verbatim.
+    ///
+    /// Drives the recovery path by writing a malformed `.pending`
+    /// file (v2 + absolute path) alongside a WAL with a `Commit`
+    /// record, then re-opening the index. `reconcile_pending_manifest`
+    /// must reject the bad pending file rather than promoting it.
+    #[test]
+    fn recovery_rejects_invalid_pending_manifest_instead_of_promoting() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(writer);
+      drop(idx);
+
+      // Plant a malformed v2 pending manifest (absolute path) next
+      // to the live manifest. The WAL already contains a Commit
+      // record from the prior commit, so `reconcile_pending_manifest`
+      // would otherwise promote this on next open.
+      let pending_path = Manifest::manifest_pending_path(dir.path());
+      let bogus_pending = serde_json::json!({
+        "version": 2,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [{
+          "id": "abs",
+          "generation": 99,
+          "paths": {
+            "terms": "/abs/poisoned.terms",
+            "postings": "/abs/poisoned.post",
+            "docstore": "/abs/poisoned.docs",
+            "fast": "/abs/poisoned.fast",
+            "meta": "/abs/poisoned.meta"
+          },
+          "doc_count": 0,
+          "max_doc_id": 0,
+          "blockmax": true,
+          "deleted_docs": [],
+          "avg_field_lengths": {},
+          "checksums": {}
+        }],
+        "committed_at": "2099-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(
+        &pending_path,
+        serde_json::to_vec_pretty(&bogus_pending).unwrap(),
+      )
+      .unwrap();
+
+      // Re-open. Reconcile must reject the bogus pending bytes
+      // rather than overwrite the live manifest with them.
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let result = Index::open(reopen_opts);
+
+      // Either the open errors with a validation failure (preferred)
+      // or it succeeds and the live manifest is unchanged. Both
+      // outcomes prove the bogus pending was NOT promoted verbatim.
+      let live_after =
+        std::fs::read(Manifest::manifest_path(dir.path())).expect("live manifest still exists");
+      let live: Manifest =
+        serde_json::from_slice(&live_after).expect("live manifest still parses");
+      assert!(
+        live.segments.iter().all(|s| s.id != "abs"),
+        "Stage 9a [P2]: bogus pending manifest with id=abs must NOT be promoted; \
+         live manifest segments: {:?}",
+        live.segments.iter().map(|s| &s.id).collect::<Vec<_>>()
+      );
+      // If open succeeded, search must still be intact (the original
+      // alpha doc).
+      if let Ok(reopened) = result {
+        let reader = reopened.reader().unwrap();
+        let req: crate::api::types::SearchRequest =
+          serde_json::from_value(serde_json::json!({
+            "query": "alpha",
+            "limit": 10,
+            "track_total_hits": true,
+          }))
+          .unwrap();
+        let r = reader.search(&req).unwrap();
+        assert_eq!(r.total_hits_estimate, 1);
+      }
+    }
+
+    // ───────────────────── Stage 9a v3 regressions ─────────────────────
+
+    /// Helper: rewrite the live manifest at `dir/MANIFEST.json` into
+    /// a v1 absolute-path shape, simulating what a pre-Stage-9 build
+    /// would have produced. Returns once the on-disk manifest is
+    /// valid v1 (passes `validate_v1_legacy`).
+    fn rewrite_manifest_as_v1_absolute(dir: &Path) {
+      let manifest_path = dir.join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      value["version"] = serde_json::json!(1);
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        let paths = seg["paths"].as_object_mut().unwrap();
+        for key in ["terms", "postings", "docstore", "fast", "meta"] {
+          let rel = paths[key].as_str().unwrap().to_string();
+          let abs = dir.join(&rel).to_string_lossy().into_owned();
+          paths[key] = serde_json::json!(abs);
+        }
+        if let Some(serde_json::Value::String(rel)) = paths.get("vector_dir").cloned() {
+          let abs = dir.join(&rel).to_string_lossy().into_owned();
+          paths.insert("vector_dir".into(), serde_json::json!(abs));
+        }
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    /// Stage 9a v3 [P2] (Codex review): `compact` against a legacy
+    /// v1 index must succeed by upgrading the manifest to v2 in place,
+    /// not fail at `Manifest::store` (which now refuses v1).
+    #[test]
+    fn compact_upgrades_legacy_v1_manifest_to_v2() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      // Need ≥2 segments for compact to do anything substantial.
+      for body in ["alpha", "bravo"] {
+        let mut writer = idx.writer().unwrap();
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(body)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+        writer.commit().unwrap();
+      }
+      drop(idx);
+
+      rewrite_manifest_as_v1_absolute(dir.path());
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert_eq!(reopened.manifest().version, 1);
+      reopened.compact().unwrap();
+
+      let upgraded: Manifest = serde_json::from_slice(
+        &std::fs::read(dir.path().join("MANIFEST.json")).unwrap(),
+      )
+      .unwrap();
+      assert_eq!(upgraded.version, MANIFEST_LATEST_VERSION);
+      assert_eq!(upgraded.segments.len(), 1);
+      for seg in &upgraded.segments {
+        seg.paths.validate_v2_relative().unwrap();
+      }
+    }
+
+    /// Stage 9a v3 [P2] (Codex review): `merge_segments` against a
+    /// legacy v1 index must succeed by upgrading to v2.
+    #[test]
+    fn merge_segments_upgrades_legacy_v1_manifest_to_v2() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      for body in ["alpha", "bravo", "charlie"] {
+        let mut writer = idx.writer().unwrap();
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(body)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+        writer.commit().unwrap();
+      }
+      let v2_segment_ids: Vec<String> =
+        idx.manifest().segments.iter().map(|s| s.id.clone()).collect();
+      assert_eq!(v2_segment_ids.len(), 3);
+      drop(idx);
+
+      rewrite_manifest_as_v1_absolute(dir.path());
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert_eq!(reopened.manifest().version, 1);
+
+      // Merge two of the three segments. The third stays untouched
+      // and must also be relativized by the upgrade (relativize_under
+      // covers every segment, not just the merge target).
+      let merge_ids = v2_segment_ids[..2].to_vec();
+      reopened.merge_segments(&merge_ids, None).unwrap();
+
+      let upgraded: Manifest = serde_json::from_slice(
+        &std::fs::read(dir.path().join("MANIFEST.json")).unwrap(),
+      )
+      .unwrap();
+      assert_eq!(upgraded.version, MANIFEST_LATEST_VERSION);
+      assert_eq!(upgraded.segments.len(), 2);
+      for seg in &upgraded.segments {
+        seg.paths.validate_v2_relative().unwrap();
+      }
+    }
+
+    /// Stage 9a v3 [P1] (Codex review): a valid pre-Stage-9 crash
+    /// state has a v1 absolute-path `.pending` file plus a WAL with a
+    /// durable Commit record. `Index::open`'s reconciler MUST upgrade
+    /// the v1 pending bytes to v2 and promote them, not reject them
+    /// — rejecting would leave the pending file in place and block
+    /// recovery.
+    #[test]
+    fn recovery_upgrades_legacy_v1_pending_manifest() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      // Phase 1: build a normal index with one durable commit. This
+      // gives us a legitimate WAL with a Commit record we can reuse
+      // as the recovery fence below.
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("seed")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(writer);
+      drop(idx);
+
+      // Phase 2: hand-craft a v1 absolute-path pending manifest that
+      // mirrors what an old searchlite build would have written. The
+      // segment files referenced by it ARE present on disk (we wrote
+      // them in Phase 1), and the WAL already has a Commit fence —
+      // so this is exactly the post-crash state of a legacy index.
+      let live_path = Manifest::manifest_path(dir.path());
+      let live: Manifest =
+        serde_json::from_slice(&std::fs::read(&live_path).unwrap()).unwrap();
+      let pending_path = Manifest::manifest_pending_path(dir.path());
+      let mut pending = live.clone();
+      pending.version = 1;
+      for seg in pending.segments.iter_mut() {
+        for key in [
+          &mut seg.paths.terms,
+          &mut seg.paths.postings,
+          &mut seg.paths.docstore,
+          &mut seg.paths.fast,
+          &mut seg.paths.meta,
+        ] {
+          *key = dir.path().join(&*key).to_string_lossy().into_owned();
+        }
+        #[cfg(feature = "vectors")]
+        if let Some(d) = seg.paths.vector_dir.as_mut() {
+          *d = dir.path().join(&*d).to_string_lossy().into_owned();
+        }
+      }
+      std::fs::write(&pending_path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+      // Bump the live manifest's `committed_at` back so the pending
+      // looks "newer" — though reconcile_pending_manifest's promote
+      // is unconditional when the WAL has a Commit, so this is just
+      // belt-and-suspenders.
+      let mut older_live = live.clone();
+      older_live.committed_at = "2000-01-01T00:00:00Z".into();
+      std::fs::write(
+        &live_path,
+        serde_json::to_vec_pretty(&older_live).unwrap(),
+      )
+      .unwrap();
+
+      // Phase 3: reopen. The reconciler must upgrade the v1 pending
+      // to v2 and promote it. After open, the live manifest must be
+      // v2 with relative paths, and the pending file must be gone.
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert!(
+        !std::fs::exists(&pending_path).unwrap(),
+        "pending file must be cleaned up after successful recovery"
+      );
+      assert_eq!(reopened.manifest().version, MANIFEST_LATEST_VERSION);
+      for seg in &reopened.manifest().segments {
+        seg.paths.validate_v2_relative().unwrap();
+      }
+
+      // The live manifest on disk is also v2.
+      let live_after: Manifest =
+        serde_json::from_slice(&std::fs::read(&live_path).unwrap()).unwrap();
+      assert_eq!(live_after.version, MANIFEST_LATEST_VERSION);
+
+      // Search still works (post-recovery, post-upgrade).
+      let reader = reopened.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "alpha",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let r = reader.search(&req).unwrap();
+      assert_eq!(r.total_hits_estimate, 1);
+    }
+
+    // ───────────────────── Stage 9a v4 regressions ─────────────────────
+
+    /// Stage 9a v4 [P2] (Codex review): the pre-Stage-9 writer used
+    /// `IndexOptions.path.join(filename)`. When the caller passed a
+    /// **relative** path (e.g. `--index idx`), the resulting v1
+    /// manifest paths were relative-with-root-prefix
+    /// (`idx/seg_X.terms`). Three invariants must hold for that shape:
+    ///
+    /// 1. `validate_v1_legacy` accepts relative + non-`..` keys.
+    /// 2. `resolve_segment_path` detects the root prefix and does
+    ///    NOT double-prefix to `idx/idx/seg_X.terms`.
+    /// 3. `relativize_under` strips the root prefix from the relative
+    ///    key (not just from absolute paths) so the upgrade produces
+    ///    bare v2 keys.
+    ///
+    /// We exercise these at the helper level (where the actual logic
+    /// lives) — a full `Index::open` round-trip with a relative root
+    /// would also need CWD manipulation, since `FsStorage` resolves
+    /// relative paths through the process CWD. The integration shape
+    /// is covered indirectly by the existing absolute-path legacy
+    /// upgrade tests and by the `Manifest::load` round-trip below.
+    #[test]
+    fn legacy_v1_relative_root_paths_load_resolve_and_upgrade() {
+      use crate::index::manifest::{resolve_segment_path, ResolvedSegmentPaths, SegmentPaths};
+
+      // (1) `validate_v1_legacy` accepts relative + non-`..`.
+      let v1_relative_paths = SegmentPaths {
+        terms: "idx/a.terms".into(),
+        postings: "idx/a.post".into(),
+        docstore: "idx/a.docs".into(),
+        fast: "idx/a.fast".into(),
+        meta: "idx/a.meta".into(),
+        #[cfg(feature = "vectors")]
+        vector_dir: None,
+      };
+      v1_relative_paths.validate_v1_legacy().unwrap();
+
+      // (2) `resolve_segment_path` doesn't double-prefix when the
+      // relative key already starts with the root.
+      let resolved = resolve_segment_path(Path::new("idx"), "idx/seg_xyz.terms");
+      assert_eq!(resolved, PathBuf::from("idx/seg_xyz.terms"));
+      // And bare-relative keys (v2 shape) are still joined under root.
+      let resolved_bare = resolve_segment_path(Path::new("idx"), "seg_xyz.terms");
+      assert_eq!(resolved_bare, PathBuf::from("idx/seg_xyz.terms"));
+      // Absolute paths under a different root (legacy v1) pass through.
+      let resolved_abs = resolve_segment_path(Path::new("/some/root"), "/elsewhere/seg.terms");
+      assert_eq!(resolved_abs, PathBuf::from("/elsewhere/seg.terms"));
+
+      // (3) `relativize_under` strips the root-prefix from a relative
+      // key as well as from an absolute one.
+      let mut rp = v1_relative_paths.clone();
+      rp.relativize_under(Path::new("idx")).unwrap();
+      assert_eq!(rp.terms, "a.terms");
+      assert_eq!(rp.postings, "a.post");
+      // Post-upgrade, `validate_v2_relative` passes.
+      rp.validate_v2_relative().unwrap();
+
+      // `ResolvedSegmentPaths::resolve` round-trips through the same
+      // logic — sanity check the struct-level helper.
+      let r: ResolvedSegmentPaths = v1_relative_paths.resolve(Path::new("idx"));
+      assert_eq!(r.terms, PathBuf::from("idx/a.terms"));
+
+      // Round-trip through `Manifest::load`: serialize a v1 manifest
+      // with relative-root keys to disk, load it, and verify
+      // validation passes (it would have errored under the v3-era
+      // strict v1-must-be-absolute rule).
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let manifest_path = Manifest::manifest_path(dir.path());
+      let v1_with_relative_root = serde_json::json!({
+        "version": 1,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [{
+          "id": "rel",
+          "generation": 1,
+          "paths": {
+            "terms": "idx/seg_rel.terms",
+            "postings": "idx/seg_rel.post",
+            "docstore": "idx/seg_rel.docs",
+            "fast": "idx/seg_rel.fast",
+            "meta": "idx/seg_rel.meta"
+          },
+          "doc_count": 0,
+          "max_doc_id": 0,
+          "blockmax": true,
+          "deleted_docs": [],
+          "avg_field_lengths": {},
+          "checksums": {}
+        }],
+        "committed_at": "2024-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&v1_with_relative_root).unwrap(),
+      )
+      .unwrap();
+      let loaded =
+        Manifest::load(&storage, &manifest_path).expect("v1 with relative-root paths must load");
+      assert_eq!(loaded.version, 1);
+    }
+
+    /// Stage 9a v4 [P3] (Codex review): a manifest with `version: 0`
+    /// and an empty segment list must be rejected. Previously the
+    /// per-segment loop owned the unsupported-version check, so an
+    /// empty manifest skipped validation entirely.
+    #[test]
+    fn manifest_load_rejects_unsupported_version_even_when_segments_empty() {
+      let dir = tempdir().unwrap();
+      let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
+      let manifest_path = Manifest::manifest_path(dir.path());
+
+      let bogus = serde_json::json!({
+        "version": 0,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [],
+        "committed_at": "2024-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&bogus).unwrap()).unwrap();
+      let err = Manifest::load(&storage, &manifest_path)
+        .expect_err("manifest with version 0 must be rejected");
+      assert!(
+        format!("{err:#}").contains("unsupported version 0"),
+        "expected error mentioning unsupported version 0; got: {err:#}"
+      );
+
+      let too_new = serde_json::json!({
+        "version": 99,
+        "uuid": uuid::Uuid::new_v4(),
+        "segments": [],
+        "committed_at": "2024-01-01T00:00:00Z",
+        "schema": {}
+      });
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&too_new).unwrap()).unwrap();
+      let err = Manifest::load(&storage, &manifest_path)
+        .expect_err("manifest with newer-than-supported version must be rejected");
+      assert!(
+        format!("{err:#}").contains("unsupported version 99"),
+        "expected error mentioning unsupported version 99; got: {err:#}"
+      );
+    }
+
+    // ───────────────────── Stage 9a v5 regressions ─────────────────────
+
+    /// Stage 9a v5 [P2] (Codex review): the recovery and
+    /// leftover-pending promote paths parse pending bytes directly
+    /// and call `upgrade_to_latest` without going through
+    /// `Manifest::load`. Any unsupported `version` (0 or >
+    /// `MANIFEST_LATEST_VERSION`) on a pending file would otherwise
+    /// be silently mutated to v2 and promoted. `upgrade_to_latest`
+    /// must reject those before mutating, mirroring `Manifest::load`.
+    #[test]
+    fn upgrade_to_latest_rejects_unsupported_versions_before_mutating() {
+      let mut bogus = Manifest::new(Schema::default_text_body());
+      bogus.version = 0;
+      let err = bogus
+        .upgrade_to_latest(Path::new("/tmp"))
+        .expect_err("v0 must be rejected before mutating");
+      assert!(
+        format!("{err:#}").contains("unsupported version 0"),
+        "expected error mentioning unsupported version 0; got: {err:#}"
+      );
+      // The manifest is left untouched (still v0).
+      assert_eq!(bogus.version, 0);
+
+      let mut too_new = Manifest::new(Schema::default_text_body());
+      too_new.version = 99;
+      let err = too_new
+        .upgrade_to_latest(Path::new("/tmp"))
+        .expect_err("v99 must be rejected before mutating");
+      assert!(
+        format!("{err:#}").contains("unsupported version 99"),
+        "expected error mentioning unsupported version 99; got: {err:#}"
+      );
+      assert_eq!(too_new.version, 99);
+    }
+
+    /// Stage 9a v5 [P2] (Codex review): a v1 manifest with absolute
+    /// segment paths must upgrade cleanly even when the user opens
+    /// the index with a **relative** root. Lexical
+    /// `Path::strip_prefix("idx")` against `/cwd/idx/seg_X.terms`
+    /// fails because the absolute path's first component is
+    /// `RootDir`, not `Normal("idx")`. `relativize_under` must fall
+    /// back to comparing against the *absolute* form of the relative
+    /// root.
+    ///
+    /// Stage 9a v6 [P3] update: previously this test mutated the
+    /// process CWD to drive the relative-root scenario, which races
+    /// against the parallel cargo test harness. Now uses the
+    /// `relativize_under_with_cwd` testable variant that takes an
+    /// explicit cwd parameter, so the test is hermetic.
+    #[test]
+    fn relativize_under_handles_absolute_key_with_relative_root() {
+      use crate::index::manifest::SegmentPaths;
+
+      let outer = tempdir().unwrap();
+      let nested = outer.path().join("idx");
+      std::fs::create_dir_all(&nested).unwrap();
+
+      // Create the on-disk segment files so `relativize_under` can
+      // canonicalize them when the absolute key uses a different
+      // symlink path than the absolute form of the relative root
+      // (e.g. macOS `/var/folders/...` vs `/private/var/folders/...`).
+      for stem in ["seg_X.terms", "seg_X.post", "seg_X.docs", "seg_X.fast", "seg_X.meta"] {
+        std::fs::write(nested.join(stem), b"").unwrap();
+      }
+      let absolute_seg = nested.join("seg_X.terms").to_string_lossy().into_owned();
+      let absolute_post = nested.join("seg_X.post").to_string_lossy().into_owned();
+      let absolute_docs = nested.join("seg_X.docs").to_string_lossy().into_owned();
+      let absolute_fast = nested.join("seg_X.fast").to_string_lossy().into_owned();
+      let absolute_meta = nested.join("seg_X.meta").to_string_lossy().into_owned();
+      let mut paths = SegmentPaths {
+        terms: absolute_seg.clone(),
+        postings: absolute_post,
+        docstore: absolute_docs,
+        fast: absolute_fast,
+        meta: absolute_meta,
+        #[cfg(feature = "vectors")]
+        vector_dir: None,
+      };
+
+      // The relative root used at "open" time. With an explicit cwd
+      // of `outer.path()`, `idx` resolves to `outer.path()/idx`,
+      // matching where the segment files live.
+      let relative_root = Path::new("idx");
+
+      // Pre-fix: this errored with "not under index root". Post-fix:
+      // succeeds because we strip against the absolute form of root
+      // (and its symlink-canonicalized form).
+      paths
+        .relativize_under_with_cwd(relative_root, Some(outer.path()))
+        .unwrap();
+      assert_eq!(paths.terms, "seg_X.terms");
+      assert_eq!(paths.postings, "seg_X.post");
+      paths.validate_v2_relative().unwrap();
     }
   }
 }

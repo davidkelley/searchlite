@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -89,7 +88,8 @@ impl IndexWriter {
       }
     }
     for seg in manifest.segments.iter() {
-      match inner.storage.read_to_end(Path::new(&seg.paths.meta)) {
+      let resolved = seg.paths.resolve(inner.storage.root());
+      match inner.storage.read_to_end(&resolved.meta) {
         Ok(bytes) => match serde_json::from_slice::<SegmentFileMeta>(&bytes) {
           Ok(seg_meta) => {
             if let Some(b64) = seg_meta.write_binding_b64.as_deref() {
@@ -388,24 +388,63 @@ impl IndexWriter {
     // between steps 2 and 3 — only durably-staged content can be promoted
     // by `Index::open`'s reconciliation pass.
 
-    let serialized_manifest =
-      serde_json::to_vec_pretty(&new_manifest).context("serializing manifest for commit")?;
+    // Stage 9a [P2] (Codex review): upgrade legacy v1 manifests to v2
+    // BEFORE staging. Without this, `new_manifest` cloned from a
+    // loaded v1 snapshot keeps `version: 1` and the pending write
+    // bypasses every v2 invariant (it goes through raw
+    // `serde_json::to_vec_pretty`, not `Manifest::store`). The result
+    // would be a v1 manifest mixing absolute legacy paths with
+    // relative new-segment paths — not portable and never upgraded.
+    new_manifest
+      .upgrade_to_latest(&self.inner.path)
+      .context("upgrading manifest to latest version before commit")?;
+    let serialized_manifest = new_manifest
+      .serialize_for_write()
+      .context("serializing manifest for commit")?;
 
     // Promote any leftover `.pending` from a prior commit whose manifest
     // publish failed post-fence. This prevents overwriting a durable staged
     // manifest with uncommitted content — without this, the old `.pending`
     // (which represents an already-committed batch) would be silently
     // replaced by the new staging write below.
+    //
+    // Stage 9a v3 [P1] (Codex review): legacy v1 leftover pending files
+    // are still valid (they describe a durably-committed batch from a
+    // pre-Stage-9 writer). Upgrade them to v2 before validating, so a
+    // recovery-on-the-next-commit path works the same as a recovery-
+    // on-open path. The validation post-upgrade still rejects truly
+    // malformed pending files.
     if self.inner.storage.exists(&pending_manifest_path) {
       match self.inner.storage.read_to_end(&pending_manifest_path) {
         Ok(prior_data) => {
-          if let Err(e) = self.inner.storage.atomic_write(&manifest_path, &prior_data) {
-            log::error!(
-              "failed to promote leftover staged manifest before new commit: {e}; \
-               proceeding with overwrite — recovery on next open will reconcile"
-            );
+          let promote_result = (|| -> Result<Vec<u8>> {
+            let mut prior_manifest: Manifest = serde_json::from_slice(&prior_data)
+              .context("parsing leftover staged manifest")?;
+            prior_manifest
+              .upgrade_to_latest(&self.inner.path)
+              .context("upgrading leftover staged manifest")?;
+            prior_manifest
+              .serialize_for_write()
+              .context("validating leftover staged manifest")
+          })();
+          match promote_result {
+            Ok(validated) => {
+              if let Err(e) = self.inner.storage.atomic_write(&manifest_path, &validated) {
+                log::error!(
+                  "failed to promote leftover staged manifest before new commit: {e}; \
+                   proceeding with overwrite — recovery on next open will reconcile"
+                );
+              }
+              let _ = self.inner.storage.remove(&pending_manifest_path);
+            }
+            Err(e) => {
+              log::error!(
+                "leftover staged manifest failed validation; discarding: {e:#}; \
+                 proceeding with new commit"
+              );
+              let _ = self.inner.storage.remove(&pending_manifest_path);
+            }
           }
-          let _ = self.inner.storage.remove(&pending_manifest_path);
         }
         Err(e) => {
           log::error!(
@@ -456,12 +495,20 @@ impl IndexWriter {
       return Err(e);
     }
 
-    // Step 3 — post-fence: promote the staged manifest to live. Failures
-    // here cannot roll back the commit (it is already durable) — they are
-    // surfaced via logs and reconciled by `Index::open` on the next start,
-    // which detects the staged file plus the WAL trailing-commit marker
-    // and promotes the staged manifest.
-    let manifest_published = match new_manifest.store(self.inner.storage.as_ref(), &manifest_path) {
+    // Step 3 — post-fence: promote the staged manifest to live. We
+    // re-serialize from the (already-upgraded) `new_manifest` so the
+    // live and pending writes go through the same `serialize_for_write`
+    // validator (Codex Stage 9a [P2]). Failures here cannot roll back
+    // the commit (it is already durable) — they are surfaced via logs
+    // and reconciled by `Index::open` on the next start, which detects
+    // the staged file plus the WAL trailing-commit marker and promotes
+    // the staged manifest.
+    let manifest_published = match self
+      .inner
+      .storage
+      .atomic_write(&manifest_path, &serialized_manifest)
+      .with_context(|| format!("writing manifest at {manifest_path:?}"))
+    {
       Ok(()) => {
         // Best-effort cleanup of the staging file. A leftover `.pending`
         // file is harmless: the next `Index::open` removes it after
@@ -1018,9 +1065,10 @@ fn unset_path_parts(current: &mut serde_json::Value, parts: &[&str], path: &str)
 fn load_live_docs(inner: &InnerIndex, manifest: &Manifest) -> Result<HashMap<String, DocAddress>> {
   let mut map = HashMap::new();
   for seg in manifest.segments.iter() {
+    let resolved = seg.paths.resolve(inner.storage.root());
     let meta_bytes = inner
       .storage
-      .read_to_end(Path::new(&seg.paths.meta))
+      .read_to_end(&resolved.meta)
       .map_err(|e| anyhow!("reading segment meta for {}: {}", seg.id, e))?;
     let seg_meta: SegmentFileMeta = serde_json::from_slice(&meta_bytes)?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {

@@ -395,6 +395,7 @@ impl IndexReader {
         core,
         seg.clone(),
         inner.blob_store.clone(),
+        inner.storage.root(),
       )?);
     }
     Ok(Self {

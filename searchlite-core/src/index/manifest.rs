@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,6 +12,14 @@ use crate::analysis::analyzer::{
 use crate::storage::Storage;
 use crate::util::doc_id::validate_doc_id;
 use crate::util::write_key::WriteKeyMeta;
+
+/// Stage 9a: latest supported manifest schema version. v2 records
+/// segment paths as **relative-to-index-root keys** (no absolute
+/// paths, no `..` components) so an index can be physically moved to
+/// a new root and reopen unchanged. v1 (legacy) recorded absolute
+/// filesystem paths; reading a v1 manifest still works (absolute
+/// paths are accepted as-is on read), but commits always emit v2.
+pub const MANIFEST_LATEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -52,10 +60,282 @@ pub struct SegmentPaths {
   pub vector_dir: Option<String>,
 }
 
+/// Resolved (root-joined, absolute) form of [`SegmentPaths`]. Produced
+/// by [`SegmentPaths::resolve`] at every read/write call site. The
+/// underlying `String` keys in `SegmentPaths` are stored
+/// relative-to-root for v2 manifests so an index can be relocated.
+#[derive(Debug, Clone)]
+pub struct ResolvedSegmentPaths {
+  pub terms: PathBuf,
+  pub postings: PathBuf,
+  pub docstore: PathBuf,
+  pub fast: PathBuf,
+  pub meta: PathBuf,
+  #[cfg(feature = "vectors")]
+  pub vector_dir: Option<PathBuf>,
+}
+
+impl SegmentPaths {
+  /// Resolve every key in this `SegmentPaths` against `root`. Absolute
+  /// keys (legacy v1 manifests) are returned as-is; relative keys
+  /// (v2) are joined under `root`. Always succeeds — validation of
+  /// the v2-relative invariant is a separate concern handled by
+  /// [`SegmentPaths::validate_v2_relative`].
+  pub fn resolve(&self, root: &Path) -> ResolvedSegmentPaths {
+    ResolvedSegmentPaths {
+      terms: resolve_segment_path(root, &self.terms),
+      postings: resolve_segment_path(root, &self.postings),
+      docstore: resolve_segment_path(root, &self.docstore),
+      fast: resolve_segment_path(root, &self.fast),
+      meta: resolve_segment_path(root, &self.meta),
+      #[cfg(feature = "vectors")]
+      vector_dir: self
+        .vector_dir
+        .as_deref()
+        .map(|d| resolve_segment_path(root, d)),
+    }
+  }
+
+  /// Validate the v2 invariant: every key in this `SegmentPaths` is
+  /// **relative** (no absolute paths) and contains **no `..`
+  /// components** (no parent-traversal escape from the index root).
+  /// Empty keys are also rejected as malformed.
+  pub fn validate_v2_relative(&self) -> Result<()> {
+    let check = |label: &str, s: &str| -> Result<()> {
+      if s.is_empty() {
+        bail!("v2 manifest: {label} segment path is empty");
+      }
+      let p = Path::new(s);
+      if p.is_absolute() {
+        bail!("v2 manifest: {label} segment path is absolute: {s:?}");
+      }
+      if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!("v2 manifest: {label} segment path contains `..` component: {s:?}");
+      }
+      Ok(())
+    };
+    check("terms", &self.terms)?;
+    check("postings", &self.postings)?;
+    check("docstore", &self.docstore)?;
+    check("fast", &self.fast)?;
+    check("meta", &self.meta)?;
+    #[cfg(feature = "vectors")]
+    if let Some(dir) = self.vector_dir.as_deref() {
+      check("vector_dir", dir)?;
+    }
+    Ok(())
+  }
+
+  /// Stage 9a [P2] (Codex review): validate the v1 *legacy* invariant
+  /// — every key is non-empty and contains no `..` component. v1
+  /// manifests produced by the pre-Stage-9 writer used
+  /// `root.join(filename)`; that produced **absolute** paths when
+  /// `IndexOptions.path` was absolute, and **root-prefixed relative**
+  /// paths when it was relative (e.g. `idx/seg_X.terms` for
+  /// `--index idx`). Both shapes are legitimate v1; only `..`
+  /// traversal and empty paths are rejected as malformed.
+  ///
+  /// Stage 9a v4 [P2] update: previously rejected non-absolute v1 paths
+  /// outright; that broke relative-root indexes created by older CLI
+  /// invocations. The `..` check still prevents resolution from
+  /// escaping the index root.
+  pub fn validate_v1_legacy(&self) -> Result<()> {
+    let check = |label: &str, s: &str| -> Result<()> {
+      if s.is_empty() {
+        bail!("v1 manifest: {label} segment path is empty");
+      }
+      let p = Path::new(s);
+      if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!("v1 manifest: {label} segment path contains `..` component: {s:?}");
+      }
+      Ok(())
+    };
+    check("terms", &self.terms)?;
+    check("postings", &self.postings)?;
+    check("docstore", &self.docstore)?;
+    check("fast", &self.fast)?;
+    check("meta", &self.meta)?;
+    #[cfg(feature = "vectors")]
+    if let Some(dir) = self.vector_dir.as_deref() {
+      check("vector_dir", dir)?;
+    }
+    Ok(())
+  }
+
+  /// Stage 9a [P2] (Codex review): convert this `SegmentPaths` to its
+  /// portable v2 form by stripping the index `root` prefix.
+  ///
+  /// Three shapes are handled, mirroring [`resolve_segment_path`]:
+  ///
+  /// * **Absolute key** — strip the (absolute) root prefix. Errors if
+  ///   the absolute key is NOT under `root` (the segment file lives
+  ///   elsewhere and an in-place upgrade would silently break reads).
+  /// * **Relative key starting with `root`** — strip the root prefix.
+  ///   This is the v1 relative-root case where the old writer
+  ///   recorded e.g. `idx/seg_X.terms` for an index opened with a
+  ///   relative `--index idx`.
+  /// * **Bare relative key** — already in v2 shape; passed through
+  ///   unchanged.
+  ///
+  /// Stage 9a v4 [P2] update: extended to handle root-prefixed
+  /// relative v1 paths in addition to absolute paths. Previously this
+  /// only stripped absolute prefixes, so a legacy relative-root
+  /// manifest would round-trip its old prefix into the v2 form (e.g.
+  /// `idx/idx/seg_X.terms` after one resolve cycle).
+  pub fn relativize_under(&mut self, root: &Path) -> Result<()> {
+    // Stage 9a v6 [P3] (Codex review): the absolute-form-of-root
+    // step needs the process CWD when `root` is relative. We resolve
+    // CWD once here and forward to `relativize_under_with_cwd` so
+    // tests can exercise the path-candidate logic without mutating
+    // the process-global CWD (which would race against parallel
+    // tests).
+    let cwd = if root.is_absolute() {
+      None
+    } else {
+      Some(std::env::current_dir().with_context(|| {
+        format!("resolving absolute form of relative index root {root:?} for upgrade")
+      })?)
+    };
+    self.relativize_under_with_cwd(root, cwd.as_deref())
+  }
+
+  /// Stage 9a v6 [P3] (Codex review): testable variant of
+  /// `relativize_under` that takes an explicit `cwd` for resolving
+  /// relative roots, instead of pulling it from the process via
+  /// `std::env::current_dir`. Production callers go through
+  /// `relativize_under`; tests use this directly to avoid mutating
+  /// process CWD under the parallel test harness.
+  pub fn relativize_under_with_cwd(&mut self, root: &Path, cwd: Option<&Path>) -> Result<()> {
+    // Build the set of candidate root forms an absolute v1 segment
+    // key might have been recorded against. Path comparison is
+    // lexical, so we need every form the on-disk path could
+    // plausibly take:
+    //
+    // * Literal `root` (handles absolute root + absolute key, or
+    //   relative root + relative key in the legacy relative-root
+    //   case).
+    // * Absolute form of `root` (cwd + root) — needed when the
+    //   user opens with a relative root but the v1 manifest stored
+    //   absolute paths.
+    // * Canonical form of `root` (symlinks resolved) — needed on
+    //   macOS where `/var/folders/...` is a symlink to
+    //   `/private/var/folders/...` and the manifest may have stored
+    //   either form depending on the writer's environment.
+    let mut root_candidates: Vec<PathBuf> = Vec::with_capacity(4);
+    root_candidates.push(root.to_path_buf());
+    let absolute_root: Option<PathBuf> = if root.is_absolute() {
+      None
+    } else {
+      let cwd = cwd.ok_or_else(|| {
+        anyhow!(
+          "relativize_under_with_cwd: cwd is required when root {root:?} is relative"
+        )
+      })?;
+      Some(cwd.join(root))
+    };
+    if let Some(abs) = absolute_root.as_deref() {
+      if !root_candidates.iter().any(|r| r == abs) {
+        root_candidates.push(abs.to_path_buf());
+      }
+    }
+    if let Ok(canon) = std::fs::canonicalize(root) {
+      if !root_candidates.iter().any(|r| r == &canon) {
+        root_candidates.push(canon);
+      }
+    }
+    if let Some(abs) = absolute_root.as_deref() {
+      if let Ok(canon) = std::fs::canonicalize(abs) {
+        if !root_candidates.iter().any(|r| r == &canon) {
+          root_candidates.push(canon);
+        }
+      }
+    }
+    fn relativize(
+      label: &str,
+      root: &Path,
+      candidates: &[PathBuf],
+      key: &mut String,
+    ) -> Result<()> {
+      if key.is_empty() {
+        bail!("cannot relativize empty {label} path");
+      }
+      let p = Path::new(key.as_str());
+      if p.is_absolute() {
+        // Try every candidate root form against both the literal
+        // key and its canonical (symlink-resolved) form. If any
+        // combination succeeds, use the resulting bare key.
+        let key_canon: Option<PathBuf> = std::fs::canonicalize(p).ok();
+        for cand in candidates {
+          if let Ok(stripped) = p.strip_prefix(cand) {
+            *key = stripped.to_string_lossy().into_owned();
+            return Ok(());
+          }
+          if let Some(kc) = key_canon.as_deref() {
+            if let Ok(stripped) = kc.strip_prefix(cand) {
+              *key = stripped.to_string_lossy().into_owned();
+              return Ok(());
+            }
+          }
+        }
+        bail!(
+          "cannot relativize {label} path {key:?}: not under index root {root:?} \
+           (tried candidates {candidates:?})"
+        );
+      }
+      if let Ok(stripped) = p.strip_prefix(root) {
+        *key = stripped.to_string_lossy().into_owned();
+        return Ok(());
+      }
+      // Already a bare relative key (v2 shape, or a v1 manifest from
+      // an empty/CWD root). Leave as-is; post-upgrade
+      // `validate_v2_relative` will catch any disallowed shape.
+      Ok(())
+    }
+    relativize("terms", root, &root_candidates, &mut self.terms)?;
+    relativize("postings", root, &root_candidates, &mut self.postings)?;
+    relativize("docstore", root, &root_candidates, &mut self.docstore)?;
+    relativize("fast", root, &root_candidates, &mut self.fast)?;
+    relativize("meta", root, &root_candidates, &mut self.meta)?;
+    #[cfg(feature = "vectors")]
+    if let Some(dir) = self.vector_dir.as_mut() {
+      relativize("vector_dir", root, &root_candidates, dir)?;
+    }
+    Ok(())
+  }
+}
+
+/// Resolve a single segment path key against an index root.
+///
+/// Three legitimate shapes are recognized — chosen so v1 (legacy) and
+/// v2 (Stage 9a) manifests both resolve to the right on-disk path:
+///
+/// * **Absolute** — passed through unchanged. v1's common shape, where
+///   the writer did `root.join(filename)` and `root` was absolute.
+/// * **Relative starting with `root`** — passed through unchanged. v1's
+///   relative-root shape: when the caller used a relative
+///   `IndexOptions.path` like `idx`, the writer recorded
+///   `idx/seg_X.terms`, which already includes the root prefix.
+///   Without this branch, naive `root.join` would double-prefix to
+///   `idx/idx/seg_X.terms`.
+/// * **Bare relative** — joined under `root`. v2's standard shape
+///   (`seg_X.terms`).
+pub fn resolve_segment_path(root: &Path, key: &str) -> PathBuf {
+  let p = Path::new(key);
+  if p.is_absolute() {
+    return p.to_path_buf();
+  }
+  if p.strip_prefix(root).is_ok() {
+    // Legacy v1 relative-root form. The path already includes the
+    // root, so use it directly rather than joining a second time.
+    return p.to_path_buf();
+  }
+  root.join(p)
+}
+
 impl Manifest {
   pub fn new(schema: Schema) -> Self {
     Self {
-      version: 1,
+      version: MANIFEST_LATEST_VERSION,
       uuid: Uuid::new_v4(),
       segments: Vec::new(),
       committed_at: Utc::now().to_rfc3339(),
@@ -70,14 +350,143 @@ impl Manifest {
       .with_context(|| format!("reading manifest at {path:?}"))?;
     let manifest: Manifest =
       serde_json::from_slice(&data).with_context(|| format!("parsing manifest at {path:?}"))?;
+    // Stage 9a v4 [P3] (Codex review): assert the manifest version
+    // **before** entering the per-segment validation loop. Previously
+    // the unsupported-version check lived inside the loop, so a
+    // malformed manifest with `version: 0` and an empty segment list
+    // would skip the loop and load successfully.
+    if manifest.version == 0 || manifest.version > MANIFEST_LATEST_VERSION {
+      bail!(
+        "manifest at {path:?} has unsupported version {} (supported: 1..={})",
+        manifest.version,
+        MANIFEST_LATEST_VERSION
+      );
+    }
+    // Stage 9a: validate the per-version path invariant. v2 requires
+    // relative-only keys; v1 (legacy) requires non-empty + `..`-free
+    // keys (absolute or root-prefixed relative are both legitimate;
+    // see `validate_v1_legacy`). A `..`-bearing path could otherwise
+    // resolve outside the index root.
+    for seg in &manifest.segments {
+      match manifest.version {
+        v if v >= 2 => seg
+          .paths
+          .validate_v2_relative()
+          .with_context(|| format!("v2 manifest validation failed for segment {}", seg.id))?,
+        1 => seg
+          .paths
+          .validate_v1_legacy()
+          .with_context(|| format!("v1 manifest validation failed for segment {}", seg.id))?,
+        // Pre-loop check above rejects all other versions.
+        _ => unreachable!("version validated before per-segment loop"),
+      }
+    }
     Ok(manifest)
   }
 
   pub fn store(&self, storage: &dyn Storage, path: &Path) -> Result<()> {
-    let data = serde_json::to_vec_pretty(self)?;
+    let data = self.serialize_for_write()?;
     storage
       .atomic_write(path, &data)
       .with_context(|| format!("writing manifest at {path:?}"))
+  }
+
+  /// Stage 9a [P2] (Codex review): in-place upgrade a (possibly v1)
+  /// `Manifest` to the latest version under `root`. Strips the root
+  /// prefix from any absolute legacy path, then bumps `version` to
+  /// `MANIFEST_LATEST_VERSION` and validates the resulting v2
+  /// invariant.
+  ///
+  /// This is the load-bearing migration step for legacy v1 manifests:
+  /// without it, a `Writer::commit` against an open v1 index would
+  /// re-emit a v1 manifest that mixes absolute legacy paths with
+  /// freshly-relative new-segment paths, and the index would never
+  /// become portable.
+  pub fn upgrade_to_latest(&mut self, root: &Path) -> Result<()> {
+    // Stage 9a v5 [P2] (Codex review): assert the supported-version
+    // invariant **before** mutating. Recovery and leftover-pending
+    // promote parse pending bytes directly and call this method
+    // without going through `Manifest::load`, so without an explicit
+    // guard a `version: 0` (or `version: 99`) pending file with no
+    // segments would skip the per-segment relativize loop and become
+    // a published v2 manifest. Mirror `Manifest::load`'s rejection
+    // boundaries here so all write/recovery paths share the same
+    // version contract.
+    if self.version == 0 || self.version > MANIFEST_LATEST_VERSION {
+      bail!(
+        "refusing to upgrade manifest with unsupported version {} (supported: 1..={})",
+        self.version,
+        MANIFEST_LATEST_VERSION
+      );
+    }
+    if self.version >= MANIFEST_LATEST_VERSION {
+      // Already at latest. Re-validate defensively to catch any
+      // in-process mutation that produced a non-portable v2 shape.
+      for seg in &self.segments {
+        seg.paths.validate_v2_relative().with_context(|| {
+          format!(
+            "v{} manifest validation failed for segment {}",
+            self.version, seg.id
+          )
+        })?;
+      }
+      return Ok(());
+    }
+    for seg in self.segments.iter_mut() {
+      seg.paths.relativize_under(root).with_context(|| {
+        format!(
+          "upgrading legacy manifest segment {} to v{MANIFEST_LATEST_VERSION}",
+          seg.id
+        )
+      })?;
+    }
+    self.version = MANIFEST_LATEST_VERSION;
+    for seg in &self.segments {
+      seg.paths.validate_v2_relative().with_context(|| {
+        format!(
+          "post-upgrade validation failed for segment {} (this is a bug)",
+          seg.id
+        )
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Stage 9a [P2] (Codex review): single serialization path used by
+  /// every commit-time write — `Manifest::store`, the pre-fence
+  /// pending write, and the recovery promote step. Consolidates
+  /// version + relative-key validation so no caller can bypass the
+  /// portability invariant.
+  ///
+  /// Note: this does NOT mutate `version` or paths — call
+  /// [`Manifest::upgrade_to_latest`] first if you have a legacy
+  /// in-memory manifest. This separation lets callers control the
+  /// upgrade timing (the writer upgrades before staging so the
+  /// pending file is itself portable).
+  pub fn serialize_for_write(&self) -> Result<Vec<u8>> {
+    if self.version > MANIFEST_LATEST_VERSION {
+      bail!(
+        "refusing to write manifest with unsupported version {} (latest supported is {})",
+        self.version,
+        MANIFEST_LATEST_VERSION
+      );
+    }
+    if self.version < MANIFEST_LATEST_VERSION {
+      bail!(
+        "refusing to write legacy v{} manifest; call Manifest::upgrade_to_latest before writing",
+        self.version
+      );
+    }
+    for seg in &self.segments {
+      seg.paths.validate_v2_relative().with_context(|| {
+        format!(
+          "refusing to write v{MANIFEST_LATEST_VERSION} manifest with non-portable \
+           path for segment {}",
+          seg.id
+        )
+      })?;
+    }
+    Ok(serde_json::to_vec_pretty(self)?)
   }
 
   pub fn manifest_path(root: &Path) -> PathBuf {
