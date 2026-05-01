@@ -1216,6 +1216,9 @@ mod tests {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      blob_store: Arc::new(crate::storage::StorageAsBlobStore::new(
+        storage.clone() as Arc<dyn crate::storage::Storage>,
+      )),
       storage: storage.clone(),
       segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: std::sync::atomic::AtomicUsize::new(0),
@@ -1287,6 +1290,9 @@ mod tests {
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
+      blob_store: Arc::new(crate::storage::StorageAsBlobStore::new(
+        storage.clone() as Arc<dyn crate::storage::Storage>,
+      )),
       storage: storage.clone(),
       segment_cache: crate::index::segment::SegmentCache::new(),
       reader_opens: std::sync::atomic::AtomicUsize::new(0),

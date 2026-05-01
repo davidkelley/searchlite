@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy, Document, IndexOptions};
+use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 #[cfg(feature = "vectors")]
 use crate::api::types::VectorMetric as ApiVectorMetric;
 use crate::index::directory;
@@ -1726,33 +1727,61 @@ impl SegmentCache {
 }
 
 /// Per-`IndexReader` view over an immutable `SegmentCore`, plus the
-/// manifest-specific state (`deleted_docs`) and per-view stateful file handles
-/// for postings/docstore reads.
+/// manifest-specific state (`deleted_docs`) and per-view handles for
+/// postings/docstore reads.
 ///
-/// Cheap to construct: opens two file handles against the manifest-current
-/// storage and paths, derives the deleted-doc set, and clones an `Arc` to
-/// the cached core. The expensive parsing has already happened on the core.
+/// Stage 8a: postings reads now go through `Arc<dyn Object>` opened from
+/// `BlobStore::open` (typically wrapping the inner `Storage` via
+/// `StorageAsBlobStore`). The postings methods issue bounded
+/// `Object::read_range` calls using `TinyFst::range_for(term, postings_len)`
+/// — for cloud backends this becomes a single `bytes=start-end` GET per
+/// term, instead of a whole-file read. Stage 8b will migrate docstore
+/// the same way; until then it stays on the existing `RefCell<DynFile>`
+/// stateful-handle shape.
+///
+/// Object handles deliberately live on the view, not on `SegmentCore` —
+/// matching Stage 1's "core stays parsed-only; per-storage state lives
+/// on the view" principle so manifest rewrites that relocate files
+/// (Stage 9 portable manifest) don't read through stale paths.
 pub struct SegmentReader {
   pub(crate) core: Arc<SegmentCore>,
   pub meta: SegmentMeta,
   deleted: FastHashSet<DocId>,
-  postings: RefCell<Box<dyn StorageFile>>,
+  /// Postings handle pinned at view-open time. `Object::stat()` exposes
+  /// the object length we need to drive `TinyFst::range_for`.
+  postings: Arc<dyn BlobObject>,
+  /// Cached postings object length so `range_for` calls don't re-stat
+  /// per term lookup. Equal to `postings.stat().len` at open time.
+  postings_len: u64,
+  /// Docstore handle. Stage 8b will migrate this to `Arc<dyn BlobObject>`
+  /// like postings; for Stage 8a it stays on the existing seek+read
+  /// shape via `Storage::open_read`.
   docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
 }
 
 impl SegmentReader {
-  /// Build a per-manifest view over an already-loaded `SegmentCore`. Opens
-  /// fresh per-view file handles for postings and docstore against the
-  /// manifest-current `meta.paths` and `storage`, so views remain safe to
-  /// use concurrently across threads despite the `RefCell`s — and a future
-  /// portable-manifest scheme that relocates files cannot accidentally read
-  /// through stale paths cached on the core.
+  /// Build a per-manifest view over an already-loaded `SegmentCore`.
+  /// Opens fresh per-view handles against the manifest-current
+  /// `meta.paths`: postings via `BlobStore::open` (Stage 8a) and
+  /// docstore via `Storage::open_read` (unchanged in 8a).
   pub fn from_core(
     core: Arc<SegmentCore>,
     meta: SegmentMeta,
     storage: Arc<dyn Storage>,
+    blob_store: Arc<dyn BlobStore>,
   ) -> Result<Self> {
-    let postings = storage.open_read(Path::new(&meta.paths.postings))?;
+    // Stage 8a: postings is opened as an `Object` so `postings()` and
+    // `doc_freq()` can issue bounded `read_range` calls using
+    // `TinyFst::range_for`. We use `block_on` to bridge the
+    // synchronous `from_core` API to the async `BlobStore::open`;
+    // this is a transitional bridge documented in the module-level
+    // comment of `storage_as_blob.rs` — Stage 8/9 may push async up
+    // the call stack, but Stage 8a keeps the read path sync.
+    let postings = futures::executor::block_on(
+      blob_store.open(Path::new(&meta.paths.postings)),
+    )?;
+    let postings_len = postings.stat().len;
+
     let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
     let docstore = DocStoreReader::new(
       doc_file,
@@ -1764,7 +1793,8 @@ impl SegmentReader {
       core,
       meta,
       deleted,
-      postings: RefCell::new(postings),
+      postings,
+      postings_len,
       docstore: RefCell::new(docstore),
     })
   }
@@ -1772,23 +1802,49 @@ impl SegmentReader {
   /// Convenience constructor that loads a fresh `SegmentCore` under the
   /// strict checksum policy and immediately builds a view from it. Bypasses
   /// any reader-side cache; callers that want caching or a non-strict
-  /// policy should go through `Index::reader()`.
+  /// policy should go through `Index::reader()`. Wraps `storage` with a
+  /// default `StorageAsBlobStore` so the test/legacy convenience API
+  /// doesn't need to thread a separate `BlobStore` argument.
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let ctx = SegmentLoadCtx::strict(keep_positions);
     let core = SegmentCore::load(storage.clone(), &meta, &ctx)?;
-    Self::from_core(core, meta, storage)
+    let blob_store: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage.clone()));
+    Self::from_core(core, meta, storage, blob_store)
   }
 
+  /// Stage 8a: bounded postings range read.
+  ///
+  /// Looks up the term's offset and length in the in-memory term
+  /// dictionary (`TinyFst::range_for`) and issues a single
+  /// `Object::read_range(start..end)` against the postings object.
+  /// On a cloud backend this becomes one `bytes=start-(end-1)` GET
+  /// per term; on local FS it's a single seek+read. Either way the
+  /// scan-from-EOF-and-decode logic in `PostingsReader::read_at`
+  /// operates on a `Cursor` over the bounded byte slice rather than
+  /// the whole postings file.
   pub fn postings(&self, term: &str) -> Option<PostingsReader> {
-    let offset = self.core.terms.0.get(term)?;
-    let mut file = self.postings.borrow_mut();
-    PostingsReader::read_at(&mut *file, offset, self.core.keep_positions).ok()
+    let range = self.core.terms.0.range_for(term, self.postings_len)?;
+    let bytes = futures::executor::block_on(self.postings.read_range(range)).ok()?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    PostingsReader::read_at(&mut cursor, 0, self.core.keep_positions).ok()
   }
 
+  /// Stage 8a: tiny range read for the leading `doc_freq` `u32`.
+  ///
+  /// `doc_freq` is the first 4 bytes of a term's postings payload. We
+  /// read just those 4 bytes via a bounded range — substantially less
+  /// I/O than the full postings list when the caller only needs the
+  /// frequency (e.g. for BM25 stats before deciding whether to
+  /// iterate).
   pub fn doc_freq(&self, term: &str) -> Option<u32> {
     let offset = self.core.terms.0.get(term)?;
-    let mut file = self.postings.borrow_mut();
-    read_doc_freq(&mut *file, offset).ok()
+    let end = offset.checked_add(4)?;
+    if end > self.postings_len {
+      return None;
+    }
+    let bytes = futures::executor::block_on(self.postings.read_range(offset..end)).ok()?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    read_doc_freq(&mut cursor, 0).ok()
   }
 
   pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {

@@ -76,6 +76,14 @@ impl Storage for BlobStoreAdapter {
     &self.root
   }
 
+  /// Stage 8a [P1] (Codex review): expose the inner blob store so
+  /// `Index::*_with_storage` constructors can avoid double-wrapping
+  /// (`StorageAsBlobStore` → `BlobStoreAdapter` → another `block_on`).
+  /// See `default_blob_store` in `index/mod.rs`.
+  fn as_blob_store(&self) -> Option<Arc<dyn BlobStore>> {
+    Some(self.blob.clone())
+  }
+
   fn ensure_dir(&self, path: &Path) -> Result<()> {
     // Filesystem-shaped: BlobStore has no notion of directories.
     // For local-FS-backed impls (Stage 6 LocalBlobStore), parent dirs

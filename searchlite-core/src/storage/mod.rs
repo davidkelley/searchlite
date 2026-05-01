@@ -22,6 +22,14 @@ pub mod blob_adapter;
 pub mod cached_blob;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local_blob;
+// `StorageAsBlobStore` is the Stage 8a transitional bridge wiring the
+// existing `Storage` trait into the BlobStore-shaped read path used by
+// segment readers. It has no native-only deps (sync `std::fs` work
+// behind `async_trait`-generated futures), so it's available on wasm32
+// too — the wasm crate's `InMemoryStorage`-backed Index uses it as the
+// default `blob_store`. Stage 9+ may migrate wasm to a dedicated
+// backend (OPFS, IndexedDB).
+pub mod storage_as_blob;
 pub use blob::{
   ArtifactIdentity, BlobStore, Capabilities, ContentHash, Object, ObjectStat, ObjectWriter,
   ProviderChecksum, PutIfMatchError,
@@ -32,6 +40,7 @@ pub use blob_adapter::BlobStoreAdapter;
 pub use cached_blob::{ByteRange, CacheStats, CachedBlobStore, DEFAULT_CACHE_CAPACITY_BYTES};
 #[cfg(not(target_arch = "wasm32"))]
 pub use local_blob::LocalBlobStore;
+pub use storage_as_blob::StorageAsBlobStore;
 
 pub trait StorageFile: Read + Write + Seek + Send {
   fn set_len(&mut self, len: u64) -> Result<()>;
@@ -62,6 +71,21 @@ pub trait Storage: Send + Sync {
   fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()>;
   fn remove(&self, path: &Path) -> Result<()>;
   fn remove_dir_all(&self, path: &Path) -> Result<()>;
+
+  /// Stage 8a [P1] hint (Codex review): if this `Storage` is itself an
+  /// adapter wrapping a `BlobStore` (e.g. [`BlobStoreAdapter`]),
+  /// return a clone of the inner store. The default returns `None`.
+  ///
+  /// `Index::*_with_storage` constructors consult this hint via
+  /// `default_blob_store(&storage)` to skip wrapping with
+  /// [`StorageAsBlobStore`] when a real `BlobStore` is already in
+  /// scope. The skip avoids a nested `futures::executor::block_on`
+  /// chain (`SegmentReader::from_core` → `StorageAsBlobStore` →
+  /// `BlobStoreAdapter::*` → another `block_on`) that the LocalPool
+  /// executor refuses with `EnterError`.
+  fn as_blob_store(&self) -> Option<Arc<dyn BlobStore>> {
+    None
+  }
 }
 
 pub struct FsStorage {

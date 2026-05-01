@@ -14,7 +14,7 @@ use crate::index::directory::ensure_root;
 use crate::index::manifest::{Manifest, Schema};
 use crate::index::segment::SegmentWriter;
 use crate::index::wal::Wal;
-use crate::storage::{FsStorage, InMemoryStorage, Storage};
+use crate::storage::{BlobStore, FsStorage, InMemoryStorage, Storage, StorageAsBlobStore};
 #[cfg(feature = "write-key")]
 use crate::util::write_key::derive_write_key_meta;
 
@@ -41,6 +41,15 @@ pub(crate) struct InnerIndex {
   pub manifest: RwLock<Manifest>,
   pub writer_lock: Mutex<()>,
   pub storage: Arc<dyn Storage>,
+  /// `BlobStore`-shaped view over `storage`. Stage 8a wires this in so
+  /// segment readers can open `Object` handles for postings and (in 8b)
+  /// docstore via bounded `Object::read_range` calls. Default is
+  /// `StorageAsBlobStore::new(storage.clone())` — a transitional bridge
+  /// that serves raw file bytes without the LocalBlobStore header
+  /// format; existing segment files (written via `Storage::open_write`)
+  /// are routable as-is. Stage 9+ replaces this with a real BlobStore
+  /// (LocalBlobStore for local FS, S3BlobStore for cloud).
+  pub blob_store: Arc<dyn BlobStore>,
   /// Cache of immutable `SegmentCore`s keyed by `(segment_id, fingerprint)`.
   /// `IndexReader::open` consults this cache when materializing per-manifest
   /// `SegmentReader` views, so the expensive segment-open work (checksum
@@ -84,6 +93,34 @@ impl Index {
     storage: Arc<dyn Storage>,
     write_key: Option<&str>,
   ) -> Result<Self> {
+    let blob_store = default_blob_store(&storage);
+    Self::create_with_storage_blob_store_and_key(path, schema, opts, storage, blob_store, write_key)
+  }
+
+  /// Stage 8a: explicit blob_store constructor. Production callers use
+  /// the storage-only variants which build a `StorageAsBlobStore`
+  /// bridge; tests inject a custom `BlobStore` (e.g. `RecordingBlobStore`)
+  /// via this entry point to assert range-read counts. Stage 9+ will
+  /// expose this for cloud-backed deployments where the native
+  /// BlobStore differs from the local Storage.
+  pub fn create_with_storage_and_blob_store(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    storage: Arc<dyn Storage>,
+    blob_store: Arc<dyn BlobStore>,
+  ) -> Result<Self> {
+    Self::create_with_storage_blob_store_and_key(path, schema, opts, storage, blob_store, None)
+  }
+
+  pub fn create_with_storage_blob_store_and_key(
+    path: &Path,
+    schema: Schema,
+    opts: IndexOptions,
+    storage: Arc<dyn Storage>,
+    blob_store: Arc<dyn BlobStore>,
+    write_key: Option<&str>,
+  ) -> Result<Self> {
     let mut opts = opts;
     opts.path = path.to_path_buf();
     schema.validate_config()?;
@@ -105,6 +142,7 @@ impl Index {
     let inner = Arc::new(InnerIndex {
       path: path.to_path_buf(),
       storage,
+      blob_store,
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
@@ -120,6 +158,17 @@ impl Index {
   }
 
   pub fn open_with_storage(opts: IndexOptions, storage: Arc<dyn Storage>) -> Result<Self> {
+    let blob_store = default_blob_store(&storage);
+    Self::open_with_storage_and_blob_store(opts, storage, blob_store)
+  }
+
+  /// Stage 8a: explicit blob_store entry point for `Index::open`. See
+  /// `create_with_storage_and_blob_store` for the rationale.
+  pub fn open_with_storage_and_blob_store(
+    opts: IndexOptions,
+    storage: Arc<dyn Storage>,
+    blob_store: Arc<dyn BlobStore>,
+  ) -> Result<Self> {
     ensure_root(storage.as_ref(), &opts.path)?;
     let manifest_path = Manifest::manifest_path(&opts.path);
     // BUG-018 recovery: if a previous `Writer::commit` crashed between the
@@ -139,6 +188,7 @@ impl Index {
     let inner = Arc::new(InnerIndex {
       path: opts.path.clone(),
       storage,
+      blob_store,
       options: opts,
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
@@ -418,6 +468,7 @@ impl Index {
           core,
           (*seg).clone(),
           inner.storage.clone(),
+          inner.blob_store.clone(),
         )
       })
       .collect::<Result<Vec<_>>>()?;
@@ -507,6 +558,27 @@ fn storage_from_options(opts: &IndexOptions) -> Arc<dyn Storage> {
     StorageType::Filesystem => Arc::new(FsStorage::new(opts.path.clone())),
     StorageType::InMemory => Arc::new(InMemoryStorage::new(opts.path.clone())),
   }
+}
+
+/// Build the default `Arc<dyn BlobStore>` for an `Index` from its
+/// `Storage`. Stage 8a uses `StorageAsBlobStore` as a transitional
+/// bridge: it serves raw file bytes (no LocalBlobStore header) so
+/// existing segment files written via `Storage::open_write` can be
+/// read through the BlobStore surface without rewriting them. Stage 9+
+/// can pass an explicit blob_store via the `*_with_storage_and_blob_store`
+/// constructors when a richer backend (e.g. S3) is configured.
+///
+/// Stage 8a [P1] (Codex review): if `storage` is itself a
+/// `BlobStoreAdapter` (or any future Storage wrapping a BlobStore),
+/// prefer the inner store via [`Storage::as_blob_store`] instead of
+/// wrapping again. Wrapping a `BlobStoreAdapter` in `StorageAsBlobStore`
+/// produces a nested `block_on` chain (segment reader →
+/// `StorageAsBlobStore::stat` → `BlobStoreAdapter::*` → another
+/// `block_on`) that the `LocalPool` executor refuses with `EnterError`.
+fn default_blob_store(storage: &Arc<dyn Storage>) -> Arc<dyn BlobStore> {
+  storage
+    .as_blob_store()
+    .unwrap_or_else(|| Arc::new(StorageAsBlobStore::new(storage.clone())))
 }
 
 /// Reconcile a `MANIFEST.json.pending` left behind by a crashed `Writer::commit`.
@@ -1771,24 +1843,31 @@ mod tests {
   ///
   /// If this test fails, Stage 5's trait surface or Stage 6's adapter is
   /// missing something the index code depends on.
+  ///
+  /// Stage 8a [P1] (Codex review): the storage-only constructor path
+  /// must keep working when `Storage` is a `BlobStoreAdapter`. Going
+  /// through `BlobStoreAdapter` for segment reads would create a nested
+  /// `futures::executor::block_on` (BlobStoreAdapter's bridge inside
+  /// SegmentReader's bridge), which the LocalPool executor refuses with
+  /// `EnterError`. The fix: `default_blob_store` consults
+  /// [`Storage::as_blob_store`], and `BlobStoreAdapter` overrides it to
+  /// return its inner `Arc<dyn BlobStore>` directly — so this test
+  /// exercises that the unwrap actually happens (any regression brings
+  /// the `EnterError` back).
   #[test]
   fn index_runs_end_to_end_through_blob_store_adapter() {
     use crate::storage::{BlobStoreAdapter, LocalBlobStore};
 
     let dir = tempdir().unwrap();
 
-    // Build the adapter chain: index → BlobStoreAdapter → Arc<dyn BlobStore>
-    // → LocalBlobStore → tempdir. The same path is shared as the
-    // adapter's "root" and the LocalBlobStore's root so resolved keys
-    // line up the way the index code expects.
     let blob: Arc<dyn crate::storage::BlobStore> =
       Arc::new(LocalBlobStore::new(dir.path().to_path_buf()));
     let adapter: Arc<dyn Storage> =
       Arc::new(BlobStoreAdapter::new(blob, dir.path().to_path_buf()));
 
     let schema = Schema::default_text_body();
-    let idx = Index::create_with_storage(dir.path(), schema, opts(dir.path()), adapter.clone())
-      .unwrap();
+    let idx =
+      Index::create_with_storage(dir.path(), schema, opts(dir.path()), adapter.clone()).unwrap();
 
     // Two commits in two separate segments to exercise multi-segment
     // reader open through the adapter as well.
@@ -1829,8 +1908,7 @@ mod tests {
     drop(idx);
     let mut reopen_opts = opts(dir.path());
     reopen_opts.create_if_missing = false;
-    let reopened =
-      Index::open_with_storage(reopen_opts, adapter).unwrap();
+    let reopened = Index::open_with_storage(reopen_opts, adapter).unwrap();
     let reader = reopened.reader().unwrap();
     let result = reader.search(&req).unwrap();
     assert_eq!(
@@ -1838,5 +1916,451 @@ mod tests {
       "search after reopen-through-adapter must return correct results"
     );
     assert_eq!(reopened.manifest().segments.len(), 3);
+  }
+
+  /// Stage 8a regression suite: with the new postings → BlobStore
+  /// migration in place, segment reads must issue bounded `read_range`
+  /// calls, not whole-file reads. A `RecordingBlobStore` wrapper logs
+  /// every `get_range` and `Object::read_range` call (path + range) for
+  /// inspection by the tests below.
+  ///
+  /// The asserted properties are *structural*, not exact-count, because
+  /// the search path may legitimately issue more than one bounded
+  /// postings read per segment (e.g. one for `doc_freq` stats, another
+  /// for iteration). The two regressions guarded here are:
+  ///
+  /// * `missing_term_performs_zero_postings_range_reads` — a query for
+  ///   a term not present in the segment must issue **zero** postings
+  ///   reads. Catches accidental unconditional fetches and any
+  ///   whole-file fallback that bypasses the FST gate.
+  /// * `hit_term_postings_reads_are_strictly_bounded_vs_whole_file` —
+  ///   a hit-term query may issue any number of postings reads, but
+  ///   each read's range MUST be strictly smaller than the whole
+  ///   postings file. Catches accidental fallback to `0..len`.
+  ///
+  /// Plus the [P1] regression added with Stage 8a v2:
+  ///
+  /// * `default_blob_store_does_not_read_postings_to_end_during_open` —
+  ///   the default `StorageAsBlobStore` open path must not call
+  ///   `Storage::read_to_end` on the postings file (i.e. `stat` must
+  ///   not slurp the file to discover its length).
+  ///
+  /// These tests live at the `Index` integration layer (rather than the
+  /// segment unit level) so they exercise the full
+  /// `IndexReader::search` → `SegmentReader::postings` →
+  /// `Object::read_range` path end to end.
+  mod stage8a_postings_range_reads {
+    use super::*;
+    use crate::storage::blob::{
+      BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError,
+    };
+    use crate::storage::StorageAsBlobStore;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Records every `get_range` and `Object::read_range` call against
+    /// the inner BlobStore, plus the cumulative byte count, for tests
+    /// that want to assert exact range-read shapes.
+    struct RecordingBlobStore {
+      inner: Arc<dyn BlobStore>,
+      log: Arc<Mutex<Vec<RangeReadEntry>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RangeReadEntry {
+      key: PathBuf,
+      range: Range<u64>,
+    }
+
+    impl RecordingBlobStore {
+      fn new(inner: Arc<dyn BlobStore>) -> (Arc<Self>, Arc<Mutex<Vec<RangeReadEntry>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(Self {
+          inner,
+          log: log.clone(),
+        });
+        (store, log)
+      }
+    }
+
+    #[async_trait]
+    impl BlobStore for RecordingBlobStore {
+      async fn stat(&self, key: &Path) -> Result<ObjectStat> {
+        self.inner.stat(key).await
+      }
+
+      async fn open(&self, key: &Path) -> Result<Arc<dyn Object>> {
+        let inner_obj = self.inner.open(key).await?;
+        Ok(Arc::new(RecordingObject {
+          inner: inner_obj,
+          key: key.to_path_buf(),
+          log: self.log.clone(),
+        }))
+      }
+
+      async fn get_range(&self, key: &Path, range: Range<u64>) -> Result<Bytes> {
+        self.log.lock().unwrap().push(RangeReadEntry {
+          key: key.to_path_buf(),
+          range: range.clone(),
+        });
+        self.inner.get_range(key, range).await
+      }
+
+      async fn get(&self, key: &Path) -> Result<Bytes> {
+        self.inner.get(key).await
+      }
+      async fn put(&self, key: &Path, body: Bytes) -> Result<ObjectStat> {
+        self.inner.put(key, body).await
+      }
+      async fn put_stream(&self, key: &Path) -> Result<Box<dyn ObjectWriter>> {
+        self.inner.put_stream(key).await
+      }
+      async fn put_if_match(
+        &self,
+        key: &Path,
+        body: Bytes,
+        expected: Option<&str>,
+      ) -> std::result::Result<ObjectStat, PutIfMatchError> {
+        self.inner.put_if_match(key, body, expected).await
+      }
+      async fn delete(&self, key: &Path) -> Result<()> {
+        self.inner.delete(key).await
+      }
+      fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+      }
+    }
+
+    struct RecordingObject {
+      inner: Arc<dyn Object>,
+      key: PathBuf,
+      log: Arc<Mutex<Vec<RangeReadEntry>>>,
+    }
+
+    #[async_trait]
+    impl Object for RecordingObject {
+      fn stat(&self) -> &ObjectStat {
+        self.inner.stat()
+      }
+
+      async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.log.lock().unwrap().push(RangeReadEntry {
+          key: self.key.clone(),
+          range: range.clone(),
+        });
+        self.inner.read_range(range).await
+      }
+    }
+
+    /// Build an `Index` whose `blob_store` is a `RecordingBlobStore`
+    /// wrapping the default `StorageAsBlobStore` over `FsStorage`.
+    /// Returns the index plus the log for assertions.
+    fn make_index_with_recording_blob_store(
+      dir: &Path,
+    ) -> (Index, Arc<Mutex<Vec<RangeReadEntry>>>) {
+      let storage: Arc<dyn Storage> =
+        Arc::new(crate::storage::FsStorage::new(dir.to_path_buf()));
+      let inner_blob: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage.clone()));
+      let (recording, log) = RecordingBlobStore::new(inner_blob);
+      let blob_store: Arc<dyn BlobStore> = recording;
+      let schema = Schema::default_text_body();
+      let idx = Index::create_with_storage_and_blob_store(
+        dir,
+        schema,
+        opts(dir),
+        storage,
+        blob_store,
+      )
+      .unwrap();
+      (idx, log)
+    }
+
+    /// Filter recorded reads to those targeting the given segment's
+    /// postings file. Used to assert range-read counts against
+    /// postings specifically (not docstore, not other segments).
+    fn postings_reads_for_segment<'a>(
+      log: &'a [RangeReadEntry],
+      postings_path: &Path,
+    ) -> Vec<&'a RangeReadEntry> {
+      log
+        .iter()
+        .filter(|e| e.key == postings_path)
+        .collect()
+    }
+
+    /// Stage 8a regression: a query with a term that does not exist in
+    /// any segment performs **zero** postings range reads. Catches any
+    /// path that accidentally fetches the postings whole-file or
+    /// queries unconditionally.
+    #[test]
+    fn missing_term_performs_zero_postings_range_reads() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha bravo")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+
+      let postings_path = PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+
+      // Snapshot the log AFTER the index is built (writes may have
+      // their own range reads) so we measure only the search phase.
+      let before = log.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "thisterm_does_not_exist_anywhere",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(result.total_hits_estimate, 0);
+
+      let after = log.lock().unwrap();
+      let search_phase = &after[before..];
+      let postings_reads = postings_reads_for_segment(search_phase, &postings_path);
+      assert_eq!(
+        postings_reads.len(),
+        0,
+        "missing term must not issue any postings range reads; got {} reads: {:?}",
+        postings_reads.len(),
+        postings_reads
+      );
+    }
+
+    /// Stage 8a regression: a hit-term query performs **bounded**
+    /// postings range reads against the matching segment — every read
+    /// is strictly less than the whole postings file size. This is the
+    /// load-bearing property: even if the search path issues multiple
+    /// reads (e.g. one for `doc_freq` stats and one for iteration),
+    /// each one is a `TinyFst::range_for` slice rather than a
+    /// fallback-to-`0..len` whole-file fetch.
+    ///
+    /// Uses a multi-term corpus so each term's range is a proper
+    /// subset of the file. With a single-term corpus the term's range
+    /// IS the whole file and the boundedness property is unobservable.
+    #[test]
+    fn hit_term_postings_reads_are_strictly_bounded_vs_whole_file() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+
+      // Multi-term, multi-doc corpus — ensures the "alpha" payload is
+      // a small slice of the postings file rather than the entire
+      // contents. Without this, a 1-term segment's range is 0..len
+      // and the assertion below trivially passes via inequality on
+      // identical numbers, defeating the test's intent.
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [
+        ("1", "alpha bravo"),
+        ("2", "bravo charlie delta"),
+        ("3", "echo foxtrot golf hotel"),
+        ("4", "india juliet kilo lima"),
+        ("5", "mike november oscar"),
+      ] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+
+      let segment = &idx.manifest().segments[0];
+      let postings_path = PathBuf::from(segment.paths.postings.clone());
+      let postings_total_len = std::fs::metadata(&postings_path).unwrap().len();
+      assert!(
+        postings_total_len > 100,
+        "test prerequisite: postings file should be substantially larger than any single term's range"
+      );
+
+      let before = log.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "alpha",
+        "limit": 10,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(result.total_hits_estimate, 1);
+
+      let after = log.lock().unwrap();
+      let search_phase = &after[before..];
+      let postings_reads = postings_reads_for_segment(search_phase, &postings_path);
+
+      assert!(
+        !postings_reads.is_empty(),
+        "hit-term search must issue at least one postings range read"
+      );
+
+      // The structural property: every postings read is a bounded
+      // range, NOT a fallback to whole-file. If a future change
+      // accidentally re-introduces a whole-file fetch for the term's
+      // payload, this assertion fails.
+      for r in &postings_reads {
+        assert!(
+          r.range.end <= postings_total_len,
+          "range {:?} must not exceed postings length {}",
+          r.range,
+          postings_total_len
+        );
+        assert!(
+          (r.range.end - r.range.start) < postings_total_len,
+          "range {:?} must be strictly bounded vs whole-file fetch \
+           (postings_total_len = {}); accidental fallback to 0..len?",
+          r.range,
+          postings_total_len
+        );
+      }
+    }
+
+    /// Stage 8a [P1] regression (Codex review): the default
+    /// `StorageAsBlobStore::open` path MUST NOT slurp the entire
+    /// postings file via `Storage::read_to_end` to compute its length.
+    /// The previous shape (`read_to_end(&path)?.len()` inside `stat`)
+    /// defeated the entire point of the Stage 8a migration: every
+    /// segment reader open re-read the full postings before any
+    /// bounded `read_range` happened.
+    ///
+    /// We wrap an `FsStorage` with a `RecordingStorage` that tallies
+    /// every `Storage::read_to_end` call, then drive the default
+    /// blob-store path (via `Index::create_with_storage`, with no
+    /// explicit `blob_store` override). After committing a segment we
+    /// open a reader and assert no `read_to_end` calls landed on the
+    /// postings file during reader open. The fixed shape uses
+    /// `open_read + seek(End)` to discover length without touching
+    /// any bytes.
+    #[test]
+    fn default_blob_store_does_not_read_postings_to_end_during_open() {
+      use crate::storage::DynFile;
+
+      struct RecordingStorage {
+        inner: Arc<dyn Storage>,
+        read_to_end_calls: Arc<Mutex<Vec<PathBuf>>>,
+      }
+
+      impl Storage for RecordingStorage {
+        fn root(&self) -> &Path {
+          self.inner.root()
+        }
+        fn ensure_dir(&self, path: &Path) -> Result<()> {
+          self.inner.ensure_dir(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+          self.inner.exists(path)
+        }
+        fn open_read(&self, path: &Path) -> Result<DynFile> {
+          self.inner.open_read(path)
+        }
+        fn open_write(&self, path: &Path) -> Result<DynFile> {
+          self.inner.open_write(path)
+        }
+        fn open_append(&self, path: &Path) -> Result<DynFile> {
+          self.inner.open_append(path)
+        }
+        fn read_to_end(&self, path: &Path) -> Result<Vec<u8>> {
+          self
+            .read_to_end_calls
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
+          self.inner.read_to_end(path)
+        }
+        fn write_all(&self, path: &Path, data: &[u8]) -> Result<()> {
+          self.inner.write_all(path, data)
+        }
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
+          self.inner.atomic_write(path, data)
+        }
+        fn remove(&self, path: &Path) -> Result<()> {
+          self.inner.remove(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> Result<()> {
+          self.inner.remove_dir_all(path)
+        }
+      }
+
+      let dir = tempdir().unwrap();
+      let inner: Arc<dyn Storage> =
+        Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+      let read_to_end_calls = Arc::new(Mutex::new(Vec::new()));
+      let recording: Arc<dyn Storage> = Arc::new(RecordingStorage {
+        inner,
+        read_to_end_calls: read_to_end_calls.clone(),
+      });
+
+      // `ChecksumPolicy::Strict` (the default) reads each segment file
+      // end-to-end to verify the manifest checksum on segment open.
+      // That's an unrelated whole-file read driven by policy, not by
+      // the `StorageAsBlobStore::stat` slurping bug we're guarding
+      // against. Switch to `TrustManifest` so the only `read_to_end`
+      // path under test is the BlobStore open path.
+      let mut idx_opts = opts(dir.path());
+      idx_opts.checksum_policy = crate::api::types::ChecksumPolicy::TrustManifest;
+
+      // Use `create_with_storage` (NOT the
+      // `*_with_storage_and_blob_store` form) so the default
+      // `StorageAsBlobStore` bridge is exactly what's exercised.
+      let schema = Schema::default_text_body();
+      let idx =
+        Index::create_with_storage(dir.path(), schema, idx_opts, recording.clone()).unwrap();
+
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            (
+              "body".into(),
+              serde_json::json!("alpha bravo charlie delta echo"),
+            ),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      let postings_path = PathBuf::from(idx.manifest().segments[0].paths.postings.clone());
+
+      // Snapshot the call count so write-side reads don't pollute the
+      // read-side measurement.
+      let before = read_to_end_calls.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      drop(reader);
+
+      let calls = read_to_end_calls.lock().unwrap();
+      let suspect: Vec<&PathBuf> = calls[before..]
+        .iter()
+        .filter(|p| **p == postings_path)
+        .collect();
+      assert!(
+        suspect.is_empty(),
+        "Stage 8a [P1] regression: StorageAsBlobStore::stat must not \
+         call Storage::read_to_end on the postings file during reader \
+         open; got {} calls: {:?}",
+        suspect.len(),
+        suspect
+      );
+    }
   }
 }
