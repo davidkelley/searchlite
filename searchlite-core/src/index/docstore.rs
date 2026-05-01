@@ -97,6 +97,13 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
   }
 }
 
+/// Stateful seek+read docstore reader. Stage 8b switched
+/// `SegmentReader::get_doc` to issue one bounded `Object::read_range`
+/// per fetch instead of the seek+two-read shape this struct
+/// implements, so production code no longer constructs this type.
+/// It is kept around for unit-test coverage of the on-wire format
+/// and as a documented reference impl until Stage 8c removes it.
+#[allow(dead_code)]
 pub struct DocStoreReader<R: Read + Seek> {
   file: R,
   offsets: Vec<u64>,
@@ -104,6 +111,7 @@ pub struct DocStoreReader<R: Read + Seek> {
   use_zstd: bool,
 }
 
+#[allow(dead_code)]
 impl<R: Read + Seek> DocStoreReader<R> {
   pub fn new(file: R, offsets: Vec<u64>, use_zstd: bool) -> Self {
     Self {
@@ -127,25 +135,72 @@ impl<R: Read + Seek> DocStoreReader<R> {
     }
     let mut buf = vec![0u8; len];
     self.file.read_exact(&mut buf)?;
-    #[cfg(feature = "zstd")]
-    let buf = if self.use_zstd {
-      let decoded = zstd::stream::decode_all(&buf[..])?;
-      if decoded.len() > MAX_DOCSTORE_BYTES {
-        bail!(
-          "stored document length {} exceeds maximum {} after decompression",
-          decoded.len(),
-          MAX_DOCSTORE_BYTES
-        );
-      }
-      decoded
-    } else {
-      buf
-    };
-    #[cfg(not(feature = "zstd"))]
-    let buf = buf;
-    let json: serde_json::Value = serde_json::from_slice(&buf)?;
-    Ok(json)
+    // Reuse the shared parse path so this seek+read shape and Stage
+    // 8b's BlobStore range-read path can never drift on
+    // length/MAX/zstd/JSON handling. The bundled byte slice is
+    // `len_bytes ++ buf` per the on-wire format.
+    let mut bundle = Vec::with_capacity(4 + buf.len());
+    bundle.extend_from_slice(&len_bytes);
+    bundle.extend_from_slice(&buf);
+    decode_docstore_record(&bundle, self.use_zstd)
   }
+}
+
+/// Decode one docstore record from a `[u32 LE length][payload]` byte
+/// bundle. The bundle MUST be exactly `4 + length` bytes; trailing
+/// bytes are treated as corruption (offset table claimed a longer
+/// record than the embedded length actually encodes).
+///
+/// This is the single source of truth for docstore parse semantics:
+/// the legacy `DocStoreReader::get` (seek + 2 read_exacts) and the
+/// Stage 8b `SegmentReader::get_doc` (one bounded `Object::read_range`)
+/// both call into here so they cannot drift on:
+///
+/// * `MAX_DOCSTORE_BYTES` enforcement (pre- and post-decompress).
+/// * zstd handling (gated on the `zstd` feature flag).
+/// * JSON decode error context.
+/// * Length-prefix / range-length consistency checks.
+///
+/// `use_zstd` reflects the segment-meta flag (`SegmentFileMeta::use_zstd`).
+pub fn decode_docstore_record(bundle: &[u8], use_zstd: bool) -> Result<serde_json::Value> {
+  if bundle.len() < 4 {
+    bail!(
+      "docstore record truncated: need at least 4 length-prefix bytes, got {}",
+      bundle.len()
+    );
+  }
+  let len = u32::from_le_bytes(bundle[..4].try_into().expect("4-byte slice")) as usize;
+  if len > MAX_DOCSTORE_BYTES {
+    bail!("stored document length {len} exceeds maximum {MAX_DOCSTORE_BYTES}");
+  }
+  if 4 + len != bundle.len() {
+    bail!(
+      "docstore record length mismatch: header says {len} bytes, range has {} payload bytes \
+       (4 + {len} != {}); offset table or file may be corrupt",
+      bundle.len().saturating_sub(4),
+      bundle.len()
+    );
+  }
+  let payload = &bundle[4..];
+  #[cfg(feature = "zstd")]
+  let owned;
+  #[cfg(feature = "zstd")]
+  let payload: &[u8] = if use_zstd {
+    owned = zstd::stream::decode_all(payload)?;
+    if owned.len() > MAX_DOCSTORE_BYTES {
+      bail!(
+        "stored document length {} exceeds maximum {MAX_DOCSTORE_BYTES} after decompression",
+        owned.len()
+      );
+    }
+    &owned
+  } else {
+    payload
+  };
+  #[cfg(not(feature = "zstd"))]
+  let _ = use_zstd;
+  let json: serde_json::Value = serde_json::from_slice(payload)?;
+  Ok(json)
 }
 
 #[cfg(test)]

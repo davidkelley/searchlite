@@ -1,11 +1,10 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 #[cfg(feature = "vectors")]
 use bincode::Options;
@@ -20,7 +19,7 @@ use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 #[cfg(feature = "vectors")]
 use crate::api::types::VectorMetric as ApiVectorMetric;
 use crate::index::directory;
-use crate::index::docstore::{DocStoreReader, DocStoreWriter};
+use crate::index::docstore::{decode_docstore_record, DocStoreWriter, MAX_DOCSTORE_BYTES};
 use crate::index::fastfields::{
   doc_length_key, nested_count_key, nested_parent_key, FastFieldsReader, FastFieldsWriter,
   FastValue,
@@ -30,7 +29,7 @@ use crate::index::manifest::{
 };
 use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
-use crate::storage::{Storage, StorageFile};
+use crate::storage::Storage;
 use crate::util::case_fold::fold_keyword;
 use crate::util::checksum::checksum;
 #[cfg(feature = "vectors")]
@@ -1730,14 +1729,20 @@ impl SegmentCache {
 /// manifest-specific state (`deleted_docs`) and per-view handles for
 /// postings/docstore reads.
 ///
-/// Stage 8a: postings reads now go through `Arc<dyn Object>` opened from
-/// `BlobStore::open` (typically wrapping the inner `Storage` via
-/// `StorageAsBlobStore`). The postings methods issue bounded
-/// `Object::read_range` calls using `TinyFst::range_for(term, postings_len)`
-/// — for cloud backends this becomes a single `bytes=start-end` GET per
-/// term, instead of a whole-file read. Stage 8b will migrate docstore
-/// the same way; until then it stays on the existing `RefCell<DynFile>`
-/// stateful-handle shape.
+/// Stage 8 (a + b): both postings and docstore reads now go through
+/// `Arc<dyn Object>` handles opened from `BlobStore::open` (typically
+/// wrapping the inner `Storage` via `StorageAsBlobStore`).
+///
+/// * **Postings** (Stage 8a): each lookup issues a bounded
+///   `Object::read_range` driven by `TinyFst::range_for(term, postings_len)`
+///   — for cloud backends this becomes a single `bytes=start-end` GET per
+///   term instead of a whole-file read.
+/// * **Docstore** (Stage 8b): `get_doc` derives the per-doc byte range from
+///   the offsets table cached in `SegmentCore::seg_meta.doc_offsets` and
+///   issues exactly one `Object::read_range` per fetched doc. The span is
+///   bounded by `MAX_DOCSTORE_BYTES + 4` *before* issuing the read so a
+///   corrupt offset table can't trigger an oversized GET. See
+///   [`SegmentReader::get_doc`] for the full strict-validation contract.
 ///
 /// Object handles deliberately live on the view, not on `SegmentCore` —
 /// matching Stage 1's "core stays parsed-only; per-storage state lives
@@ -1753,21 +1758,27 @@ pub struct SegmentReader {
   /// Cached postings object length so `range_for` calls don't re-stat
   /// per term lookup. Equal to `postings.stat().len` at open time.
   postings_len: u64,
-  /// Docstore handle. Stage 8b will migrate this to `Arc<dyn BlobObject>`
-  /// like postings; for Stage 8a it stays on the existing seek+read
-  /// shape via `Storage::open_read`.
-  docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
+  /// Stage 8b: docstore handle pinned at view-open time. `get_doc` issues
+  /// exactly one bounded `read_range` call per fetched doc — see the
+  /// comment on `get_doc` for the offsets→range derivation and the
+  /// strict validation contract.
+  docstore: Arc<dyn BlobObject>,
+  /// Stage 8b: cached docstore object length, used as the upper bound
+  /// for the **last** doc's range (`offsets[N-1]..docstore_len`) so
+  /// `get_doc` doesn't re-stat per fetch. Equal to
+  /// `docstore.stat().len` at open time.
+  docstore_len: u64,
 }
 
 impl SegmentReader {
   /// Build a per-manifest view over an already-loaded `SegmentCore`.
   /// Opens fresh per-view handles against the manifest-current
-  /// `meta.paths`: postings via `BlobStore::open` (Stage 8a) and
-  /// docstore via `Storage::open_read` (unchanged in 8a).
+  /// `meta.paths`: postings and docstore both via `BlobStore::open`
+  /// (Stages 8a + 8b). `Storage` is no longer needed here — both hot
+  /// reads now flow through `BlobStore`.
   pub fn from_core(
     core: Arc<SegmentCore>,
     meta: SegmentMeta,
-    storage: Arc<dyn Storage>,
     blob_store: Arc<dyn BlobStore>,
   ) -> Result<Self> {
     // Stage 8a: postings is opened as an `Object` so `postings()` and
@@ -1782,12 +1793,15 @@ impl SegmentReader {
     )?;
     let postings_len = postings.stat().len;
 
-    let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
-    let docstore = DocStoreReader::new(
-      doc_file,
-      core.seg_meta.doc_offsets.clone(),
-      core.seg_meta.use_zstd,
-    );
+    // Stage 8b: docstore now uses the same Object shape. `get_doc`
+    // computes the per-doc byte range from the offsets table cached
+    // in `SegmentCore::seg_meta.doc_offsets` and issues exactly one
+    // `Object::read_range` per fetch.
+    let docstore = futures::executor::block_on(
+      blob_store.open(Path::new(&meta.paths.docstore)),
+    )?;
+    let docstore_len = docstore.stat().len;
+
     let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
     Ok(Self {
       core,
@@ -1795,7 +1809,8 @@ impl SegmentReader {
       deleted,
       postings,
       postings_len,
-      docstore: RefCell::new(docstore),
+      docstore,
+      docstore_len,
     })
   }
 
@@ -1808,8 +1823,8 @@ impl SegmentReader {
   pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
     let ctx = SegmentLoadCtx::strict(keep_positions);
     let core = SegmentCore::load(storage.clone(), &meta, &ctx)?;
-    let blob_store: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage.clone()));
-    Self::from_core(core, meta, storage, blob_store)
+    let blob_store: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage));
+    Self::from_core(core, meta, blob_store)
   }
 
   /// Stage 8a: bounded postings range read.
@@ -1861,8 +1876,92 @@ impl SegmentReader {
       .unwrap_or(0.0)
   }
 
+  /// Stage 8b: fetch a single stored document via one bounded
+  /// `Object::read_range` against the docstore object.
+  ///
+  /// The byte range is derived from the offset table cached in
+  /// `SegmentCore::seg_meta.doc_offsets` (loaded once at segment-load
+  /// time): `start = offsets[doc_id]`, and `end = offsets[doc_id + 1]`
+  /// for any non-last doc, or `end = docstore_len` for the last doc.
+  /// The returned bundle is the exact `[u32 LE length][payload]`
+  /// record; parsing/decompression goes through the shared
+  /// [`decode_docstore_record`] helper so this path can never drift
+  /// from the legacy `DocStoreReader::get` semantics.
+  ///
+  /// Strict validation (Codex Stage 8b review, including the v2 P1
+  /// pre-read span guard):
+  /// * `doc_id` must be in bounds for the offset table.
+  /// * `start < end <= docstore_len` (rejects empty, inverted, and
+  ///   out-of-bounds ranges as corruption).
+  /// * `end - start` must be in `[4, MAX_DOCSTORE_BYTES + 4]` —
+  ///   enforced **before** issuing `read_range` so a corrupt offset
+  ///   table or appended/sparse docstore can't trigger a multi-GB
+  ///   object-store GET / Vec allocation before parse-time validation
+  ///   has a chance to reject.
+  /// * `decode_docstore_record` then enforces (post-read) that the
+  ///   embedded length is `<= MAX_DOCSTORE_BYTES` and that
+  ///   `4 + embedded_len == fetched_range.len()` — a longer offset-
+  ///   table-implied range than the embedded length actually encodes
+  ///   is treated as corruption rather than silently ignored.
   pub fn get_doc(&self, doc_id: DocId) -> Result<serde_json::Value> {
-    self.docstore.borrow_mut().get(doc_id)
+    let offsets = &self.core.seg_meta.doc_offsets;
+    let idx = doc_id as usize;
+    let start = *offsets.get(idx).ok_or_else(|| {
+      anyhow!(
+        "doc id {doc_id} out of bounds: offsets table has {} entries",
+        offsets.len()
+      )
+    })?;
+    let end = offsets
+      .get(idx + 1)
+      .copied()
+      .unwrap_or(self.docstore_len);
+    if start >= end {
+      bail!(
+        "docstore: invalid range {start}..{end} for doc {doc_id} \
+         (offsets must be strictly increasing within the file)"
+      );
+    }
+    if end > self.docstore_len {
+      bail!(
+        "docstore: range {start}..{end} for doc {doc_id} exceeds \
+         docstore object length {}",
+        self.docstore_len
+      );
+    }
+    // Stage 8b [P1] (Codex review): bound the offset-derived span
+    // *before* issuing `read_range`. Without this guard, a corrupt
+    // offset table or a docstore that's been appended to / sparsely
+    // extended out-of-band can produce an arbitrarily large span,
+    // causing `read_range` to issue a multi-GB object-store GET (and
+    // a `Vec::with_capacity` of the same size) before
+    // `decode_docstore_record` ultimately rejects the length-prefix
+    // mismatch. The legitimate upper bound is `4 + MAX_DOCSTORE_BYTES`
+    // — the writer enforces `MAX_DOCSTORE_BYTES` post-compression on
+    // the payload, plus 4 bytes for the LE u32 length prefix. The
+    // lower bound is 4 because the bundle MUST contain at least the
+    // length prefix.
+    let span = end - start;
+    const MAX_BUNDLE_BYTES: u64 = MAX_DOCSTORE_BYTES as u64 + 4;
+    if span < 4 {
+      bail!(
+        "docstore: span {span} for doc {doc_id} too small for the 4-byte length \
+         prefix (offset table or file may be corrupt)"
+      );
+    }
+    if span > MAX_BUNDLE_BYTES {
+      bail!(
+        "docstore: span {span} for doc {doc_id} exceeds maximum bundle size \
+         {MAX_BUNDLE_BYTES} (= 4 + MAX_DOCSTORE_BYTES); refusing to issue \
+         oversized read_range — offset table or docstore file may be corrupt"
+      );
+    }
+    let bytes =
+      futures::executor::block_on(self.docstore.read_range(start..end)).with_context(|| {
+        format!("docstore read_range({start}..{end}) for doc {doc_id} failed")
+      })?;
+    decode_docstore_record(&bytes, self.core.seg_meta.use_zstd)
+      .with_context(|| format!("decoding docstore record for doc {doc_id}"))
   }
 
   pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {

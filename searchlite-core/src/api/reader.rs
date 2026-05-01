@@ -394,7 +394,6 @@ impl IndexReader {
       segments.push(SegmentReader::from_core(
         core,
         seg.clone(),
-        inner.storage.clone(),
         inner.blob_store.clone(),
       )?);
     }

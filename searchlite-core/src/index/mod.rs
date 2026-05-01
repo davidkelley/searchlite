@@ -467,7 +467,6 @@ impl Index {
         crate::index::segment::SegmentReader::from_core(
           core,
           (*seg).clone(),
-          inner.storage.clone(),
           inner.blob_store.clone(),
         )
       })
@@ -1918,38 +1917,57 @@ mod tests {
     assert_eq!(reopened.manifest().segments.len(), 3);
   }
 
-  /// Stage 8a regression suite: with the new postings → BlobStore
-  /// migration in place, segment reads must issue bounded `read_range`
-  /// calls, not whole-file reads. A `RecordingBlobStore` wrapper logs
-  /// every `get_range` and `Object::read_range` call (path + range) for
-  /// inspection by the tests below.
+  /// Stage 8 (a + b) regression suite. With postings (8a) and docstore
+  /// (8b) both routed through `BlobStore`, segment reads must issue
+  /// bounded `Object::read_range` calls, not whole-file reads. A
+  /// `RecordingBlobStore` wrapper logs every `get_range` and
+  /// `Object::read_range` call (path + range) for inspection.
   ///
-  /// The asserted properties are *structural*, not exact-count, because
-  /// the search path may legitimately issue more than one bounded
-  /// postings read per segment (e.g. one for `doc_freq` stats, another
-  /// for iteration). The two regressions guarded here are:
+  /// **Postings (Stage 8a)** — properties are *structural*, not
+  /// exact-count, because the search path may issue more than one
+  /// bounded postings read per segment (e.g. one for `doc_freq` stats,
+  /// one for iteration):
   ///
-  /// * `missing_term_performs_zero_postings_range_reads` — a query for
-  ///   a term not present in the segment must issue **zero** postings
-  ///   reads. Catches accidental unconditional fetches and any
-  ///   whole-file fallback that bypasses the FST gate.
+  /// * `missing_term_performs_zero_postings_range_reads` — query for a
+  ///   missing term ⇒ **zero** postings reads (FST gate).
   /// * `hit_term_postings_reads_are_strictly_bounded_vs_whole_file` —
-  ///   a hit-term query may issue any number of postings reads, but
-  ///   each read's range MUST be strictly smaller than the whole
-  ///   postings file. Catches accidental fallback to `0..len`.
+  ///   each postings read is a proper subset of the file (no fallback
+  ///   to `0..len`).
+  /// * `default_blob_store_does_not_read_postings_to_end_during_open`
+  ///   — `StorageAsBlobStore::stat` must not slurp the postings file
+  ///   on segment open (Stage 8a v2 P1 regression).
   ///
-  /// Plus the [P1] regression added with Stage 8a v2:
+  /// **Docstore (Stage 8b)** — properties are *exact-count*, because
+  /// the offset table makes a single bounded read per fetched doc
+  /// achievable (and per Codex's Stage 8 done criterion: a top-K=10
+  /// search produces exactly 10 docstore range reads):
   ///
-  /// * `default_blob_store_does_not_read_postings_to_end_during_open` —
-  ///   the default `StorageAsBlobStore` open path must not call
-  ///   `Storage::read_to_end` on the postings file (i.e. `stat` must
-  ///   not slurp the file to discover its length).
+  /// * `mget_yields_exactly_one_docstore_range_read_per_returned_doc`
+  ///   — N IDs with `_source: true` ⇒ exactly N docstore reads.
+  /// * `mget_with_source_false_issues_zero_docstore_reads` —
+  ///   `_source: false` ⇒ zero docstore reads (no consult at all).
+  /// * `top_k_search_with_source_yields_one_docstore_range_read_per_hit`
+  ///   — a top-10 search with `_source: true` ⇒ exactly 10 docstore
+  ///   reads (the original Stage 8 done criterion).
+  /// * `docstore_range_reads_match_offset_table` — each recorded
+  ///   range exactly equals `offsets[doc_id]..offsets[doc_id+1]`
+  ///   (or `..docstore_len` for the last doc).
+  /// * `docstore_offset_length_mismatch_is_detected_as_corruption` —
+  ///   if the offset table implies a longer record than the embedded
+  ///   length actually encodes (but still within the span-guard
+  ///   bound), `get_doc` returns an error rather than silently
+  ///   ignoring trailing bytes.
+  /// * `oversized_offset_derived_range_is_rejected_without_issuing_read`
+  ///   — Stage 8b v2 P1 regression. An offset-derived span larger
+  ///   than `MAX_DOCSTORE_BYTES + 4` must be rejected **before**
+  ///   `read_range` is issued, so a corrupt offset table can't
+  ///   trigger a multi-GB object-store GET / `Vec` allocation.
   ///
-  /// These tests live at the `Index` integration layer (rather than the
-  /// segment unit level) so they exercise the full
-  /// `IndexReader::search` → `SegmentReader::postings` →
-  /// `Object::read_range` path end to end.
-  mod stage8a_postings_range_reads {
+  /// These tests live at the `Index` integration layer so they
+  /// exercise the full `IndexReader::{search,mget}` →
+  /// `SegmentReader::{postings,get_doc}` → `Object::read_range` path
+  /// end to end.
+  mod stage8_postings_and_docstore_range_reads {
     use super::*;
     use crate::storage::blob::{
       BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError,
@@ -2360,6 +2378,448 @@ mod tests {
          open; got {} calls: {:?}",
         suspect.len(),
         suspect
+      );
+    }
+
+    // ───────────────────────── Stage 8b: docstore ─────────────────────────
+    //
+    // Stage 8b migrated `SegmentReader::get_doc` to one bounded
+    // `Object::read_range` per fetched doc. The offset table makes the
+    // exact range derivable up-front, so unlike postings (where the
+    // search path may issue multiple reads per term) the docstore path
+    // can — and is required to — issue **exactly one** range read per
+    // returned doc. The next four tests guard that contract; the fifth
+    // covers the strict-validation corruption path.
+
+    /// Filter to docstore reads on a specific segment.
+    fn docstore_reads_for_segment<'a>(
+      log: &'a [RangeReadEntry],
+      docstore_path: &Path,
+    ) -> Vec<&'a RangeReadEntry> {
+      log.iter().filter(|e| e.key == docstore_path).collect()
+    }
+
+    /// Stage 8b: `mget` of N IDs with `_source: true` against a single
+    /// segment must issue **exactly N** docstore range reads — one per
+    /// returned doc.
+    #[test]
+    fn mget_yields_exactly_one_docstore_range_read_per_returned_doc() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [
+        ("1", "alpha bravo"),
+        ("2", "bravo charlie"),
+        ("3", "charlie delta"),
+        ("4", "delta echo"),
+        ("5", "echo foxtrot"),
+      ] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+
+      let before = log.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      let ids = vec!["1".to_string(), "3".to_string(), "5".to_string()];
+      let results = reader.mget(&ids, true).unwrap();
+      assert_eq!(results.len(), 3);
+      assert!(results.iter().all(|r| r._source.is_some()));
+
+      let after = log.lock().unwrap();
+      let phase = &after[before..];
+      let docstore_reads = docstore_reads_for_segment(phase, &docstore_path);
+      assert_eq!(
+        docstore_reads.len(),
+        3,
+        "Stage 8b: mget of 3 IDs with _source=true must issue exactly 3 \
+         docstore range reads; got {} reads: {:?}",
+        docstore_reads.len(),
+        docstore_reads
+      );
+    }
+
+    /// Stage 8b: `mget` with `_source: false` (i.e. just existence
+    /// check, no payload fetch) must issue **zero** docstore reads —
+    /// the materialization fast-path in `mget` skips `seg.get_doc`
+    /// entirely.
+    #[test]
+    fn mget_with_source_false_issues_zero_docstore_reads() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+      let mut writer = idx.writer().unwrap();
+      for (id, body) in [
+        ("1", "alpha"),
+        ("2", "bravo"),
+        ("3", "charlie"),
+      ] {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(id)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+
+      let before = log.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      let ids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+      let results = reader.mget(&ids, false).unwrap();
+      assert_eq!(results.len(), 3);
+      assert!(
+        results.iter().all(|r| r._source.is_none()),
+        "_source=false must not populate _source"
+      );
+
+      let after = log.lock().unwrap();
+      let phase = &after[before..];
+      let docstore_reads = docstore_reads_for_segment(phase, &docstore_path);
+      assert_eq!(
+        docstore_reads.len(),
+        0,
+        "Stage 8b: mget with _source=false must NOT consult the \
+         docstore; got {} reads: {:?}",
+        docstore_reads.len(),
+        docstore_reads
+      );
+    }
+
+    /// Stage 8b (the original Stage 8 done criterion): a top-K=10
+    /// scoring search with `return_stored: true` must materialize
+    /// exactly 10 hits and issue **exactly 10** docstore range reads —
+    /// one per hit. Catches any path that fetches sources for
+    /// pruned/non-returned candidates, or any path that doesn't fetch
+    /// for a returned hit.
+    #[test]
+    fn top_k_search_with_source_yields_one_docstore_range_read_per_hit() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+      let mut writer = idx.writer().unwrap();
+      // Twenty docs — top-K=10 must prune ten of them out of the
+      // returned set. If the search path still reads docstore for
+      // pruned candidates the count will exceed 10.
+      for i in 0..20 {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(format!("doc{i}"))),
+              (
+                "body".into(),
+                serde_json::json!(format!("alpha pos{i} term{i}")),
+              ),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+
+      let before = log.lock().unwrap().len();
+
+      let reader = idx.reader().unwrap();
+      let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+        "query": "alpha",
+        "limit": 10,
+        "return_stored": true,
+        "track_total_hits": true,
+      }))
+      .unwrap();
+      let result = reader.search(&req).unwrap();
+      assert_eq!(result.hits.len(), 10);
+      assert!(
+        result.hits.iter().all(|h| h.fields.is_some()),
+        "all returned hits must carry fields when return_stored=true"
+      );
+
+      let after = log.lock().unwrap();
+      let phase = &after[before..];
+      let docstore_reads = docstore_reads_for_segment(phase, &docstore_path);
+      assert_eq!(
+        docstore_reads.len(),
+        10,
+        "Stage 8b: top-10 search with return_stored=true must issue \
+         exactly 10 docstore range reads; got {} reads: {:?}",
+        docstore_reads.len(),
+        docstore_reads
+      );
+    }
+
+    /// Stage 8b: each recorded docstore range exactly equals
+    /// `offsets[doc_id]..offsets[doc_id+1]` (or `..docstore_len` for
+    /// the last doc). Catches any drift in the offsets→range
+    /// derivation logic in `SegmentReader::get_doc`.
+    #[test]
+    fn docstore_range_reads_match_offset_table() {
+      let dir = tempdir().unwrap();
+      let (idx, log) = make_index_with_recording_blob_store(dir.path());
+      let mut writer = idx.writer().unwrap();
+      let bodies: Vec<&str> = vec![
+        "alpha bravo charlie",
+        "delta echo",
+        "foxtrot golf hotel india juliet",
+        "kilo",
+      ];
+      for (i, body) in bodies.iter().enumerate() {
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(format!("d{i}"))),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+      }
+      writer.commit().unwrap();
+      let segment = &idx.manifest().segments[0];
+      let docstore_path = PathBuf::from(segment.paths.docstore.clone());
+      let docstore_total_len = std::fs::metadata(&docstore_path).unwrap().len();
+
+      let before = log.lock().unwrap().len();
+      let reader = idx.reader().unwrap();
+      // Fetch docs in non-monotonic order so the test isn't trivially
+      // satisfied by any in-order slicing scheme.
+      let ids: Vec<String> = vec!["d2".into(), "d0".into(), "d3".into(), "d1".into()];
+      let results = reader.mget(&ids, true).unwrap();
+      assert!(results.iter().all(|r| r._source.is_some()));
+      drop(results);
+      let after = log.lock().unwrap();
+      let phase = &after[before..];
+      let docstore_reads = docstore_reads_for_segment(phase, &docstore_path);
+
+      // Recover the offset table from the segment's *.meta.json
+      // (the same file `SegmentCore::load` parses).
+      let seg_meta_bytes = std::fs::read(&segment.paths.meta).unwrap();
+      let seg_meta: crate::index::segment::SegmentFileMeta =
+        serde_json::from_slice(&seg_meta_bytes).unwrap();
+      let offsets = seg_meta.doc_offsets;
+
+      assert_eq!(docstore_reads.len(), 4);
+      // Build the expected ranges per doc id.
+      let expected_for = |doc_idx: usize| -> std::ops::Range<u64> {
+        let start = offsets[doc_idx];
+        let end = offsets
+          .get(doc_idx + 1)
+          .copied()
+          .unwrap_or(docstore_total_len);
+        start..end
+      };
+
+      // `mget` iterates a `HashMap`, so the fetch order across doc
+      // ids is non-deterministic. Assert the recorded ranges as a
+      // sorted multiset against the sorted expected ranges — a
+      // bijection: each requested doc produced exactly one range
+      // read, and each range matches some doc's offset-derived range.
+      let mut got: Vec<std::ops::Range<u64>> =
+        docstore_reads.iter().map(|r| r.range.clone()).collect();
+      let mut expected: Vec<std::ops::Range<u64>> = vec![
+        expected_for(0),
+        expected_for(1),
+        expected_for(2),
+        expected_for(3),
+      ];
+      got.sort_by_key(|r| (r.start, r.end));
+      expected.sort_by_key(|r| (r.start, r.end));
+      assert_eq!(
+        got, expected,
+        "Stage 8b: docstore range reads must equal the offset-derived \
+         ranges as a multiset"
+      );
+    }
+
+    /// Stage 8b v2 [P1] (Codex review): an offset-derived span larger
+    /// than `MAX_DOCSTORE_BYTES + 4` MUST be rejected **before**
+    /// `read_range` is issued — otherwise a corrupt offset table or a
+    /// docstore that's been sparsely extended out-of-band can trigger
+    /// a multi-GB object-store GET / `Vec` allocation before
+    /// parse-time validation has a chance to reject.
+    ///
+    /// We trigger an oversized span by sparsely extending the
+    /// docstore file via `set_len` to `MAX_DOCSTORE_BYTES + 4096`
+    /// after segment publish (sparse so the test stays cheap on disk
+    /// and doesn't actually allocate 32 MiB). With a single-doc
+    /// segment, `get_doc(0)` derives `end = docstore_len`, so the
+    /// span equals the whole inflated file size — well past the
+    /// guard threshold.
+    ///
+    /// The test wires a `RecordingBlobStore` and asserts:
+    /// * `get_doc` errors with a message mentioning the span / bundle
+    ///   size guard.
+    /// * the recording log contains **zero** `read_range` calls
+    ///   against the docstore — the guard fired before the read.
+    #[test]
+    fn oversized_offset_derived_range_is_rejected_without_issuing_read() {
+      use crate::index::docstore::MAX_DOCSTORE_BYTES;
+
+      let dir = tempdir().unwrap();
+
+      // Phase 1: build a normal index with a single doc, then drop it.
+      {
+        let storage: Arc<dyn Storage> =
+          Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+        let schema = Schema::default_text_body();
+        let idx =
+          Index::create_with_storage(dir.path(), schema, opts(dir.path()), storage).unwrap();
+        let mut writer = idx.writer().unwrap();
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!("1")),
+              ("body".into(), serde_json::json!("alpha bravo")),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+        writer.commit().unwrap();
+      }
+
+      // Find the docstore on disk by reading the manifest directly.
+      let manifest_bytes =
+        std::fs::read(dir.path().join("MANIFEST.json")).expect("manifest must exist");
+      let manifest_value: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("manifest must be valid JSON");
+      let docstore_str = manifest_value["segments"][0]["paths"]["docstore"]
+        .as_str()
+        .expect("manifest segment[0].paths.docstore present")
+        .to_string();
+      let docstore_path = PathBuf::from(&docstore_str);
+
+      // Phase 2: sparsely extend the docstore so `docstore_len` at
+      // next open exceeds `MAX_DOCSTORE_BYTES + 4`. `set_len` extends
+      // the file logically without writing zeros (sparse) so the test
+      // doesn't pay a 32 MiB write cost.
+      {
+        let f = std::fs::OpenOptions::new()
+          .write(true)
+          .open(&docstore_path)
+          .unwrap();
+        let inflated_len = MAX_DOCSTORE_BYTES as u64 + 4096;
+        f.set_len(inflated_len).unwrap();
+        f.sync_all().unwrap();
+      }
+
+      // Phase 3: reopen with a `RecordingBlobStore` so we can assert
+      // **zero** `read_range` calls against the docstore. Use
+      // `TrustManifest` so the docstore checksum mismatch caused by
+      // our sparse extension doesn't reject the segment open before
+      // `get_doc` runs.
+      let storage: Arc<dyn Storage> =
+        Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+      let inner_blob: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage.clone()));
+      let (recording, log) = RecordingBlobStore::new(inner_blob);
+      let blob_store: Arc<dyn BlobStore> = recording;
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      reopen_opts.checksum_policy = crate::api::types::ChecksumPolicy::TrustManifest;
+      let idx =
+        Index::open_with_storage_and_blob_store(reopen_opts, storage, blob_store).unwrap();
+      let reader = idx.reader().unwrap();
+
+      let before = log.lock().unwrap().len();
+      let err = reader
+        .mget(&["1".to_string()], true)
+        .expect_err("oversized offset-derived span must surface as an error");
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("exceeds maximum bundle size") || msg.contains("oversized"),
+        "expected span-guard error mentioning 'maximum bundle size' or 'oversized'; got: {msg}"
+      );
+
+      let after = log.lock().unwrap();
+      let phase = &after[before..];
+      let docstore_reads = docstore_reads_for_segment(phase, &docstore_path);
+      assert_eq!(
+        docstore_reads.len(),
+        0,
+        "Stage 8b [P1]: oversized offset-derived span must be rejected \
+         BEFORE issuing read_range; got {} unexpected reads: {:?}",
+        docstore_reads.len(),
+        docstore_reads
+      );
+    }
+
+    /// Stage 8b corruption guard: if the offset table implies a longer
+    /// record than the embedded length actually encodes (but still
+    /// within the span guard's bound), `get_doc` must error rather
+    /// than silently ignore the trailing bytes. We trigger this by
+    /// appending a small amount of junk to the on-disk docstore file
+    /// after segment publish, then re-opening with `TrustManifest`
+    /// (so the docstore file's manifest checksum mismatch doesn't
+    /// reject the open before `get_doc` runs).
+    #[test]
+    fn docstore_offset_length_mismatch_is_detected_as_corruption() {
+      let dir = tempdir().unwrap();
+      let storage: Arc<dyn Storage> =
+        Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+      let schema = Schema::default_text_body();
+      let idx = Index::create_with_storage(dir.path(), schema, opts(dir.path()), storage.clone())
+        .unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha bravo")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      let docstore_path = PathBuf::from(idx.manifest().segments[0].paths.docstore.clone());
+      drop(idx);
+
+      // Append junk so docstore_len at next open exceeds the actual
+      // last record's `4 + embedded_len` boundary. The single-doc
+      // range becomes 0..(real_len + junk_len), and
+      // `decode_docstore_record` rejects the mismatch.
+      {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+          .append(true)
+          .open(&docstore_path)
+          .unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+        f.sync_all().unwrap();
+      }
+
+      // Reopen with TrustManifest so the recorded docstore checksum
+      // mismatch caused by our corruption doesn't reject the segment
+      // before `get_doc` runs.
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      reopen_opts.checksum_policy = crate::api::types::ChecksumPolicy::TrustManifest;
+      let reopened = Index::open_with_storage(reopen_opts, storage).unwrap();
+      let reader = reopened.reader().unwrap();
+      let err = reader
+        .mget(&["1".to_string()], true)
+        .expect_err("offset/length mismatch must surface as an error");
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("length mismatch") || msg.contains("offset table") || msg.contains("corrupt"),
+        "expected corruption error mentioning length mismatch / offset table / corrupt; got: {msg}"
       );
     }
   }
