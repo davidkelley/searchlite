@@ -241,9 +241,8 @@ impl Drop for LeaderGuard {
     if self.fired {
       return;
     }
-    let cancellation = InFlightResult::Err(
-      "cached fetch leader was cancelled before publishing".into(),
-    );
+    let cancellation =
+      InFlightResult::Err("cached fetch leader was cancelled before publishing".into());
     let senders = take_pending_senders(&self.slot, cancellation.clone());
     for tx in senders {
       // Receivers may have been dropped (their futures cancelled too);
@@ -442,10 +441,7 @@ impl CachedBlobStore {
 
     match role {
       Role::Leader(slot) => {
-        self
-          .stats
-          .leader_fetches
-          .fetch_add(1, Ordering::Relaxed);
+        self.stats.leader_fetches.fetch_add(1, Ordering::Relaxed);
         // Hold a `LeaderGuard` across the `fetch().await` so that if
         // the future is dropped (HTTP request cancelled mid-fetch,
         // etc.), the slot is published with a cancellation result
@@ -480,10 +476,7 @@ impl CachedBlobStore {
         result
       }
       Role::Waiter { slot: _slot, rx } => {
-        self
-          .stats
-          .inflight_waits
-          .fetch_add(1, Ordering::Relaxed);
+        self.stats.inflight_waits.fetch_add(1, Ordering::Relaxed);
         // Async wait; doesn't block the executing thread, so
         // single-thread runtimes don't deadlock.
         let result = rx.await.unwrap_or_else(|_| {
@@ -723,10 +716,7 @@ impl Object for CachedObject {
 
     match role {
       Role::Leader(slot) => {
-        self
-          .stats
-          .leader_fetches
-          .fetch_add(1, Ordering::Relaxed);
+        self.stats.leader_fetches.fetch_add(1, Ordering::Relaxed);
         let leader_guard = LeaderGuard {
           inflight: self.inflight.clone(),
           cache_key: cache_key.clone(),
@@ -750,10 +740,7 @@ impl Object for CachedObject {
         result
       }
       Role::Waiter { slot: _slot, rx } => {
-        self
-          .stats
-          .inflight_waits
-          .fetch_add(1, Ordering::Relaxed);
+        self.stats.inflight_waits.fetch_add(1, Ordering::Relaxed);
         let result = rx.await.unwrap_or_else(|_| {
           InFlightResult::Err(
             "cached fetch single-flight sender was dropped without sending".into(),

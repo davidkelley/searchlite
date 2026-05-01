@@ -14,10 +14,9 @@ use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy, Document, IndexOptions};
-use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 #[cfg(feature = "vectors")]
 use crate::api::types::VectorMetric as ApiVectorMetric;
+use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy, Document, IndexOptions};
 use crate::index::directory;
 use crate::index::docstore::{decode_docstore_record, DocStoreWriter, MAX_DOCSTORE_BYTES};
 use crate::index::fastfields::{
@@ -30,6 +29,7 @@ use crate::index::manifest::{
 use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
 use crate::storage::Storage;
+use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 use crate::util::case_fold::fold_keyword;
 use crate::util::checksum::checksum;
 #[cfg(feature = "vectors")]
@@ -958,17 +958,20 @@ impl<'a> SegmentWriter<'a> {
     };
     write_segment_meta(self.storage.as_ref(), &resolved_paths.meta, &seg_file_meta)?;
 
+    // Stage 9b: compute CRC32 + SHA-256 in one pass per file. Vector
+    // artifacts are added below from buffers we already have in
+    // memory (or read once and add via `record_blob`).
     #[cfg(feature = "vectors")]
-    let mut checksums = collect_checksums(self.storage.as_ref(), &resolved_paths)?;
+    let mut integrity = collect_segment_integrity(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(not(feature = "vectors"))]
-    let checksums = collect_checksums(self.storage.as_ref(), &resolved_paths)?;
+    let integrity = collect_segment_integrity(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(feature = "vectors")]
     for (field, _meta) in vector_meta.iter() {
       let (vec_path, hnsw_path) = vector_paths(&resolved_paths, field)?;
       let vec_buf = self.storage.read_to_end(&vec_path)?;
       let hnsw_buf = self.storage.read_to_end(&hnsw_path)?;
-      checksums.insert(format!("vector_{field}_bin"), checksum(&vec_buf));
-      checksums.insert(format!("vector_{field}_hnsw"), checksum(&hnsw_buf));
+      integrity.record_blob(&format!("vector_{field}_bin"), &vec_buf);
+      integrity.record_blob(&format!("vector_{field}_hnsw"), &hnsw_buf);
     }
 
     let meta = SegmentMeta {
@@ -980,7 +983,8 @@ impl<'a> SegmentWriter<'a> {
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,
-      checksums,
+      checksums: integrity.checksums,
+      content_hashes: integrity.content_hashes,
       write_binding_b64: self
         .write_binding
         .as_ref()
@@ -1192,14 +1196,29 @@ fn read_vector_file(
   Ok(VectorStore::new(dim, metric, offsets, values))
 }
 
+/// Stage 9b: bundle of integrity records computed for a segment at
+/// write time. Carries both the legacy CRC32 checksums (kept for
+/// back-compat in the manifest schema) and the new Stage 9b SHA-256
+/// content hashes. Both are computed from the same buffer so we
+/// don't pay the read cost twice.
+#[derive(Debug, Default)]
+pub(crate) struct SegmentIntegrity {
+  pub checksums: HashMap<String, u32>,
+  pub content_hashes: std::collections::BTreeMap<String, String>,
+}
+
+/// Compute CRC32 + SHA-256 over each non-vector segment artifact in
+/// one read pass per file. Vector artifacts are added separately via
+/// [`SegmentIntegrity::record_blob`] in the vectors-feature block.
+///
 /// Stage 9a: takes a [`ResolvedSegmentPaths`] (per-call resolution
 /// against the index root) so this works regardless of whether the
 /// manifest's `SegmentPaths` are v1 absolute or v2 relative keys.
-fn collect_checksums(
+fn collect_segment_integrity(
   storage: &dyn Storage,
   resolved: &crate::index::manifest::ResolvedSegmentPaths,
-) -> Result<HashMap<String, u32>> {
-  let mut map = HashMap::new();
+) -> Result<SegmentIntegrity> {
+  let mut integ = SegmentIntegrity::default();
   for (name, p) in [
     ("terms", &resolved.terms),
     ("postings", &resolved.postings),
@@ -1208,13 +1227,51 @@ fn collect_checksums(
     ("meta", &resolved.meta),
   ] {
     let buf = storage.read_to_end(p)?;
-    map.insert(name.to_string(), checksum(&buf));
+    integ.record_blob(name, &buf);
   }
-  Ok(map)
+  Ok(integ)
 }
 
-/// Stage 9a: takes a [`ResolvedSegmentPaths`] for the same reason as
-/// [`collect_checksums`].
+impl SegmentIntegrity {
+  /// Record both CRC32 and SHA-256 for a buffer under the given
+  /// artifact name (e.g. `terms`, `vector_v_bin`).
+  pub(crate) fn record_blob(&mut self, name: &str, buf: &[u8]) {
+    use sha2::{Digest, Sha256};
+    self.checksums.insert(name.to_string(), checksum(buf));
+    let digest = Sha256::digest(buf);
+    self
+      .content_hashes
+      .insert(name.to_string(), hex_lower(&digest));
+  }
+}
+
+/// Lowercase hex encoding, no allocations on the dependency graph.
+/// (`hex` crate would be one more dep for one function.)
+fn hex_lower(bytes: &[u8]) -> String {
+  const TABLE: &[u8; 16] = b"0123456789abcdef";
+  let mut out = String::with_capacity(bytes.len() * 2);
+  for b in bytes {
+    out.push(TABLE[(b >> 4) as usize] as char);
+    out.push(TABLE[(b & 0x0f) as usize] as char);
+  }
+  out
+}
+
+/// Stage 9b: verify on-disk segment artifacts against the manifest's
+/// recorded integrity. Two paths:
+///
+/// * **`content_hashes` non-empty (Stage 9b+ manifests)** — verify
+///   each artifact's SHA-256 against the recorded hex digest. The
+///   map MUST contain every expected artifact (`meta`, `terms`,
+///   `postings`, `docstore`, `fast`, plus `vector_{field}_bin` and
+///   `vector_{field}_hnsw` per vector field). A partial map is
+///   treated as corruption (Codex Stage 9b plan #2). Missing fall-
+///   through to CRC32 is **not** allowed: a Stage 9b writer that
+///   produced this manifest had every hash, so anything missing
+///   means the manifest was tampered with.
+/// * **`content_hashes` empty (legacy v1/v2 pre-9b manifests)** —
+///   fall back to CRC32 verification. Same per-artifact coverage
+///   contract enforced via the existing `meta.checksums` map.
 fn verify_checksums(
   storage: &dyn Storage,
   meta: &SegmentMeta,
@@ -1222,6 +1279,118 @@ fn verify_checksums(
   seg_meta_bytes: &[u8],
   resolved: &crate::index::manifest::ResolvedSegmentPaths,
 ) -> Result<()> {
+  use sha2::{Digest, Sha256};
+
+  // Build the set of expected artifact names for this segment shape.
+  // Vector fields contribute two artifacts each (`*_bin` + `*_hnsw`).
+  // `mut` only used under `--features vectors` to push vector
+  // artifact names; allow the warning on the no-vectors build.
+  #[allow(unused_mut)]
+  let mut expected: Vec<String> = vec![
+    "meta".into(),
+    "terms".into(),
+    "postings".into(),
+    "docstore".into(),
+    "fast".into(),
+  ];
+  #[cfg(feature = "vectors")]
+  {
+    let seg_meta = _seg_meta;
+    if resolved.vector_dir.is_some() {
+      for field in seg_meta.vector_fields.keys() {
+        expected.push(format!("vector_{field}_bin"));
+        expected.push(format!("vector_{field}_hnsw"));
+      }
+    }
+  }
+  // Helper to read the artifact bytes once per name. The `meta`
+  // entry is special-cased: its bytes were already loaded by the
+  // caller, so we reuse them rather than re-reading.
+  let read_bytes = |name: &str| -> Result<Vec<u8>> {
+    let path: &Path = match name {
+      "meta" => &resolved.meta,
+      "terms" => &resolved.terms,
+      "postings" => &resolved.postings,
+      "docstore" => &resolved.docstore,
+      "fast" => &resolved.fast,
+      #[cfg(feature = "vectors")]
+      n if n.starts_with("vector_") && n.ends_with("_bin") => {
+        // Strip "vector_" prefix and "_bin" suffix to recover field name.
+        let field = &n["vector_".len()..n.len() - "_bin".len()];
+        let (vec_path, _) = vector_paths(resolved, field)?;
+        return storage.read_to_end(&vec_path);
+      }
+      #[cfg(feature = "vectors")]
+      n if n.starts_with("vector_") && n.ends_with("_hnsw") => {
+        let field = &n["vector_".len()..n.len() - "_hnsw".len()];
+        let (_, hnsw_path) = vector_paths(resolved, field)?;
+        return storage.read_to_end(&hnsw_path);
+      }
+      other => bail!("unknown segment artifact {other:?}"),
+    };
+    if name == "meta" {
+      return Ok(seg_meta_bytes.to_vec());
+    }
+    storage.read_to_end(path)
+  };
+
+  if !meta.content_hashes.is_empty() {
+    // Stage 9b path. First assert completeness (Codex plan #2).
+    for name in &expected {
+      if !meta.content_hashes.contains_key(name) {
+        bail!(
+          "segment {} content_hashes is non-empty but missing artifact {name:?}; \
+           manifest is malformed or tampered",
+          meta.id
+        );
+      }
+    }
+    for (name, hash) in &meta.content_hashes {
+      // Validate the hash format up-front so we get a clean error
+      // rather than a cryptic compare-mismatch.
+      if hash.len() != 64
+        || !hash
+          .chars()
+          .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+      {
+        bail!(
+          "segment {} content_hashes[{name:?}] is not a 64-char lowercase hex string: {hash:?}",
+          meta.id
+        );
+      }
+      let bytes = read_bytes(name)?;
+      let actual = hex_lower(&Sha256::digest(&bytes));
+      if &actual != hash {
+        bail!(
+          "segment {} failed SHA-256 verification for {} (expected {}, found {})",
+          meta.id,
+          name,
+          hash,
+          actual
+        );
+      }
+    }
+    return Ok(());
+  }
+
+  // Legacy CRC32 fallback for pre-Stage-9b manifests.
+  //
+  // Stage 9b v2 [P2] (Codex review): require every expected artifact
+  // to have a CRC32 entry, mirroring the SHA-256 path's completeness
+  // contract. Without this assertion, a downgraded/malformed manifest
+  // that strips both `content_hashes` AND a subset of `checksums`
+  // would silently open under `Strict` because the per-key `verify`
+  // closure is a no-op for `None`. Valid pre-9b manifests had every
+  // entry, so any missing one is corruption.
+  for name in &expected {
+    if !meta.checksums.contains_key(name) {
+      bail!(
+        "segment {} legacy CRC32 verification: checksums missing artifact {name:?}; \
+         manifest is malformed or tampered (no SHA-256 fallback available)",
+        meta.id
+      );
+    }
+  }
   let verify = |label: &str, path: &Path, expected: Option<&u32>, data: Option<&[u8]>| {
     if let Some(expected) = expected {
       let actual = if let Some(bytes) = data {
@@ -1387,7 +1556,13 @@ impl SegmentCore {
     }
     match ctx.checksum_policy {
       ChecksumPolicy::Strict => {
-        verify_checksums(storage.as_ref(), meta, &seg_meta, &seg_meta_bytes, &resolved)?;
+        verify_checksums(
+          storage.as_ref(),
+          meta,
+          &seg_meta,
+          &seg_meta_bytes,
+          &resolved,
+        )?;
       }
       ChecksumPolicy::TrustManifest => {
         // Manifest is the trust anchor. No whole-file reads beyond what
@@ -1496,11 +1671,7 @@ impl SegmentCore {
 /// The cached core's parsed structures (terms, fast fields, doc-id table)
 /// are reused — verification re-reads the files but does not re-parse
 /// them. The bytes are dropped after CRC computation.
-fn verify_cached_core(
-  storage: &dyn Storage,
-  meta: &SegmentMeta,
-  core: &SegmentCore,
-) -> Result<()> {
+fn verify_cached_core(storage: &dyn Storage, meta: &SegmentMeta, core: &SegmentCore) -> Result<()> {
   // `seg_meta_bytes` is not retained on the cached core (the parsed
   // `SegmentFileMeta` is). Re-read it so `verify_checksums` can compare
   // the live meta-file bytes against the manifest's recorded checksum;
@@ -1530,9 +1701,13 @@ fn dispatch_checksum_audit(
   rayon::spawn(move || {
     let segment_id = meta.id.clone();
     let resolved = meta.paths.resolve(storage.root());
-    if let Err(err) =
-      verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes, &resolved)
-    {
+    if let Err(err) = verify_checksums(
+      storage.as_ref(),
+      &meta,
+      &seg_meta,
+      &seg_meta_bytes,
+      &resolved,
+    ) {
       match audit_hook {
         Some(hook) => hook.invoke(&segment_id, &err),
         None => log::error!("checksum audit failed for segment {segment_id}: {err:#}"),
@@ -1541,25 +1716,87 @@ fn dispatch_checksum_audit(
   });
 }
 
-/// Cache key for `SegmentCore`. The fingerprint hashes `SegmentMeta.checksums`
-/// deterministically; if any underlying segment file changes, its checksum
-/// changes, so the fingerprint changes and the cache misses. The segment id
-/// stays in the key so two segments that happen to collide on fingerprint
-/// (impossible in practice for `u64`-of-content-hashes, but defended against)
-/// don't share a core.
+/// Cache key for `SegmentCore`.
+///
+/// The fingerprint is a [`SegmentFingerprint`] derived from whichever
+/// integrity record the manifest carries:
+///
+/// * Stage 9b+ manifests with `content_hashes` populated → SHA-256
+///   over the canonical encoding of the full hashes map
+///   (`SegmentFingerprint::ContentHashes([u8; 32])`).
+/// * Pre-Stage-9b manifests with only CRC32 `checksums` → deterministic
+///   `u64` fold of those entries (`SegmentFingerprint::LegacyCrc32`).
+///
+/// Either way: if any underlying segment file changes, its hash/CRC
+/// changes, so the fingerprint changes and the cache misses. The
+/// version tag on `SegmentFingerprint` ensures a SHA-256 fingerprint
+/// can never collide with a CRC32 one even if their hashed entropy
+/// happens to coincide.
+///
+/// The segment id stays in the key as belt-and-suspenders defense
+/// against fingerprint collisions (effectively impossible for
+/// SHA-256, theoretically possible for the `u64`-folded CRC32 path).
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub(crate) struct SegmentCacheKey {
   pub id: String,
-  pub fingerprint: u64,
+  pub fingerprint: SegmentFingerprint,
+}
+
+/// Stage 9b: explicit version-tagged fingerprint shape for the
+/// segment cache key. Two manifests with content_hashes vs CRC32-only
+/// integrity records produce different fingerprint variants and
+/// therefore can never collide on the cache key, even if their
+/// hashed entropy happens to coincide.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub(crate) enum SegmentFingerprint {
+  /// Stage 9b+: SHA-256 over the deterministic encoding of the full
+  /// `content_hashes` map. Strong cryptographic identity. Unlike a
+  /// `u64` collapse, this preserves the full 256-bit collision
+  /// resistance of the underlying hashes.
+  ContentHashes([u8; 32]),
+  /// Pre-Stage-9b legacy: deterministic `u64` fold of the CRC32
+  /// `checksums` map. Weaker, but stable across processes.
+  LegacyCrc32(u64),
 }
 
 impl SegmentCacheKey {
   pub fn from_meta(meta: &SegmentMeta) -> Self {
     Self {
       id: meta.id.clone(),
-      fingerprint: fingerprint_checksums(&meta.checksums),
+      fingerprint: SegmentFingerprint::from_meta(meta),
     }
   }
+}
+
+impl SegmentFingerprint {
+  pub fn from_meta(meta: &SegmentMeta) -> Self {
+    if !meta.content_hashes.is_empty() {
+      Self::ContentHashes(fingerprint_content_hashes(&meta.content_hashes))
+    } else {
+      Self::LegacyCrc32(fingerprint_checksums(&meta.checksums))
+    }
+  }
+}
+
+/// Stage 9b: SHA-256 over the canonical `name=hex\n` encoding of
+/// every entry in the (already-sorted) BTreeMap. Output is the full
+/// 32-byte digest — no `u64` collapse.
+fn fingerprint_content_hashes(
+  content_hashes: &std::collections::BTreeMap<String, String>,
+) -> [u8; 32] {
+  use sha2::{Digest, Sha256};
+  let mut hasher = Sha256::new();
+  // BTreeMap iteration is sorted by key, which gives us
+  // deterministic encoding for free. The `=` and `\n` separators
+  // disambiguate `{a=1, b=2}` from `{a=1b=2}` so cross-name
+  // concatenation can't collide.
+  for (k, v) in content_hashes {
+    hasher.update(k.as_bytes());
+    hasher.update(b"=");
+    hasher.update(v.as_bytes());
+    hasher.update(b"\n");
+  }
+  hasher.finalize().into()
 }
 
 fn fingerprint_checksums(checksums: &HashMap<String, u32>) -> u64 {
@@ -1925,10 +2162,7 @@ impl SegmentReader {
         offsets.len()
       )
     })?;
-    let end = offsets
-      .get(idx + 1)
-      .copied()
-      .unwrap_or(self.docstore_len);
+    let end = offsets.get(idx + 1).copied().unwrap_or(self.docstore_len);
     if start >= end {
       bail!(
         "docstore: invalid range {start}..{end} for doc {doc_id} \
@@ -1969,10 +2203,8 @@ impl SegmentReader {
          oversized read_range — offset table or docstore file may be corrupt"
       );
     }
-    let bytes =
-      futures::executor::block_on(self.docstore.read_range(start..end)).with_context(|| {
-        format!("docstore read_range({start}..{end}) for doc {doc_id} failed")
-      })?;
+    let bytes = futures::executor::block_on(self.docstore.read_range(start..end))
+      .with_context(|| format!("docstore read_range({start}..{end}) for doc {doc_id} failed"))?;
     decode_docstore_record(&bytes, self.core.seg_meta.use_zstd)
       .with_context(|| format!("decoding docstore record for doc {doc_id}"))
   }
@@ -2189,6 +2421,7 @@ mod tests {
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
       checksums: HashMap::new(),
+      content_hashes: std::collections::BTreeMap::new(),
       write_binding_b64: None,
     };
     let err = SegmentReader::open(storage, meta, true);
@@ -2609,8 +2842,12 @@ mod tests {
       // unsized borrow that `PostingsReader::read_at`'s `R: Read + Seek`
       // bound rejects).
       let mut file = storage.open_read(&postings_path).unwrap();
-      let _decoded = PostingsReader::read_at(&mut file, computed.start, true)
-        .unwrap_or_else(|e| panic!("read_at failed for term {term:?} at offset {}: {e}", computed.start));
+      let _decoded = PostingsReader::read_at(&mut file, computed.start, true).unwrap_or_else(|e| {
+        panic!(
+          "read_at failed for term {term:?} at offset {}: {e}",
+          computed.start
+        )
+      });
       let consumed_end = file.stream_position().unwrap();
 
       assert_eq!(

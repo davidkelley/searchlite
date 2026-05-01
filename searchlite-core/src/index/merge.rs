@@ -154,6 +154,7 @@ mod tests {
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
       checksums: HashMap::new(),
+      content_hashes: std::collections::BTreeMap::new(),
       write_binding_b64: None,
     }
   }

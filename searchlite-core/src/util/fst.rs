@@ -169,10 +169,7 @@ mod tests {
 
   #[test]
   fn range_for_returns_none_for_missing_term() {
-    let fst = TinyFst::from_terms(&[
-      ("alpha".to_string(), 0),
-      ("beta".to_string(), 100),
-    ]);
+    let fst = TinyFst::from_terms(&[("alpha".to_string(), 0), ("beta".to_string(), 100)]);
     assert_eq!(fst.range_for("missing", 1000), None);
   }
 
@@ -187,10 +184,7 @@ mod tests {
     // Defensive: a malformed call where `postings_len` < last term's offset
     // would otherwise produce `start > end`. Surface as None rather than
     // returning a nonsense range to the caller.
-    let fst = TinyFst::from_terms(&[
-      ("alpha".to_string(), 0),
-      ("beta".to_string(), 500),
-    ]);
+    let fst = TinyFst::from_terms(&[("alpha".to_string(), 0), ("beta".to_string(), 500)]);
     assert_eq!(fst.range_for("beta", 100), None);
   }
 
@@ -203,10 +197,7 @@ mod tests {
     // caller plumbing this into `BlobStore::get_range` would issue an
     // out-of-bounds range read. Reject it here so the failure surfaces as
     // a missing range, not an opaque storage-layer error.
-    let fst = TinyFst::from_terms(&[
-      ("alpha".to_string(), 0),
-      ("beta".to_string(), 500),
-    ]);
+    let fst = TinyFst::from_terms(&[("alpha".to_string(), 0), ("beta".to_string(), 500)]);
     assert_eq!(
       fst.range_for("alpha", 100),
       None,
@@ -222,10 +213,7 @@ mod tests {
     // multi-byte header — but if it ever does (corrupt FST data, a future
     // writer bug), the API must reject it. A zero-byte range GET would
     // decode as an empty postings list and silently mask the corruption.
-    let fst = TinyFst::from_terms(&[
-      ("alpha".to_string(), 50),
-      ("beta".to_string(), 50),
-    ]);
+    let fst = TinyFst::from_terms(&[("alpha".to_string(), 50), ("beta".to_string(), 50)]);
     assert_eq!(
       fst.range_for("alpha", 1000),
       None,

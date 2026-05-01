@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,6 +44,21 @@ pub struct SegmentMeta {
   pub deleted_docs: Vec<u32>,
   pub avg_field_lengths: HashMap<String, f32>,
   pub checksums: HashMap<String, u32>,
+  /// Stage 9b: SHA-256 content hashes per segment artifact (`terms`,
+  /// `postings`, `docstore`, `fast`, `meta`, plus `vector_{field}_bin`
+  /// and `vector_{field}_hnsw` under `--features vectors`). Stored as
+  /// 64-char lowercase hex. `BTreeMap` for deterministic JSON output.
+  ///
+  /// Empty for legacy v1/v2 manifests written before Stage 9b — those
+  /// fall back to CRC32 verification via `checksums`. Stage 9b+
+  /// writers always populate every expected artifact's hash; a
+  /// non-empty map missing any expected artifact is treated as
+  /// corruption (see `verify_checksums` in segment.rs).
+  ///
+  /// Will become the sole integrity field once Stage 9c removes the
+  /// CRC32 `checksums` field.
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub content_hashes: BTreeMap<String, String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub write_binding_b64: Option<String>,
 }
@@ -227,9 +242,7 @@ impl SegmentPaths {
       None
     } else {
       let cwd = cwd.ok_or_else(|| {
-        anyhow!(
-          "relativize_under_with_cwd: cwd is required when root {root:?} is relative"
-        )
+        anyhow!("relativize_under_with_cwd: cwd is required when root {root:?} is relative")
       })?;
       Some(cwd.join(root))
     };

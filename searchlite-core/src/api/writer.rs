@@ -418,8 +418,8 @@ impl IndexWriter {
       match self.inner.storage.read_to_end(&pending_manifest_path) {
         Ok(prior_data) => {
           let promote_result = (|| -> Result<Vec<u8>> {
-            let mut prior_manifest: Manifest = serde_json::from_slice(&prior_data)
-              .context("parsing leftover staged manifest")?;
+            let mut prior_manifest: Manifest =
+              serde_json::from_slice(&prior_data).context("parsing leftover staged manifest")?;
             prior_manifest
               .upgrade_to_latest(&self.inner.path)
               .context("upgrading leftover staged manifest")?;
@@ -1265,7 +1265,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       blob_store: Arc::new(crate::storage::StorageAsBlobStore::new(
-        storage.clone() as Arc<dyn crate::storage::Storage>,
+        storage.clone() as Arc<dyn crate::storage::Storage>
       )),
       storage: storage.clone(),
       segment_cache: crate::index::segment::SegmentCache::new(),
@@ -1339,7 +1339,7 @@ mod tests {
       manifest: RwLock::new(manifest),
       writer_lock: Mutex::new(()),
       blob_store: Arc::new(crate::storage::StorageAsBlobStore::new(
-        storage.clone() as Arc<dyn crate::storage::Storage>,
+        storage.clone() as Arc<dyn crate::storage::Storage>
       )),
       storage: storage.clone(),
       segment_cache: crate::index::segment::SegmentCache::new(),

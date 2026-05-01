@@ -958,6 +958,7 @@ mod tests {
         deleted_docs: Vec::new(),
         avg_field_lengths: HashMap::new(),
         checksums: HashMap::new(),
+        content_hashes: std::collections::BTreeMap::new(),
         write_binding_b64: None,
       }
     };
@@ -1433,22 +1434,20 @@ mod tests {
 
     // Load segment 0 and clone an Arc out of the cache so we can verify the
     // core stays usable after it's evicted from the cache itself.
-    let core_0 = cache
-      .get_or_load(&metas[0], &ctx, storage.clone())
-      .unwrap();
+    let core_0 = cache.get_or_load(&metas[0], &ctx, storage.clone()).unwrap();
     assert_eq!(cache.len(), 1);
     assert_eq!(cache.loads(), 1);
 
     // Load segment 1 and segment 2. After the third insert the cache is over
     // capacity (cap=2) and segment 0 — the LRU — must have been evicted.
-    let _core_1 = cache
-      .get_or_load(&metas[1], &ctx, storage.clone())
-      .unwrap();
-    let _core_2 = cache
-      .get_or_load(&metas[2], &ctx, storage.clone())
-      .unwrap();
+    let _core_1 = cache.get_or_load(&metas[1], &ctx, storage.clone()).unwrap();
+    let _core_2 = cache.get_or_load(&metas[2], &ctx, storage.clone()).unwrap();
     assert_eq!(cache.len(), 2, "cache must respect its capacity bound");
-    assert_eq!(cache.loads(), 3, "each distinct meta must have caused one load");
+    assert_eq!(
+      cache.loads(),
+      3,
+      "each distinct meta must have caused one load"
+    );
     let key_0 = SegmentCacheKey::from_meta(&metas[0]);
     assert!(
       !cache.contains_key(&key_0),
@@ -1467,9 +1466,7 @@ mod tests {
     // Re-requesting segment 0 now causes a fresh load (cache miss) — proving
     // it really was evicted, not just hidden by a hash collision.
     let loads_before = cache.loads();
-    let _core_0_again = cache
-      .get_or_load(&metas[0], &ctx, storage.clone())
-      .unwrap();
+    let _core_0_again = cache.get_or_load(&metas[0], &ctx, storage.clone()).unwrap();
     assert_eq!(
       cache.loads() - loads_before,
       1,
@@ -1544,15 +1541,16 @@ mod tests {
     // on the cache hit. Without the P1 fix this would silently succeed
     // and serve queries against the corrupted file.
     let err = match idx.reader() {
-      Ok(_) => panic!(
-        "Strict cache hit must re-verify and reject the externally-mutated segment"
-      ),
+      Ok(_) => panic!("Strict cache hit must re-verify and reject the externally-mutated segment"),
       Err(e) => e,
     };
     let msg = format!("{err:#}");
     assert!(
-      msg.contains("checksum") && msg.contains("postings"),
-      "expected checksum/postings failure, got: {msg}"
+      // Stage 9b: Strict path now reports SHA-256 verification by
+      // default; legacy manifests with only CRC32 still produce a
+      // "failed checksum" error. Either substring is acceptable.
+      msg.contains("postings") && (msg.contains("checksum") || msg.contains("SHA-256")),
+      "expected postings checksum/SHA-256 failure, got: {msg}"
     );
 
     // No new SegmentCore was loaded — the re-verify path doesn't bump the
@@ -1590,8 +1588,11 @@ mod tests {
     };
     let msg = format!("{err:#}");
     assert!(
-      msg.contains("checksum") && msg.contains("postings"),
-      "expected checksum/postings failure, got: {msg}"
+      // Stage 9b: Strict path now reports SHA-256 verification by
+      // default; legacy manifests with only CRC32 still produce a
+      // "failed checksum" error. Either substring is acceptable.
+      msg.contains("postings") && (msg.contains("checksum") || msg.contains("SHA-256")),
+      "expected postings checksum/SHA-256 failure, got: {msg}"
     );
   }
 
@@ -1667,8 +1668,11 @@ mod tests {
       .expect("audit hook should fire within 5s on a corrupted segment");
     assert_eq!(got_segment_id, expected_segment_id);
     assert!(
-      err_msg.contains("checksum") && err_msg.contains("postings"),
-      "hook should report a checksum-postings error, got: {err_msg}"
+      // Stage 9b: Audit path now reports SHA-256 verification by
+      // default; legacy manifests still produce a "failed checksum"
+      // error.
+      err_msg.contains("postings") && (err_msg.contains("checksum") || err_msg.contains("SHA-256")),
+      "hook should report a checksum/SHA-256 postings error, got: {err_msg}"
     );
   }
 
@@ -1824,7 +1828,10 @@ mod tests {
 
     let sync_result = reader.search(&req).unwrap();
     let async_result = block_on_immediate(reader.search_async(&req)).unwrap();
-    assert_eq!(sync_result.total_hits_estimate, async_result.total_hits_estimate);
+    assert_eq!(
+      sync_result.total_hits_estimate,
+      async_result.total_hits_estimate
+    );
     assert_eq!(sync_result.hits.len(), async_result.hits.len());
     for (sync_hit, async_hit) in sync_result.hits.iter().zip(async_result.hits.iter()) {
       assert_eq!(sync_hit.doc_id, async_hit.doc_id);
@@ -1899,8 +1906,7 @@ mod tests {
 
     let blob: Arc<dyn crate::storage::BlobStore> =
       Arc::new(LocalBlobStore::new(dir.path().to_path_buf()));
-    let adapter: Arc<dyn Storage> =
-      Arc::new(BlobStoreAdapter::new(blob, dir.path().to_path_buf()));
+    let adapter: Arc<dyn Storage> = Arc::new(BlobStoreAdapter::new(blob, dir.path().to_path_buf()));
 
     let schema = Schema::default_text_body();
     let idx =
@@ -2118,20 +2124,14 @@ mod tests {
     fn make_index_with_recording_blob_store(
       dir: &Path,
     ) -> (Index, Arc<Mutex<Vec<RangeReadEntry>>>) {
-      let storage: Arc<dyn Storage> =
-        Arc::new(crate::storage::FsStorage::new(dir.to_path_buf()));
+      let storage: Arc<dyn Storage> = Arc::new(crate::storage::FsStorage::new(dir.to_path_buf()));
       let inner_blob: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage.clone()));
       let (recording, log) = RecordingBlobStore::new(inner_blob);
       let blob_store: Arc<dyn BlobStore> = recording;
       let schema = Schema::default_text_body();
-      let idx = Index::create_with_storage_and_blob_store(
-        dir,
-        schema,
-        opts(dir),
-        storage,
-        blob_store,
-      )
-      .unwrap();
+      let idx =
+        Index::create_with_storage_and_blob_store(dir, schema, opts(dir), storage, blob_store)
+          .unwrap();
       (idx, log)
     }
 
@@ -2142,10 +2142,7 @@ mod tests {
       log: &'a [RangeReadEntry],
       postings_path: &Path,
     ) -> Vec<&'a RangeReadEntry> {
-      log
-        .iter()
-        .filter(|e| e.key == postings_path)
-        .collect()
+      log.iter().filter(|e| e.key == postings_path).collect()
     }
 
     /// Stage 8a regression: a query with a term that does not exist in
@@ -2169,9 +2166,7 @@ mod tests {
         .unwrap();
       writer.commit().unwrap();
 
-      let postings_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.postings);
+      let postings_path = dir.path().join(&idx.manifest().segments[0].paths.postings);
 
       // Snapshot the log AFTER the index is built (writes may have
       // their own range reads) so we measure only the search phase.
@@ -2397,9 +2392,7 @@ mod tests {
         })
         .unwrap();
       writer.commit().unwrap();
-      let postings_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.postings);
+      let postings_path = dir.path().join(&idx.manifest().segments[0].paths.postings);
 
       // Snapshot the call count so write-side reads don't pollute the
       // read-side measurement.
@@ -2468,9 +2461,7 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.docstore);
+      let docstore_path = dir.path().join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2502,11 +2493,7 @@ mod tests {
       let dir = tempdir().unwrap();
       let (idx, log) = make_index_with_recording_blob_store(dir.path());
       let mut writer = idx.writer().unwrap();
-      for (id, body) in [
-        ("1", "alpha"),
-        ("2", "bravo"),
-        ("3", "charlie"),
-      ] {
+      for (id, body) in [("1", "alpha"), ("2", "bravo"), ("3", "charlie")] {
         writer
           .add_document(&Document {
             fields: [
@@ -2519,9 +2506,7 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.docstore);
+      let docstore_path = dir.path().join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2577,9 +2562,7 @@ mod tests {
           .unwrap();
       }
       writer.commit().unwrap();
-      let docstore_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.docstore);
+      let docstore_path = dir.path().join(&idx.manifest().segments[0].paths.docstore);
 
       let before = log.lock().unwrap().len();
 
@@ -2783,8 +2766,7 @@ mod tests {
       let mut reopen_opts = opts(dir.path());
       reopen_opts.create_if_missing = false;
       reopen_opts.checksum_policy = crate::api::types::ChecksumPolicy::TrustManifest;
-      let idx =
-        Index::open_with_storage_and_blob_store(reopen_opts, storage, blob_store).unwrap();
+      let idx = Index::open_with_storage_and_blob_store(reopen_opts, storage, blob_store).unwrap();
       let reader = idx.reader().unwrap();
 
       let before = log.lock().unwrap().len();
@@ -2824,8 +2806,8 @@ mod tests {
       let storage: Arc<dyn Storage> =
         Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
       let schema = Schema::default_text_body();
-      let idx = Index::create_with_storage(dir.path(), schema, opts(dir.path()), storage.clone())
-        .unwrap();
+      let idx =
+        Index::create_with_storage(dir.path(), schema, opts(dir.path()), storage.clone()).unwrap();
       let mut writer = idx.writer().unwrap();
       writer
         .add_document(&Document {
@@ -2838,9 +2820,7 @@ mod tests {
         })
         .unwrap();
       writer.commit().unwrap();
-      let docstore_path = dir
-        .path()
-        .join(&idx.manifest().segments[0].paths.docstore);
+      let docstore_path = dir.path().join(&idx.manifest().segments[0].paths.docstore);
       drop(idx);
 
       // Append junk so docstore_len at next open exceeds the actual
@@ -3166,11 +3146,12 @@ mod tests {
         deleted_docs: Vec::new(),
         avg_field_lengths: Default::default(),
         checksums: Default::default(),
+        content_hashes: Default::default(),
         write_binding_b64: None,
       });
-      let err = manifest.store(&storage, &manifest_path).expect_err(
-        "v2 manifest with absolute segment path must be rejected by Manifest::store",
-      );
+      let err = manifest
+        .store(&storage, &manifest_path)
+        .expect_err("v2 manifest with absolute segment path must be rejected by Manifest::store");
       assert!(format!("{err:#}").contains("absolute"));
 
       // Now `..`.
@@ -3433,8 +3414,7 @@ mod tests {
       // outcomes prove the bogus pending was NOT promoted verbatim.
       let live_after =
         std::fs::read(Manifest::manifest_path(dir.path())).expect("live manifest still exists");
-      let live: Manifest =
-        serde_json::from_slice(&live_after).expect("live manifest still parses");
+      let live: Manifest = serde_json::from_slice(&live_after).expect("live manifest still parses");
       assert!(
         live.segments.iter().all(|s| s.id != "abs"),
         "Stage 9a [P2]: bogus pending manifest with id=abs must NOT be promoted; \
@@ -3445,13 +3425,12 @@ mod tests {
       // alpha doc).
       if let Ok(reopened) = result {
         let reader = reopened.reader().unwrap();
-        let req: crate::api::types::SearchRequest =
-          serde_json::from_value(serde_json::json!({
-            "query": "alpha",
-            "limit": 10,
-            "track_total_hits": true,
-          }))
-          .unwrap();
+        let req: crate::api::types::SearchRequest = serde_json::from_value(serde_json::json!({
+          "query": "alpha",
+          "limit": 10,
+          "track_total_hits": true,
+        }))
+        .unwrap();
         let r = reader.search(&req).unwrap();
         assert_eq!(r.total_hits_estimate, 1);
       }
@@ -3517,10 +3496,8 @@ mod tests {
       assert_eq!(reopened.manifest().version, 1);
       reopened.compact().unwrap();
 
-      let upgraded: Manifest = serde_json::from_slice(
-        &std::fs::read(dir.path().join("MANIFEST.json")).unwrap(),
-      )
-      .unwrap();
+      let upgraded: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.path().join("MANIFEST.json")).unwrap()).unwrap();
       assert_eq!(upgraded.version, MANIFEST_LATEST_VERSION);
       assert_eq!(upgraded.segments.len(), 1);
       for seg in &upgraded.segments {
@@ -3549,8 +3526,12 @@ mod tests {
           .unwrap();
         writer.commit().unwrap();
       }
-      let v2_segment_ids: Vec<String> =
-        idx.manifest().segments.iter().map(|s| s.id.clone()).collect();
+      let v2_segment_ids: Vec<String> = idx
+        .manifest()
+        .segments
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
       assert_eq!(v2_segment_ids.len(), 3);
       drop(idx);
 
@@ -3567,10 +3548,8 @@ mod tests {
       let merge_ids = v2_segment_ids[..2].to_vec();
       reopened.merge_segments(&merge_ids, None).unwrap();
 
-      let upgraded: Manifest = serde_json::from_slice(
-        &std::fs::read(dir.path().join("MANIFEST.json")).unwrap(),
-      )
-      .unwrap();
+      let upgraded: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.path().join("MANIFEST.json")).unwrap()).unwrap();
       assert_eq!(upgraded.version, MANIFEST_LATEST_VERSION);
       assert_eq!(upgraded.segments.len(), 2);
       for seg in &upgraded.segments {
@@ -3613,8 +3592,7 @@ mod tests {
       // them in Phase 1), and the WAL already has a Commit fence —
       // so this is exactly the post-crash state of a legacy index.
       let live_path = Manifest::manifest_path(dir.path());
-      let live: Manifest =
-        serde_json::from_slice(&std::fs::read(&live_path).unwrap()).unwrap();
+      let live: Manifest = serde_json::from_slice(&std::fs::read(&live_path).unwrap()).unwrap();
       let pending_path = Manifest::manifest_pending_path(dir.path());
       let mut pending = live.clone();
       pending.version = 1;
@@ -3640,11 +3618,7 @@ mod tests {
       // belt-and-suspenders.
       let mut older_live = live.clone();
       older_live.committed_at = "2000-01-01T00:00:00Z".into();
-      std::fs::write(
-        &live_path,
-        serde_json::to_vec_pretty(&older_live).unwrap(),
-      )
-      .unwrap();
+      std::fs::write(&live_path, serde_json::to_vec_pretty(&older_live).unwrap()).unwrap();
 
       // Phase 3: reopen. The reconciler must upgrade the v1 pending
       // to v2 and promote it. After open, the live manifest must be
@@ -3882,7 +3856,13 @@ mod tests {
       // canonicalize them when the absolute key uses a different
       // symlink path than the absolute form of the relative root
       // (e.g. macOS `/var/folders/...` vs `/private/var/folders/...`).
-      for stem in ["seg_X.terms", "seg_X.post", "seg_X.docs", "seg_X.fast", "seg_X.meta"] {
+      for stem in [
+        "seg_X.terms",
+        "seg_X.post",
+        "seg_X.docs",
+        "seg_X.fast",
+        "seg_X.meta",
+      ] {
         std::fs::write(nested.join(stem), b"").unwrap();
       }
       let absolute_seg = nested.join("seg_X.terms").to_string_lossy().into_owned();
@@ -3914,6 +3894,453 @@ mod tests {
       assert_eq!(paths.terms, "seg_X.terms");
       assert_eq!(paths.postings, "seg_X.post");
       paths.validate_v2_relative().unwrap();
+    }
+  }
+
+  /// Stage 9b regression suite — `ContentHash` (SHA-256) per segment
+  /// artifact. Codex's plan calls out four invariants that this
+  /// suite guards:
+  ///
+  /// 1. Fresh commits record valid lowercase-hex SHA-256 hashes for
+  ///    every segment artifact (and vector files under the feature).
+  /// 2. `Strict` policy verifies SHA-256 when present and rejects
+  ///    corruption with a SHA-256-mismatch error.
+  /// 3. A non-empty `content_hashes` map missing any expected entry
+  ///    is treated as corruption (no implicit fall-through to CRC32).
+  /// 4. Legacy manifests with empty `content_hashes` still verify
+  ///    via the CRC32 fallback, so pre-Stage-9b indexes keep working.
+  /// 5. `SegmentCacheKey::from_meta` produces stable identity:
+  ///    same `(id, content_hashes)` ⇒ same key regardless of paths;
+  ///    any one hash change ⇒ different key; legacy meta ⇒
+  ///    `LegacyCrc32` variant.
+  mod stage9b_content_hashes {
+    use super::*;
+    use crate::index::manifest::SegmentMeta;
+    use crate::index::segment::{SegmentCacheKey, SegmentFingerprint};
+    use std::collections::BTreeMap;
+
+    /// Stage 9b: every fresh segment artifact gets a SHA-256 hash
+    /// recorded in `content_hashes`, formatted as 64-char lowercase
+    /// hex.
+    #[test]
+    fn fresh_commits_record_sha256_for_every_segment_artifact() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+
+      let seg = &idx.manifest().segments[0];
+      // Required artifact names for a non-vector segment.
+      for name in ["meta", "terms", "postings", "docstore", "fast"] {
+        let hash = seg
+          .content_hashes
+          .get(name)
+          .unwrap_or_else(|| panic!("content_hashes missing {name}: {seg:?}"));
+        assert_eq!(
+          hash.len(),
+          64,
+          "expected 64-char SHA-256 hex for {name}; got {hash:?}"
+        );
+        assert!(
+          hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+          "expected lowercase hex for {name}; got {hash:?}"
+        );
+      }
+    }
+
+    /// Stage 9b: under `Strict` policy, a corrupted postings file
+    /// must be rejected at reader open with a SHA-256 mismatch
+    /// error (rather than falling through silently).
+    #[test]
+    fn strict_policy_rejects_sha256_mismatch_on_corrupted_postings() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      let postings_path = dir.path().join(&idx.manifest().segments[0].paths.postings);
+      drop(idx);
+
+      // Corrupt by flipping a byte mid-file.
+      let mut bytes = std::fs::read(&postings_path).unwrap();
+      assert!(bytes.len() > 4, "postings file must be non-trivial");
+      bytes[2] ^= 0xff;
+      std::fs::write(&postings_path, &bytes).unwrap();
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      // Strict is the default; spell it out for clarity.
+      reopen_opts.checksum_policy = crate::api::types::ChecksumPolicy::Strict;
+      let reopened = Index::open(reopen_opts).unwrap();
+      let err = match reopened.reader() {
+        Ok(_) => panic!("Strict must reject corrupted postings"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("SHA-256") && msg.contains("postings"),
+        "expected SHA-256-mismatch error mentioning postings; got: {msg}"
+      );
+    }
+
+    /// Stage 9b: a non-empty `content_hashes` map missing any
+    /// expected artifact is treated as corruption (no fall-through
+    /// to CRC32). Codex's #2 invariant.
+    #[test]
+    fn partial_content_hashes_is_treated_as_corruption_under_strict() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Surgically remove the `postings` entry from `content_hashes`
+      // in the live manifest. Other entries remain → `content_hashes`
+      // is non-empty but incomplete.
+      let manifest_path = dir.path().join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        let ch = seg["content_hashes"].as_object_mut().unwrap();
+        ch.remove("postings");
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      let err = match reopened.reader() {
+        Ok(_) => panic!("partial content_hashes must be rejected under Strict"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("missing artifact") && msg.contains("postings"),
+        "expected 'missing artifact \"postings\"' error; got: {msg}"
+      );
+    }
+
+    /// Stage 9b: legacy manifests with empty `content_hashes` still
+    /// verify via the CRC32 fallback. Without this, pre-9b indexes
+    /// would error on Strict open.
+    #[test]
+    fn legacy_manifest_without_content_hashes_falls_back_to_crc32() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Strip `content_hashes` entirely from the on-disk manifest to
+      // mimic a pre-Stage-9b artifact. CRC32 `checksums` stays — the
+      // verifier must use it.
+      let manifest_path = dir.path().join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        seg.as_object_mut().unwrap().remove("content_hashes");
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      // Default Strict: must verify via CRC32 path and succeed.
+      let reopened = Index::open(reopen_opts).unwrap();
+      assert!(
+        reopened.manifest().segments[0].content_hashes.is_empty(),
+        "test setup: content_hashes must be empty for the fallback path"
+      );
+      let _reader = reopened
+        .reader()
+        .expect("legacy manifest must verify via CRC32 fallback under Strict");
+    }
+
+    /// Stage 9b v2 [P2] (Codex review): when the manifest has empty
+    /// `content_hashes` AND a missing CRC32 entry for an expected
+    /// artifact, `Strict` must reject the open rather than silently
+    /// skipping verification of that artifact. Valid pre-9b manifests
+    /// always recorded every expected CRC32 entry, so any missing
+    /// one is corruption — and there's no SHA-256 fallback to fall
+    /// further back to.
+    #[test]
+    fn legacy_fallback_rejects_missing_crc_entries_under_strict() {
+      let dir = tempdir().unwrap();
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+      drop(idx);
+
+      // Strip `content_hashes` AND remove the `postings` CRC32
+      // entry, simulating a downgraded/tampered manifest.
+      let manifest_path = dir.path().join("MANIFEST.json");
+      let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+      let segments = value["segments"].as_array_mut().unwrap();
+      for seg in segments.iter_mut() {
+        seg.as_object_mut().unwrap().remove("content_hashes");
+        let cks = seg["checksums"].as_object_mut().unwrap();
+        cks.remove("postings");
+      }
+      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      let err = match reopened.reader() {
+        Ok(_) => {
+          panic!("missing CRC32 entry must be rejected under Strict — there's no SHA-256 fallback")
+        }
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("missing artifact") && msg.contains("postings"),
+        "expected 'missing artifact \"postings\"' error from CRC32 path; got: {msg}"
+      );
+    }
+
+    /// Stage 9b: cache key identity properties (Codex plan #4 / #5).
+    /// Tests are at the helper level — `SegmentCache` is per-Index,
+    /// so cross-index dedupe assertions need direct access to the
+    /// key constructor rather than the cache itself.
+    #[test]
+    fn segment_cache_key_identity_properties() {
+      use crate::index::manifest::SegmentPaths;
+
+      let make_meta =
+        |id: &str, paths: SegmentPaths, hashes: BTreeMap<String, String>| -> SegmentMeta {
+          SegmentMeta {
+            id: id.to_string(),
+            generation: 1,
+            paths,
+            doc_count: 0,
+            max_doc_id: 0,
+            blockmax: true,
+            deleted_docs: Vec::new(),
+            avg_field_lengths: Default::default(),
+            checksums: Default::default(),
+            content_hashes: hashes,
+            write_binding_b64: None,
+          }
+        };
+      let bare_paths = SegmentPaths {
+        terms: "seg_a.terms".into(),
+        postings: "seg_a.post".into(),
+        docstore: "seg_a.docs".into(),
+        fast: "seg_a.fast".into(),
+        meta: "seg_a.meta".into(),
+        #[cfg(feature = "vectors")]
+        vector_dir: None,
+      };
+      let prefixed_paths = SegmentPaths {
+        terms: "/abs/seg_a.terms".into(),
+        postings: "/abs/seg_a.post".into(),
+        docstore: "/abs/seg_a.docs".into(),
+        fast: "/abs/seg_a.fast".into(),
+        meta: "/abs/seg_a.meta".into(),
+        #[cfg(feature = "vectors")]
+        vector_dir: None,
+      };
+      let mut hashes = BTreeMap::new();
+      hashes.insert("meta".into(), "a".repeat(64));
+      hashes.insert("terms".into(), "b".repeat(64));
+      hashes.insert("postings".into(), "c".repeat(64));
+      hashes.insert("docstore".into(), "d".repeat(64));
+      hashes.insert("fast".into(), "e".repeat(64));
+
+      // Same id + content_hashes ⇒ same key, regardless of paths.
+      let key_a = SegmentCacheKey::from_meta(&make_meta("seg_a", bare_paths, hashes.clone()));
+      let key_a_relocated =
+        SegmentCacheKey::from_meta(&make_meta("seg_a", prefixed_paths, hashes.clone()));
+      assert_eq!(
+        key_a, key_a_relocated,
+        "cross-location dedupe: same content_hashes ⇒ same cache key"
+      );
+      assert!(
+        matches!(key_a.fingerprint, SegmentFingerprint::ContentHashes(_)),
+        "fingerprint must be ContentHashes when content_hashes is populated"
+      );
+
+      // Changing any one hash ⇒ different key.
+      let mut hashes_changed = hashes.clone();
+      hashes_changed.insert("postings".into(), "0".repeat(64));
+      let bare_paths_2 = SegmentPaths {
+        terms: "seg_a.terms".into(),
+        postings: "seg_a.post".into(),
+        docstore: "seg_a.docs".into(),
+        fast: "seg_a.fast".into(),
+        meta: "seg_a.meta".into(),
+        #[cfg(feature = "vectors")]
+        vector_dir: None,
+      };
+      let key_a_changed =
+        SegmentCacheKey::from_meta(&make_meta("seg_a", bare_paths_2, hashes_changed));
+      assert_ne!(
+        key_a, key_a_changed,
+        "any hash change must change the cache key"
+      );
+
+      // Legacy meta (empty content_hashes) ⇒ LegacyCrc32 variant.
+      let mut legacy_meta = make_meta(
+        "seg_legacy",
+        SegmentPaths {
+          terms: "x".into(),
+          postings: "x".into(),
+          docstore: "x".into(),
+          fast: "x".into(),
+          meta: "x".into(),
+          #[cfg(feature = "vectors")]
+          vector_dir: None,
+        },
+        BTreeMap::new(),
+      );
+      legacy_meta.checksums.insert("meta".into(), 1);
+      legacy_meta.checksums.insert("terms".into(), 2);
+      let legacy_key = SegmentCacheKey::from_meta(&legacy_meta);
+      assert!(
+        matches!(legacy_key.fingerprint, SegmentFingerprint::LegacyCrc32(_)),
+        "fingerprint must be LegacyCrc32 when content_hashes is empty"
+      );
+    }
+  }
+
+  /// Vectors-feature regression: SHA-256 must be recorded for every
+  /// vector artifact (`vector_{field}_bin` + `vector_{field}_hnsw`),
+  /// and `Strict` verification must reject corruption in either.
+  #[cfg(feature = "vectors")]
+  mod stage9b_content_hashes_vectors {
+    use super::*;
+
+    #[test]
+    fn vector_artifacts_recorded_and_verified_via_sha256() {
+      use crate::api::types::VectorMetric as ApiVectorMetric;
+
+      let dir = tempdir().unwrap();
+      let mut schema = Schema::default_text_body();
+      schema
+        .vector_fields
+        .push(crate::index::manifest::VectorField {
+          name: "v".into(),
+          dim: 3,
+          metric: ApiVectorMetric::Cosine.into(),
+          hnsw: None,
+        });
+      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
+      let mut writer = idx.writer().unwrap();
+      writer
+        .add_document(&Document {
+          fields: [
+            ("_id".into(), serde_json::json!("1")),
+            ("body".into(), serde_json::json!("alpha")),
+            ("v".into(), serde_json::json!([0.1, 0.2, 0.3])),
+          ]
+          .into_iter()
+          .collect(),
+        })
+        .unwrap();
+      writer.commit().unwrap();
+
+      let bin_path;
+      {
+        let manifest = idx.manifest();
+        let seg = &manifest.segments[0];
+        let bin = seg
+          .content_hashes
+          .get("vector_v_bin")
+          .expect("vector_v_bin hash must be recorded");
+        let hnsw = seg
+          .content_hashes
+          .get("vector_v_hnsw")
+          .expect("vector_v_hnsw hash must be recorded");
+        for h in [bin, hnsw] {
+          assert_eq!(h.len(), 64);
+          assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        }
+        let vec_dir = dir
+          .path()
+          .join(seg.paths.vector_dir.as_ref().expect("vector dir set"));
+        bin_path = vec_dir.join("v.bin");
+      }
+      drop(idx);
+
+      // Corrupt the vector bin and reopen under Strict — must fail.
+      let mut bin_bytes = std::fs::read(&bin_path).unwrap();
+      assert!(!bin_bytes.is_empty());
+      bin_bytes[0] ^= 0xff;
+      std::fs::write(&bin_path, bin_bytes).unwrap();
+
+      let mut reopen_opts = opts(dir.path());
+      reopen_opts.create_if_missing = false;
+      let reopened = Index::open(reopen_opts).unwrap();
+      let err = match reopened.reader() {
+        Ok(_) => panic!("corrupted vector bin must be rejected under Strict"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("SHA-256") && msg.contains("vector_v_bin"),
+        "expected SHA-256 mismatch on vector_v_bin, got: {msg}"
+      );
     }
   }
 }

@@ -44,9 +44,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use uuid::Uuid;
 
-use super::blob::{
-  BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError,
-};
+use super::blob::{BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError};
 
 /// Local-filesystem [`BlobStore`]. Keys may be absolute paths (used
 /// directly) or paths relative to the configured `root`.
@@ -122,8 +120,8 @@ impl BlobStore for LocalBlobStore {
 
   async fn get(&self, key: &Path) -> Result<Bytes> {
     let path = self.resolve(key);
-    let logical_len = logical_len_of(&path)
-      .with_context(|| format!("LocalBlobStore::get({})", path.display()))?;
+    let logical_len =
+      logical_len_of(&path).with_context(|| format!("LocalBlobStore::get({})", path.display()))?;
     read_logical_range(&path, 0..logical_len)
       .with_context(|| format!("LocalBlobStore::get({})", path.display()))
   }
@@ -198,7 +196,9 @@ impl BlobStore for LocalBlobStore {
       Ok(()) => Ok(()),
       // Idempotent: deleting an absent object is not an error.
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(anyhow!(e)).with_context(|| format!("LocalBlobStore::delete({})", path.display())),
+      Err(e) => {
+        Err(anyhow!(e)).with_context(|| format!("LocalBlobStore::delete({})", path.display()))
+      }
     }
   }
 
@@ -517,8 +517,12 @@ fn read_and_validate_header(file: &mut File, path: &Path) -> Result<String> {
       HEADER_LEN_USIZE - 1
     );
   }
-  let version = std::str::from_utf8(&buf[..HEADER_LEN_USIZE - 1])
-    .map_err(|e| anyhow!("LocalBlobStore: malformed UUID in header at {}: {e}", path.display()))?;
+  let version = std::str::from_utf8(&buf[..HEADER_LEN_USIZE - 1]).map_err(|e| {
+    anyhow!(
+      "LocalBlobStore: malformed UUID in header at {}: {e}",
+      path.display()
+    )
+  })?;
   Ok(version.to_string())
 }
 
@@ -896,10 +900,8 @@ mod tests {
 
     // Re-using the original (now stale) version yields Conflict carrying
     // the current stat.
-    let err =
-      block_on(store.put_if_match(key, Bytes::from_static(b"v3"), Some(&v0))).expect_err(
-        "stale-version conflict",
-      );
+    let err = block_on(store.put_if_match(key, Bytes::from_static(b"v3"), Some(&v0)))
+      .expect_err("stale-version conflict");
     match err {
       PutIfMatchError::Conflict { current } => {
         let current = current.expect("Conflict should carry current stat");
@@ -915,9 +917,8 @@ mod tests {
     let dir = tempdir().unwrap();
     let store = store(dir.path());
     let key = Path::new("never-existed");
-    let err = block_on(store.put_if_match(key, Bytes::from_static(b"v1"), Some("0-0"))).expect_err(
-      "Some(version) on missing object must Conflict",
-    );
+    let err = block_on(store.put_if_match(key, Bytes::from_static(b"v1"), Some("0-0")))
+      .expect_err("Some(version) on missing object must Conflict");
     match err {
       PutIfMatchError::Conflict { current } => assert!(current.is_none()),
       PutIfMatchError::Other(e) => panic!("expected Conflict, got Other: {e:#}"),

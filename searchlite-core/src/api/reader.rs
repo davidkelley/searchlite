@@ -1678,11 +1678,7 @@ impl IndexReader {
   /// the body is sync work behind an `async fn`, future resolves on first
   /// poll, Stage 8 replaces the body with `BlobStore::get_range`-driven
   /// docstore reads.
-  pub async fn mget_async(
-    &self,
-    ids: &[String],
-    return_stored: bool,
-  ) -> Result<Vec<MgetDoc>> {
+  pub async fn mget_async(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
     self.mget(ids, return_stored)
   }
 

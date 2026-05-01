@@ -42,9 +42,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::blob::{
-  BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError,
-};
+use super::blob::{BlobStore, Capabilities, Object, ObjectStat, ObjectWriter, PutIfMatchError};
 use super::Storage;
 
 /// Adapter wrapping `Arc<dyn Storage>` and exposing it as a `BlobStore`
@@ -361,10 +359,7 @@ mod tests {
     let dir = tempdir().unwrap();
     let blob = fs_blob(dir.path());
     let cap = blob.capabilities();
-    assert!(
-      !cap.conditional_put,
-      "Storage trait has no CAS primitive"
-    );
+    assert!(!cap.conditional_put, "Storage trait has no CAS primitive");
     assert!(!cap.multipart_upload);
   }
 
@@ -373,9 +368,8 @@ mod tests {
     let dir = tempdir().unwrap();
     let blob = fs_blob(dir.path());
     let key = dir.path().join("k");
-    let err = block_on(blob.put_if_match(&key, Bytes::from_static(b"x"), None)).expect_err(
-      "StorageAsBlobStore must not support conditional PUT",
-    );
+    let err = block_on(blob.put_if_match(&key, Bytes::from_static(b"x"), None))
+      .expect_err("StorageAsBlobStore must not support conditional PUT");
     match err {
       PutIfMatchError::Other(e) => {
         let msg = format!("{e:#}");
