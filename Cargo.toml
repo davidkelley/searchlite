@@ -8,6 +8,7 @@ members = [
   "searchlite-http",
   "searchlite-node",
   "searchlite-adapter-elastic",
+  "searchlite-s3",
 ]
 resolver = "2"
 

@@ -35,21 +35,21 @@
 //!   `block_on`. `block_in_place` parks the worker so other tasks
 //!   can be re-scheduled elsewhere; the inner `block_on` then drives
 //!   the future without panicking on the nested-runtime check.
-//! * **Current-thread runtime active** → `block_in_place` would panic
-//!   (it requires a multi-thread runtime). We detect this case via
-//!   `Handle::runtime_flavor()` and panic up-front with a clear
-//!   message rather than crashing in tokio internals. This is a
-//!   deliberate design constraint: if you're embedding searchlite in
-//!   a current-thread runtime, drive its sync API from a separate OS
-//!   thread spawned outside any tokio runtime (`std::thread::spawn`).
-//!   Note that `tokio::task::spawn_blocking` is NOT sufficient — its
-//!   closure still observes the current-thread runtime via
-//!   `Handle::try_current()` and would re-trigger the panic.
+//! * **Current-thread runtime active** (Stage 10b v2) → spawn a
+//!   short-lived OS thread via [`std::thread::scope`] that drives
+//!   the future on our owned global multi-thread runtime, then join
+//!   it. `block_in_place` doesn't work on current-thread runtimes,
+//!   and `Runtime::block_on` from inside another runtime panics.
+//!   `std::thread::scope` lets the worker borrow from the calling
+//!   stack frame (no `'static` bound on the future), and joining
+//!   blocks the calling thread while the worker drives the future
+//!   on a thread that is itself outside any tokio runtime. The future
+//!   must be `Send` (already true for every `BlobStore` future, since
+//!   `async_trait` produces `Send` futures by default).
 //!
 //! Either way, callers of `block_on_blob` observe the future's
 //! `Output` — semantically identical to the default
-//! `futures::executor::block_on` shape, modulo the documented
-//! current-thread limitation.
+//! `futures::executor::block_on` shape.
 
 use std::future::Future;
 
@@ -58,26 +58,36 @@ use std::future::Future;
 /// See module docs for the runtime selection logic. Behavior:
 ///
 /// * Default build: identical to `futures::executor::block_on(fut)`.
+///   No `Send` bound — works for any future shape.
 /// * `tokio-runtime` build: drives `fut` on a global lazy multi-thread
 ///   Tokio runtime. Safe to call from a thread without an active
-///   runtime, or from inside an active **multi-thread** Tokio runtime
-///   (uses `block_in_place`). Calling from inside a **current-thread**
-///   Tokio runtime panics with an actionable message — `block_in_place`
-///   doesn't work on current-thread runtimes, and there is no
-///   no-allocation way to drive an arbitrary `F: Future` from a
-///   current-thread context without restructuring as async.
+///   runtime, from inside an active multi-thread Tokio runtime
+///   (uses `block_in_place`), and from inside an active current-thread
+///   runtime (uses `std::thread::scope` to escape the runtime). The
+///   `tokio-runtime` build adds `Send` bounds on `F` and `F::Output`
+///   because the current-thread fallback dispatches the future to a
+///   scoped OS thread; every `BlobStore` future produced by
+///   `async_trait` is already `Send`.
+#[cfg(not(feature = "tokio-runtime"))]
 pub fn block_on_blob<F>(fut: F) -> F::Output
 where
   F: Future,
 {
-  #[cfg(feature = "tokio-runtime")]
-  {
-    tokio_bridge::block_on(fut)
-  }
-  #[cfg(not(feature = "tokio-runtime"))]
-  {
-    futures::executor::block_on(fut)
-  }
+  futures::executor::block_on(fut)
+}
+
+/// `tokio-runtime`-feature variant of [`block_on_blob`]. See the
+/// module docs and the cfg-default variant for behavior. The `Send`
+/// bound is required by the current-thread-runtime fallback path,
+/// which dispatches the future to a [`std::thread::scope`]-spawned
+/// worker.
+#[cfg(feature = "tokio-runtime")]
+pub fn block_on_blob<F>(fut: F) -> F::Output
+where
+  F: Future + Send,
+  F::Output: Send,
+{
+  tokio_bridge::block_on(fut)
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -98,29 +108,37 @@ mod tokio_bridge {
     })
   }
 
-  pub(super) fn block_on<F: Future>(fut: F) -> F::Output {
+  pub(super) fn block_on<F>(fut: F) -> F::Output
+  where
+    F: Future + Send,
+    F::Output: Send,
+  {
     match tokio::runtime::Handle::try_current() {
-      Ok(handle) => {
-        // Stage 10a v2 [P2] (Codex review): `block_in_place` only
-        // works on multi-thread runtimes. Detect the flavor and
-        // panic up-front with a clear message rather than crashing
-        // inside tokio when called from a current-thread runtime.
-        match handle.runtime_flavor() {
-          tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(fut))
-          }
-          flavor => panic!(
-            "searchlite runtime bridge: cannot block on a BlobStore future from \
-             within a Tokio runtime of flavor {flavor:?} — block_in_place requires \
-             a multi-thread runtime. Configure tokio with \
-             `tokio::runtime::Builder::new_multi_thread()`, or call searchlite's \
-             sync API from a fresh thread without any active runtime (e.g. via \
-             `std::thread::spawn`). Note: `tokio::task::spawn_blocking` is NOT a \
-             workaround here — its closure still observes the current-thread \
-             runtime via `Handle::try_current()` and would re-trigger this panic."
-          ),
+      Ok(handle) => match handle.runtime_flavor() {
+        // Multi-thread runtime: park the worker via `block_in_place`
+        // and drive on the active handle. No new threads needed.
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+          tokio::task::block_in_place(|| handle.block_on(fut))
         }
-      }
+        // Stage 10b v2 [P1] (Codex review): current-thread runtime
+        // can't host a nested `block_on`, and `block_in_place`
+        // panics on this flavor. Spawn an OS thread via
+        // `std::thread::scope` so the future is driven outside any
+        // tokio runtime, on our owned global multi-thread Tokio
+        // runtime. `scope` lets the future borrow from the calling
+        // stack frame (no `'static` bound).
+        tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|s| {
+          s.spawn(|| runtime().block_on(fut))
+            .join()
+            .expect("searchlite blob bridge worker panicked")
+        }),
+        // Future flavors we don't recognize → bail out clearly.
+        flavor => panic!(
+          "searchlite runtime bridge: unsupported Tokio runtime flavor {flavor:?}; \
+           the bridge supports MultiThread (block_in_place) and CurrentThread \
+           (scoped-thread fallback)."
+        ),
+      },
       Err(_) => runtime().block_on(fut),
     }
   }
@@ -172,55 +190,48 @@ mod tests {
     assert_eq!(value, 7);
   }
 
-  /// Stage 10a v2 [P2] (Codex review): calling `block_on_blob` from
-  /// inside a **current-thread** Tokio runtime must surface a clear
-  /// error. The previous shape used `tokio::task::block_in_place`
-  /// unconditionally, which panics with a tokio-internal message on
-  /// current-thread runtimes (because `block_in_place` requires a
-  /// multi-thread runtime). The new shape detects the flavor and
-  /// panics up-front with an actionable message.
-  ///
-  /// We assert via `catch_unwind` that the panic message names the
-  /// `CurrentThread` flavor, recommends a fresh OS thread via
-  /// `std::thread::spawn`, and explicitly warns that
-  /// `tokio::task::spawn_blocking` is NOT a workaround (its closure
-  /// still observes the current-thread runtime).
+  /// Stage 10b v2 [P1] (Codex review): calling `block_on_blob` from
+  /// inside a current-thread Tokio runtime must SUCCEED — earlier
+  /// stages panicked here, but the workspace `--all-features` build
+  /// surfaces this on `searchlite-http`'s default-flavor tests. The
+  /// fix routes the future through a `std::thread::scope`-spawned
+  /// worker that drives our global multi-thread runtime, escaping
+  /// the active current-thread runtime entirely.
   #[cfg(feature = "tokio-runtime")]
   #[test]
-  fn block_on_blob_panics_with_clear_message_inside_current_thread_runtime() {
+  fn block_on_blob_works_inside_current_thread_runtime_via_scoped_thread() {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_all()
       .build()
       .unwrap();
-    let result = rt.block_on(async {
-      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        block_on_blob(async { 1u32 })
-      }))
+    let value: u32 = rt.block_on(async {
+      // Inside a current-thread runtime: must NOT panic, must drive
+      // the future on the scoped-thread fallback.
+      block_on_blob(async { 13u32 })
     });
-    let payload = result.expect_err(
-      "block_on_blob must panic when called from inside a current-thread Tokio runtime",
-    );
-    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-      (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-      s.clone()
-    } else {
-      String::from("<non-string panic payload>")
-    };
-    assert!(
-      msg.contains("CurrentThread") && msg.contains("multi-thread"),
-      "panic message must name the CurrentThread flavor and mention the multi-thread workaround; \
-       got: {msg}"
-    );
-    assert!(
-      msg.contains("std::thread::spawn"),
-      "panic message must recommend std::thread::spawn as the current-thread workaround; \
-       got: {msg}"
-    );
-    assert!(
-      msg.contains("spawn_blocking") && msg.contains("NOT"),
-      "panic message must explicitly warn that tokio::task::spawn_blocking is NOT a workaround; \
-       got: {msg}"
-    );
+    assert_eq!(value, 13);
+  }
+
+  /// Stage 10b v2: a non-trivial future with internal `.await` works
+  /// the same way under the current-thread fallback. Confirms the
+  /// scoped worker can drive multi-poll futures, not just trivial
+  /// ready futures.
+  #[cfg(feature = "tokio-runtime")]
+  #[test]
+  fn block_on_blob_drives_multi_poll_future_under_current_thread() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    let value: u32 = rt.block_on(async {
+      block_on_blob(async {
+        // Force at least one yield so the future isn't ready on
+        // first poll; the scoped-thread runtime polls it again on
+        // wake.
+        futures::future::ready(()).await;
+        17u32
+      })
+    });
+    assert_eq!(value, 17);
   }
 }
