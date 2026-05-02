@@ -108,6 +108,24 @@ pub struct IndexOptions {
   /// in which case audit failures are reported via `log::error!`.
   #[serde(skip)]
   pub checksum_audit_failure_hook: Option<ChecksumAuditFailureHook>,
+  /// Stage 10a: when `true`, the index refuses every write path —
+  /// `Index::create*`, `Index::open` auto-create, `Index::open`
+  /// recovery (a `MANIFEST.json.pending` is fail-closed), and the
+  /// mutators `writer`, `compact`, `merge_segments`. Designed for
+  /// serving baked indexes from cloud storage (S3 / R2 with a
+  /// read-only token, tigrisfs read-only mount).
+  ///
+  /// To bake an index for read-only serving: open with
+  /// `read_only = false` once to create / commit / let recovery
+  /// run, then reopen with `read_only = true` to serve. Trying
+  /// `Index::create*` directly with `read_only = true` errors with
+  /// a clear message rather than issuing a 403 from the storage
+  /// layer.
+  ///
+  /// Defaults to `false`; skipped on serialize when `false` to keep
+  /// existing serialized `IndexOptions` byte-stable.
+  #[serde(default, skip_serializing_if = "is_false")]
+  pub read_only: bool,
   #[cfg(feature = "vectors")]
   pub vector_defaults: Option<VectorOptions>,
 }
@@ -137,6 +155,7 @@ impl Default for IndexOptions {
       storage: StorageType::default(),
       checksum_policy: ChecksumPolicy::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }

@@ -411,6 +411,7 @@ impl IndexReader {
         storage: inner.options.storage.clone(),
         checksum_policy: inner.options.checksum_policy,
         checksum_audit_failure_hook: inner.options.checksum_audit_failure_hook.clone(),
+        read_only: inner.options.read_only,
         #[cfg(feature = "vectors")]
         vector_defaults: inner.options.vector_defaults.clone(),
       },
@@ -3467,6 +3468,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3603,6 +3605,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3720,6 +3723,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3835,6 +3839,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3950,6 +3955,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4009,6 +4015,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4269,6 +4276,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4337,6 +4345,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4428,6 +4437,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4514,6 +4524,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4591,6 +4602,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4660,6 +4672,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4731,6 +4744,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4809,6 +4823,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4890,6 +4905,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4972,6 +4988,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5049,6 +5066,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5125,6 +5143,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5184,6 +5203,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         vector_defaults: None,
       },
     )
@@ -5277,6 +5297,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5331,6 +5352,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5526,6 +5548,7 @@ mod tests {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },

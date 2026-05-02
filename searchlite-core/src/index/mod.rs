@@ -121,6 +121,17 @@ impl Index {
     blob_store: Arc<dyn BlobStore>,
     write_key: Option<&str>,
   ) -> Result<Self> {
+    // Stage 10a v2 [P2] (Codex review): a read-only index cannot be
+    // *created* — creation issues writes (`ensure_root`,
+    // `Manifest::store`). Reject before touching storage so a
+    // read-only token (S3/R2) can't be tricked into issuing writes
+    // through a misconfigured `IndexOptions`.
+    if opts.read_only {
+      bail!(
+        "Index::create*: cannot create an index with IndexOptions.read_only = true; \
+         creation requires writes — open an existing index with read_only = true to serve it"
+      );
+    }
     let mut opts = opts;
     opts.path = path.to_path_buf();
     schema.validate_config()?;
@@ -169,8 +180,65 @@ impl Index {
     storage: Arc<dyn Storage>,
     blob_store: Arc<dyn BlobStore>,
   ) -> Result<Self> {
-    ensure_root(storage.as_ref(), &opts.path)?;
+    // Stage 10a v2 [P2] (Codex review): when `read_only` is set, the
+    // open path must NOT issue any writes — that includes
+    // `ensure_root` (creates the dir if missing), the auto-create
+    // manifest write below, and the recovery promote in
+    // `reconcile_pending_manifest`. The intended deployment is
+    // serving a baked index from a read-only S3/R2 token; any of
+    // those writes would otherwise issue a 403 from the storage
+    // layer with a backend-specific message rather than a clear
+    // "index is read-only" error.
     let manifest_path = Manifest::manifest_path(&opts.path);
+    if opts.read_only {
+      // Recovery is a write. Auto-create is a write. Both must
+      // be refused before any storage-layer call.
+      if !storage.exists(&manifest_path) {
+        if opts.create_if_missing {
+          bail!(
+            "Index::open: cannot auto-create an index with read_only = true; \
+             create_if_missing and read_only are mutually exclusive"
+          );
+        }
+        bail!("index does not exist at {manifest_path:?}");
+      }
+      // Stage 10a v3 [P1] (Codex review): if a `MANIFEST.json.pending`
+      // exists, it may carry a durably-committed batch (BUG-018: the
+      // WAL has crossed the commit fence but the live manifest
+      // publish was interrupted). Loading the live manifest without
+      // first promoting the pending file would silently serve a
+      // stale state and hide committed docs. Read-only mode cannot
+      // promote-or-discard the pending file (both are writes), so
+      // fail closed with a clear error and ask the operator to
+      // reopen mutably to reconcile.
+      let pending_path = Manifest::manifest_pending_path(&opts.path);
+      if storage.exists(&pending_path) {
+        bail!(
+          "Index::open: a `MANIFEST.json.pending` exists at {pending_path:?} \
+           and read_only mode cannot perform recovery (promote or discard the \
+           pending file). Reopen with read_only = false once to reconcile, \
+           then reopen read-only to serve. This protects against silently \
+           serving stale state when the pending file carries a durably \
+           committed batch."
+        );
+      }
+      // Existing manifest. Skip ensure_root (might create dirs) and
+      // skip pending-manifest reconciliation (would atomic_write).
+      let manifest = Manifest::load(storage.as_ref(), &manifest_path)?;
+      let inner = Arc::new(InnerIndex {
+        path: opts.path.clone(),
+        storage,
+        blob_store,
+        options: opts,
+        manifest: RwLock::new(manifest),
+        writer_lock: Mutex::new(()),
+        segment_cache: crate::index::segment::SegmentCache::new(),
+        reader_opens: AtomicUsize::new(0),
+      });
+      return Ok(Self { inner });
+    }
+
+    ensure_root(storage.as_ref(), &opts.path)?;
     // BUG-018 recovery: if a previous `Writer::commit` crashed between the
     // WAL commit fence and the live manifest publish, finish promoting the
     // staged manifest now (or discard it if the WAL never crossed the fence).
@@ -206,7 +274,22 @@ impl Index {
     &self,
     write_key: Option<&str>,
   ) -> Result<crate::api::writer::IndexWriter> {
+    self.ensure_mutable("writer")?;
     crate::api::writer::IndexWriter::new(self.inner.clone(), write_key)
+  }
+
+  /// Stage 10a: gate every mutator entry point on `IndexOptions.read_only`.
+  /// Returns a clear error rather than letting the mutation proceed and
+  /// fail later at the storage/blob-store layer, where the message would
+  /// be backend-specific (e.g. `403 Forbidden` from a read-only S3 token).
+  pub(crate) fn ensure_mutable(&self, mutator: &'static str) -> Result<()> {
+    if self.inner.options.read_only {
+      bail!(
+        "Index::{mutator}: index is open read-only \
+         (IndexOptions.read_only = true); reopen with read_only = false to mutate"
+      );
+    }
+    Ok(())
   }
 
   pub fn reader(&self) -> Result<crate::api::reader::IndexReader> {
@@ -253,6 +336,7 @@ impl Index {
   }
 
   pub fn compact_with_key(&self, write_key: Option<&str>) -> Result<()> {
+    self.ensure_mutable("compact")?;
     let _writer_guard = self.inner.writer_lock.lock();
     let reader = self.reader()?;
     let manifest_snapshot = reader.manifest.clone();
@@ -374,6 +458,7 @@ impl Index {
     if segment_ids.is_empty() {
       return Ok(());
     }
+    self.ensure_mutable("merge_segments")?;
     let _writer_guard = self.inner.writer_lock.lock();
     let manifest_snapshot = self.inner.manifest.read().clone();
     ensure_compact_safe(&manifest_snapshot.schema)?;
@@ -713,6 +798,7 @@ mod tests {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
@@ -4340,6 +4426,327 @@ mod tests {
       assert!(
         msg.contains("SHA-256") && msg.contains("vector_v_bin"),
         "expected SHA-256 mismatch on vector_v_bin, got: {msg}"
+      );
+    }
+  }
+
+  /// Stage 10a regression suite — read-only enforcement.
+  /// `IndexOptions.read_only = true` must refuse every mutator entry
+  /// point (`writer`, `compact`, `merge_segments`) with a clear error
+  /// message, rather than letting the mutation proceed and fail later
+  /// at the storage/blob-store layer where the message would be
+  /// backend-specific.
+  mod stage10a_read_only {
+    use super::*;
+
+    fn build_committed_index(dir: &Path) -> Index {
+      let schema = Schema::default_text_body();
+      let idx = Index::create(dir, schema, opts(dir)).unwrap();
+      // At least one committed segment so `compact` and
+      // `merge_segments` have something to act on.
+      for body in ["alpha", "bravo"] {
+        let mut writer = idx.writer().unwrap();
+        writer
+          .add_document(&Document {
+            fields: [
+              ("_id".into(), serde_json::json!(body)),
+              ("body".into(), serde_json::json!(body)),
+            ]
+            .into_iter()
+            .collect(),
+          })
+          .unwrap();
+        writer.commit().unwrap();
+      }
+      idx
+    }
+
+    fn read_only_opts(dir: &Path) -> crate::api::types::IndexOptions {
+      let mut o = opts(dir);
+      o.create_if_missing = false;
+      o.read_only = true;
+      o
+    }
+
+    /// Stage 10a: `Index::writer` must error when `read_only = true`.
+    #[test]
+    fn read_only_index_refuses_writer() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      drop(idx);
+
+      let reopened = Index::open(read_only_opts(dir.path())).unwrap();
+      assert!(reopened.manifest().segments.len() >= 2);
+      let err = match reopened.writer() {
+        Ok(_) => panic!("read_only index must refuse writer()"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("read-only") && msg.contains("writer"),
+        "expected error mentioning read-only writer; got: {msg}"
+      );
+    }
+
+    /// Stage 10a: `Index::compact` must error when `read_only = true`.
+    #[test]
+    fn read_only_index_refuses_compact() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      drop(idx);
+
+      let reopened = Index::open(read_only_opts(dir.path())).unwrap();
+      let err = reopened
+        .compact()
+        .expect_err("read_only index must refuse compact()");
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("read-only") && msg.contains("compact"),
+        "expected error mentioning read-only compact; got: {msg}"
+      );
+      // Manifest must be unchanged (still 2 segments, not merged).
+      assert!(reopened.manifest().segments.len() >= 2);
+    }
+
+    /// Stage 10a: `Index::merge_segments` must error when
+    /// `read_only = true`. Empty input still short-circuits to Ok
+    /// (the early-return is before the read-only check), which
+    /// matches the contract.
+    #[test]
+    fn read_only_index_refuses_merge_segments() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      let segment_ids: Vec<String> = idx
+        .manifest()
+        .segments
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+      drop(idx);
+
+      let reopened = Index::open(read_only_opts(dir.path())).unwrap();
+      // Empty list is a no-op even on read-only indexes — matches
+      // the existing contract that `merge_segments(&[], ...)` is Ok.
+      reopened.merge_segments(&[], None).unwrap();
+
+      // Non-empty list must error.
+      let err = reopened
+        .merge_segments(&segment_ids, None)
+        .expect_err("read_only index must refuse merge_segments()");
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("read-only") && msg.contains("merge_segments"),
+        "expected error mentioning read-only merge_segments; got: {msg}"
+      );
+      // Manifest unchanged — segments not merged.
+      assert_eq!(
+        reopened.manifest().segments.len(),
+        segment_ids.len(),
+        "merge_segments error must not mutate the manifest"
+      );
+    }
+
+    /// Stage 10a: `read_only = false` (the default) keeps the historical
+    /// mutator behavior — no regression.
+    #[test]
+    fn read_only_false_does_not_block_mutators() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      // Read_only defaults to false; a fresh writer still works.
+      let _ = idx.writer().unwrap();
+      // compact succeeds (≥2 segments → 1).
+      idx.compact().unwrap();
+      assert_eq!(idx.manifest().segments.len(), 1);
+    }
+
+    /// Stage 10a v2 [P2] (Codex review): `Index::create*` must reject
+    /// `read_only = true` BEFORE issuing any storage write. Otherwise
+    /// a misconfigured deployment with a read-only S3/R2 token would
+    /// surface a backend-specific 403 instead of a clear "cannot
+    /// create read-only index" error.
+    #[test]
+    fn read_only_index_refuses_create() {
+      let dir = tempdir().unwrap();
+      let mut o = opts(dir.path());
+      o.read_only = true;
+      let schema = Schema::default_text_body();
+      let err = match Index::create(dir.path(), schema, o) {
+        Ok(_) => panic!("Index::create with read_only = true must error"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("read_only") && msg.contains("create"),
+        "expected error mentioning create + read_only; got: {msg}"
+      );
+      // No MANIFEST.json was written. `ensure_root` and
+      // `Manifest::store` were both skipped.
+      assert!(
+        !dir.path().join("MANIFEST.json").exists(),
+        "Index::create with read_only must NOT write MANIFEST.json"
+      );
+    }
+
+    /// Stage 10a v2 [P2] (Codex review): `Index::open` with both
+    /// `read_only = true` AND `create_if_missing = true` must error
+    /// rather than silently auto-creating a manifest with a write.
+    #[test]
+    fn read_only_index_refuses_auto_create_on_open() {
+      let dir = tempdir().unwrap();
+      let mut o = opts(dir.path());
+      o.read_only = true;
+      o.create_if_missing = true;
+      let err = match Index::open(o) {
+        Ok(_) => panic!("Index::open with read_only + create_if_missing must error"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("auto-create") && msg.contains("read_only"),
+        "expected error mentioning auto-create vs read_only; got: {msg}"
+      );
+      assert!(
+        !dir.path().join("MANIFEST.json").exists(),
+        "open(read_only, create_if_missing) must NOT write MANIFEST.json"
+      );
+    }
+
+    /// Stage 10a v2 [P2] (Codex review): `Index::open` with
+    /// `read_only = true` against a non-existent index errors
+    /// cleanly (without create_if_missing, regardless of read_only).
+    #[test]
+    fn read_only_index_open_on_missing_errors_without_writing() {
+      let dir = tempdir().unwrap();
+      let mut o = opts(dir.path());
+      o.read_only = true;
+      o.create_if_missing = false;
+      let err = match Index::open(o) {
+        Ok(_) => panic!("open must error when manifest absent"),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("does not exist"),
+        "expected 'does not exist' error; got: {msg}"
+      );
+      assert!(
+        !dir.path().join("MANIFEST.json").exists(),
+        "missing-index open must NOT write MANIFEST.json"
+      );
+    }
+
+    /// Stage 10a v3 [P1] (Codex review): when `MANIFEST.json.pending`
+    /// exists and `read_only = true`, the open must FAIL CLOSED with
+    /// a clear "pending recovery requires mutable open" error. The
+    /// pending file may carry a durably-committed batch (BUG-018:
+    /// WAL crossed the commit fence but the live manifest publish
+    /// was interrupted); silently loading the live manifest would
+    /// hide those committed docs.
+    ///
+    /// This test was previously phrased as "read_only must skip
+    /// recovery writes and leave the pending file untouched", which
+    /// is correct on the no-write side but missed the load-bearing
+    /// safety property: read_only must not serve stale state. The
+    /// inversion here is deliberate.
+    #[test]
+    fn read_only_index_open_fails_closed_when_pending_manifest_exists() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      drop(idx);
+
+      // Plant a `MANIFEST.json.pending` simulating an interrupted
+      // commit publish. We don't need it to be a valid manifest —
+      // we want to verify open errors before any parse.
+      let pending_path = dir.path().join("MANIFEST.json.pending");
+      std::fs::write(&pending_path, b"\"placeholder-pending-bytes\"").unwrap();
+      let pending_before = std::fs::read(&pending_path).unwrap();
+      let live_before = std::fs::read(dir.path().join("MANIFEST.json")).unwrap();
+
+      let err = match Index::open(read_only_opts(dir.path())) {
+        Ok(_) => panic!(
+          "read_only open with a pending manifest must fail closed; \
+           silently loading the live manifest would hide durably committed docs"
+        ),
+        Err(e) => e,
+      };
+      let msg = format!("{err:#}");
+      assert!(
+        msg.contains("MANIFEST.json.pending") && msg.contains("read_only"),
+        "expected error mentioning the pending file and read_only mode; got: {msg}"
+      );
+
+      // Both files are untouched (no writes issued by the failed
+      // open).
+      assert_eq!(
+        std::fs::read(&pending_path).unwrap(),
+        pending_before,
+        "failed read_only open must NOT touch MANIFEST.json.pending"
+      );
+      assert_eq!(
+        std::fs::read(dir.path().join("MANIFEST.json")).unwrap(),
+        live_before,
+        "failed read_only open must NOT touch the live manifest"
+      );
+    }
+
+    /// Stage 10a v3 [P1] companion: after a normal mutable open
+    /// reconciles the pending file (promoting or discarding it), a
+    /// read-only reopen succeeds with the recovered state.
+    #[test]
+    fn read_only_open_succeeds_once_pending_is_reconciled_via_mutable_open() {
+      let dir = tempdir().unwrap();
+      let idx = build_committed_index(dir.path());
+      drop(idx);
+
+      // Plant a pending file with bytes that won't survive
+      // validation — `reconcile_pending_manifest` will read the
+      // WAL, see that there IS a Commit fence (because the prior
+      // commits were durable), and try to promote. The promote
+      // step parses + re-validates via `serialize_for_write`, which
+      // will reject the placeholder payload — but in either case
+      // the pending file is removed.
+      let pending_path = dir.path().join("MANIFEST.json.pending");
+      std::fs::write(&pending_path, b"\"placeholder-pending-bytes\"").unwrap();
+
+      // Mutable open performs reconciliation. The placeholder
+      // payload may surface an error during promote; what matters
+      // here is that the pending file is removed (best-effort
+      // cleanup runs in either branch of `reconcile_pending_manifest`).
+      // We tolerate either outcome (Ok or Err) and verify the
+      // pending file is gone afterwards.
+      let mut mutable_opts = opts(dir.path());
+      mutable_opts.create_if_missing = false;
+      let _ = Index::open(mutable_opts);
+      assert!(
+        !pending_path.exists(),
+        "mutable open must clean up MANIFEST.json.pending"
+      );
+
+      // Now read-only open succeeds.
+      let reopened = Index::open(read_only_opts(dir.path())).unwrap();
+      assert!(reopened.manifest().segments.len() >= 2);
+    }
+
+    /// Stage 10a: `read_only` survives `IndexOptions` JSON
+    /// serialization round-trip with `default = false` /
+    /// `skip_serializing_if = false`. Confirms the serde annotations
+    /// don't drop the flag.
+    #[test]
+    fn read_only_serialize_round_trip() {
+      let dir = tempdir().unwrap();
+      let mut o = opts(dir.path());
+      o.read_only = true;
+      let json = serde_json::to_string(&o).unwrap();
+      let parsed: crate::api::types::IndexOptions = serde_json::from_str(&json).unwrap();
+      assert!(parsed.read_only, "read_only=true must survive round-trip");
+
+      let mut default_o = opts(dir.path());
+      default_o.read_only = false;
+      let default_json = serde_json::to_string(&default_o).unwrap();
+      assert!(
+        !default_json.contains("read_only"),
+        "read_only=false must be skipped during serialization to keep \
+         serialized IndexOptions byte-stable; got: {default_json}"
       );
     }
   }

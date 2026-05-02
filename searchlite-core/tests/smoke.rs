@@ -67,6 +67,7 @@ fn build_index_with_docs(docs: Vec<Document>) -> (tempfile::TempDir, Index) {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -111,6 +112,7 @@ fn index_and_search() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -432,6 +434,7 @@ fn compact_removes_old_segments() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -490,6 +493,7 @@ fn upsert_and_delete_by_id() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -577,6 +581,7 @@ fn cursor_paginates_ordered_hits() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -774,6 +779,7 @@ fn cursor_rejects_invalid_hex() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -836,6 +842,7 @@ fn cursor_rejects_when_limit_zero() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -900,6 +907,7 @@ fn cursor_rejects_excessive_advance() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -969,6 +977,7 @@ fn cursor_rejects_mismatched_position() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1045,6 +1054,7 @@ fn cursor_orders_stably_across_segments() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1184,6 +1194,7 @@ fn in_memory_storage_keeps_disk_clean() {
     storage: StorageType::InMemory,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1280,6 +1291,7 @@ fn nested_filters_scope_to_object_and_preserve_stored_shape() {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1427,6 +1439,7 @@ fn nested_numeric_filters_bind_to_object_values() {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1580,6 +1593,7 @@ fn collapse_returns_top_hit_per_group_with_inner_hits() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1687,6 +1701,7 @@ fn highlight_configuration_applies_tags() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

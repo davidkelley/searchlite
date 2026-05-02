@@ -1492,6 +1492,7 @@ fn open_opts(path: PathBuf) -> IndexOptions {
     storage: StorageType::InMemory,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }
@@ -1771,6 +1772,7 @@ impl Searchlite {
       storage: StorageType::InMemory,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
@@ -2716,6 +2718,7 @@ mod tests {
       storage: StorageType::InMemory,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

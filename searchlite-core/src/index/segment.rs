@@ -2041,14 +2041,14 @@ impl SegmentReader {
     // this is a transitional bridge documented in the module-level
     // comment of `storage_as_blob.rs` — Stage 8/9 may push async up
     // the call stack, but Stage 8a keeps the read path sync.
-    let postings = futures::executor::block_on(blob_store.open(&resolved.postings))?;
+    let postings = crate::runtime::block_on_blob(blob_store.open(&resolved.postings))?;
     let postings_len = postings.stat().len;
 
     // Stage 8b: docstore now uses the same Object shape. `get_doc`
     // computes the per-doc byte range from the offsets table cached
     // in `SegmentCore::seg_meta.doc_offsets` and issues exactly one
     // `Object::read_range` per fetch.
-    let docstore = futures::executor::block_on(blob_store.open(&resolved.docstore))?;
+    let docstore = crate::runtime::block_on_blob(blob_store.open(&resolved.docstore))?;
     let docstore_len = docstore.stat().len;
 
     let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
@@ -2089,7 +2089,7 @@ impl SegmentReader {
   /// the whole postings file.
   pub fn postings(&self, term: &str) -> Option<PostingsReader> {
     let range = self.core.terms.0.range_for(term, self.postings_len)?;
-    let bytes = futures::executor::block_on(self.postings.read_range(range)).ok()?;
+    let bytes = crate::runtime::block_on_blob(self.postings.read_range(range)).ok()?;
     let mut cursor = std::io::Cursor::new(bytes);
     PostingsReader::read_at(&mut cursor, 0, self.core.keep_positions).ok()
   }
@@ -2107,7 +2107,7 @@ impl SegmentReader {
     if end > self.postings_len {
       return None;
     }
-    let bytes = futures::executor::block_on(self.postings.read_range(offset..end)).ok()?;
+    let bytes = crate::runtime::block_on_blob(self.postings.read_range(offset..end)).ok()?;
     let mut cursor = std::io::Cursor::new(bytes);
     read_doc_freq(&mut cursor, 0).ok()
   }
@@ -2203,7 +2203,7 @@ impl SegmentReader {
          oversized read_range — offset table or docstore file may be corrupt"
       );
     }
-    let bytes = futures::executor::block_on(self.docstore.read_range(start..end))
+    let bytes = crate::runtime::block_on_blob(self.docstore.read_range(start..end))
       .with_context(|| format!("docstore read_range({start}..{end}) for doc {doc_id} failed"))?;
     decode_docstore_record(&bytes, self.core.seg_meta.use_zstd)
       .with_context(|| format!("decoding docstore record for doc {doc_id}"))

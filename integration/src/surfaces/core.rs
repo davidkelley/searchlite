@@ -34,6 +34,7 @@ impl CoreHarness {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }

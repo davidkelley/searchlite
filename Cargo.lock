@@ -2358,6 +2358,7 @@ dependencies = [
  "tdigest",
  "tempfile",
  "thiserror",
+ "tokio",
  "unicode-normalization",
  "unicode-segmentation",
  "uuid",

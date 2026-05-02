@@ -44,6 +44,7 @@ fn setup_reader() -> (TempDir, searchlite_core::api::IndexReader) {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -425,6 +426,7 @@ fn cross_fields_mixed_field_kinds_are_deterministic() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -524,6 +526,7 @@ fn cross_fields_zero_token_analyzer_behavior_is_deterministic() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -707,6 +710,7 @@ fn multi_match_ignores_overflow_boost_on_numeric_field_kind() {
     storage: StorageType::Filesystem,
     checksum_policy: Default::default(),
     checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };

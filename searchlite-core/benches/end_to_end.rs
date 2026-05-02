@@ -25,6 +25,7 @@ fn bench_indexing(c: &mut Criterion) {
         storage: StorageType::Filesystem,
         checksum_policy: Default::default(),
         checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       };
@@ -66,6 +67,7 @@ fn bench_search(c: &mut Criterion) {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
@@ -168,6 +170,7 @@ fn bench_nested_filters(c: &mut Criterion) {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
@@ -262,6 +265,7 @@ fn bench_cursor_pagination(c: &mut Criterion) {
       storage: StorageType::Filesystem,
       checksum_policy: Default::default(),
       checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

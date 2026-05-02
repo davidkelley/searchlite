@@ -7,12 +7,19 @@
 //!
 //! ## Sync-over-async bridging
 //!
-//! The adapter uses [`futures::executor::block_on`] to drive `BlobStore`
-//! futures from the sync `Storage` methods. Unlike the lighter
-//! "single-poll, panic on Pending" pattern from Stage 4, `block_on`
-//! parks the calling thread for any future shape — so this adapter is
-//! safe to wrap a real async backend (Stage 9's S3) without panicking
-//! the moment a future returns Pending.
+//! The adapter uses [`crate::runtime::block_on_blob`] (Stage 10a) to
+//! drive `BlobStore` futures from the sync `Storage` methods. The
+//! bridge selects an executor based on the calling context:
+//!
+//! * Default build: `futures::executor::block_on`. Lightweight; no
+//!   Tokio dep. Fine for [`LocalBlobStore`](super::local_blob),
+//!   [`StorageAsBlobStore`](super::storage_as_blob), and any other
+//!   pure-sync-or-pollable BlobStore impl.
+//! * `tokio-runtime` feature: a global lazy multi-thread Tokio runtime
+//!   (with `block_in_place` fallback when called from inside an
+//!   active multi-thread runtime). Required for Stage 10b's
+//!   `S3BlobStore` futures, whose `hyper`/`tokio-rustls` internals
+//!   need a real reactor.
 //!
 //! ## Filesystem-shaped methods
 //!
@@ -21,9 +28,9 @@
 //! O_APPEND semantics. The adapter handles these against the local
 //! filesystem when `key` resolves to a local path, which works for
 //! `LocalBlobStore` (the only Stage 6 impl) and any future
-//! local-FS-backed BlobStore. Stage 9's S3 adapter would not go through
-//! this path; it would consume `BlobStore` directly via the segment
-//! reader migration in Stage 8.
+//! local-FS-backed BlobStore. The Stage 10b S3 backend will NOT go
+//! through this adapter; it consumes `BlobStore` directly via the
+//! segment reader migration completed in Stage 8.
 //!
 //! ## Buffered file handles
 //!
@@ -36,8 +43,9 @@
 //! index code's usage (sequential write-then-close, sequential
 //! read-with-occasional-seeks), but it does mean a 1 GB segment write
 //! buffers 1 GB in memory before the put. Stage 8's hot-path migration
-//! eliminates this — segment readers will consume `BlobStore` directly
-//! via bounded `read_range` calls instead of going through this adapter.
+//! eliminated this for postings/docstore — segment readers consume
+//! `BlobStore` directly via bounded `read_range` calls instead of
+//! going through this adapter.
 
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -45,10 +53,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures::executor::block_on;
 
 use super::blob::BlobStore;
 use super::{DynFile, Storage, StorageFile};
+use crate::runtime::block_on_blob as block_on;
 
 /// Adapts an `Arc<dyn BlobStore>` to the existing `Storage` trait. See
 /// the module docs for the impedance mismatches and how they're handled.
