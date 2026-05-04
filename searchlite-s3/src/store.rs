@@ -65,7 +65,22 @@ impl S3BlobStore {
       )),
       S3Credentials::LoadFromEnv => apply_env_credentials(builder, &region).await?,
     };
-    let client = aws_sdk_s3::Client::from_conf(builder.build());
+    // Stage 10c v3: serialize the synchronous Client::from_conf
+    // step so the aws-smithy-http-client TLS provider's
+    // native-roots load doesn't race across concurrent callers in
+    // the same process. The panic surfaces on macOS as "TrustStore
+    // configured to enable native roots but no valid root
+    // certificates parsed!" when multiple threads hit the keychain
+    // at the same time. The guard is held only across the sync
+    // builder finalize (no .await inside), so the lock is fully
+    // contained and clippy's `await_holding_lock` lint is happy.
+    let client = {
+      static SDK_INIT_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+      let _guard = SDK_INIT_GUARD
+        .lock()
+        .map_err(|e| anyhow!("S3BlobStore::new: SDK init guard poisoned: {e}"))?;
+      aws_sdk_s3::Client::from_conf(builder.build())
+    };
     Ok(Self {
       client: Arc::new(client),
       config: Arc::new(config),

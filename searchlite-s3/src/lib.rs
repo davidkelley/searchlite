@@ -36,8 +36,12 @@
 mod config;
 mod errors;
 mod object;
+mod open;
 mod store;
+mod sync;
 
 pub use config::{S3Config, S3Credentials};
 pub use errors::S3StoreError;
+pub use open::open_index_read_only;
 pub use store::S3BlobStore;
+pub use sync::{sync_to_s3, SyncReport};
