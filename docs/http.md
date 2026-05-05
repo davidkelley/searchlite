@@ -39,7 +39,7 @@ You can mount multiple indexes with repeated `--index` flags (e.g., `--index pro
 
 | Flag | Env Var | Default | Purpose |
 |---|---|---|---|
-| `--index`, `-I` | `SEARCHLITE_INDEX_MAP` | *(required)* | `NAME:PATH` index mount (repeatable; semicolon-delimited for env). Supports per-index overrides, see below. |
+| `--index`, `-I` | `SEARCHLITE_INDEX_MAP` | *(required)* | `NAME:PATH` index mount (repeatable; semicolon-delimited for env). `PATH` is either a local filesystem path or an `s3://bucket/prefix` URL — see [s3.md](s3.md). Supports per-index overrides, see below. |
 | `--alias` | `SEARCHLITE_INDEX_ALIASES` | -- | `ALIAS:TARGET` indirections that point one name at another mounted index (semicolon-delimited for env) |
 | `--bind` | `SEARCHLITE_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `--require-existing-index` | `SEARCHLITE_REQUIRE_EXISTING_INDEX` | `false` | Fail at startup if an index's manifest is missing |
@@ -51,8 +51,44 @@ You can mount multiple indexes with repeated `--index` flags (e.g., `--index pro
 | `--auto-commit-interval-secs` | `SEARCHLITE_AUTO_COMMIT_INTERVAL_SECS` | `0` (disabled) | Default auto-commit interval for all indexes (seconds). Disabled on write-key-protected indexes. |
 | `--auto-refresh-interval-secs` | `SEARCHLITE_AUTO_REFRESH_INTERVAL_SECS` | `0` (disabled) | Default auto-refresh interval for all indexes (seconds) |
 | `--max-vector-candidates`&nbsp;⚙️ | `SEARCHLITE_MAX_VECTOR_CANDIDATES` | *(vectors feature only)* | Global cap on combined vector candidates across clauses |
+| `--checksum-policy` | `SEARCHLITE_CHECKSUM_POLICY` | `strict` | Checksum verification policy applied at index open. `trust-manifest` is recommended for `s3://` mounts. |
+| `--s3-endpoint` | `SEARCHLITE_S3_ENDPOINT` | -- | S3-compatible endpoint URL. Set for R2 / MinIO / LocalStack; unset for AWS S3. |
+| `--s3-region` | `AWS_REGION` | `us-east-1` | Region passed to SigV4. Use `auto` for R2. |
+| `--s3-force-path-style` | `SEARCHLITE_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (`https://endpoint/bucket/key`). Required for MinIO / LocalStack. |
+| `--s3-conditional-put` | `SEARCHLITE_S3_CONDITIONAL_PUT` | *(auto)* | Override conditional-PUT support. Defaults to `true` on AWS S3 / MinIO and `false` on R2 (auto-detected from `*.r2.cloudflarestorage.com`). |
 
 All errors return `{"error": {"type": "...", "reason": "..."}}`.
+
+### S3-backed mounts
+
+Pass `s3://bucket/prefix` in place of a local path on `--index` to serve a
+read-only index straight out of object storage. Connection-level flags
+(`--s3-endpoint`, `--s3-region`, `--s3-force-path-style`,
+`--s3-conditional-put`) apply to every S3 mount on the same server. AWS
+credentials come from the standard chain (`AWS_ACCESS_KEY_ID` env vars,
+shared credentials file, IAM roles).
+
+```bash
+# Serve a single S3-mounted index from AWS S3.
+searchlite http \
+  --index products:s3://my-search-indexes/products/v1 \
+  --bind 0.0.0.0:8080 \
+  --checksum-policy trust-manifest
+
+# Mix local and S3 mounts on the same server.
+searchlite http \
+  --index orders:/data/orders \
+  --index catalog:s3://my-search-indexes/catalog/v3 \
+  --bind 0.0.0.0:8080
+```
+
+S3 mounts are read-only by design: every writer endpoint
+(`/indexes/{name}/init`, `/add`, `/commit`, `/delete`, `/compact`,
+`/update`, `/_bulk_update`) returns an error against an S3-backed index.
+Bake the index locally with `searchlite init`/`add`/`commit`/`compact`,
+then publish with `searchlite sync` — see [s3.md](s3.md) for the full
+workflow. `auto_commit` and `auto_refresh` per-mount overrides are
+rejected at parse time on `s3://` mounts.
 
 ### Per-index overrides
 

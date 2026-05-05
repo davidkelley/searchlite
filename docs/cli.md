@@ -41,7 +41,14 @@ Supported platforms: `x86_64`/`aarch64` Linux and macOS, Windows via Git Bash/WS
 | `search <index> [options]` | Query the index and return JSON results |
 | `inspect <index>` | Print manifest and segment metadata |
 | `compact <index>` | Merge all segments to reduce fragmentation |
+| `sync <local-path> <s3-url>` | Bake-and-publish a local index to S3 / R2 / MinIO. See [s3.md](s3.md) |
 | `http [options]` | Run the HTTP server. See [http.md](http.md) |
+
+The `<index>` argument on `search` and `inspect` accepts either a local
+filesystem path or an `s3://bucket/prefix` URL — see [s3.md](s3.md) for
+the bake-and-sync workflow and the `--s3-*` connection flags. Writer
+commands (`init`, `add`, `update`, `delete`, `commit`, `compact`) are
+local-only by design; bake locally then `sync` the result.
 
 Documents are **buffered** when added -- they won't appear in search results until
 you run `commit`. This lets you batch thousands of documents before making them

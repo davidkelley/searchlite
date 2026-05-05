@@ -7,8 +7,18 @@ license = "MIT"
 description = "CLI for searchlite"
 
 [features]
-default = []
-vectors = ["searchlite-core/vectors", "searchlite-http/vectors"]
+default = ["s3"]
+# `searchlite sync` plus `--index s3://bucket/prefix` on read-side
+# subcommands. Pulls in `searchlite-s3` (and `aws-sdk-s3`); on by
+# default so the official CLI build "just works" against AWS S3,
+# Cloudflare R2, and MinIO. Disable with `--no-default-features` for
+# size-sensitive packagers.
+s3 = ["dep:searchlite-s3", "searchlite-http/s3"]
+vectors = [
+  "searchlite-core/vectors",
+  "searchlite-http/vectors",
+  "searchlite-s3?/vectors",
+]
 gpu = ["searchlite-core/gpu", "searchlite-http/gpu"]
 zstd = ["searchlite-core/zstd", "searchlite-http/zstd"]
 ffi = ["searchlite-core/ffi"]
@@ -20,6 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core", features = ["write-key"] }
 searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
+searchlite-s3 = { path = "../searchlite-s3", package = "searchlite-s3", optional = true }
 tokio = { version = "1.52.1", features = ["rt-multi-thread"] }
 chrono = { workspace = true }
 env_logger = { workspace = true }

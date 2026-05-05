@@ -56,9 +56,11 @@ mod object;
 mod open;
 mod store;
 mod sync;
+mod url;
 
 pub use config::{S3Config, S3Credentials};
 pub use errors::S3StoreError;
 pub use open::{open_index_read_only, open_index_read_only_with_options};
 pub use store::S3BlobStore;
 pub use sync::{sync_to_s3, SyncReport};
+pub use url::{is_r2_endpoint, parse_s3_url, S3Url};

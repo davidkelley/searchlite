@@ -16,7 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use searchlite_core::api::builder::IndexBuilder;
@@ -49,7 +49,17 @@ const DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES: usize = 20_000;
 #[derive(Debug, Clone)]
 pub struct IndexSpec {
   pub name: String,
+  /// Filesystem path for local mounts. For `s3://...` mounts this
+  /// is an empty `PathBuf` placeholder — see [`Self::s3`] for the
+  /// real location.
   pub path: PathBuf,
+  /// Set when the user passed `s3://bucket[/prefix]` instead of a
+  /// local path. Connection-level knobs (endpoint, region,
+  /// force-path-style, conditional-put) come from server-level
+  /// flags on [`ServeArgs`] and are merged at mount-construction
+  /// time, not stored here.
+  #[cfg(feature = "s3")]
+  pub s3: Option<searchlite_s3::S3Url>,
   pub auto_commit_interval_secs: Option<u64>,
   pub auto_refresh_interval_secs: Option<u64>,
 }
@@ -61,16 +71,46 @@ pub fn parse_index_spec(raw: &str) -> Result<IndexSpec, String> {
   if name.trim().is_empty() {
     return Err("index name cannot be empty".into());
   }
+  // The `s3://bucket/prefix` form embeds extra `/` separators in the
+  // path slot. The first token after the name:path split is therefore
+  // the FULL `s3://...` URL up to the first `,` that introduces a
+  // mount-level option (auto_commit / auto_refresh). Plain local
+  // paths can also contain `,` only by user convention; the existing
+  // local grammar treats `,` as the option separator and that's
+  // preserved here.
   let mut path_parts = path_and_opts.split(',');
-  let Some(path) = path_parts.next() else {
+  let Some(path_or_url) = path_parts.next() else {
     return Err("index path cannot be empty".into());
   };
-  if path.trim().is_empty() {
+  let path_or_url = path_or_url.trim();
+  if path_or_url.is_empty() {
     return Err("index path cannot be empty".into());
   }
+  let lowered = path_or_url.to_ascii_lowercase();
+  let is_s3 = lowered.starts_with("s3://");
+  #[cfg(not(feature = "s3"))]
+  if is_s3 {
+    return Err(format!(
+      "{path_or_url:?} is an s3:// URL but this build was compiled without the `s3` feature; \
+       rebuild searchlite-http with `--features s3` (default in the searchlite CLI binary)"
+    ));
+  }
+  #[cfg(feature = "s3")]
+  let s3_url = if is_s3 {
+    Some(searchlite_s3::parse_s3_url(path_or_url)?)
+  } else {
+    None
+  };
+  let path = if is_s3 {
+    PathBuf::new()
+  } else {
+    PathBuf::from(path_or_url)
+  };
   let mut spec = IndexSpec {
     name: name.trim().to_string(),
-    path: PathBuf::from(path.trim()),
+    path,
+    #[cfg(feature = "s3")]
+    s3: s3_url,
     auto_commit_interval_secs: None,
     auto_refresh_interval_secs: None,
   };
@@ -98,12 +138,24 @@ pub fn parse_index_spec(raw: &str) -> Result<IndexSpec, String> {
       .map_err(|_| format!("index option `{key}` must be a non-negative integer"))?;
     match key {
       "auto_commit" => {
+        if is_s3 {
+          return Err(format!(
+            "index option `auto_commit` is not supported on s3:// mounts (read-only); \
+             remove it from the index spec for {path_or_url:?}"
+          ));
+        }
         if spec.auto_commit_interval_secs.is_some() {
           return Err("duplicate index option `auto_commit`".into());
         }
         spec.auto_commit_interval_secs = Some(parsed);
       }
       "auto_refresh" => {
+        if is_s3 {
+          return Err(format!(
+            "index option `auto_refresh` is not supported on s3:// mounts in this version; \
+             remove it from the index spec for {path_or_url:?}"
+          ));
+        }
         if spec.auto_refresh_interval_secs.is_some() {
           return Err("duplicate index option `auto_refresh`".into());
         }
@@ -224,24 +276,154 @@ pub struct ServeArgs {
     default_value_t = DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES
   )]
   pub max_vector_candidates: usize,
+
+  /// Checksum verification policy applied at index open. Defaults
+  /// to `strict`. Cloud serving (`s3://...` mounts) typically
+  /// benefits from `trust-manifest` to skip whole-file SHA-256
+  /// re-reads on every fresh `Index::reader()`.
+  #[arg(
+    long = "checksum-policy",
+    env = "SEARCHLITE_CHECKSUM_POLICY",
+    value_enum,
+    default_value_t = ChecksumPolicyArg::default()
+  )]
+  pub checksum_policy: ChecksumPolicyArg,
+
+  // ───────── S3 connection flags ─────────
+  // Apply to every `s3://` mount on this server. Per-mount
+  // connection config is a future extension; today, all S3 mounts
+  // share these.
+  /// S3-compatible endpoint URL. Set this for Cloudflare R2
+  /// (`https://<account>.r2.cloudflarestorage.com`) or MinIO /
+  /// LocalStack (`http://localhost:9000`). Leave unset to target
+  /// AWS S3 directly.
+  #[cfg(feature = "s3")]
+  #[arg(long = "s3-endpoint", env = "SEARCHLITE_S3_ENDPOINT")]
+  pub s3_endpoint: Option<String>,
+
+  /// AWS region for S3 mounts. Required by SigV4 even for R2 (use
+  /// `auto`) and MinIO. Defaults to the standard `AWS_REGION` env
+  /// var; falls back to `us-east-1` if neither is set.
+  #[cfg(feature = "s3")]
+  #[arg(long = "s3-region", env = "AWS_REGION")]
+  pub s3_region: Option<String>,
+
+  /// Use path-style addressing (`https://endpoint/bucket/key`)
+  /// instead of virtual-hosted (`https://bucket.endpoint/key`).
+  /// Required for MinIO / LocalStack.
+  #[cfg(feature = "s3")]
+  #[arg(long = "s3-force-path-style", env = "SEARCHLITE_S3_FORCE_PATH_STYLE")]
+  pub s3_force_path_style: bool,
+
+  /// Enable conditional PUTs (`If-Match` / `If-None-Match`).
+  /// Defaults to `true` on AWS S3 and MinIO, `false` on R2 (auto-
+  /// detected from the endpoint hostname pattern
+  /// `*.r2.cloudflarestorage.com`). Override explicitly to opt in
+  /// once your R2 account/bucket supports them.
+  #[cfg(feature = "s3")]
+  #[arg(long = "s3-conditional-put", env = "SEARCHLITE_S3_CONDITIONAL_PUT")]
+  pub s3_conditional_put: Option<bool>,
+}
+
+/// `--checksum-policy` enum exposed both on the HTTP server and the
+/// CLI. Maps onto [`searchlite_core::api::types::ChecksumPolicy`].
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[clap(rename_all = "kebab-case")]
+pub enum ChecksumPolicyArg {
+  /// Re-verify SHA-256 of every segment artifact on each fresh
+  /// `Index::reader()`. Safest, but expensive on remote backends.
+  #[default]
+  Strict,
+  /// Trust the manifest's recorded hashes without re-verifying.
+  /// Recommended for cloud serving where each reader open should
+  /// avoid pulling whole segment files over the network.
+  TrustManifest,
+  /// Open immediately and verify in a background `rayon` task.
+  Audit,
+}
+
+impl From<ChecksumPolicyArg> for searchlite_core::api::types::ChecksumPolicy {
+  fn from(value: ChecksumPolicyArg) -> Self {
+    use searchlite_core::api::types::ChecksumPolicy;
+    match value {
+      ChecksumPolicyArg::Strict => ChecksumPolicy::Strict,
+      ChecksumPolicyArg::TrustManifest => ChecksumPolicy::TrustManifest,
+      ChecksumPolicyArg::Audit => ChecksumPolicy::Audit,
+    }
+  }
+}
+
+/// Per-mount S3 configuration assembled from the parsed
+/// `s3://bucket/prefix` URL and the server-level connection flags
+/// on [`ServeArgs`]. One of these is built per S3 mount in
+/// [`IndexRegistry::from_args`].
+#[cfg(feature = "s3")]
+#[derive(Clone, Debug)]
+struct S3MountConfig {
+  url: searchlite_s3::S3Url,
+  endpoint: Option<String>,
+  region: Option<String>,
+  force_path_style: bool,
+  conditional_put_override: Option<bool>,
+}
+
+#[cfg(feature = "s3")]
+impl S3MountConfig {
+  /// Realize this mount config into a full [`searchlite_s3::S3Config`]
+  /// for [`searchlite_s3::open_index_read_only_with_options`].
+  fn to_s3_config(&self) -> searchlite_s3::S3Config {
+    let region = self
+      .region
+      .clone()
+      .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+      .filter(|r| !r.trim().is_empty())
+      .unwrap_or_else(|| "us-east-1".to_string());
+    let endpoint_url = self.endpoint.clone().filter(|e| !e.trim().is_empty());
+    let is_r2 = endpoint_url
+      .as_deref()
+      .map(searchlite_s3::is_r2_endpoint)
+      .unwrap_or(false);
+    let conditional_put = self.conditional_put_override.unwrap_or(!is_r2);
+    searchlite_s3::S3Config {
+      endpoint_url,
+      region,
+      bucket: self.url.bucket.clone(),
+      prefix: self.url.prefix.clone(),
+      credentials: searchlite_s3::S3Credentials::LoadFromEnv,
+      conditional_put,
+      force_path_style: self.force_path_style,
+    }
+  }
 }
 
 #[derive(Clone)]
 struct ManagedIndex {
   name: String,
   path: PathBuf,
+  /// `Some` for `s3://...` mounts; `None` for local-FS mounts.
+  /// When set, the mount is read-only — every writer-side endpoint
+  /// surfaces the underlying core's `read_only` error, and bootstrap
+  /// goes through [`searchlite_s3::open_index_read_only_with_options`]
+  /// instead of [`Index::open`].
+  #[cfg(feature = "s3")]
+  s3_mount: Option<S3MountConfig>,
   require_existing_index: bool,
   refresh_on_commit: bool,
   auto_commit_interval_secs: u64,
   auto_refresh_interval_secs: u64,
   #[cfg(feature = "vectors")]
   max_vector_candidates: usize,
+  checksum_policy: searchlite_core::api::types::ChecksumPolicy,
   index: Arc<tokio::sync::RwLock<Option<Arc<Index>>>>,
   writer_lock: Arc<tokio::sync::Mutex<()>>,
   auto_commit_enabled: Arc<AtomicBool>,
 }
 
 impl ManagedIndex {
+  // The constructor takes one argument per `ManagedIndex` field;
+  // grouping them into a builder struct would just shuffle the same
+  // bag of options through one more layer of plumbing.
+  #[allow(clippy::too_many_arguments)]
   fn new(
     spec: &IndexSpec,
     require_existing_index: bool,
@@ -249,23 +431,76 @@ impl ManagedIndex {
     auto_commit_interval_secs: u64,
     auto_refresh_interval_secs: u64,
     #[cfg(feature = "vectors")] max_vector_candidates: usize,
+    #[cfg(feature = "s3")] s3_mount: Option<S3MountConfig>,
+    checksum_policy: searchlite_core::api::types::ChecksumPolicy,
   ) -> Self {
+    // S3 mounts are always read-only and always require the remote
+    // index to already exist — `searchlite-http` cannot init an S3
+    // index, the user must `searchlite sync` it from a local bake.
+    #[cfg(feature = "s3")]
+    let require_existing_index = require_existing_index || s3_mount.is_some();
+    // S3 mounts disable auto-commit: there's no writer to commit
+    // through. Auto-refresh would be a useful future feature for
+    // periodic manifest re-poll but is not wired up in this version.
+    #[cfg(feature = "s3")]
+    let auto_commit_enabled = Arc::new(AtomicBool::new(s3_mount.is_none()));
+    #[cfg(not(feature = "s3"))]
+    let auto_commit_enabled = Arc::new(AtomicBool::new(true));
     Self {
       name: spec.name.clone(),
       path: spec.path.clone(),
+      #[cfg(feature = "s3")]
+      s3_mount,
       require_existing_index,
       refresh_on_commit,
       auto_commit_interval_secs,
       auto_refresh_interval_secs,
       #[cfg(feature = "vectors")]
       max_vector_candidates,
+      checksum_policy,
       index: Arc::new(tokio::sync::RwLock::new(None)),
       writer_lock: Arc::new(tokio::sync::Mutex::new(())),
-      auto_commit_enabled: Arc::new(AtomicBool::new(true)),
+      auto_commit_enabled,
+    }
+  }
+
+  /// Whether this mount is read-only at the server level (S3 mounts
+  /// always are; local mounts are writable).
+  #[allow(dead_code)]
+  fn is_read_only(&self) -> bool {
+    #[cfg(feature = "s3")]
+    {
+      self.s3_mount.is_some()
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+      false
     }
   }
 
   async fn bootstrap(&self) -> anyhow::Result<()> {
+    #[cfg(feature = "s3")]
+    if let Some(mount) = self.s3_mount.as_ref() {
+      let s3_config = mount.to_s3_config();
+      let opts = IndexOptions {
+        checksum_policy: self.checksum_policy,
+        ..Default::default()
+      };
+      let idx = searchlite_s3::open_index_read_only_with_options(s3_config, opts)
+        .await
+        .with_context(|| {
+          format!(
+            "failed to open S3-backed index `{}` (s3://{}/{}) during startup",
+            self.name,
+            mount.url.bucket,
+            mount.url.prefix.as_deref().unwrap_or("")
+          )
+        })?;
+      let arc = Arc::new(idx);
+      let mut guard = self.index.write().await;
+      *guard = Some(arc);
+      return Ok(());
+    }
     if !self.manifest_exists() {
       if self.require_existing_index {
         anyhow::bail!(
@@ -289,6 +524,15 @@ impl ManagedIndex {
   }
 
   fn manifest_exists(&self) -> bool {
+    // S3 mounts: the mount itself IS the index pointer. The HTTP
+    // `/init` endpoint correctly rejects re-init on an S3-backed
+    // mount because of this — and any actual remote-existence check
+    // happens during bootstrap, where it surfaces a clean error if
+    // the bucket has no manifest.
+    #[cfg(feature = "s3")]
+    if self.s3_mount.is_some() {
+      return true;
+    }
     Manifest::manifest_path(&self.path).exists()
   }
 
@@ -300,9 +544,9 @@ impl ManagedIndex {
       bm25_k1: DEFAULT_K1,
       bm25_b: DEFAULT_B,
       storage: StorageType::Filesystem,
-      checksum_policy: Default::default(),
+      checksum_policy: self.checksum_policy,
       checksum_audit_failure_hook: None,
-      read_only: false,
+      read_only: self.is_read_only(),
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     }
@@ -318,6 +562,23 @@ impl ManagedIndex {
   async fn require_index(&self) -> ApiResult<Arc<Index>> {
     if let Some(existing) = self.index.read().await.as_ref() {
       return Ok(existing.clone());
+    }
+    // S3 mounts only ever materialize via `bootstrap()` at server
+    // startup. If we hit this path with no cached index, bootstrap
+    // either failed or never ran — surface a clear 503 rather than
+    // attempting a lazy local-FS open against an empty placeholder
+    // path.
+    #[cfg(feature = "s3")]
+    if self.s3_mount.is_some() {
+      return Err(HttpError::from_anyhow(
+        "open_index",
+        StatusCode::SERVICE_UNAVAILABLE,
+        anyhow::anyhow!(
+          "S3-backed index `{}` was not bootstrapped at server start; \
+           check the server logs for the open error",
+          self.name
+        ),
+      ));
     }
     if !self.manifest_exists() {
       return Err(HttpError::not_found(
@@ -473,6 +734,19 @@ impl IndexRegistry {
       let auto_refresh_interval_secs = spec
         .auto_refresh_interval_secs
         .unwrap_or(args.auto_refresh_interval_secs);
+      // Build the per-mount S3 config by merging the URL parsed from
+      // `--index` with the server-level connection flags (endpoint,
+      // region, force-path-style, conditional-put). All s3 mounts on
+      // the same server share these connection flags; per-mount
+      // overrides are a future extension.
+      #[cfg(feature = "s3")]
+      let s3_mount = spec.s3.as_ref().map(|url| S3MountConfig {
+        url: url.clone(),
+        endpoint: args.s3_endpoint.clone(),
+        region: args.s3_region.clone(),
+        force_path_style: args.s3_force_path_style,
+        conditional_put_override: args.s3_conditional_put,
+      });
       let managed = ManagedIndex::new(
         spec,
         args.require_existing_index,
@@ -481,6 +755,9 @@ impl IndexRegistry {
         auto_refresh_interval_secs,
         #[cfg(feature = "vectors")]
         args.max_vector_candidates,
+        #[cfg(feature = "s3")]
+        s3_mount,
+        args.checksum_policy.into(),
       );
       indexes.insert(spec.name.clone(), Arc::new(managed));
     }
@@ -2145,8 +2422,6 @@ async fn multi_search(
   }
   #[cfg(feature = "vectors")]
   let mut searches = searches;
-  #[cfg(not(feature = "vectors"))]
-  let searches = searches;
   let managed = state.registry().resolve(&index_name)?;
   #[cfg(feature = "vectors")]
   {
@@ -2468,6 +2743,8 @@ mod tests {
       indexes: vec![IndexSpec {
         name: INDEX_NAME.into(),
         path: index,
+        #[cfg(feature = "s3")]
+        s3: None,
         auto_commit_interval_secs: None,
         auto_refresh_interval_secs: None,
       }],
@@ -2483,6 +2760,15 @@ mod tests {
       auto_refresh_interval_secs: 0,
       #[cfg(feature = "vectors")]
       max_vector_candidates: DEFAULT_MAX_VECTOR_GLOBAL_CANDIDATES,
+      checksum_policy: ChecksumPolicyArg::default(),
+      #[cfg(feature = "s3")]
+      s3_endpoint: None,
+      #[cfg(feature = "s3")]
+      s3_region: None,
+      #[cfg(feature = "s3")]
+      s3_force_path_style: false,
+      #[cfg(feature = "s3")]
+      s3_conditional_put: None,
     }
   }
 
@@ -4867,18 +5153,24 @@ mod tests {
         IndexSpec {
           name: "idx1".into(),
           path: base.join("a"),
+          #[cfg(feature = "s3")]
+          s3: None,
           auto_commit_interval_secs: None,
           auto_refresh_interval_secs: None,
         },
         IndexSpec {
           name: "idx2".into(),
           path: base.join("b"),
+          #[cfg(feature = "s3")]
+          s3: None,
           auto_commit_interval_secs: None,
           auto_refresh_interval_secs: None,
         },
         IndexSpec {
           name: "idx3".into(),
           path: base.join("c"),
+          #[cfg(feature = "s3")]
+          s3: None,
           auto_commit_interval_secs: None,
           auto_refresh_interval_secs: None,
         },
@@ -4933,12 +5225,66 @@ mod tests {
     assert!(err.contains("index option key cannot be empty"));
   }
 
+  #[cfg(feature = "s3")]
+  #[test]
+  fn parse_index_spec_accepts_s3_url() {
+    let spec = parse_index_spec("products:s3://my-bucket/products/v1").unwrap();
+    assert_eq!(spec.name, "products");
+    assert_eq!(spec.path, PathBuf::new());
+    let s3 = spec.s3.as_ref().expect("s3 mount populated");
+    assert_eq!(s3.bucket, "my-bucket");
+    assert_eq!(s3.prefix.as_deref(), Some("products/v1"));
+  }
+
+  #[cfg(feature = "s3")]
+  #[test]
+  fn parse_index_spec_accepts_s3_url_without_prefix() {
+    let spec = parse_index_spec("products:s3://my-bucket").unwrap();
+    let s3 = spec.s3.as_ref().expect("s3 mount populated");
+    assert_eq!(s3.bucket, "my-bucket");
+    assert_eq!(s3.prefix, None);
+  }
+
+  #[cfg(feature = "s3")]
+  #[test]
+  fn parse_index_spec_rejects_auto_commit_on_s3_mount() {
+    // auto_commit makes no sense for read-only S3 mounts; reject at
+    // parse time rather than letting the writer error surface later.
+    let err = parse_index_spec("products:s3://my-bucket/v1,auto_commit=30").unwrap_err();
+    assert!(
+      err.contains("auto_commit") && err.contains("s3://"),
+      "expected auto_commit/s3:// rejection, got: {err}"
+    );
+  }
+
+  #[cfg(feature = "s3")]
+  #[test]
+  fn parse_index_spec_rejects_auto_refresh_on_s3_mount() {
+    let err = parse_index_spec("products:s3://my-bucket/v1,auto_refresh=10").unwrap_err();
+    assert!(
+      err.contains("auto_refresh") && err.contains("s3://"),
+      "expected auto_refresh/s3:// rejection, got: {err}"
+    );
+  }
+
+  #[cfg(feature = "s3")]
+  #[test]
+  fn parse_index_spec_rejects_empty_s3_bucket() {
+    let err = parse_index_spec("products:s3:///prefix").unwrap_err();
+    assert!(
+      err.contains("missing a bucket"),
+      "expected missing-bucket rejection, got: {err}"
+    );
+  }
+
   #[test]
   fn duplicate_index_name_rejected() {
     let mut args = default_args(PathBuf::from("/tmp/idx-one"));
     args.indexes.push(IndexSpec {
       name: INDEX_NAME.into(),
       path: PathBuf::from("/tmp/idx-two"),
+      #[cfg(feature = "s3")]
+      s3: None,
       auto_commit_interval_secs: None,
       auto_refresh_interval_secs: None,
     });
