@@ -2135,8 +2135,9 @@ impl SegmentReader {
   /// for any non-last doc, or `end = docstore_len` for the last doc.
   /// The returned bundle is the exact `[u32 LE length][payload]`
   /// record; parsing/decompression goes through the shared
-  /// [`decode_docstore_record`] helper so this path can never drift
-  /// from the legacy `DocStoreReader::get` semantics.
+  /// [`decode_docstore_record`] helper, which is the single source of
+  /// truth for docstore on-wire-format semantics (length cap, zstd
+  /// handling, JSON decode, range/length consistency).
   ///
   /// Strict validation (Codex Stage 8b review, including the v2 P1
   /// pre-read span guard):
