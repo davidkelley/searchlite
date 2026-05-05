@@ -480,6 +480,57 @@ fn pick_first_segment_terms_key(local_root: &Path, prefix: Option<&str>) -> Stri
 /// root-prefixed-relative paths from a v1 manifest would silently
 /// miss after upload. Sync's preflight catches this, naming the
 /// version mismatch and pointing at the local-upgrade workflow.
+/// Stage 10c v5 [P2] (Codex review): a v2 manifest can name an
+/// artifact at a non-canonical lexical form (e.g. `./seg_X.post`)
+/// that resolves to an existing local file but doesn't match the
+/// key the upload walker would emit (`seg_X.post`). S3 stores keys
+/// verbatim, so the manifest would publish a reference to
+/// `./seg_X.post` while the bytes live at `seg_X.post` — visible
+/// but unservable. Preflight rejects non-canonical keys before any
+/// upload.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_errors_when_manifest_references_non_canonical_key() {
+  let (local_dir, _) = bake_local_index();
+
+  // Read the manifest, find the postings key, and rewrite it with a
+  // leading `./` (lexical drift). The file on disk doesn't move —
+  // `local_root.join("./seg_X.post")` resolves to the same regular
+  // file, so the existence check passes; only the canonical-form
+  // assertion catches the drift.
+  let manifest_path = local_dir.path().join("MANIFEST.json");
+  let mut value: serde_json::Value =
+    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+  let original_postings_key = value["segments"][0]["paths"]["postings"]
+    .as_str()
+    .expect("postings path in v2 manifest")
+    .to_string();
+  let drifted_key = format!("./{original_postings_key}");
+  value["segments"][0]["paths"]["postings"] = serde_json::json!(drifted_key);
+  std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+  let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
+  let server_uri = bucket.spawn_server().await;
+  let err = sync_to_s3(
+    local_dir.path(),
+    config_for(&server_uri, "test-bucket", None),
+  )
+  .await
+  .expect_err("non-canonical key must be rejected at preflight");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("canonical form") && msg.contains(&drifted_key),
+    "expected canonical-form rejection naming the drifted key; got: {msg}"
+  );
+  // No PUT issued — preflight failed before any network write,
+  // and crucially: no `MANIFEST.json` was published.
+  let remote = bucket.snapshot();
+  assert!(
+    remote.is_empty(),
+    "non-canonical-key rejection must abort BEFORE any upload; remote: {:?}",
+    remote.keys().collect::<Vec<_>>()
+  );
+}
+
 /// Stage 10c v4 [P2] (Codex review): if a v2 manifest names a
 /// segment artifact at a path that the sync walker would SKIP
 /// (e.g. a dot-file, `wal.log`, or the top-level

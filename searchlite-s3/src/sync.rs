@@ -95,6 +95,53 @@ fn is_uploadable_relative_path(relative: &Path) -> bool {
   true
 }
 
+/// Stage 10c v5 [P2] (Codex review): assert that a manifest key is
+/// in the canonical form the sync walker would emit. The walker
+/// builds keys via `read_dir` + `strip_prefix(local_root)`, which
+/// produces no leading `./`, no trailing `/`, no `//`, no
+/// backslash separators, and no `.`/`..`/`RootDir`/`Prefix`
+/// components.
+///
+/// Without this check, a v2 manifest can name `./seg_X.post`:
+/// `validate_v2_relative` accepts it (no `..`, no leading slash),
+/// `local_root.join("./seg_X.post")` stats successfully (filesystem
+/// collapses `./`), but the walker emits the key as `seg_X.post`
+/// (no `./`) and S3 stores keys verbatim. The manifest would then
+/// publish a reference to `./seg_X.post`, but the bytes live at
+/// `seg_X.post` on the remote — a visible-but-unservable index.
+///
+/// Returns Ok(()) if the key is canonical; Err otherwise with a
+/// reason. Callers in `preflight_manifest` then `bail!` with a
+/// uniform error.
+fn validate_canonical_segment_key(key: &str) -> Result<(), &'static str> {
+  if key.is_empty() {
+    return Err("key is empty");
+  }
+  if key.contains('\\') {
+    return Err("key contains a backslash separator");
+  }
+  if key.starts_with('/') {
+    return Err("key starts with `/`");
+  }
+  if key.ends_with('/') {
+    return Err("key ends with `/`");
+  }
+  if key.contains("//") {
+    return Err("key contains `//` (repeated separators)");
+  }
+  let p = Path::new(key);
+  for component in p.components() {
+    match component {
+      Component::Normal(_) => {}
+      Component::CurDir => return Err("key contains a `.` component"),
+      Component::ParentDir => return Err("key contains a `..` component"),
+      Component::RootDir => return Err("key contains a root component"),
+      Component::Prefix(_) => return Err("key contains a platform prefix"),
+    }
+  }
+  Ok(())
+}
+
 /// Per-call summary of a successful [`sync_to_s3`] run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncReport {
@@ -307,6 +354,22 @@ fn preflight_manifest(local_root: &Path) -> Result<Vec<u8>> {
       ("fast", seg.paths.fast.as_str(), &resolved.fast),
       ("meta", seg.paths.meta.as_str(), &resolved.meta),
     ] {
+      // Stage 10c v5 [P2] (Codex review): assert the manifest key
+      // is in the **canonical** form the walker would emit. This
+      // closes the "manifest references `./seg_X.post` but walker
+      // uploads `seg_X.post`" lexical-drift gap.
+      if let Err(reason) = validate_canonical_segment_key(relative_key) {
+        bail!(
+          "sync_to_s3: refusing to upload — segment {} references {label} \
+           artifact at relative key {relative_key:?}, which is NOT in the \
+           canonical form the sync walker would emit ({reason}). The walker \
+           builds keys via `read_dir` + `strip_prefix(local_root)`, which \
+           produces no leading `./`, no `..`, no repeated/leading/trailing \
+           `/`, no backslashes, and no platform prefixes. Re-emit the \
+           manifest with canonical keys before re-syncing.",
+          seg.id
+        );
+      }
       require_regular_file(label, &seg.id, abs_path)?;
       // Stage 10c v4 [P2] (Codex review): also check that the
       // uploader will actually upload this path. A manifest that
