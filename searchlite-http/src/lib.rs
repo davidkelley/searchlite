@@ -728,12 +728,6 @@ impl IndexRegistry {
       if indexes.contains_key(&spec.name) {
         anyhow::bail!("duplicate index name provided: {}", spec.name);
       }
-      let auto_commit_interval_secs = spec
-        .auto_commit_interval_secs
-        .unwrap_or(args.auto_commit_interval_secs);
-      let auto_refresh_interval_secs = spec
-        .auto_refresh_interval_secs
-        .unwrap_or(args.auto_refresh_interval_secs);
       // Build the per-mount S3 config by merging the URL parsed from
       // `--index` with the server-level connection flags (endpoint,
       // region, force-path-style, conditional-put). All s3 mounts on
@@ -747,6 +741,36 @@ impl IndexRegistry {
         force_path_style: args.s3_force_path_style,
         conditional_put_override: args.s3_conditional_put,
       });
+      // Auto-commit and auto-refresh are local-only concepts. Per-mount
+      // overrides are already rejected for `s3://` at parse time
+      // (`parse_index_spec`), but the global
+      // `--auto-commit-interval-secs` / `--auto-refresh-interval-secs`
+      // would otherwise bleed into S3 mounts via the `unwrap_or` below
+      // and trigger maintenance tasks that either chase a non-existent
+      // local manifest (auto-commit's `validate_auto_commit_support`
+      // reads `Manifest::manifest_path(&managed.path)` against the
+      // empty placeholder path) or do meaningless re-verification of
+      // the already-open `Index` without re-polling the remote
+      // manifest (auto-refresh). Force both to 0 for S3 mounts so the
+      // maintenance loop never enters their branches.
+      #[cfg(feature = "s3")]
+      let force_local_only_intervals_to_zero = s3_mount.is_some();
+      #[cfg(not(feature = "s3"))]
+      let force_local_only_intervals_to_zero = false;
+      let auto_commit_interval_secs = if force_local_only_intervals_to_zero {
+        0
+      } else {
+        spec
+          .auto_commit_interval_secs
+          .unwrap_or(args.auto_commit_interval_secs)
+      };
+      let auto_refresh_interval_secs = if force_local_only_intervals_to_zero {
+        0
+      } else {
+        spec
+          .auto_refresh_interval_secs
+          .unwrap_or(args.auto_refresh_interval_secs)
+      };
       let managed = ManagedIndex::new(
         spec,
         args.require_existing_index,
@@ -5274,6 +5298,52 @@ mod tests {
     assert!(
       err.contains("missing a bucket"),
       "expected missing-bucket rejection, got: {err}"
+    );
+  }
+
+  #[cfg(feature = "s3")]
+  #[test]
+  fn s3_mount_zeros_global_auto_commit_and_refresh() {
+    // Regression for Codex P2: a server with `--auto-commit-interval-secs N`
+    // / `--auto-refresh-interval-secs M` and a mixed local + s3 mount
+    // set must NOT inherit those globals onto the s3 mount. Auto-commit's
+    // `validate_auto_commit_support` reads `Manifest::manifest_path(...)`
+    // against the empty placeholder path used for s3 mounts; auto-refresh
+    // would do extra Strict re-verification of the already-open `Index`
+    // without re-polling the remote manifest. Both must be 0 for s3 mounts.
+    let dir = tempdir().unwrap();
+    let local_path = dir.path().join("local-idx");
+    let s3_url = searchlite_s3::parse_s3_url("s3://my-bucket/v1").unwrap();
+    let mut args = default_args(local_path.clone());
+    args.indexes.push(IndexSpec {
+      name: "remote".into(),
+      path: PathBuf::new(),
+      s3: Some(s3_url),
+      auto_commit_interval_secs: None,
+      auto_refresh_interval_secs: None,
+    });
+    args.auto_commit_interval_secs = 30;
+    args.auto_refresh_interval_secs = 10;
+    let registry = IndexRegistry::from_args(&args).unwrap();
+
+    let local = registry.indexes.get(INDEX_NAME).unwrap();
+    assert_eq!(
+      local.auto_commit_interval_secs, 30,
+      "local mount inherits global auto-commit"
+    );
+    assert_eq!(
+      local.auto_refresh_interval_secs, 10,
+      "local mount inherits global auto-refresh"
+    );
+
+    let remote = registry.indexes.get("remote").unwrap();
+    assert_eq!(
+      remote.auto_commit_interval_secs, 0,
+      "s3 mount must NOT inherit global auto-commit (would chase a non-existent local manifest)"
+    );
+    assert_eq!(
+      remote.auto_refresh_interval_secs, 0,
+      "s3 mount must NOT inherit global auto-refresh (no remote re-poll wired up)"
     );
   }
 

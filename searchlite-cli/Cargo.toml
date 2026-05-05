@@ -8,11 +8,12 @@ description = "CLI for searchlite"
 
 [features]
 default = ["s3"]
-# `searchlite sync` plus `--index s3://bucket/prefix` on read-side
-# subcommands. Pulls in `searchlite-s3` (and `aws-sdk-s3`); on by
-# default so the official CLI build "just works" against AWS S3,
-# Cloudflare R2, and MinIO. Disable with `--no-default-features` for
-# size-sensitive packagers.
+# `searchlite sync` plus `s3://bucket/prefix` paths on the
+# `searchlite search` / `inspect` positional `<INDEX>` arg, and
+# `--index name:s3://bucket/prefix` on `searchlite http`. Pulls in
+# `searchlite-s3` (and `aws-sdk-s3`); on by default so the official
+# CLI build "just works" against AWS S3, Cloudflare R2, and MinIO.
+# Disable with `--no-default-features` for size-sensitive packagers.
 s3 = ["dep:searchlite-s3", "searchlite-http/s3"]
 vectors = [
   "searchlite-core/vectors",

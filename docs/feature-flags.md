@@ -47,7 +47,7 @@ The CLI binary can be built with optional capabilities:
 
 | Flag | Default | What it enables |
 |---|---|---|
-| `s3` | **on** | `searchlite sync` and `--index s3://...` on read-side subcommands. Pulls in `searchlite-s3` (and `aws-sdk-s3`). Disable with `--no-default-features` for size-sensitive packagers. See [s3.md](s3.md). |
+| `s3` | **on** | `searchlite sync` and `s3://bucket/prefix` paths on the `search` / `inspect` `<INDEX>` arg (plus `--index name:s3://bucket/prefix` on `searchlite http`). Pulls in `searchlite-s3` (and `aws-sdk-s3`). Disable with `--no-default-features` for size-sensitive packagers. See [s3.md](s3.md). |
 | `vectors` | off | Vector field support in CLI commands |
 | `zstd` | off | Zstandard compression for stored fields |
 | `gpu` | off | GPU reranker stubs |
