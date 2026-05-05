@@ -480,6 +480,67 @@ fn pick_first_segment_terms_key(local_root: &Path, prefix: Option<&str>) -> Stri
 /// root-prefixed-relative paths from a v1 manifest would silently
 /// miss after upload. Sync's preflight catches this, naming the
 /// version mismatch and pointing at the local-upgrade workflow.
+/// Stage 10c v6 [P2] (Codex review): even with v5's canonical-form
+/// check via `Path::components()`, an **interior** `.` segment
+/// (e.g. `dir/./seg.post`) silently slipped through because
+/// `Path::components()` normalizes those away to
+/// `[Normal("dir"), Normal("seg.post")]` — indistinguishable from
+/// the canonical `dir/seg.post`. Stage 10c v6 switched to raw
+/// `split('/')` validation which catches every variant.
+///
+/// We exercise the interior-dot case: bake an index, move the
+/// `.terms` file into a nested subdirectory, rewrite the manifest
+/// to reference `nested/./seg_X.terms`. The on-disk path resolves
+/// (FS collapses interior `.`), but S3 keys are verbatim — the
+/// walker would upload `nested/seg_X.terms` while the manifest
+/// would publish a reference to `nested/./seg_X.terms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_errors_when_manifest_references_interior_dot_segment() {
+  let (local_dir, _) = bake_local_index();
+
+  // Move the terms file into a nested subdir, then rewrite the
+  // manifest to reference it via a path with an interior `.`
+  // segment.
+  let manifest_path = local_dir.path().join("MANIFEST.json");
+  let mut value: serde_json::Value =
+    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+  let original_terms_key = value["segments"][0]["paths"]["terms"]
+    .as_str()
+    .expect("terms path in v2 manifest")
+    .to_string();
+  std::fs::create_dir_all(local_dir.path().join("nested")).unwrap();
+  std::fs::rename(
+    local_dir.path().join(&original_terms_key),
+    local_dir.path().join("nested").join(&original_terms_key),
+  )
+  .unwrap();
+  // The interior-dot key. `local_root.join` collapses it on stat
+  // (the file is found), but S3 stores it verbatim.
+  let interior_dot_key = format!("nested/./{original_terms_key}");
+  value["segments"][0]["paths"]["terms"] = serde_json::json!(interior_dot_key);
+  std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+  let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
+  let server_uri = bucket.spawn_server().await;
+  let err = sync_to_s3(
+    local_dir.path(),
+    config_for(&server_uri, "test-bucket", None),
+  )
+  .await
+  .expect_err("interior-dot key must be rejected at preflight");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("canonical form") && msg.contains(&interior_dot_key),
+    "expected canonical-form rejection naming the interior-dot key; got: {msg}"
+  );
+  // No PUT issued — preflight failed before any network write.
+  assert!(
+    bucket.snapshot().is_empty(),
+    "interior-dot rejection must abort BEFORE any upload; remote: {:?}",
+    bucket.snapshot().keys().collect::<Vec<_>>()
+  );
+}
+
 /// Stage 10c v5 [P2] (Codex review): a v2 manifest can name an
 /// artifact at a non-canonical lexical form (e.g. `./seg_X.post`)
 /// that resolves to an existing local file but doesn't match the

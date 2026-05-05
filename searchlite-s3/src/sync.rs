@@ -110,6 +110,16 @@ fn is_uploadable_relative_path(relative: &Path) -> bool {
 /// publish a reference to `./seg_X.post`, but the bytes live at
 /// `seg_X.post` on the remote — a visible-but-unservable index.
 ///
+/// Stage 10c v6 [P2] (Codex review): switched from
+/// `Path::components()` to raw `split('/')` because
+/// `Path::components()` silently normalizes **interior** `.`
+/// components away: `Path::new("dir/./seg.post").components()`
+/// yields `[Normal("dir"), Normal("seg.post")]` — same as
+/// `dir/seg.post`. The previous component-based check missed
+/// `dir/./seg.post`, which would still drift between manifest key
+/// and uploaded key. Splitting on `/` and rejecting `.`, `..`, and
+/// empty segments catches every variant including interior dots.
+///
 /// Returns Ok(()) if the key is canonical; Err otherwise with a
 /// reason. Callers in `preflight_manifest` then `bail!` with a
 /// uniform error.
@@ -120,23 +130,29 @@ fn validate_canonical_segment_key(key: &str) -> Result<(), &'static str> {
   if key.contains('\\') {
     return Err("key contains a backslash separator");
   }
-  if key.starts_with('/') {
-    return Err("key starts with `/`");
+  // Split on `/` and reject any segment that isn't a normal
+  // path component. This catches leading `/` (empty first segment),
+  // trailing `/` (empty last segment), `//` (empty interior
+  // segment), `.` segments anywhere (including interior — which
+  // `Path::components()` would silently collapse), and `..`.
+  for segment in key.split('/') {
+    match segment {
+      "" => return Err("key has an empty segment (leading/trailing/repeated `/`)"),
+      "." => return Err("key contains a `.` segment"),
+      ".." => return Err("key contains a `..` segment"),
+      _ => {}
+    }
   }
-  if key.ends_with('/') {
-    return Err("key ends with `/`");
-  }
-  if key.contains("//") {
-    return Err("key contains `//` (repeated separators)");
-  }
+  // Defense-in-depth: the `Path::components()` check still catches
+  // `Component::Prefix` (Windows drive letters) and
+  // `Component::RootDir` even when neither shows up as a `/`-split
+  // segment.
   let p = Path::new(key);
   for component in p.components() {
     match component {
-      Component::Normal(_) => {}
-      Component::CurDir => return Err("key contains a `.` component"),
-      Component::ParentDir => return Err("key contains a `..` component"),
-      Component::RootDir => return Err("key contains a root component"),
       Component::Prefix(_) => return Err("key contains a platform prefix"),
+      Component::RootDir => return Err("key contains a root component"),
+      _ => {}
     }
   }
   Ok(())
