@@ -20,7 +20,7 @@ searchlite-core = { path = "../searchlite-core", package = "searchlite-core", fe
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
+tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
 tokio-util = { version = "0.7.10", features = ["io"] }
 tower = { version = "0.5.3", features = ["timeout", "limit"] }
 tower-http = { version = "0.6.8", features = ["limit", "trace"] }
@@ -30,4 +30,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
 [dev-dependencies]
 reqwest = { version = "0.12.28", features = ["json", "rustls-tls"] }
 tempfile = "3.27.0"
-tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
+tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "io-util"] }

@@ -20,7 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core", features = ["write-key"] }
 searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
-tokio = { version = "1.52.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.52.2", features = ["rt-multi-thread"] }
 chrono = { workspace = true }
 env_logger = { workspace = true }
 tracing = "0.1.40"
