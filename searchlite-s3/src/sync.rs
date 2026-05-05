@@ -43,6 +43,7 @@
 //! clean NotFound rather than a partially-published index pointing
 //! at missing segment files.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -54,6 +55,24 @@ use crate::config::S3Config;
 use crate::store::S3BlobStore;
 
 const MANIFEST_FILE_NAME: &str = "MANIFEST.json";
+
+/// Files at or below this size go through the in-memory
+/// [`BlobStore::put`] path; anything larger is streamed via
+/// [`BlobStore::put_stream`] so peak memory stays bounded by
+/// [`STREAM_CHUNK_SIZE`] rather than by the source file size.
+///
+/// 8 MiB sits comfortably above typical small-segment artifacts
+/// (terms / fast / meta files in fresh single-document indexes) and
+/// well below the size at which the in-memory path would cause
+/// visible memory pressure when several syncs run concurrently.
+const STREAM_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Chunk size for the streaming-upload path. Each chunk is read into
+/// a fresh `Bytes` and handed to [`BlobStore::put_stream`]; on the S3
+/// backend chunks are buffered up to S3's 5 MiB multipart minimum
+/// before being flushed as a part. 4 MiB keeps allocation modest
+/// while still feeding the multipart pipeline at a useful cadence.
+const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Centralized "is this path uploadable?" predicate, shared by
 /// [`upload_dir`] (deciding what to skip) and [`preflight_manifest`]
@@ -243,12 +262,29 @@ fn upload_dir<'a>(
       if !metadata.is_file() {
         continue;
       }
-      let bytes = std::fs::read(&path).with_context(|| format!("sync_to_s3: reading {path:?}"))?;
-      let len = bytes.len() as u64;
-      store
-        .put(relative, Bytes::from(bytes))
-        .await
-        .with_context(|| format!("sync_to_s3: put {path:?} → {relative:?}"))?;
+      // Choose the upload strategy by file size. Small files fit
+      // comfortably in memory and use the simple in-memory `put`.
+      // Large files (typical postings / docstore artifacts can run
+      // into hundreds of MiB or GiB) are streamed through
+      // [`BlobStore::put_stream`] in fixed-size chunks so peak
+      // memory stays bounded by `STREAM_CHUNK_SIZE`, not by the
+      // file size. The threshold (8 MiB) is well above typical
+      // small-segment artifacts (terms / fast / meta) and well
+      // below the size at which the in-memory path would cause
+      // visible memory pressure under concurrent syncs.
+      let len = metadata.len();
+      if len <= STREAM_THRESHOLD {
+        let bytes =
+          std::fs::read(&path).with_context(|| format!("sync_to_s3: reading {path:?}"))?;
+        store
+          .put(relative, Bytes::from(bytes))
+          .await
+          .with_context(|| format!("sync_to_s3: put {path:?} → {relative:?}"))?;
+      } else {
+        stream_upload(store, relative, &path)
+          .await
+          .with_context(|| format!("sync_to_s3: stream {path:?} → {relative:?}"))?;
+      }
       report.files += 1;
       report.bytes = report
         .bytes
@@ -400,6 +436,63 @@ fn preflight_manifest(local_root: &Path) -> Result<Vec<u8>> {
         );
       }
     }
+
+    // Vector-feature-only: verify that every per-field vector
+    // artifact the segment promises (`<vector_dir>/<field>.bin` and
+    // `<vector_dir>/<field>.hnsw` for every schema-declared vector
+    // field) actually exists, has a canonical relative-key shape, and
+    // would be uploaded by the walker. Without this, a vector-enabled
+    // index could pass the standard 5-artifact preflight even when a
+    // per-field `.bin` / `.hnsw` is missing — `sync_to_s3` would
+    // publish `MANIFEST.json` and surface a remotely visible but
+    // unopenable index once a vector field is loaded.
+    #[cfg(feature = "vectors")]
+    if let Some(vector_dir_key) = seg.paths.vector_dir.as_deref() {
+      if let Err(reason) = validate_canonical_segment_key(vector_dir_key) {
+        bail!(
+          "sync_to_s3: refusing to upload — segment {} has vector_dir \
+           {vector_dir_key:?}, which is NOT in the canonical form the sync \
+           walker would emit ({reason}). Re-emit the manifest with canonical \
+           keys before re-syncing.",
+          seg.id
+        );
+      }
+      if !is_uploadable_relative_path(Path::new(vector_dir_key)) {
+        bail!(
+          "sync_to_s3: refusing to upload — segment {} has vector_dir \
+           {vector_dir_key:?}, which matches the sync walker's skip rules \
+           (dot-prefixed, `wal.log`, or top-level `MANIFEST.json`). The local \
+           directory exists but its files would NOT be uploaded.",
+          seg.id
+        );
+      }
+      for vf in &manifest.schema.vector_fields {
+        for ext in ["bin", "hnsw"] {
+          let relative_key = format!("{vector_dir_key}/{}.{}", vf.name, ext);
+          let label = format!("vector_{}_{}", vf.name, ext);
+          let abs_path = local_root.join(&relative_key);
+          if let Err(reason) = validate_canonical_segment_key(&relative_key) {
+            bail!(
+              "sync_to_s3: refusing to upload — segment {} references {label} \
+               artifact at relative key {relative_key:?}, which is NOT in the \
+               canonical form the sync walker would emit ({reason}). Re-emit \
+               the manifest with canonical keys before re-syncing.",
+              seg.id
+            );
+          }
+          require_regular_file(&label, &seg.id, &abs_path)?;
+          if !is_uploadable_relative_path(Path::new(&relative_key)) {
+            bail!(
+              "sync_to_s3: refusing to upload — segment {} references {label} \
+               artifact at relative key {relative_key:?}, which matches the \
+               sync walker's skip rules. The local file exists but would NOT \
+               be uploaded.",
+              seg.id
+            );
+          }
+        }
+      }
+    }
   }
   Ok(bytes)
 }
@@ -418,6 +511,51 @@ fn require_regular_file(label: &str, seg_id: &str, path: &Path) -> Result<()> {
        artifact {path:?} but it is not a regular file."
     );
   }
+  Ok(())
+}
+
+/// Upload a single file to `relative` via [`BlobStore::put_stream`],
+/// reading the source in [`STREAM_CHUNK_SIZE`]-byte chunks rather
+/// than loading the whole file into memory.
+///
+/// Strict abort/complete discipline: on any read or write error we
+/// call [`ObjectWriter::abort`] best-effort before returning the
+/// underlying error so a multipart upload doesn't leak in-progress
+/// parts to S3. The successful path always calls
+/// [`ObjectWriter::complete`].
+async fn stream_upload(store: &S3BlobStore, relative: &Path, path: &Path) -> Result<()> {
+  let file = std::fs::File::open(path).with_context(|| format!("sync_to_s3: opening {path:?}"))?;
+  let mut reader = BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+  let mut writer = store.put_stream(relative).await?;
+
+  let stream_err = loop {
+    let chunk_len;
+    let chunk = match reader.fill_buf() {
+      Ok([]) => break None,
+      Ok(slice) => {
+        chunk_len = slice.len();
+        Bytes::copy_from_slice(slice)
+      }
+      Err(e) => {
+        break Some(
+          anyhow::Error::new(e).context(format!("sync_to_s3: reading chunk of {path:?}")),
+        );
+      }
+    };
+    if let Err(e) = writer.write(chunk).await {
+      break Some(e.context(format!("sync_to_s3: writing chunk of {path:?}")));
+    }
+    reader.consume(chunk_len);
+  };
+
+  if let Some(e) = stream_err {
+    let _ = writer.abort().await;
+    return Err(e);
+  }
+  writer
+    .complete()
+    .await
+    .with_context(|| format!("sync_to_s3: completing upload of {path:?}"))?;
   Ok(())
 }
 

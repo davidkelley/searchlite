@@ -9,8 +9,16 @@ description = "S3-compatible BlobStore implementation for searchlite (AWS S3, R2
 [lib]
 path = "src/lib.rs"
 
-# Stage 10b: aws-sdk-s3 doesn't compile on wasm32 (depends on tokio reactor +
-# native TLS). Wasm consumers continue on the StorageAsBlobStore path inside
+[features]
+# Forwards the `vectors` feature to searchlite-core so this crate can
+# inspect vector artifacts on a vector-enabled index. With this feature
+# off, sync_to_s3 still works for vector-built indexes (it uploads every
+# file the walker sees), but the preflight does not validate that each
+# declared vector field's per-segment `*.bin` / `*.hnsw` files exist.
+vectors = ["searchlite-core/vectors"]
+
+# aws-sdk-s3 doesn't compile on wasm32 (depends on tokio reactor + native
+# TLS). Wasm consumers continue on the StorageAsBlobStore path inside
 # searchlite-core; this crate is non-wasm-only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 searchlite-core = { path = "../searchlite-core", features = ["tokio-runtime"] }

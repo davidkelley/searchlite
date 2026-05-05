@@ -144,7 +144,12 @@ impl Respond for StatefulResponder {
         if let Some(range) = req.headers.get(HeaderName::from_static("range")) {
           let raw = range.to_str().unwrap_or("");
           if let Some((start, end_inclusive)) = parse_byte_range(raw) {
-            if end_inclusive >= bytes.len() {
+            // Validate every shape the slice below would otherwise
+            // panic on: inverted ranges (`bytes=10-1`), out-of-bounds
+            // start (`bytes=999-50` against a 100-byte body), and
+            // out-of-bounds end. Real S3 responds 416 for all three;
+            // the mock should match.
+            if start > end_inclusive || start >= bytes.len() || end_inclusive >= bytes.len() {
               return ResponseTemplate::new(416)
                 .set_body_string(format!("range OOB: {raw} for len {}", bytes.len()));
             }
