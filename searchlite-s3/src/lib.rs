@@ -1,25 +1,39 @@
-//! `searchlite-s3` — S3-compatible [`BlobStore`] implementation.
+//! `searchlite-s3` — S3-compatible [`BlobStore`] implementation and
+//! helpers for serving Searchlite indexes out of object storage.
 //!
-//! Stage 10b of the searchlite cloud-storage migration. This crate
-//! provides a single concrete [`S3BlobStore`] type that implements the
-//! [`BlobStore`] trait defined in `searchlite-core`, mapped onto the
-//! `aws-sdk-s3` client. Targets:
+//! This crate provides:
 //!
-//! * **AWS S3** — the canonical implementation. `endpoint_url: None`,
-//!   `force_path_style: false`, `conditional_put: true`.
-//! * **Cloudflare R2** — S3-compatible. Set `endpoint_url` to your
-//!   account's R2 URL. Conditional PUTs (`If-Match` / `If-None-Match`)
-//!   rolled out on R2 in late 2024; default `conditional_put: false`
-//!   and opt in once you've confirmed your bucket supports it.
+//! * [`S3BlobStore`] — a concrete `BlobStore` backed by the
+//!   `aws-sdk-s3` client. Targets AWS S3, Cloudflare R2, and
+//!   MinIO / LocalStack / wiremock. Provider defaults are exposed via
+//!   [`S3Config::aws_default`] and [`S3Config::r2_default`].
+//! * [`sync_to_s3`] — bake-locally-then-upload helper. Walks a local
+//!   index directory, uploads every segment artifact, then publishes
+//!   `MANIFEST.json` last as the visibility fence. Returns a
+//!   [`SyncReport`] with file/byte counts. Refuses to run against a
+//!   partially-baked index (pending manifest, non-empty WAL, staging
+//!   files, legacy v1 manifests, non-canonical keys).
+//! * [`open_index_read_only`] — top-level `Index` constructor for
+//!   S3-backed read-only deployments. Wraps `S3BlobStore` in
+//!   `CachedBlobStore` (64 MiB byte-weighted RAM cache), threads it
+//!   through a `BlobStoreAdapter`, and returns an `Index` with every
+//!   mutator wired off.
+//! * [`open_index_read_only_with_options`] — same shape as
+//!   [`open_index_read_only`] but lets the caller customize
+//!   [`searchlite_core::api::types::IndexOptions`] (notably
+//!   `checksum_policy`). `path`, `create_if_missing`, and `read_only`
+//!   are still forced regardless of caller input.
+//!
+//! ## Provider compatibility
+//!
+//! * **AWS S3** — `endpoint_url: None`, `force_path_style: false`,
+//!   `conditional_put: true`.
+//! * **Cloudflare R2** — set `endpoint_url` to your account's R2 URL.
+//!   Conditional PUTs (`If-Match` / `If-None-Match`) rolled out on R2
+//!   in late 2024; the default is `conditional_put: false`. Opt in
+//!   once you've confirmed your bucket supports them.
 //! * **MinIO / LocalStack / wiremock** — set `endpoint_url` and
 //!   `force_path_style: true`.
-//!
-//! ## Stage 10b scope
-//!
-//! Per Stage 10b's plan: this crate ships the `BlobStore` trait impl
-//! and protocol-level unit tests via wiremock. End-to-end Index open
-//! over S3 (the `BlobStoreAdapter<CachedBlobStore<S3BlobStore>>`
-//! shape) and any CLI/HTTP wiring land in Stage 10c.
 //!
 //! ## Runtime requirements
 //!
@@ -45,6 +59,6 @@ mod sync;
 
 pub use config::{S3Config, S3Credentials};
 pub use errors::S3StoreError;
-pub use open::open_index_read_only;
+pub use open::{open_index_read_only, open_index_read_only_with_options};
 pub use store::S3BlobStore;
 pub use sync::{sync_to_s3, SyncReport};

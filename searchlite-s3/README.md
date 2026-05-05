@@ -8,8 +8,9 @@ out of S3, R2, or MinIO -- no local disk, no replication daemon.
   64 MiB byte-weighted RAM cache fronts bounded postings/docstore range
   reads; whole-file segment artifacts are fetched at open and re-verified
   on each fresh `Index::reader()` under the default `Strict` checksum
-  policy. Drop to `ChecksumPolicy::TrustManifest` to skip whole-file
-  verification entirely.
+  policy. Use `open_index_read_only_with_options` to override the policy
+  (e.g. `ChecksumPolicy::TrustManifest` to skip whole-file verification
+  entirely).
 - **Atomic publish**: `sync_to_s3` uploads segment artifacts first and
   publishes `MANIFEST.json` last as the visibility fence -- partial syncs
   never leave a servable manifest.
