@@ -28,8 +28,11 @@
 //! callers must drive these futures via
 //! [`searchlite_core::runtime::block_on_blob`] with the
 //! `tokio-runtime` feature enabled (this crate does that
-//! transitively). Calling from inside a current-thread Tokio runtime
-//! panics with an actionable message; see the runtime module's docs.
+//! transitively). The bridge supports every Tokio runtime flavor:
+//! multi-thread runtimes use `block_in_place` to park the worker, and
+//! current-thread runtimes route the future to a `std::thread::scope`-spawned
+//! worker on a global multi-thread bridge runtime. See the runtime
+//! module's docs for the full contract.
 
 #![cfg(not(target_arch = "wasm32"))]
 

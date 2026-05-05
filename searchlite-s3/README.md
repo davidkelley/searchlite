@@ -4,8 +4,12 @@ S3-compatible storage for Searchlite. Bake an index locally, sync it to a
 bucket, and any number of read-only processes can serve queries straight
 out of S3, R2, or MinIO -- no local disk, no replication daemon.
 
-- **Stateless readers**: `open_index_read_only` against a prefix; cold
-  start is one S3 GET, hot reads stay in a 64 MiB byte-weighted RAM cache.
+- **Stateless readers**: `open_index_read_only` against a prefix. A
+  64 MiB byte-weighted RAM cache fronts bounded postings/docstore range
+  reads; whole-file segment artifacts are fetched at open and re-verified
+  on each fresh `Index::reader()` under the default `Strict` checksum
+  policy. Drop to `ChecksumPolicy::TrustManifest` to skip whole-file
+  verification entirely.
 - **Atomic publish**: `sync_to_s3` uploads segment artifacts first and
   publishes `MANIFEST.json` last as the visibility fence -- partial syncs
   never leave a servable manifest.
@@ -27,10 +31,13 @@ out of S3, R2, or MinIO -- no local disk, no replication daemon.
 searchlite-core = "0.8"
 searchlite-s3 = "0.2"
 tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"
 ```
 
 `searchlite-s3` brings `aws-sdk-s3` and the `tokio-runtime` feature on
 `searchlite-core` along with it. No additional features to enable.
+`anyhow` and `serde_json` are used by the quickstart below.
 
 ---
 
@@ -114,9 +121,11 @@ let rt = tokio::runtime::Runtime::new()?;
 let index = rt.block_on(open_index_read_only(s3_config))?;
 ```
 
-Calling from inside a current-thread Tokio runtime panics with an
-actionable message; see [`searchlite_core::runtime`] for the bridge
-contract.
+The bridge is also safe to call from inside an active Tokio runtime of
+either flavor: multi-thread runtimes use `block_in_place` to park the
+worker, and current-thread runtimes route the future to a
+`std::thread::scope`-spawned worker on a global multi-thread bridge
+runtime. See [`searchlite_core::runtime`] for the full contract.
 
 ---
 
