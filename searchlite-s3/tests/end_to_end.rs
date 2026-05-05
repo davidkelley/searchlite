@@ -17,6 +17,30 @@
 //! finding) and range-read regressions in one shot — the local
 //! reader's results have to match the S3-backed reader's results
 //! exactly.
+//!
+//! ## Known macOS test-concurrency flake
+//!
+//! `aws-smithy-http-client` eagerly initializes a rustls TLS layer
+//! during `aws_sdk_s3::Client::from_conf` even when the endpoint is
+//! `http://` (we never actually negotiate TLS against wiremock).
+//! That init walks the macOS keychain via `rustls-native-certs`,
+//! which races between processes when multiple `cargo test` binaries
+//! run in parallel and surfaces as:
+//!
+//!   `TrustStore configured to enable native roots but no valid
+//!   root certificates parsed!`
+//!
+//! `S3BlobStore::new` mitigates the **within-process** variant via a
+//! global `Mutex` around the synchronous `Client::from_conf` step;
+//! cross-process serialization isn't possible from a library and
+//! isn't worth a file-lock workaround for a test-only issue. Users
+//! never hit this in production (one `S3BlobStore::new` per
+//! process, at startup).
+//!
+//! If you see those panics under `cargo test --workspace
+//! --all-features`, retry: the per-package run
+//! (`cargo test -p searchlite-s3 --tests`) is the canonical
+//! invocation and the failure is environmental, not a regression.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -456,6 +480,61 @@ fn pick_first_segment_terms_key(local_root: &Path, prefix: Option<&str>) -> Stri
 /// root-prefixed-relative paths from a v1 manifest would silently
 /// miss after upload. Sync's preflight catches this, naming the
 /// version mismatch and pointing at the local-upgrade workflow.
+/// Stage 10c v4 [P2] (Codex review): if a v2 manifest names a
+/// segment artifact at a path that the sync walker would SKIP
+/// (e.g. a dot-file, `wal.log`, or the top-level
+/// `MANIFEST.json`), preflight must reject it before any upload.
+/// Otherwise the existence check passes, the upload silently
+/// skips the path, and the manifest publish surfaces a remote
+/// index pointing at a key that was never PUT.
+///
+/// We exercise the dot-file case: rename a real `.terms` file to
+/// `.hidden.terms` and rewrite the manifest to point at it. The
+/// file exists, the path is relative + `..`-free (so v2 validation
+/// passes), but the uploader's skip rules would drop it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_errors_when_manifest_references_skipped_dotfile_artifact() {
+  let (local_dir, _) = bake_local_index();
+
+  // Read the manifest, find the terms key, rename the file to a
+  // dot-prefixed name, and rewrite the manifest path to match.
+  let manifest_path = local_dir.path().join("MANIFEST.json");
+  let mut value: serde_json::Value =
+    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+  let original_terms_key = value["segments"][0]["paths"]["terms"]
+    .as_str()
+    .expect("terms path in v2 manifest")
+    .to_string();
+  let hidden_key = format!(".hidden_{original_terms_key}");
+  std::fs::rename(
+    local_dir.path().join(&original_terms_key),
+    local_dir.path().join(&hidden_key),
+  )
+  .unwrap();
+  value["segments"][0]["paths"]["terms"] = serde_json::json!(hidden_key);
+  std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+  let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
+  let server_uri = bucket.spawn_server().await;
+  let err = sync_to_s3(
+    local_dir.path(),
+    config_for(&server_uri, "test-bucket", None),
+  )
+  .await
+  .expect_err("manifest pointing at a skipped dotfile must be rejected at preflight");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("skip rules") && msg.contains(&hidden_key),
+    "expected skip-rule rejection naming the dotfile artifact; got: {msg}"
+  );
+  // No PUT issued — preflight failed before any network write.
+  assert!(
+    bucket.snapshot().is_empty(),
+    "skip-rule rejection must abort BEFORE any upload; remote: {:?}",
+    bucket.snapshot().keys().collect::<Vec<_>>()
+  );
+}
+
 /// Stage 10c v3 [P2] (Codex review): if the manifest references a
 /// segment artifact that doesn't exist on disk (partial bake,
 /// manual deletion, etc.), preflight must fail BEFORE any HTTP

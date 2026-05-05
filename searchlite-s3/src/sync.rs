@@ -44,7 +44,7 @@
 //! clean NotFound rather than a partially-published index pointing
 //! at missing segment files.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
@@ -55,6 +55,45 @@ use crate::config::S3Config;
 use crate::store::S3BlobStore;
 
 const MANIFEST_FILE_NAME: &str = "MANIFEST.json";
+
+/// Stage 10c v4 [P2] (Codex review): centralized "is this path
+/// uploadable?" predicate, shared by [`upload_dir`] (deciding what
+/// to skip) and [`preflight_manifest`] (refusing manifests that
+/// reference paths the walker would skip).
+///
+/// A relative-to-`local_root` path is uploadable iff:
+///
+/// * No path component starts with `.` (dot-files / hidden dirs).
+/// * No path component is named `wal.log` (the WAL is local-only;
+///   the read-only open path never replays it).
+/// * It is not the top-level `MANIFEST.json` (handled separately
+///   by the publish-fence step).
+///
+/// Without sharing this predicate between the walker and the
+/// preflight, a malformed manifest could legally name a
+/// `.hidden.post` artifact, pass the existence check, get silently
+/// SKIPPED during upload, and still publish `MANIFEST.json` —
+/// leaving an unservable remote index pointing at a key that was
+/// never PUT.
+fn is_uploadable_relative_path(relative: &Path) -> bool {
+  for component in relative.components() {
+    if let Component::Normal(name) = component {
+      let s = match name.to_str() {
+        Some(s) => s,
+        None => return false,
+      };
+      if s.starts_with('.') || s == "wal.log" {
+        return false;
+      }
+    }
+  }
+  // Top-level MANIFEST.json: the manifest IS the fence and is
+  // published separately.
+  if relative == Path::new(MANIFEST_FILE_NAME) {
+    return false;
+  }
+  true
+}
 
 /// Per-call summary of a successful [`sync_to_s3`] run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,22 +165,13 @@ fn upload_dir<'a>(
     for entry in std::fs::read_dir(dir).with_context(|| format!("sync_to_s3: read_dir({dir:?})"))? {
       let entry = entry.with_context(|| format!("sync_to_s3: read_dir entry under {dir:?}"))?;
       let path = entry.path();
-      let file_name = entry.file_name();
-      let file_name_str = file_name
-        .to_str()
-        .ok_or_else(|| anyhow!("sync_to_s3: non-UTF8 file name under {dir:?}: {file_name:?}"))?;
-      // Skip dot-files (e.g. `.DS_Store`, `.gitkeep`).
-      if file_name_str.starts_with('.') {
-        continue;
-      }
-      // Skip the WAL — read-only opens don't replay it. Preflight
-      // already verified it's empty.
-      if file_name_str == "wal.log" {
-        continue;
-      }
-      // Skip MANIFEST.json — caller publishes it last as the
-      // visibility fence.
-      if dir == base && file_name_str == MANIFEST_FILE_NAME {
+      let relative = path.strip_prefix(base).map_err(|_| {
+        anyhow!("sync_to_s3: file {path:?} is not under base {base:?} (this is a bug)")
+      })?;
+      // Stage 10c v4 [P2]: defer to the centralized predicate so
+      // the walker's skip rules and `preflight_manifest`'s
+      // uploadability assertion can never drift apart.
+      if !is_uploadable_relative_path(relative) {
         continue;
       }
       let metadata = entry
@@ -154,9 +184,6 @@ fn upload_dir<'a>(
       if !metadata.is_file() {
         continue;
       }
-      let relative = path.strip_prefix(base).map_err(|_| {
-        anyhow!("sync_to_s3: file {path:?} is not under base {base:?} (this is a bug)")
-      })?;
       let bytes = std::fs::read(&path).with_context(|| format!("sync_to_s3: reading {path:?}"))?;
       let len = bytes.len() as u64;
       store
@@ -273,14 +300,31 @@ fn preflight_manifest(local_root: &Path) -> Result<Vec<u8>> {
     // unservable index. Catching this at preflight (before any
     // network write) keeps the manifest-as-fence guarantee intact.
     let resolved = seg.paths.resolve(local_root);
-    for (label, path) in [
-      ("terms", &resolved.terms),
-      ("postings", &resolved.postings),
-      ("docstore", &resolved.docstore),
-      ("fast", &resolved.fast),
-      ("meta", &resolved.meta),
+    for (label, relative_key, abs_path) in [
+      ("terms", seg.paths.terms.as_str(), &resolved.terms),
+      ("postings", seg.paths.postings.as_str(), &resolved.postings),
+      ("docstore", seg.paths.docstore.as_str(), &resolved.docstore),
+      ("fast", seg.paths.fast.as_str(), &resolved.fast),
+      ("meta", seg.paths.meta.as_str(), &resolved.meta),
     ] {
-      require_regular_file(label, &seg.id, path)?;
+      require_regular_file(label, &seg.id, abs_path)?;
+      // Stage 10c v4 [P2] (Codex review): also check that the
+      // uploader will actually upload this path. A manifest that
+      // names an existing-but-skipped path (e.g. `.hidden.post`,
+      // `wal.log`, top-level `MANIFEST.json`) would otherwise pass
+      // the existence check, get silently skipped during upload,
+      // and still publish the manifest — leaving the remote prefix
+      // pointing at a key that was never PUT.
+      if !is_uploadable_relative_path(Path::new(relative_key)) {
+        bail!(
+          "sync_to_s3: refusing to upload — segment {} references {label} \
+           artifact at relative key {relative_key:?}, which matches the \
+           sync walker's skip rules (dot-file, `wal.log`, or top-level \
+           `MANIFEST.json`). The local file exists but would NOT be \
+           uploaded, so the manifest must NOT name it as a segment artifact.",
+          seg.id
+        );
+      }
     }
   }
   Ok(bytes)
