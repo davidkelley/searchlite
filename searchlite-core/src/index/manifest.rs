@@ -43,20 +43,22 @@ pub struct SegmentMeta {
   #[serde(default)]
   pub deleted_docs: Vec<u32>,
   pub avg_field_lengths: HashMap<String, f32>,
-  pub checksums: HashMap<String, u32>,
-  /// Stage 9b: SHA-256 content hashes per segment artifact (`terms`,
+  /// Stage 9b/9c: SHA-256 content hashes per segment artifact (`terms`,
   /// `postings`, `docstore`, `fast`, `meta`, plus `vector_{field}_bin`
   /// and `vector_{field}_hnsw` under `--features vectors`). Stored as
   /// 64-char lowercase hex. `BTreeMap` for deterministic JSON output.
   ///
-  /// Empty for legacy v1/v2 manifests written before Stage 9b — those
-  /// fall back to CRC32 verification via `checksums`. Stage 9b+
-  /// writers always populate every expected artifact's hash; a
-  /// non-empty map missing any expected artifact is treated as
-  /// corruption (see `verify_checksums` in segment.rs).
-  ///
-  /// Will become the sole integrity field once Stage 9c removes the
-  /// CRC32 `checksums` field.
+  /// Stage 9c made this the sole integrity field. Manifests written
+  /// before Stage 9b had a CRC32 `checksums` map and an empty
+  /// `content_hashes`; deserializing such a manifest into the current
+  /// struct shape silently drops the legacy `checksums` map and
+  /// surfaces an empty `content_hashes`. `verify_checksums` rejects
+  /// segments with empty `content_hashes` because there is no longer
+  /// any fallback to fall back to — pre-9b indexes must be rebuilt to
+  /// open under current code. Stage 9b+ writers always populate every
+  /// expected artifact's hash; a non-empty map missing any expected
+  /// artifact is treated as corruption (see `verify_checksums` in
+  /// segment.rs).
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub content_hashes: BTreeMap<String, String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]

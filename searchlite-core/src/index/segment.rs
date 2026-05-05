@@ -31,7 +31,6 @@ use crate::index::terms::{read_terms, write_terms};
 use crate::storage::Storage;
 use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 use crate::util::case_fold::fold_keyword;
-use crate::util::checksum::checksum;
 #[cfg(feature = "vectors")]
 use crate::vectors::hnsw::HnswParams;
 #[cfg(feature = "vectors")]
@@ -983,7 +982,6 @@ impl<'a> SegmentWriter<'a> {
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,
-      checksums: integrity.checksums,
       content_hashes: integrity.content_hashes,
       write_binding_b64: self
         .write_binding
@@ -1196,19 +1194,19 @@ fn read_vector_file(
   Ok(VectorStore::new(dim, metric, offsets, values))
 }
 
-/// Stage 9b: bundle of integrity records computed for a segment at
-/// write time. Carries both the legacy CRC32 checksums (kept for
-/// back-compat in the manifest schema) and the new Stage 9b SHA-256
-/// content hashes. Both are computed from the same buffer so we
-/// don't pay the read cost twice.
+/// Stage 9b/9c: bundle of integrity records computed for a segment at
+/// write time. Stage 9c collapsed this to SHA-256-only after dropping
+/// the legacy CRC32 path; the wrapper struct stays so that vector
+/// artifacts can be appended to the same builder via
+/// [`SegmentIntegrity::record_blob`] without threading a bare map
+/// through the code base.
 #[derive(Debug, Default)]
 pub(crate) struct SegmentIntegrity {
-  pub checksums: HashMap<String, u32>,
   pub content_hashes: std::collections::BTreeMap<String, String>,
 }
 
-/// Compute CRC32 + SHA-256 over each non-vector segment artifact in
-/// one read pass per file. Vector artifacts are added separately via
+/// Compute SHA-256 over each non-vector segment artifact in one read
+/// pass per file. Vector artifacts are added separately via
 /// [`SegmentIntegrity::record_blob`] in the vectors-feature block.
 ///
 /// Stage 9a: takes a [`ResolvedSegmentPaths`] (per-call resolution
@@ -1233,11 +1231,10 @@ fn collect_segment_integrity(
 }
 
 impl SegmentIntegrity {
-  /// Record both CRC32 and SHA-256 for a buffer under the given
-  /// artifact name (e.g. `terms`, `vector_v_bin`).
+  /// Record SHA-256 for a buffer under the given artifact name (e.g.
+  /// `terms`, `vector_v_bin`).
   pub(crate) fn record_blob(&mut self, name: &str, buf: &[u8]) {
     use sha2::{Digest, Sha256};
-    self.checksums.insert(name.to_string(), checksum(buf));
     let digest = Sha256::digest(buf);
     self
       .content_hashes
@@ -1257,21 +1254,20 @@ fn hex_lower(bytes: &[u8]) -> String {
   out
 }
 
-/// Stage 9b: verify on-disk segment artifacts against the manifest's
-/// recorded integrity. Two paths:
+/// Stage 9b/9c: verify on-disk segment artifacts against the
+/// manifest's recorded SHA-256 hashes.
 ///
-/// * **`content_hashes` non-empty (Stage 9b+ manifests)** — verify
-///   each artifact's SHA-256 against the recorded hex digest. The
-///   map MUST contain every expected artifact (`meta`, `terms`,
-///   `postings`, `docstore`, `fast`, plus `vector_{field}_bin` and
-///   `vector_{field}_hnsw` per vector field). A partial map is
-///   treated as corruption (Codex Stage 9b plan #2). Missing fall-
-///   through to CRC32 is **not** allowed: a Stage 9b writer that
-///   produced this manifest had every hash, so anything missing
-///   means the manifest was tampered with.
-/// * **`content_hashes` empty (legacy v1/v2 pre-9b manifests)** —
-///   fall back to CRC32 verification. Same per-artifact coverage
-///   contract enforced via the existing `meta.checksums` map.
+/// `meta.content_hashes` MUST be non-empty and MUST contain every
+/// expected artifact (`meta`, `terms`, `postings`, `docstore`, `fast`,
+/// plus `vector_{field}_bin` and `vector_{field}_hnsw` per vector
+/// field). Stage 9b writers always populate every entry, so:
+///
+/// * an empty map means a pre-Stage-9b legacy manifest — Stage 9c
+///   removed the CRC32 fallback, so such indexes must be rebuilt;
+/// * a non-empty map missing any expected entry means tampering.
+///
+/// Both surfaces fail the open with a clean explanation rather than
+/// silently skipping verification.
 fn verify_checksums(
   storage: &dyn Storage,
   meta: &SegmentMeta,
@@ -1334,126 +1330,47 @@ fn verify_checksums(
     storage.read_to_end(path)
   };
 
-  if !meta.content_hashes.is_empty() {
-    // Stage 9b path. First assert completeness (Codex plan #2).
-    for name in &expected {
-      if !meta.content_hashes.contains_key(name) {
-        bail!(
-          "segment {} content_hashes is non-empty but missing artifact {name:?}; \
-           manifest is malformed or tampered",
-          meta.id
-        );
-      }
-    }
-    for (name, hash) in &meta.content_hashes {
-      // Validate the hash format up-front so we get a clean error
-      // rather than a cryptic compare-mismatch.
-      if hash.len() != 64
-        || !hash
-          .chars()
-          .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-      {
-        bail!(
-          "segment {} content_hashes[{name:?}] is not a 64-char lowercase hex string: {hash:?}",
-          meta.id
-        );
-      }
-      let bytes = read_bytes(name)?;
-      let actual = hex_lower(&Sha256::digest(&bytes));
-      if &actual != hash {
-        bail!(
-          "segment {} failed SHA-256 verification for {} (expected {}, found {})",
-          meta.id,
-          name,
-          hash,
-          actual
-        );
-      }
-    }
-    return Ok(());
+  if meta.content_hashes.is_empty() {
+    bail!(
+      "segment {} has no SHA-256 content_hashes; manifest predates Stage 9b. \
+       The legacy CRC32 fallback was removed in Stage 9c — rebuild the index \
+       under current code to upgrade its integrity records.",
+      meta.id
+    );
   }
-
-  // Legacy CRC32 fallback for pre-Stage-9b manifests.
-  //
-  // Stage 9b v2 [P2] (Codex review): require every expected artifact
-  // to have a CRC32 entry, mirroring the SHA-256 path's completeness
-  // contract. Without this assertion, a downgraded/malformed manifest
-  // that strips both `content_hashes` AND a subset of `checksums`
-  // would silently open under `Strict` because the per-key `verify`
-  // closure is a no-op for `None`. Valid pre-9b manifests had every
-  // entry, so any missing one is corruption.
+  // First assert completeness (Codex Stage 9b plan #2).
   for name in &expected {
-    if !meta.checksums.contains_key(name) {
+    if !meta.content_hashes.contains_key(name) {
       bail!(
-        "segment {} legacy CRC32 verification: checksums missing artifact {name:?}; \
-         manifest is malformed or tampered (no SHA-256 fallback available)",
+        "segment {} content_hashes is non-empty but missing artifact {name:?}; \
+         manifest is malformed or tampered",
         meta.id
       );
     }
   }
-  let verify = |label: &str, path: &Path, expected: Option<&u32>, data: Option<&[u8]>| {
-    if let Some(expected) = expected {
-      let actual = if let Some(bytes) = data {
-        checksum(bytes)
-      } else {
-        checksum(&storage.read_to_end(path)?)
-      };
-      if actual != *expected {
-        bail!(
-          "segment {} failed checksum for {} (expected {}, found {})",
-          meta.id,
-          label,
-          expected,
-          actual
-        );
-      }
+  for (name, hash) in &meta.content_hashes {
+    // Validate the hash format up-front so we get a clean error
+    // rather than a cryptic compare-mismatch.
+    if hash.len() != 64
+      || !hash
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+      bail!(
+        "segment {} content_hashes[{name:?}] is not a 64-char lowercase hex string: {hash:?}",
+        meta.id
+      );
     }
-    Ok(())
-  };
-  verify(
-    "meta",
-    &resolved.meta,
-    meta.checksums.get("meta"),
-    Some(seg_meta_bytes),
-  )?;
-  verify("terms", &resolved.terms, meta.checksums.get("terms"), None)?;
-  verify(
-    "postings",
-    &resolved.postings,
-    meta.checksums.get("postings"),
-    None,
-  )?;
-  verify(
-    "docstore",
-    &resolved.docstore,
-    meta.checksums.get("docstore"),
-    None,
-  )?;
-  verify(
-    "fast fields",
-    &resolved.fast,
-    meta.checksums.get("fast"),
-    None,
-  )?;
-  #[cfg(feature = "vectors")]
-  {
-    let seg_meta = _seg_meta;
-    if resolved.vector_dir.is_some() {
-      for field in seg_meta.vector_fields.keys() {
-        let (vec_path, hnsw_path) = vector_paths(resolved, field)?;
-        verify(
-          &format!("vector {field} bin"),
-          &vec_path,
-          meta.checksums.get(&format!("vector_{field}_bin")),
-          None,
-        )?;
-        verify(
-          &format!("vector {field} hnsw"),
-          &hnsw_path,
-          meta.checksums.get(&format!("vector_{field}_hnsw")),
-          None,
-        )?;
-      }
+    let bytes = read_bytes(name)?;
+    let actual = hex_lower(&Sha256::digest(&bytes));
+    if &actual != hash {
+      bail!(
+        "segment {} failed SHA-256 verification for {} (expected {}, found {})",
+        meta.id,
+        name,
+        hash,
+        actual
+      );
     }
   }
   Ok(())
@@ -1718,46 +1635,29 @@ fn dispatch_checksum_audit(
 
 /// Cache key for `SegmentCore`.
 ///
-/// The fingerprint is a [`SegmentFingerprint`] derived from whichever
-/// integrity record the manifest carries:
-///
-/// * Stage 9b+ manifests with `content_hashes` populated → SHA-256
-///   over the canonical encoding of the full hashes map
-///   (`SegmentFingerprint::ContentHashes([u8; 32])`).
-/// * Pre-Stage-9b manifests with only CRC32 `checksums` → deterministic
-///   `u64` fold of those entries (`SegmentFingerprint::LegacyCrc32`).
-///
-/// Either way: if any underlying segment file changes, its hash/CRC
-/// changes, so the fingerprint changes and the cache misses. The
-/// version tag on `SegmentFingerprint` ensures a SHA-256 fingerprint
-/// can never collide with a CRC32 one even if their hashed entropy
-/// happens to coincide.
+/// The fingerprint is a [`SegmentFingerprint`] derived from the
+/// manifest's `content_hashes`: SHA-256 over the canonical encoding
+/// of the full hashes map. If any underlying segment file changes,
+/// its hash changes, so the fingerprint changes and the cache misses.
 ///
 /// The segment id stays in the key as belt-and-suspenders defense
 /// against fingerprint collisions (effectively impossible for
-/// SHA-256, theoretically possible for the `u64`-folded CRC32 path).
+/// SHA-256, but cheap to keep).
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub(crate) struct SegmentCacheKey {
   pub id: String,
   pub fingerprint: SegmentFingerprint,
 }
 
-/// Stage 9b: explicit version-tagged fingerprint shape for the
-/// segment cache key. Two manifests with content_hashes vs CRC32-only
-/// integrity records produce different fingerprint variants and
-/// therefore can never collide on the cache key, even if their
-/// hashed entropy happens to coincide.
+/// Stage 9b/9c: SHA-256-based fingerprint for the segment cache key.
+/// Stage 9b introduced a version-tagged enum to keep this distinct
+/// from the legacy CRC32 path; Stage 9c removed the legacy path so
+/// the enum collapses to a single-variant tuple struct holding the
+/// 32-byte digest. The cache key carries the full digest (no `u64`
+/// fold) so the 256-bit collision resistance of the underlying
+/// SHA-256 hashes is preserved end-to-end.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
-pub(crate) enum SegmentFingerprint {
-  /// Stage 9b+: SHA-256 over the deterministic encoding of the full
-  /// `content_hashes` map. Strong cryptographic identity. Unlike a
-  /// `u64` collapse, this preserves the full 256-bit collision
-  /// resistance of the underlying hashes.
-  ContentHashes([u8; 32]),
-  /// Pre-Stage-9b legacy: deterministic `u64` fold of the CRC32
-  /// `checksums` map. Weaker, but stable across processes.
-  LegacyCrc32(u64),
-}
+pub(crate) struct SegmentFingerprint(pub [u8; 32]);
 
 impl SegmentCacheKey {
   pub fn from_meta(meta: &SegmentMeta) -> Self {
@@ -1769,12 +1669,14 @@ impl SegmentCacheKey {
 }
 
 impl SegmentFingerprint {
+  /// Hash the manifest's `content_hashes` into the cache-key
+  /// fingerprint. An empty map (legacy pre-9b manifest) hashes to a
+  /// stable sentinel digest rather than panicking — `verify_checksums`
+  /// rejects empty `content_hashes` before any reader is returned, so
+  /// the sentinel is unreachable in practice but keeps the cache-key
+  /// path total in the face of future refactors.
   pub fn from_meta(meta: &SegmentMeta) -> Self {
-    if !meta.content_hashes.is_empty() {
-      Self::ContentHashes(fingerprint_content_hashes(&meta.content_hashes))
-    } else {
-      Self::LegacyCrc32(fingerprint_checksums(&meta.checksums))
-    }
+    Self(fingerprint_content_hashes(&meta.content_hashes))
   }
 }
 
@@ -1797,21 +1699,6 @@ fn fingerprint_content_hashes(
     hasher.update(b"\n");
   }
   hasher.finalize().into()
-}
-
-fn fingerprint_checksums(checksums: &HashMap<String, u32>) -> u64 {
-  use std::collections::hash_map::DefaultHasher;
-  use std::hash::{Hash, Hasher};
-  // `HashMap` iteration order is non-deterministic, so sort first to keep the
-  // fingerprint stable across processes and runs.
-  let mut entries: Vec<(&String, &u32)> = checksums.iter().collect();
-  entries.sort_by(|a, b| a.0.cmp(b.0));
-  let mut hasher = DefaultHasher::new();
-  for (k, v) in entries {
-    k.hash(&mut hasher);
-    v.hash(&mut hasher);
-  }
-  hasher.finish()
 }
 
 /// Default capacity of the per-`InnerIndex` segment-core cache. Sized to
@@ -2421,7 +2308,6 @@ mod tests {
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
-      checksums: HashMap::new(),
       content_hashes: std::collections::BTreeMap::new(),
       write_binding_b64: None,
     };

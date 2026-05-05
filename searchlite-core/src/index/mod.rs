@@ -1043,7 +1043,6 @@ mod tests {
         blockmax: false,
         deleted_docs: Vec::new(),
         avg_field_lengths: HashMap::new(),
-        checksums: HashMap::new(),
         content_hashes: std::collections::BTreeMap::new(),
         write_binding_b64: None,
       }
@@ -3231,7 +3230,6 @@ mod tests {
         blockmax: true,
         deleted_docs: Vec::new(),
         avg_field_lengths: Default::default(),
-        checksums: Default::default(),
         content_hashes: Default::default(),
         write_binding_b64: None,
       });
@@ -3989,16 +3987,13 @@ mod tests {
   ///
   /// 1. Fresh commits record valid lowercase-hex SHA-256 hashes for
   ///    every segment artifact (and vector files under the feature).
-  /// 2. `Strict` policy verifies SHA-256 when present and rejects
-  ///    corruption with a SHA-256-mismatch error.
-  /// 3. A non-empty `content_hashes` map missing any expected entry
-  ///    is treated as corruption (no implicit fall-through to CRC32).
-  /// 4. Legacy manifests with empty `content_hashes` still verify
-  ///    via the CRC32 fallback, so pre-Stage-9b indexes keep working.
-  /// 5. `SegmentCacheKey::from_meta` produces stable identity:
+  /// 2. `Strict` policy verifies SHA-256 and rejects corruption with
+  ///    a SHA-256-mismatch error.
+  /// 3. A `content_hashes` map missing any expected entry is treated
+  ///    as corruption (Stage 9c removed the CRC32 fall-through).
+  /// 4. `SegmentCacheKey::from_meta` produces stable identity:
   ///    same `(id, content_hashes)` ⇒ same key regardless of paths;
-  ///    any one hash change ⇒ different key; legacy meta ⇒
-  ///    `LegacyCrc32` variant.
+  ///    any one hash change ⇒ different key.
   mod stage9b_content_hashes {
     use super::*;
     use crate::index::manifest::SegmentMeta;
@@ -4141,11 +4136,15 @@ mod tests {
       );
     }
 
-    /// Stage 9b: legacy manifests with empty `content_hashes` still
-    /// verify via the CRC32 fallback. Without this, pre-9b indexes
-    /// would error on Strict open.
+    /// Stage 9c: a manifest written before Stage 9b carries a CRC32
+    /// `checksums` map and an empty `content_hashes`. The current
+    /// struct silently drops the legacy `checksums` field on
+    /// deserialization, so the manifest reaches `verify_checksums`
+    /// with an empty map; without the (now-removed) CRC32 fallback,
+    /// `Strict` must reject the open with a clear "rebuild" error
+    /// rather than panicking or silently skipping verification.
     #[test]
-    fn legacy_manifest_without_content_hashes_falls_back_to_crc32() {
+    fn legacy_manifest_without_content_hashes_is_rejected_under_strict() {
       let dir = tempdir().unwrap();
       let schema = Schema::default_text_body();
       let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
@@ -4164,8 +4163,7 @@ mod tests {
       drop(idx);
 
       // Strip `content_hashes` entirely from the on-disk manifest to
-      // mimic a pre-Stage-9b artifact. CRC32 `checksums` stays — the
-      // verifier must use it.
+      // mimic a pre-Stage-9b artifact.
       let manifest_path = dir.path().join("MANIFEST.json");
       let mut value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
@@ -4177,69 +4175,19 @@ mod tests {
 
       let mut reopen_opts = opts(dir.path());
       reopen_opts.create_if_missing = false;
-      // Default Strict: must verify via CRC32 path and succeed.
       let reopened = Index::open(reopen_opts).unwrap();
       assert!(
         reopened.manifest().segments[0].content_hashes.is_empty(),
-        "test setup: content_hashes must be empty for the fallback path"
+        "test setup: content_hashes must be empty to exercise the rejection path"
       );
-      let _reader = reopened
-        .reader()
-        .expect("legacy manifest must verify via CRC32 fallback under Strict");
-    }
-
-    /// Stage 9b v2 [P2] (Codex review): when the manifest has empty
-    /// `content_hashes` AND a missing CRC32 entry for an expected
-    /// artifact, `Strict` must reject the open rather than silently
-    /// skipping verification of that artifact. Valid pre-9b manifests
-    /// always recorded every expected CRC32 entry, so any missing
-    /// one is corruption — and there's no SHA-256 fallback to fall
-    /// further back to.
-    #[test]
-    fn legacy_fallback_rejects_missing_crc_entries_under_strict() {
-      let dir = tempdir().unwrap();
-      let schema = Schema::default_text_body();
-      let idx = Index::create(dir.path(), schema, opts(dir.path())).unwrap();
-      let mut writer = idx.writer().unwrap();
-      writer
-        .add_document(&Document {
-          fields: [
-            ("_id".into(), serde_json::json!("1")),
-            ("body".into(), serde_json::json!("alpha")),
-          ]
-          .into_iter()
-          .collect(),
-        })
-        .unwrap();
-      writer.commit().unwrap();
-      drop(idx);
-
-      // Strip `content_hashes` AND remove the `postings` CRC32
-      // entry, simulating a downgraded/tampered manifest.
-      let manifest_path = dir.path().join("MANIFEST.json");
-      let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-      let segments = value["segments"].as_array_mut().unwrap();
-      for seg in segments.iter_mut() {
-        seg.as_object_mut().unwrap().remove("content_hashes");
-        let cks = seg["checksums"].as_object_mut().unwrap();
-        cks.remove("postings");
-      }
-      std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-
-      let mut reopen_opts = opts(dir.path());
-      reopen_opts.create_if_missing = false;
-      let reopened = Index::open(reopen_opts).unwrap();
       let err = match reopened.reader() {
-        Ok(_) => {
-          panic!("missing CRC32 entry must be rejected under Strict — there's no SHA-256 fallback")
-        }
+        Ok(_) => panic!("Stage 9c removed the CRC32 fallback — empty content_hashes must reject"),
         Err(e) => e,
       };
       let msg = format!("{err:#}");
       assert!(
-        msg.contains("missing artifact") && msg.contains("postings"),
-        "expected 'missing artifact \"postings\"' error from CRC32 path; got: {msg}"
+        msg.contains("no SHA-256 content_hashes") && msg.contains("rebuild the index"),
+        "expected pre-Stage-9b rejection with rebuild guidance; got: {msg}"
       );
     }
 
@@ -4262,7 +4210,6 @@ mod tests {
             blockmax: true,
             deleted_docs: Vec::new(),
             avg_field_lengths: Default::default(),
-            checksums: Default::default(),
             content_hashes: hashes,
             write_binding_b64: None,
           }
@@ -4300,9 +4247,14 @@ mod tests {
         key_a, key_a_relocated,
         "cross-location dedupe: same content_hashes ⇒ same cache key"
       );
-      assert!(
-        matches!(key_a.fingerprint, SegmentFingerprint::ContentHashes(_)),
-        "fingerprint must be ContentHashes when content_hashes is populated"
+      // Stage 9c: SegmentFingerprint collapsed to a single tuple-struct
+      // variant. The 32-byte digest carries the SHA-256 of the canonical
+      // content_hashes encoding; here we assert it's not the all-zero
+      // sentinel that an empty map would hash through.
+      let SegmentFingerprint(digest_a) = &key_a.fingerprint;
+      assert_ne!(
+        digest_a, &[0u8; 32],
+        "populated content_hashes must produce a non-sentinel digest"
       );
 
       // Changing any one hash ⇒ different key.
@@ -4322,28 +4274,6 @@ mod tests {
       assert_ne!(
         key_a, key_a_changed,
         "any hash change must change the cache key"
-      );
-
-      // Legacy meta (empty content_hashes) ⇒ LegacyCrc32 variant.
-      let mut legacy_meta = make_meta(
-        "seg_legacy",
-        SegmentPaths {
-          terms: "x".into(),
-          postings: "x".into(),
-          docstore: "x".into(),
-          fast: "x".into(),
-          meta: "x".into(),
-          #[cfg(feature = "vectors")]
-          vector_dir: None,
-        },
-        BTreeMap::new(),
-      );
-      legacy_meta.checksums.insert("meta".into(), 1);
-      legacy_meta.checksums.insert("terms".into(), 2);
-      let legacy_key = SegmentCacheKey::from_meta(&legacy_meta);
-      assert!(
-        matches!(legacy_key.fingerprint, SegmentFingerprint::LegacyCrc32(_)),
-        "fingerprint must be LegacyCrc32 when content_hashes is empty"
       );
     }
   }
