@@ -188,6 +188,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | **C FFI** | [`searchlite-ffi`](searchlite-ffi/) | Stable &mdash; shared library + C header |
 | **Node.js** | [`searchlite-js`](searchlite-node/) | Stable &mdash; native bindings + HTTP client, TypeScript + Zod |
 | **WASM** | [`searchlite-wasm`](searchlite-wasm/README.md) | Pre-1.0 &mdash; IndexedDB-backed browser search with worker runtime, migrations, quota handling |
+| **S3 / R2 / MinIO** | [`searchlite-s3`](searchlite-s3/README.md) | Experimental &mdash; read-only `Index` opens against object stores, with `sync_to_s3` for publishing locally-baked indexes |
 | **Elasticsearch adapter** | [`searchlite-adapter-elastic`](searchlite-adapter-elastic/README.md) | Pre-1.0 &mdash; read-only Elasticsearch HTTP-API compatibility for existing ES clients (Kibana, official SDKs) |
 
 ---
@@ -248,6 +249,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | Collapsing and highlighting | [docs/collapsing-and-highlighting.md](docs/collapsing-and-highlighting.md) |
 | Vector search | [docs/vectors.md](docs/vectors.md) |
 | In-memory indexes | [docs/in-memory.md](docs/in-memory.md) |
+| S3-compatible storage | [docs/s3.md](docs/s3.md) |
 | WASM bindings | [docs/wasm.md](docs/wasm.md) |
 | C FFI | [docs/ffi.md](docs/ffi.md) |
 | Write-key protection | [docs/write-key.md](docs/write-key.md) |

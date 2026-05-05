@@ -18,6 +18,7 @@ These flags apply to the core library. Other crates forward them to `searchlite-
 | `gpu` | off | Stub hooks for GPU-accelerated reranking. Currently a no-op placeholder for future development. |
 | `ffi` | off | Marks types and functions for C FFI export. Used by the `searchlite-ffi` crate. |
 | `browser` | off | Adjustments for browser/WASM environments. Used by `searchlite-wasm`. |
+| `tokio-runtime` | off | Sync→async bridge that lets blocking callers drive `aws-sdk-s3` (and any other async `BlobStore` impl) via `runtime::block_on_blob`. Used by `searchlite-s3`, which enables it transitively -- you don't need to set it manually unless you're calling the bridge directly. See [s3.md](s3.md). |
 
 ### Usage
 
@@ -120,5 +121,6 @@ wasm-pack build searchlite-wasm --target web --release -- --features threads
   Rust toolchain pinned in `searchlite-wasm/rust-toolchain.toml`.
 - `browser` is used internally by `searchlite-wasm` and should not be set manually.
 - `gpu` is a placeholder -- it compiles but does not currently accelerate anything.
+- `tokio-runtime` is only meaningful when an async `BlobStore` is being driven from sync code; `searchlite-s3` enables it transitively, so most users never need to flip it manually.
 
 No feature flags conflict with each other. Any combination is valid.
