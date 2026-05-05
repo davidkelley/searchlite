@@ -45,10 +45,10 @@ pub struct S3Config {
   ///   verified.
   /// * MinIO: `true`.
   /// * Endpoints that don't support conditional puts must set this
-  ///   to `false`. Stage 10b's [`crate::S3BlobStore::put_if_match`]
-  ///   refuses to issue a request when this flag is `false` rather
-  ///   than silently sending an `If-Match` header that the endpoint
-  ///   would ignore — better to surface a clear capability error.
+  ///   to `false`. [`crate::S3BlobStore::put_if_match`] refuses to
+  ///   issue a request when this flag is `false` rather than silently
+  ///   sending an `If-Match` header that the endpoint would ignore —
+  ///   better to surface a clear capability error.
   pub conditional_put: bool,
   /// Toggle path-style addressing (`https://endpoint/bucket/key`)
   /// vs virtual-hosted (`https://bucket.endpoint/key`).

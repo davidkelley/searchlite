@@ -1,11 +1,11 @@
 //! S3 error mapping.
 //!
-//! Stage 10b [Codex review #3]: existing adapter code (notably
-//! `BlobStoreAdapter::open_append`) walks the `anyhow::Error` chain
-//! looking for a `std::io::Error` whose `kind() == NotFound`. To
-//! preserve that contract for S3-backed callers, every method that
-//! could return an "object/bucket not found" error must put a real
-//! `io::Error` of kind `NotFound` into the chain. We emit that via
+//! Existing adapter code (notably `BlobStoreAdapter::open_append`)
+//! walks the `anyhow::Error` chain looking for a `std::io::Error`
+//! whose `kind() == NotFound`. To preserve that contract for
+//! S3-backed callers, every method that could return an
+//! "object/bucket not found" error must put a real `io::Error` of
+//! kind `NotFound` into the chain. We emit that via
 //! [`not_found_anyhow`] (so the chain root is an `io::Error` that
 //! `chain().downcast_ref::<io::Error>()` will surface).
 //!
@@ -21,9 +21,9 @@ use std::io;
 #[derive(thiserror::Error, Debug)]
 pub enum S3StoreError {
   /// Conditional PUT (`put_if_match`) was attempted but the backend
-  /// does not advertise `Capabilities::conditional_put`. Codex Stage
-  /// 10b plan #5: refuse to issue a request rather than silently
-  /// sending headers the endpoint would ignore.
+  /// does not advertise `Capabilities::conditional_put`. We refuse to
+  /// issue a request rather than silently sending headers the endpoint
+  /// would ignore.
   #[error(
     "S3 backend does not advertise conditional_put; \
      refusing to issue put_if_match. Check `S3Config::conditional_put`."
@@ -58,7 +58,7 @@ pub fn not_found_anyhow(key: &str) -> anyhow::Error {
 mod tests {
   use super::*;
 
-  /// Stage 10b [P3] sanity: the chain walk used by
+  /// Sanity check: the chain walk used by
   /// `BlobStoreAdapter::error_is_not_found` succeeds against errors
   /// produced by [`not_found_anyhow`].
   #[test]

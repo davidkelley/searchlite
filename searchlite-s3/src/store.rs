@@ -24,7 +24,7 @@ use crate::config::{S3Config, S3Credentials};
 use crate::errors::{not_found_anyhow, S3StoreError};
 use crate::object::{classify_conditional_status, S3Object};
 
-/// Stage 10b: concrete [`BlobStore`] over S3-compatible APIs.
+/// Concrete [`BlobStore`] over S3-compatible APIs.
 ///
 /// Tested against AWS S3, Cloudflare R2, MinIO, and (in unit tests)
 /// `wiremock`. See the crate-level docs for the supported targets and
@@ -87,8 +87,8 @@ impl S3BlobStore {
     })
   }
 
-  /// Stage 10b [Codex review #7]: validate + prefix-join a `BlobStore`
-  /// key onto the configured bucket namespace.
+  /// Validate + prefix-join a `BlobStore` key onto the configured
+  /// bucket namespace.
   ///
   /// Rejects: empty/whitespace-only keys, absolute paths
   /// (`/foo`), `..` traversal components, backslash separators
@@ -365,9 +365,9 @@ async fn head_to_stat(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> R
 ///
 /// 412/409 are NOT special-cased here: a plain `get`/`put`/`delete`/
 /// `head` did not send a precondition header, so labeling those
-/// codes as [`S3StoreError::PreconditionFailed`] would be misleading
-/// (Stage 10b v4 [P3], Codex review). Use [`map_conditional_sdk_error`]
-/// at call sites that DID send `If-Match` / `If-None-Match`.
+/// codes as [`S3StoreError::PreconditionFailed`] would be misleading.
+/// Use [`map_conditional_sdk_error`] at call sites that DID send
+/// `If-Match` / `If-None-Match`.
 pub(crate) fn map_sdk_error<E>(err: SdkError<E, SmithyResponse>, ctx: &str) -> anyhow::Error
 where
   E: std::error::Error + Send + Sync + 'static,
@@ -494,11 +494,10 @@ fn validate_bucket_name(bucket: &str) -> Result<()> {
   Ok(())
 }
 
-/// Stage 10b [Codex review #4]: parse `x-amz-checksum-*` headers from
-/// a HEAD response. The header values are **base64-encoded** raw
-/// checksum bytes — not hex, not integers. We validate the byte
-/// length matches the expected size for each algorithm before
-/// constructing a [`ProviderChecksum`].
+/// Parse `x-amz-checksum-*` headers from a HEAD response. The header
+/// values are **base64-encoded** raw checksum bytes — not hex, not
+/// integers. We validate the byte length matches the expected size
+/// for each algorithm before constructing a [`ProviderChecksum`].
 fn parse_head_checksum(
   resp: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
 ) -> Option<ProviderChecksum> {
@@ -581,8 +580,8 @@ async fn apply_env_credentials(
   Ok(builder)
 }
 
-/// Stage 10b [Codex review #2]: multipart upload writer with proper
-/// part-sizing discipline. See [`stream_writer::S3StreamWriter`].
+/// Multipart upload writer with proper part-sizing discipline. See
+/// [`stream_writer::S3StreamWriter`].
 mod stream_writer {
   use super::{anyhow, ByteStream, Bytes, Context, Result};
   use anyhow::bail;
@@ -599,8 +598,8 @@ mod stream_writer {
 
   /// Streaming `BlobStore::ObjectWriter` over S3 multipart uploads.
   ///
-  /// Stage 10b [Codex review #2]: respects multipart sizing
-  /// constraints. Buffers writes until the buffer reaches
+  /// Respects multipart sizing constraints. Buffers writes until the
+  /// buffer reaches
   /// [`MIN_PART_SIZE`] and uploads at that boundary. The final flush
   /// happens on `complete()`. For empty or sub-min-part-size streams
   /// we fall back to single `PutObject` (no multipart upload at all),

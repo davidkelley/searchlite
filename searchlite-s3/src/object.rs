@@ -14,13 +14,13 @@ use crate::errors::S3StoreError;
 /// `ObjectStat` observed at open time, so [`Object::read_range`]
 /// doesn't re-HEAD per call.
 ///
-/// Stage 10b [Codex review #1]: `read_range` sends `If-Match: <etag>`
-/// when the open-time ETag is known, so a concurrent overwrite by
-/// another writer can't return bytes from a different generation than
-/// the stat we cached. Without `If-Match`, an `open()` followed by
-/// `read_range` would silently mix old-stat metadata with new-content
-/// bytes — exactly the kind of stat/get race the BlobStore identity
-/// model was designed to eliminate.
+/// `read_range` sends `If-Match: <etag>` when the open-time ETag is
+/// known, so a concurrent overwrite by another writer can't return
+/// bytes from a different generation than the stat we cached.
+/// Without `If-Match`, an `open()` followed by `read_range` would
+/// silently mix old-stat metadata with new-content bytes — exactly
+/// the kind of stat/get race the BlobStore identity model was
+/// designed to eliminate.
 pub(crate) struct S3Object {
   pub(crate) client: Arc<aws_sdk_s3::Client>,
   pub(crate) bucket: String,
@@ -93,7 +93,7 @@ impl Object for S3Object {
   }
 }
 
-/// Stage 10b: helper used by [`S3Object`] and the top-level
+/// Helper used by [`S3Object`] and the top-level
 /// `BlobStore::get_range` to detect a 412/409 conditional failure
 /// returned when the pinned object has been overwritten under the
 /// reader. Surface as a typed [`S3StoreError::PreconditionFailed`]

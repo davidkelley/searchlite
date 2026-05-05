@@ -1,4 +1,4 @@
-//! Stage 10c: bake-local-then-upload sync helper.
+//! Bake-local-then-upload sync helper.
 //!
 //! Walks a local index directory and uploads every regular file
 //! verbatim to an S3-compatible bucket via [`S3BlobStore::put`]. The
@@ -8,7 +8,7 @@
 //! single-source-of-truth namespace mapping that
 //! [`crate::open_index_read_only`] depends on.
 //!
-//! ## Fail-closed contract (Codex Stage 10c review)
+//! ## Fail-closed contract
 //!
 //! Refuses to upload a partially-baked index. Errors before any
 //! `put` is issued if any of the following hold for `local_root`:
@@ -24,14 +24,13 @@
 //!   a crashed write).
 //! * `MANIFEST.json` is missing, malformed, below the latest
 //!   manifest schema version, or contains non-portable segment
-//!   paths (Stage 10c v2 [P2], Codex review). The S3 open path
-//!   resolves keys against an empty logical root, so absolute or
-//!   root-prefixed-relative segment paths from a legacy v1 manifest
-//!   would silently miss after upload. Run a local mutable
-//!   open-then-commit first to upgrade the manifest in place, then
-//!   re-sync.
+//!   paths. The S3 open path resolves keys against an empty logical
+//!   root, so absolute or root-prefixed-relative segment paths from
+//!   a legacy v1 manifest would silently miss after upload. Run a
+//!   local mutable open-then-commit first to upgrade the manifest
+//!   in place, then re-sync.
 //!
-//! ## Manifest publish ordering (Codex Stage 10c v2 [P1])
+//! ## Manifest publish ordering
 //!
 //! `MANIFEST.json` is the visibility fence. The sync sequence is:
 //!
@@ -56,10 +55,9 @@ use crate::store::S3BlobStore;
 
 const MANIFEST_FILE_NAME: &str = "MANIFEST.json";
 
-/// Stage 10c v4 [P2] (Codex review): centralized "is this path
-/// uploadable?" predicate, shared by [`upload_dir`] (deciding what
-/// to skip) and [`preflight_manifest`] (refusing manifests that
-/// reference paths the walker would skip).
+/// Centralized "is this path uploadable?" predicate, shared by
+/// [`upload_dir`] (deciding what to skip) and [`preflight_manifest`]
+/// (refusing manifests that reference paths the walker would skip).
 ///
 /// A relative-to-`local_root` path is uploadable iff:
 ///
@@ -95,12 +93,11 @@ fn is_uploadable_relative_path(relative: &Path) -> bool {
   true
 }
 
-/// Stage 10c v5 [P2] (Codex review): assert that a manifest key is
-/// in the canonical form the sync walker would emit. The walker
-/// builds keys via `read_dir` + `strip_prefix(local_root)`, which
-/// produces no leading `./`, no trailing `/`, no `//`, no
-/// backslash separators, and no `.`/`..`/`RootDir`/`Prefix`
-/// components.
+/// Assert that a manifest key is in the canonical form the sync
+/// walker would emit. The walker builds keys via `read_dir` +
+/// `strip_prefix(local_root)`, which produces no leading `./`, no
+/// trailing `/`, no `//`, no backslash separators, and no
+/// `.`/`..`/`RootDir`/`Prefix` components.
 ///
 /// Without this check, a v2 manifest can name `./seg_X.post`:
 /// `validate_v2_relative` accepts it (no `..`, no leading slash),
@@ -110,12 +107,11 @@ fn is_uploadable_relative_path(relative: &Path) -> bool {
 /// publish a reference to `./seg_X.post`, but the bytes live at
 /// `seg_X.post` on the remote — a visible-but-unservable index.
 ///
-/// Stage 10c v6 [P2] (Codex review): switched from
-/// `Path::components()` to raw `split('/')` because
+/// We use raw `split('/')` rather than `Path::components()` because
 /// `Path::components()` silently normalizes **interior** `.`
 /// components away: `Path::new("dir/./seg.post").components()`
 /// yields `[Normal("dir"), Normal("seg.post")]` — same as
-/// `dir/seg.post`. The previous component-based check missed
+/// `dir/seg.post`. A component-based check would miss
 /// `dir/./seg.post`, which would still drift between manifest key
 /// and uploaded key. Splitting on `/` and rejecting `.`, `..`, and
 /// empty segments catches every variant including interior dots.
@@ -263,9 +259,9 @@ fn upload_dir<'a>(
   })
 }
 
-/// Stage 10c [Codex review]: pre-flight invariants for the local
-/// directory shape. Fail before any upload is issued so a
-/// partial-state index can't reach the cloud.
+/// Pre-flight invariants for the local directory shape. Fail before
+/// any upload is issued so a partial-state index can't reach the
+/// cloud.
 fn preflight_local_root(local_root: &Path) -> Result<()> {
   let pending = local_root.join("MANIFEST.json.pending");
   if pending.exists() {
@@ -311,9 +307,8 @@ fn preflight_local_root(local_root: &Path) -> Result<()> {
   Ok(())
 }
 
-/// Stage 10c v2 [P2] (Codex review): read + validate the local
-/// manifest before any upload. Returns the raw bytes for the
-/// final visibility-fence PUT.
+/// Read + validate the local manifest before any upload. Returns
+/// the raw bytes for the final visibility-fence PUT.
 ///
 /// The validations match what `open_index_read_only` requires:
 ///
