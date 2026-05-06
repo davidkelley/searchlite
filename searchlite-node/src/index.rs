@@ -6,10 +6,12 @@ use napi_derive::napi;
 use std::collections::BTreeMap;
 
 use searchlite_core::api::types::{
-  ExecutionStrategy, IndexOptions, Query, SearchRequest, StorageType,
+  ChecksumPolicy, ExecutionStrategy, IndexOptions, Query, SearchRequest, StorageType,
 };
+use searchlite_core::runtime::block_on_blob;
 use searchlite_core::Index as CoreIndex;
 use searchlite_core::Schema;
+use searchlite_s3::{S3Config, S3Credentials};
 
 use crate::convert::{value_to_document, value_to_documents};
 use crate::error::{catch_panic, to_napi_error};
@@ -21,6 +23,97 @@ const BM25_B: f32 = 0.4;
 pub struct OpenOptions {
   pub write_key: Option<String>,
   pub schema: Option<serde_json::Value>,
+}
+
+/// Static credentials for an S3-compatible endpoint. Omit the
+/// containing `credentials` field on `S3IndexConfig` to load
+/// credentials from the standard AWS chain (env vars, shared
+/// credentials file, IMDS, EC2 instance role).
+#[napi(object)]
+pub struct S3StaticCredentials {
+  pub access_key_id: String,
+  pub secret_access_key: String,
+  pub session_token: Option<String>,
+}
+
+/// Configuration for opening a read-only Index against an
+/// S3-compatible backend (AWS S3, Cloudflare R2, MinIO).
+#[napi(object)]
+pub struct S3IndexConfig {
+  /// Bucket name.
+  pub bucket: String,
+  /// Region. Defaults to `us-east-1` when unset (required by SigV4
+  /// even for R2 — pass `auto` for R2).
+  pub region: Option<String>,
+  /// Optional namespace within the bucket.
+  pub prefix: Option<String>,
+  /// Endpoint URL. Set for R2
+  /// (`https://<account>.r2.cloudflarestorage.com`) or MinIO /
+  /// LocalStack. Leave unset for AWS S3.
+  pub endpoint_url: Option<String>,
+  /// Path-style addressing (`https://endpoint/bucket/key`). Required
+  /// for MinIO / LocalStack. Defaults to `false`.
+  pub force_path_style: Option<bool>,
+  /// Conditional PUT support (`If-Match` / `If-None-Match`). Defaults
+  /// to `true` on AWS S3 and MinIO, and `false` on R2 (auto-detected
+  /// from the endpoint hostname pattern `*.r2.cloudflarestorage.com`).
+  pub conditional_put: Option<bool>,
+  /// Credentials. When omitted, the standard AWS chain is used.
+  pub credentials: Option<S3StaticCredentials>,
+  /// Checksum policy: `"strict"` (default), `"trust-manifest"`, or
+  /// `"audit"`. See `searchlite-core` docs for the trade-offs.
+  pub checksum_policy: Option<String>,
+}
+
+impl S3IndexConfig {
+  fn into_parts(self) -> napi::Result<(S3Config, IndexOptions)> {
+    let region = self
+      .region
+      .filter(|r| !r.trim().is_empty())
+      .unwrap_or_else(|| "us-east-1".to_string());
+    let endpoint_url = self.endpoint_url.filter(|e| !e.trim().is_empty());
+    let is_r2 = endpoint_url
+      .as_deref()
+      .map(searchlite_s3::is_r2_endpoint)
+      .unwrap_or(false);
+    let conditional_put = self.conditional_put.unwrap_or(!is_r2);
+    let credentials = match self.credentials {
+      Some(c) => S3Credentials::Static {
+        access_key_id: c.access_key_id,
+        secret_access_key: c.secret_access_key,
+        session_token: c.session_token,
+      },
+      None => S3Credentials::LoadFromEnv,
+    };
+    let s3 = S3Config {
+      endpoint_url,
+      region,
+      bucket: self.bucket,
+      prefix: self.prefix,
+      credentials,
+      conditional_put,
+      force_path_style: self.force_path_style.unwrap_or(false),
+    };
+
+    let checksum_policy = match self.checksum_policy.as_deref() {
+      None | Some("strict") => ChecksumPolicy::Strict,
+      Some("trust-manifest") => ChecksumPolicy::TrustManifest,
+      Some("audit") => ChecksumPolicy::Audit,
+      Some(other) => {
+        return Err(napi::Error::new(
+          napi::Status::InvalidArg,
+          format!(
+            "invalid checksumPolicy: {other}; expected strict, trust-manifest, or audit"
+          ),
+        ));
+      }
+    };
+    let opts = IndexOptions {
+      checksum_policy,
+      ..IndexOptions::default()
+    };
+    Ok((s3, opts))
+  }
 }
 
 #[napi]
@@ -95,6 +188,26 @@ impl Index {
       Ok(Self {
         inner: Mutex::new(Some(index)),
         write_key: opts.write_key,
+      })
+    })
+  }
+
+  /// Open a read-only Index against an S3-compatible backend.
+  ///
+  /// The schema is read from the manifest in the bucket — there is
+  /// no constructor-time schema for S3-backed indexes. Mutators
+  /// (`add`, `addMany`, `commit`, `compact`) will error.
+  #[napi(factory, js_name = "fromS3")]
+  pub fn from_s3(config: S3IndexConfig) -> napi::Result<Self> {
+    catch_panic("Index::fromS3", || {
+      let (s3_config, opts) = config.into_parts()?;
+      let index = block_on_blob(searchlite_s3::open_index_read_only_with_options(
+        s3_config, opts,
+      ))
+      .map_err(to_napi_error)?;
+      Ok(Self {
+        inner: Mutex::new(Some(index)),
+        write_key: None,
       })
     })
   }

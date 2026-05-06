@@ -37,8 +37,13 @@ interface NativeIndex {
 	close(): void;
 }
 
+interface NativeIndexConstructor {
+	new (path: string, options?: Record<string, unknown>): NativeIndex;
+	fromS3(config: Record<string, unknown>): NativeIndex;
+}
+
 interface NativeBinding {
-	Index: new (path: string, options?: Record<string, unknown>) => NativeIndex;
+	Index: NativeIndexConstructor;
 }
 
 const SUFFIX_MAP: Record<string, string> = {
@@ -93,6 +98,83 @@ function isZodLike(value: unknown): boolean {
 // Accepted shapes for the `schema` option.
 type AnySchemaInput = SchemaDefinition | ZodIndexSchema | Record<string, unknown>;
 
+/**
+ * Static credentials for an S3-compatible endpoint. Omit the
+ * containing `credentials` field on `S3IndexConfig` to load
+ * credentials from the standard AWS chain (env vars, shared
+ * credentials file, IMDS, EC2 instance role).
+ */
+export interface S3StaticCredentials {
+	accessKeyId: string;
+	secretAccessKey: string;
+	/** Optional session token for temporary credentials (STS, R2). */
+	sessionToken?: string;
+}
+
+/**
+ * Configuration for opening a read-only `EmbeddedIndex` against an
+ * S3-compatible backend (AWS S3, Cloudflare R2, MinIO).
+ *
+ * The schema is read from the manifest in the bucket — there is no
+ * constructor-time schema. Mutators (`add`, `addMany`, `commit`,
+ * `compact`) on the resulting index will error.
+ */
+export interface S3IndexConfig {
+	/** Bucket name. */
+	bucket: string;
+	/**
+	 * AWS region. Defaults to `us-east-1` when unset (required by
+	 * SigV4 even for R2 — pass `auto` for R2).
+	 */
+	region?: string;
+	/** Optional namespace within the bucket. */
+	prefix?: string;
+	/**
+	 * Endpoint URL. Set for R2
+	 * (`https://<account>.r2.cloudflarestorage.com`) or MinIO /
+	 * LocalStack. Leave unset for AWS S3.
+	 */
+	endpointUrl?: string;
+	/**
+	 * Path-style addressing (`https://endpoint/bucket/key`). Required
+	 * for MinIO / LocalStack. Defaults to `false`.
+	 */
+	forcePathStyle?: boolean;
+	/**
+	 * Conditional PUT support (`If-Match` / `If-None-Match`). Defaults
+	 * to `true` on AWS S3 and MinIO, and `false` on R2 (auto-detected
+	 * from the endpoint hostname pattern `*.r2.cloudflarestorage.com`).
+	 */
+	conditionalPut?: boolean;
+	/**
+	 * Static credentials. Omit to use the standard AWS credential
+	 * chain.
+	 */
+	credentials?: S3StaticCredentials;
+	/**
+	 * Checksum policy. Defaults to `"strict"` (per-segment SHA-256
+	 * verification on every `Index::reader()`). Use `"trust-manifest"`
+	 * to skip verification (cheaper opens for object storage), or
+	 * `"audit"` to verify in the background.
+	 */
+	checksumPolicy?: "strict" | "trust-manifest" | "audit";
+}
+
+/** Internal init bag for `EmbeddedIndex.fromS3`. Not exported. */
+interface NativeInit {
+	__searchliteNativeInit: true;
+	native: NativeIndex;
+	zodSchema?: ZodIndexSchema;
+}
+
+function isNativeInit(value: unknown): value is NativeInit {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { __searchliteNativeInit?: unknown }).__searchliteNativeInit === true
+	);
+}
+
 // --- EmbeddedIndex ---
 
 export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T> {
@@ -110,6 +192,20 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	#docIdField: string | undefined;
 
 	constructor(path: string, options?: { writeKey?: string; schema?: AnySchemaInput }) {
+		// Internal `fromS3` path: bypass path validation and native
+		// construction; install the supplied native index directly.
+		if (isNativeInit(path)) {
+			const init = path as unknown as NativeInit;
+			this.#native = init.native;
+			if (init.zodSchema) {
+				this.#zodSchema = init.zodSchema;
+				this.#responseSchema = deriveResponseSchema(init.zodSchema);
+				this.#docIdField =
+					SearchliteIndexRegistry.get(init.zodSchema as never)?.docIdField ?? "_id";
+			}
+			return;
+		}
+
 		if (typeof path !== "string" || path.length === 0) {
 			throw new Error("path must be a non-empty string");
 		}
@@ -154,6 +250,88 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 			path,
 			nativeOpts.schema || nativeOpts.writeKey ? nativeOpts : undefined,
 		);
+	}
+
+	/**
+	 * Open a read-only `EmbeddedIndex` against an S3-compatible backend
+	 * (AWS S3, Cloudflare R2, MinIO). The schema is read from the
+	 * manifest stored in the bucket. Mutators (`add`, `addMany`,
+	 * `commit`, `compact`) will error on the returned index.
+	 *
+	 * Pass an optional Zod-authored index schema for client-side typed
+	 * search results — this does not validate the index's stored schema.
+	 *
+	 * @example AWS S3 (credentials from env)
+	 * ```ts
+	 * const idx = EmbeddedIndex.fromS3({
+	 *   bucket: "my-search-indexes",
+	 *   region: "us-east-1",
+	 *   prefix: "products/v1",
+	 * });
+	 * ```
+	 *
+	 * @example Cloudflare R2
+	 * ```ts
+	 * const idx = EmbeddedIndex.fromS3({
+	 *   bucket: "my-bucket",
+	 *   region: "auto",
+	 *   endpointUrl: "https://<account>.r2.cloudflarestorage.com",
+	 *   credentials: { accessKeyId, secretAccessKey },
+	 * });
+	 * ```
+	 *
+	 * @example MinIO / LocalStack
+	 * ```ts
+	 * const idx = EmbeddedIndex.fromS3({
+	 *   bucket: "my-bucket",
+	 *   region: "us-east-1",
+	 *   endpointUrl: "http://localhost:9000",
+	 *   forcePathStyle: true,
+	 *   credentials: { accessKeyId, secretAccessKey },
+	 * });
+	 * ```
+	 */
+	static fromS3<U = Record<string, unknown>>(
+		s3Config: S3IndexConfig,
+		options?: { schema?: ZodIndexSchema },
+	): EmbeddedIndex<U> {
+		if (!s3Config || typeof s3Config !== "object") {
+			throw new Error("s3Config must be an object");
+		}
+		if (typeof s3Config.bucket !== "string" || s3Config.bucket.length === 0) {
+			throw new Error("s3Config.bucket must be a non-empty string");
+		}
+		if (options?.schema !== undefined && !isZodIndexSchema(options.schema)) {
+			throw new Error(
+				"EmbeddedIndex.fromS3 `options.schema` must be a Zod index schema wrapped with `sl.index(...)`.",
+			);
+		}
+
+		const nativeConfig: Record<string, unknown> = { bucket: s3Config.bucket };
+		if (s3Config.region !== undefined) nativeConfig.region = s3Config.region;
+		if (s3Config.prefix !== undefined) nativeConfig.prefix = s3Config.prefix;
+		if (s3Config.endpointUrl !== undefined) nativeConfig.endpointUrl = s3Config.endpointUrl;
+		if (s3Config.forcePathStyle !== undefined)
+			nativeConfig.forcePathStyle = s3Config.forcePathStyle;
+		if (s3Config.conditionalPut !== undefined)
+			nativeConfig.conditionalPut = s3Config.conditionalPut;
+		if (s3Config.checksumPolicy !== undefined)
+			nativeConfig.checksumPolicy = s3Config.checksumPolicy;
+		if (s3Config.credentials !== undefined) {
+			nativeConfig.credentials = {
+				accessKeyId: s3Config.credentials.accessKeyId,
+				secretAccessKey: s3Config.credentials.secretAccessKey,
+				sessionToken: s3Config.credentials.sessionToken,
+			};
+		}
+
+		const native = getNative().Index.fromS3(nativeConfig);
+		const init: NativeInit = {
+			__searchliteNativeInit: true,
+			native,
+			zodSchema: options?.schema,
+		};
+		return new EmbeddedIndex<U>(init as unknown as string);
 	}
 
 	/**

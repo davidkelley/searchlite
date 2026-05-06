@@ -3289,6 +3289,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "searchlite-core",
+ "searchlite-s3",
  "serde_json",
 ]
 
