@@ -39,7 +39,7 @@ interface NativeIndex {
 
 interface NativeIndexConstructor {
 	new (path: string, options?: Record<string, unknown>): NativeIndex;
-	fromS3(config: Record<string, unknown>): NativeIndex;
+	fromS3(config: Record<string, unknown>): Promise<NativeIndex>;
 }
 
 interface NativeBinding {
@@ -160,9 +160,17 @@ export interface S3IndexConfig {
 	checksumPolicy?: "strict" | "trust-manifest" | "audit";
 }
 
+/**
+ * Module-private symbol used to discriminate the internal native-init
+ * path through the `EmbeddedIndex` constructor. Unforgeable: callers
+ * outside this module have no reference to it, so user-supplied
+ * objects can never accidentally bypass path validation.
+ */
+const NATIVE_INIT_KEY: unique symbol = Symbol("searchlite.nativeInit");
+
 /** Internal init bag for `EmbeddedIndex.fromS3`. Not exported. */
 interface NativeInit {
-	__searchliteNativeInit: true;
+	[NATIVE_INIT_KEY]: true;
 	native: NativeIndex;
 	zodSchema?: ZodIndexSchema;
 }
@@ -171,7 +179,7 @@ function isNativeInit(value: unknown): value is NativeInit {
 	return (
 		!!value &&
 		typeof value === "object" &&
-		(value as { __searchliteNativeInit?: unknown }).__searchliteNativeInit === true
+		(value as { [NATIVE_INIT_KEY]?: unknown })[NATIVE_INIT_KEY] === true
 	);
 }
 
@@ -191,17 +199,23 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	/** docIdField resolved from the Zod index metadata, or undefined. */
 	#docIdField: string | undefined;
 
-	constructor(path: string, options?: { writeKey?: string; schema?: AnySchemaInput }) {
+	constructor(path: string, options?: { writeKey?: string; schema?: AnySchemaInput });
+	/**
+	 * @internal Used by `EmbeddedIndex.fromS3` to install a pre-built native
+	 * index. Callers outside this module have no way to construct a valid
+	 * `NativeInit` (the discriminator is a module-private `Symbol`).
+	 */
+	constructor(init: NativeInit);
+	constructor(path: string | NativeInit, options?: { writeKey?: string; schema?: AnySchemaInput }) {
 		// Internal `fromS3` path: bypass path validation and native
 		// construction; install the supplied native index directly.
 		if (isNativeInit(path)) {
-			const init = path as unknown as NativeInit;
-			this.#native = init.native;
-			if (init.zodSchema) {
-				this.#zodSchema = init.zodSchema;
-				this.#responseSchema = deriveResponseSchema(init.zodSchema);
+			this.#native = path.native;
+			if (path.zodSchema) {
+				this.#zodSchema = path.zodSchema;
+				this.#responseSchema = deriveResponseSchema(path.zodSchema);
 				this.#docIdField =
-					SearchliteIndexRegistry.get(init.zodSchema as never)?.docIdField ?? "_id";
+					SearchliteIndexRegistry.get(path.zodSchema as never)?.docIdField ?? "_id";
 			}
 			return;
 		}
@@ -261,9 +275,13 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	 * Pass an optional Zod-authored index schema for client-side typed
 	 * search results — this does not validate the index's stored schema.
 	 *
+	 * Returns a `Promise` because opening involves at least one network
+	 * round-trip (HEAD on `MANIFEST.json`) plus checksum-driven segment
+	 * reads, and must not block Node's event loop.
+	 *
 	 * @example AWS S3 (credentials from env)
 	 * ```ts
-	 * const idx = EmbeddedIndex.fromS3({
+	 * const idx = await EmbeddedIndex.fromS3({
 	 *   bucket: "my-search-indexes",
 	 *   region: "us-east-1",
 	 *   prefix: "products/v1",
@@ -272,7 +290,7 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	 *
 	 * @example Cloudflare R2
 	 * ```ts
-	 * const idx = EmbeddedIndex.fromS3({
+	 * const idx = await EmbeddedIndex.fromS3({
 	 *   bucket: "my-bucket",
 	 *   region: "auto",
 	 *   endpointUrl: "https://<account>.r2.cloudflarestorage.com",
@@ -282,7 +300,7 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	 *
 	 * @example MinIO / LocalStack
 	 * ```ts
-	 * const idx = EmbeddedIndex.fromS3({
+	 * const idx = await EmbeddedIndex.fromS3({
 	 *   bucket: "my-bucket",
 	 *   region: "us-east-1",
 	 *   endpointUrl: "http://localhost:9000",
@@ -291,10 +309,10 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	 * });
 	 * ```
 	 */
-	static fromS3<U = Record<string, unknown>>(
+	static async fromS3<U = Record<string, unknown>>(
 		s3Config: S3IndexConfig,
 		options?: { schema?: ZodIndexSchema },
-	): EmbeddedIndex<U> {
+	): Promise<EmbeddedIndex<U>> {
 		if (!s3Config || typeof s3Config !== "object") {
 			throw new Error("s3Config must be an object");
 		}
@@ -325,13 +343,13 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 			};
 		}
 
-		const native = getNative().Index.fromS3(nativeConfig);
+		const native = await getNative().Index.fromS3(nativeConfig);
 		const init: NativeInit = {
-			__searchliteNativeInit: true,
+			[NATIVE_INIT_KEY]: true,
 			native,
 			zodSchema: options?.schema,
 		};
-		return new EmbeddedIndex<U>(init as unknown as string);
+		return new EmbeddedIndex<U>(init);
 	}
 
 	/**

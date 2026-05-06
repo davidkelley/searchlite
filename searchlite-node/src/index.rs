@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use searchlite_core::api::types::{
   ChecksumPolicy, ExecutionStrategy, IndexOptions, Query, SearchRequest, StorageType,
 };
-use searchlite_core::runtime::block_on_blob;
 use searchlite_core::Index as CoreIndex;
 use searchlite_core::Schema;
 use searchlite_s3::{S3Config, S3Credentials};
@@ -85,11 +84,19 @@ impl S3IndexConfig {
       },
       None => S3Credentials::LoadFromEnv,
     };
+    let prefix = self.prefix.and_then(|p| {
+      let trimmed = p.trim();
+      if trimmed.is_empty() {
+        None
+      } else {
+        Some(trimmed.to_string())
+      }
+    });
     let s3 = S3Config {
       endpoint_url,
       region,
       bucket: self.bucket,
-      prefix: self.prefix,
+      prefix,
       credentials,
       conditional_put,
       force_path_style: self.force_path_style.unwrap_or(false),
@@ -108,8 +115,12 @@ impl S3IndexConfig {
         ));
       }
     };
+    // Preserve the Node binding's BM25 tuning so search rankings match
+    // those of filesystem-backed indexes opened via `Index::new`.
     let opts = IndexOptions {
       checksum_policy,
+      bm25_k1: BM25_K1,
+      bm25_b: BM25_B,
       ..IndexOptions::default()
     };
     Ok((s3, opts))
@@ -197,18 +208,19 @@ impl Index {
   /// The schema is read from the manifest in the bucket — there is
   /// no constructor-time schema for S3-backed indexes. Mutators
   /// (`add`, `addMany`, `commit`, `compact`) will error.
+  ///
+  /// This factory is async: opening involves at least one network
+  /// round-trip (HEAD on `MANIFEST.json`) plus checksum-driven segment
+  /// reads, and must not block Node's event loop.
   #[napi(factory, js_name = "fromS3")]
-  pub fn from_s3(config: S3IndexConfig) -> napi::Result<Self> {
-    catch_panic("Index::fromS3", || {
-      let (s3_config, opts) = config.into_parts()?;
-      let index = block_on_blob(searchlite_s3::open_index_read_only_with_options(
-        s3_config, opts,
-      ))
+  pub async fn from_s3(config: S3IndexConfig) -> napi::Result<Self> {
+    let (s3_config, opts) = config.into_parts()?;
+    let index = searchlite_s3::open_index_read_only_with_options(s3_config, opts)
+      .await
       .map_err(to_napi_error)?;
-      Ok(Self {
-        inner: Mutex::new(Some(index)),
-        write_key: None,
-      })
+    Ok(Self {
+      inner: Mutex::new(Some(index)),
+      write_key: None,
     })
   }
 
