@@ -375,10 +375,13 @@ where
   if let SdkError::ServiceError(svc) = &err {
     let status = svc.raw().status().as_u16();
     if status == 404 {
-      // Synthesize a NotFound chain. The original SDK error is
-      // attached as context so debug info isn't lost.
+      // Synthesize a NotFound chain rooted at `io::Error{kind:
+      // NotFound}` so `BlobStoreAdapter::error_is_not_found` can
+      // detect it. Wrap with the original SDK error (preserved via
+      // anyhow context) and the call-site `ctx` so debug info isn't
+      // lost when callers print the error chain.
       let key = ctx.split_whitespace().last().unwrap_or(ctx);
-      return not_found_anyhow(key);
+      return not_found_anyhow(key).context(format!("{ctx} ({err})"));
     }
   }
   anyhow::Error::new(err).context(ctx.to_string())
@@ -400,8 +403,10 @@ where
   if let SdkError::ServiceError(svc) = &err {
     let status = svc.raw().status().as_u16();
     if status == 404 {
+      // Same shape as `map_sdk_error`: NotFound chain root + SDK
+      // detail attached as context.
       let key = ctx.split_whitespace().last().unwrap_or(ctx);
-      return not_found_anyhow(key);
+      return not_found_anyhow(key).context(format!("{ctx} ({err})"));
     }
     if let Some(typed) = classify_conditional_status(status, ctx) {
       // Build a chain rooted at the typed `S3StoreError` so callers
@@ -470,15 +475,65 @@ fn validate_relative_segment(s: &str, label: &str) -> Result<()> {
   Ok(())
 }
 
-/// Convert a `Path` key to a UTF-8 S3 string after the same
-/// validation as [`validate_relative_segment`]. Rejects non-UTF8
-/// paths (S3 keys must be UTF-8).
+/// Convert a `Path` key to a UTF-8 S3 string in the canonical
+/// forward-slash-separated form required by S3.
+///
+/// On Linux/macOS, `Path` already uses `/` as the separator, so the
+/// to_str path is exact. On Windows, `Path::strip_prefix` produces
+/// `\\`-separated paths; we walk `Path::components()` and join with
+/// `/` so a Windows-host caller of [`crate::sync_to_s3`] uploads
+/// keys in the same shape the open-side reader expects. Each
+/// component is validated against the same rules as
+/// [`validate_relative_segment`] (no `..`, no platform prefix, no
+/// root component, non-empty after trim).
 fn path_to_relative_string(key: &Path) -> Result<String> {
-  let s = key
-    .to_str()
-    .ok_or_else(|| anyhow!("S3 key is not valid UTF-8: {key:?}"))?;
-  validate_relative_segment(s, "key")?;
-  Ok(s.to_string())
+  let mut parts: Vec<&str> = Vec::new();
+  for component in key.components() {
+    match component {
+      Component::Normal(name) => {
+        let s = name
+          .to_str()
+          .ok_or_else(|| anyhow!("S3 key has a non-UTF-8 component: {key:?}"))?;
+        if s.trim().is_empty() {
+          // Catches both empty strings and whitespace-only segments
+          // — the latter is what `Path::new("   ").components()`
+          // produces on Linux and is never a valid S3 key shape.
+          bail!("S3 key: empty / whitespace-only component: {key:?}");
+        }
+        if s.contains('/') {
+          // A literal `/` inside a single OS component would mean
+          // the OS layer let an embedded separator through; reject
+          // rather than emit a key that wouldn't round-trip.
+          bail!("S3 key: component {s:?} contains an embedded `/`: {key:?}");
+        }
+        if s.contains('\\') {
+          // A `\` inside a *single* component can only mean we're
+          // on a non-Windows platform AND the user passed a literal
+          // backslash in the key (Windows would have split on it).
+          // S3 keys are forward-slash-separated; reject so we don't
+          // upload a key that other clients can't parse.
+          bail!("S3 key: component {s:?} contains an embedded `\\`: {key:?}");
+        }
+        parts.push(s);
+      }
+      Component::ParentDir => bail!("S3 key: contains `..`: {key:?}"),
+      Component::Prefix(_) => {
+        bail!("S3 key: contains a platform prefix (e.g. drive letter): {key:?}")
+      }
+      Component::RootDir => bail!("S3 key: contains a root component: {key:?}"),
+      Component::CurDir => {
+        // `Path::components()` collapses interior `.` away, but a
+        // standalone `.` (e.g. `Path::new(".")`) shows up here. An
+        // S3 key can never be `.`; rejecting matches the behavior
+        // of `validate_relative_segment` for a `.`-only string.
+        bail!("S3 key: contains a `.` component: {key:?}");
+      }
+    }
+  }
+  if parts.is_empty() {
+    bail!("S3 key: empty");
+  }
+  Ok(parts.join("/"))
 }
 
 /// Lightweight S3 bucket name validation. Doesn't replicate every

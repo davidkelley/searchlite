@@ -52,8 +52,12 @@ impl StatefulS3Bucket {
     }
   }
 
-  /// Mount the responder on a fresh `MockServer` and return the URI.
-  pub async fn spawn_server(self: &Arc<Self>) -> String {
+  /// Mount the responder on a fresh `MockServer` and return its URI
+  /// alongside the [`MockServer`] handle. Tests must hold the handle
+  /// for as long as they want the mock alive — its `Drop` releases
+  /// the listening socket so parallel tests don't leak ports under
+  /// long CI runs.
+  pub async fn spawn_server(self: &Arc<Self>) -> (String, MockServer) {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
       .respond_with(StatefulResponder {
@@ -65,11 +69,7 @@ impl StatefulS3Bucket {
       .mount(&server)
       .await;
     let uri = server.uri();
-    // Leak the MockServer so it lives for the duration of the test.
-    // Tests are short-lived; the server's port is released on
-    // process exit.
-    std::mem::forget(server);
-    uri
+    (uri, server)
   }
 
   /// Snapshot the stored keys + bytes (useful for path-shape
@@ -94,13 +94,20 @@ impl StatefulS3Bucket {
 
 /// Convenience helper — equivalent to constructing a
 /// `StatefulS3Bucket` and calling `spawn_server`. Returns
-/// `(server_uri, bucket_name)`. The bucket state is dropped when
-/// the test ends; if you need to introspect keys, use
-/// `StatefulS3Bucket` + `snapshot` directly.
-pub async fn spawn_stateful_s3_mock(bucket: &str) -> (String, String) {
+/// `(server_uri, bucket_name, server_handle)`. Bind the handle to a
+/// `_`-prefixed local in the test so the [`MockServer`] is dropped
+/// only at scope end:
+///
+/// ```ignore
+/// let (uri, bucket, _server) = spawn_stateful_s3_mock("test").await;
+/// ```
+///
+/// If you need to introspect stored keys, use `StatefulS3Bucket` +
+/// `snapshot` directly instead.
+pub async fn spawn_stateful_s3_mock(bucket: &str) -> (String, String, MockServer) {
   let bucket_state = Arc::new(StatefulS3Bucket::new(bucket));
-  let uri = bucket_state.spawn_server().await;
-  (uri, bucket.to_string())
+  let (uri, server) = bucket_state.spawn_server().await;
+  (uri, bucket.to_string(), server)
 }
 
 struct StatefulResponder {

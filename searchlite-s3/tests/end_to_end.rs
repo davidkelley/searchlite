@@ -146,7 +146,7 @@ async fn end_to_end_bake_sync_open_search_with_prefix() {
     result.total_hits_estimate
   };
 
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
 
   // Sync local files to S3 under prefix "idx-baked".
   let report = sync_to_s3(
@@ -190,7 +190,7 @@ async fn end_to_end_bake_sync_open_search_with_prefix() {
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_bake_sync_open_search_without_prefix() {
   let (local_dir, _) = bake_local_index();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
 
   let report = sync_to_s3(local_dir.path(), config_for(&server_uri, &bucket, None))
     .await
@@ -216,7 +216,7 @@ async fn end_to_end_bake_sync_open_search_without_prefix() {
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_mget_returns_source_from_s3() {
   let (local_dir, _) = bake_local_index();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
   sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, &bucket, Some("idx")),
@@ -250,7 +250,7 @@ async fn end_to_end_mget_returns_source_from_s3() {
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_backed_index_refuses_every_mutator() {
   let (local_dir, _) = bake_local_index();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
   sync_to_s3(local_dir.path(), config_for(&server_uri, &bucket, None))
     .await
     .unwrap();
@@ -277,7 +277,7 @@ async fn s3_backed_index_refuses_every_mutator() {
 async fn synced_keys_target_prefix_exactly_once() {
   let (local_dir, _) = bake_local_index();
   let bucket_state = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket_state.spawn_server().await;
+  let (server_uri, _server) = bucket_state.spawn_server().await;
   sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", Some("idx-baked")),
@@ -332,7 +332,7 @@ async fn sync_errors_when_pending_manifest_exists() {
     b"\"untouched\"",
   )
   .unwrap();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
   let err = sync_to_s3(local_dir.path(), config_for(&server_uri, &bucket, None))
     .await
     .expect_err("pending manifest must block sync");
@@ -349,7 +349,7 @@ async fn sync_errors_when_wal_is_non_empty() {
   // Append junk to the WAL.
   let wal = local_dir.path().join("wal.log");
   std::fs::write(&wal, b"\x00\x00uncommitted-stuff").unwrap();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
   let err = sync_to_s3(local_dir.path(), config_for(&server_uri, &bucket, None))
     .await
     .expect_err("non-empty WAL must block sync");
@@ -371,7 +371,7 @@ async fn sync_errors_when_wal_is_non_empty() {
 async fn sync_publishes_manifest_last_as_visibility_fence() {
   let (local_dir, _) = bake_local_index();
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", Some("idx-baked")),
@@ -407,7 +407,7 @@ async fn sync_publishes_manifest_last_as_visibility_fence() {
 async fn failed_sync_leaves_no_remote_manifest() {
   let (local_dir, _) = bake_local_index();
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
 
   // Inject a 500 on one of the segment file PUTs. The exact key
   // isn't known up-front (uuid-based), so we walk the local dir
@@ -521,7 +521,7 @@ async fn sync_errors_when_manifest_references_interior_dot_segment() {
   std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
@@ -570,7 +570,7 @@ async fn sync_errors_when_manifest_references_non_canonical_key() {
   std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
@@ -627,7 +627,7 @@ async fn sync_errors_when_manifest_references_skipped_dotfile_artifact() {
   std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
@@ -668,7 +668,7 @@ async fn sync_errors_when_manifest_references_missing_segment_file() {
   std::fs::remove_file(&postings_path).expect("delete postings file");
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
@@ -712,7 +712,7 @@ async fn sync_errors_when_local_manifest_is_legacy_v1() {
   std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
@@ -742,7 +742,7 @@ async fn sync_errors_when_staging_file_present() {
     b"staging",
   )
   .unwrap();
-  let (server_uri, bucket) = spawn_stateful_s3_mock("test-bucket").await;
+  let (server_uri, bucket, _server) = spawn_stateful_s3_mock("test-bucket").await;
   let err = sync_to_s3(local_dir.path(), config_for(&server_uri, &bucket, None))
     .await
     .expect_err("staging file must block sync");
@@ -801,7 +801,7 @@ async fn sync_errors_when_schema_declares_vectors_but_segment_lacks_vector_dir()
   std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
   let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
-  let server_uri = bucket.spawn_server().await;
+  let (server_uri, _server) = bucket.spawn_server().await;
   let err = sync_to_s3(
     local_dir.path(),
     config_for(&server_uri, "test-bucket", None),
