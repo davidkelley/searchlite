@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.12...searchlite-cli-v0.1.13) - 2026-05-06
+
+### Added
+
+- BlobStore trait + searchlite-s3 backend (S3/R2/MinIO) ([#482](https://github.com/davidkelley/searchlite/pull/482))
+
 ## [0.1.12](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.11...searchlite-cli-v0.1.12) - 2026-04-27
 
 ### Other
