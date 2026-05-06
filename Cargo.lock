@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "integration"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-adapter-elastic"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3258,7 +3258,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-http"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3281,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-node"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "napi",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "searchlite-s3"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

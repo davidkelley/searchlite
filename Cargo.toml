@@ -14,7 +14,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.6"
+version = "0.3.0"
 authors = ["Searchlite Authors"]
 license = "MIT"
 
