@@ -752,3 +752,77 @@ async fn sync_errors_when_staging_file_present() {
     "expected staging-file error; got: {msg}"
   );
 }
+
+/// Regression: a manifest where `schema.vector_fields` is non-empty
+/// but the segment has no `paths.vector_dir`. Without preflight
+/// catching this, `sync_to_s3` would publish `MANIFEST.json`, and a
+/// reader's `SegmentCore::load` would later bail at `vector_paths`
+/// with "segment missing vector directory path" — the manifest is
+/// visible on S3 but the index is unservable. Preflight must reject
+/// before any PUT.
+#[cfg(feature = "vectors")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_errors_when_schema_declares_vectors_but_segment_lacks_vector_dir() {
+  let (local_dir, _) = bake_local_index();
+  // Synthesize the mismatch: the manifest's schema declares one
+  // vector field (`embedding`), but the segment's `paths` has no
+  // `vector_dir`. Under the `vectors` feature, the segment writer
+  // populates `vector_dir` even for non-vector schemas, so we must
+  // strip it explicitly to reproduce the legacy/hand-edited shape
+  // the preflight check is guarding against.
+  let manifest_path = local_dir.path().join("MANIFEST.json");
+  let mut value: serde_json::Value =
+    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+  // 1. Drop `vector_dir` from every segment's paths.
+  let segments = value["segments"]
+    .as_array_mut()
+    .expect("segments is an array");
+  for seg in segments.iter_mut() {
+    seg["paths"]
+      .as_object_mut()
+      .expect("paths is a map")
+      .remove("vector_dir");
+  }
+  // 2. Add a schema-level vector field declaration. The
+  //    deserializer's `parse_vector_field` recognizes the
+  //    `searchlite:vector` marker and populates
+  //    `Schema.vector_fields`.
+  let props = value["schema"]["properties"]
+    .as_object_mut()
+    .expect("schema.properties is a map");
+  props.insert(
+    "embedding".into(),
+    serde_json::json!({
+      "type": "array",
+      "items": { "type": "number" },
+      "searchlite:vector": { "dim": 4, "metric": "Cosine" }
+    }),
+  );
+  std::fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+  let bucket = Arc::new(StatefulS3Bucket::new("test-bucket"));
+  let server_uri = bucket.spawn_server().await;
+  let err = sync_to_s3(
+    local_dir.path(),
+    config_for(&server_uri, "test-bucket", None),
+  )
+  .await
+  .expect_err("schema/segment vector mismatch must abort sync at preflight");
+  let msg = format!("{err:#}");
+  assert!(
+    msg.contains("vector_dir") && msg.contains("vector field"),
+    "expected vector_dir-mismatch error; got: {msg}"
+  );
+  assert!(
+    msg.contains("\"embedding\""),
+    "expected the offending field name in the error; got: {msg}"
+  );
+  // Critical: no PUT was issued. preflight failed before any network
+  // write, so the bucket is empty and `MANIFEST.json` was never
+  // published.
+  assert!(
+    bucket.snapshot().is_empty(),
+    "vector_dir-mismatch rejection must abort BEFORE any upload; remote: {:?}",
+    bucket.snapshot().keys().collect::<Vec<_>>()
+  );
+}

@@ -447,6 +447,38 @@ fn preflight_manifest(local_root: &Path) -> Result<Vec<u8>> {
     // publish `MANIFEST.json` and surface a remotely visible but
     // unopenable index once a vector field is loaded.
     #[cfg(feature = "vectors")]
+    {
+      // Codex round-N follow-up: a manifest can have a non-empty
+      // `schema.vector_fields` while the segment's `paths.vector_dir`
+      // is `None` (e.g. vector fields were added to the schema after
+      // the segment was written, or a hand-edited manifest dropped
+      // the directory). The downstream open path then calls
+      // `vector_paths(resolved, field)`, which bails with "segment
+      // missing vector directory path" — so the index is unservable
+      // even though it would pass every other preflight gate. Reject
+      // here so `MANIFEST.json` never reaches the bucket.
+      if !manifest.schema.vector_fields.is_empty() && seg.paths.vector_dir.is_none() {
+        let names = manifest
+          .schema
+          .vector_fields
+          .iter()
+          .map(|vf| format!("{:?}", vf.name))
+          .collect::<Vec<_>>()
+          .join(", ");
+        bail!(
+          "sync_to_s3: refusing to upload — manifest schema declares {} vector \
+           field(s) ({names}) but segment {} has no `vector_dir` in its paths. \
+           The S3 open path's `vector_paths(...)` call will bail with \"segment \
+           missing vector directory path\", so this index would be remotely \
+           visible but unservable. Re-bake the segment under the current schema \
+           (with vector data populated) and re-sync, or remove the schema's \
+           vector fields if they were declared in error.",
+          manifest.schema.vector_fields.len(),
+          seg.id
+        );
+      }
+    }
+    #[cfg(feature = "vectors")]
     if let Some(vector_dir_key) = seg.paths.vector_dir.as_deref() {
       if let Err(reason) = validate_canonical_segment_key(vector_dir_key) {
         bail!(
