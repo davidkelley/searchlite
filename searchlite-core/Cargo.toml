@@ -4,7 +4,12 @@ version = "0.9.0"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
-description = "Embedded search engine core for searchlite"
+description = "Embedded full-text search engine: BM25, inverted index, WAL durability, aggregations"
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["search", "index", "bm25", "embedded", "fulltext"]
+categories = ["database-implementations", "text-processing"]
 
 [features]
 default = []
