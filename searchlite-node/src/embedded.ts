@@ -316,7 +316,7 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 		if (!s3Config || typeof s3Config !== "object") {
 			throw new Error("s3Config must be an object");
 		}
-		if (typeof s3Config.bucket !== "string" || s3Config.bucket.length === 0) {
+		if (typeof s3Config.bucket !== "string" || s3Config.bucket.trim().length === 0) {
 			throw new Error("s3Config.bucket must be a non-empty string");
 		}
 		if (options?.schema !== undefined && !isZodIndexSchema(options.schema)) {
@@ -335,7 +335,13 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 			nativeConfig.conditionalPut = s3Config.conditionalPut;
 		if (s3Config.checksumPolicy !== undefined)
 			nativeConfig.checksumPolicy = s3Config.checksumPolicy;
-		if (s3Config.credentials !== undefined) {
+		// `!= null` (loose equality) catches both `undefined` and `null`,
+		// avoiding an opaque `TypeError: Cannot read properties of null`
+		// for callers that load config from `JSON.parse` output.
+		if (s3Config.credentials != null) {
+			if (typeof s3Config.credentials !== "object") {
+				throw new Error("s3Config.credentials must be an object");
+			}
 			nativeConfig.credentials = {
 				accessKeyId: s3Config.credentials.accessKeyId,
 				secretAccessKey: s3Config.credentials.secretAccessKey,

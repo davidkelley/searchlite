@@ -64,13 +64,27 @@ pub struct S3IndexConfig {
   pub checksum_policy: Option<String>,
 }
 
+/// Trim whitespace and treat the empty string as `None`. Used to keep
+/// every user-supplied string forwarded into the AWS SDK on equal
+/// footing — passing a value with stray padding into SigV4 signing
+/// surfaces as an opaque `SignatureDoesNotMatch` rather than a clean
+/// validation error.
+fn normalize_string(s: Option<String>) -> Option<String> {
+  s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 impl S3IndexConfig {
   fn into_parts(self) -> napi::Result<(S3Config, IndexOptions)> {
-    let region = self
-      .region
-      .filter(|r| !r.trim().is_empty())
-      .unwrap_or_else(|| "us-east-1".to_string());
-    let endpoint_url = self.endpoint_url.filter(|e| !e.trim().is_empty());
+    let bucket = self.bucket.trim().to_string();
+    if bucket.is_empty() {
+      return Err(napi::Error::new(
+        napi::Status::InvalidArg,
+        "bucket must be a non-empty string",
+      ));
+    }
+    let region = normalize_string(self.region).unwrap_or_else(|| "us-east-1".to_string());
+    let endpoint_url = normalize_string(self.endpoint_url);
+    let prefix = normalize_string(self.prefix);
     let is_r2 = endpoint_url
       .as_deref()
       .map(searchlite_s3::is_r2_endpoint)
@@ -84,18 +98,10 @@ impl S3IndexConfig {
       },
       None => S3Credentials::LoadFromEnv,
     };
-    let prefix = self.prefix.and_then(|p| {
-      let trimmed = p.trim();
-      if trimmed.is_empty() {
-        None
-      } else {
-        Some(trimmed.to_string())
-      }
-    });
     let s3 = S3Config {
       endpoint_url,
       region,
-      bucket: self.bucket,
+      bucket,
       prefix,
       credentials,
       conditional_put,
