@@ -1,8 +1,6 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
-
-use crate::DocId;
 
 /// Hard cap on stored document payload size to avoid OOM or corrupt reads.
 pub const MAX_DOCSTORE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
@@ -97,55 +95,62 @@ impl<'a, W: Write + Seek + ?Sized> DocStoreWriter<'a, W> {
   }
 }
 
-pub struct DocStoreReader<R: Read + Seek> {
-  file: R,
-  offsets: Vec<u64>,
-  #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
-  use_zstd: bool,
-}
-
-impl<R: Read + Seek> DocStoreReader<R> {
-  pub fn new(file: R, offsets: Vec<u64>, use_zstd: bool) -> Self {
-    Self {
-      file,
-      offsets,
-      use_zstd,
-    }
+/// Decode one docstore record from a `[u32 LE length][payload]` byte
+/// bundle. The bundle MUST be exactly `4 + length` bytes; trailing
+/// bytes are treated as corruption (offset table claimed a longer
+/// record than the embedded length actually encodes).
+///
+/// This is the single source of truth for docstore parse semantics.
+/// Production reads go through Stage 8b's `SegmentReader::get_doc`,
+/// which issues one bounded `Object::read_range` per fetch and then
+/// hands the resulting bundle to this helper, so the on-wire format
+/// is enforced in exactly one place:
+///
+/// * `MAX_DOCSTORE_BYTES` enforcement (pre- and post-decompress).
+/// * zstd handling (gated on the `zstd` feature flag).
+/// * JSON decode error context.
+/// * Length-prefix / range-length consistency checks.
+///
+/// `use_zstd` reflects the segment-meta flag (`SegmentFileMeta::use_zstd`).
+pub fn decode_docstore_record(bundle: &[u8], use_zstd: bool) -> Result<serde_json::Value> {
+  if bundle.len() < 4 {
+    bail!(
+      "docstore record truncated: need at least 4 length-prefix bytes, got {}",
+      bundle.len()
+    );
   }
-
-  pub fn get(&mut self, doc_id: DocId) -> Result<serde_json::Value> {
-    let offset = *self
-      .offsets
-      .get(doc_id as usize)
-      .ok_or_else(|| anyhow::anyhow!("doc id out of bounds"))?;
-    self.file.seek(SeekFrom::Start(offset))?;
-    let mut len_bytes = [0u8; 4];
-    self.file.read_exact(&mut len_bytes)?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > MAX_DOCSTORE_BYTES {
-      bail!("stored document length {len} exceeds maximum {MAX_DOCSTORE_BYTES}");
-    }
-    let mut buf = vec![0u8; len];
-    self.file.read_exact(&mut buf)?;
-    #[cfg(feature = "zstd")]
-    let buf = if self.use_zstd {
-      let decoded = zstd::stream::decode_all(&buf[..])?;
-      if decoded.len() > MAX_DOCSTORE_BYTES {
-        bail!(
-          "stored document length {} exceeds maximum {} after decompression",
-          decoded.len(),
-          MAX_DOCSTORE_BYTES
-        );
-      }
-      decoded
-    } else {
-      buf
-    };
-    #[cfg(not(feature = "zstd"))]
-    let buf = buf;
-    let json: serde_json::Value = serde_json::from_slice(&buf)?;
-    Ok(json)
+  let len = u32::from_le_bytes(bundle[..4].try_into().expect("4-byte slice")) as usize;
+  if len > MAX_DOCSTORE_BYTES {
+    bail!("stored document length {len} exceeds maximum {MAX_DOCSTORE_BYTES}");
   }
+  if 4 + len != bundle.len() {
+    bail!(
+      "docstore record length mismatch: header says {len} bytes, range has {} payload bytes \
+       (4 + {len} != {}); offset table or file may be corrupt",
+      bundle.len().saturating_sub(4),
+      bundle.len()
+    );
+  }
+  let payload = &bundle[4..];
+  #[cfg(feature = "zstd")]
+  let owned;
+  #[cfg(feature = "zstd")]
+  let payload: &[u8] = if use_zstd {
+    owned = zstd::stream::decode_all(payload)?;
+    if owned.len() > MAX_DOCSTORE_BYTES {
+      bail!(
+        "stored document length {} exceeds maximum {MAX_DOCSTORE_BYTES} after decompression",
+        owned.len()
+      );
+    }
+    &owned
+  } else {
+    payload
+  };
+  #[cfg(not(feature = "zstd"))]
+  let _ = use_zstd;
+  let json: serde_json::Value = serde_json::from_slice(payload)?;
+  Ok(json)
 }
 
 #[cfg(test)]
@@ -169,11 +174,21 @@ mod tests {
     let offsets = writer.offsets().to_vec();
     drop(writer);
     drop(file);
-    let reader_file = std::fs::File::open(path).unwrap();
-    let mut reader = DocStoreReader::new(reader_file, offsets, false);
-    let first = reader.get(0).unwrap();
+    // Read the raw file bytes and slice per offset, mirroring the byte-range
+    // shape that production `SegmentReader::get_doc` derives from
+    // `seg_meta.doc_offsets` + the docstore object length, then hand each
+    // range to the shared `decode_docstore_record` parser.
+    let buffer = std::fs::read(&path).unwrap();
+    let total = buffer.len() as u64;
+    let range_for = |id: usize| -> &[u8] {
+      let start = offsets[id] as usize;
+      let end = offsets.get(id + 1).copied().unwrap_or(total) as usize;
+      &buffer[start..end]
+    };
+    let first = decode_docstore_record(range_for(0), false).unwrap();
     assert_eq!(first["title"], "Rust");
-    assert!(reader.get(2).is_err());
+    let second = decode_docstore_record(range_for(1), false).unwrap();
+    assert_eq!(second["title"], "Search");
   }
 
   #[test]
@@ -297,13 +312,19 @@ mod tests {
 
     let offsets = writer.offsets().to_vec();
     drop(writer);
-    // Read back both docs from the in-memory buffer via a cursor.
+    // Read back both docs by deriving byte ranges from the offsets table,
+    // mirroring how production `SegmentReader::get_doc` slices the docstore
+    // object and feeds each range to `decode_docstore_record`.
     let buffer = file.inner.into_inner();
-    let cursor = std::io::Cursor::new(buffer);
-    let mut reader = DocStoreReader::new(cursor, offsets, false);
-    let first = reader.get(0).unwrap();
+    let total = buffer.len() as u64;
+    let range_for = |id: usize| -> &[u8] {
+      let start = offsets[id] as usize;
+      let end = offsets.get(id + 1).copied().unwrap_or(total) as usize;
+      &buffer[start..end]
+    };
+    let first = decode_docstore_record(range_for(0), false).unwrap();
     assert_eq!(first["title"], "Rust");
-    let second = reader.get(1).unwrap();
+    let second = decode_docstore_record(range_for(1), false).unwrap();
     assert_eq!(
       second["title"], "Retry",
       "doc_id 1 must resolve to the retried document, not the abandoned one"
@@ -414,21 +435,43 @@ mod tests {
 
   #[test]
   fn rejects_corrupt_length_header() {
-    use std::io::Write;
-
-    let tmp = NamedTempFile::new().unwrap();
-    let path = tmp.path().to_path_buf();
-    // Write a bogus length header that exceeds the limit; no body is needed because
-    // the reader should fail before attempting to read the payload.
-    {
-      let mut file = std::fs::File::create(&path).unwrap();
-      let len = (MAX_DOCSTORE_BYTES as u32).saturating_add(1);
-      file.write_all(&len.to_le_bytes()).unwrap();
-    }
-    let mut reader = DocStoreReader::new(std::fs::File::open(&path).unwrap(), vec![0], false);
-    let err = reader.get(0).unwrap_err();
+    // Hand `decode_docstore_record` a 4-byte bundle whose embedded length
+    // prefix exceeds `MAX_DOCSTORE_BYTES`. The MAX-bytes guard fires before
+    // the length/range-mismatch guard (the helper validates the embedded
+    // length first), so the bundle does not need to carry a payload.
+    let len = (MAX_DOCSTORE_BYTES as u32).saturating_add(1);
+    let bundle = len.to_le_bytes();
+    let err = decode_docstore_record(&bundle, false).unwrap_err();
     assert!(
-      err.to_string().contains("stored document length") && err.to_string().contains("exceeds")
+      err.to_string().contains("stored document length") && err.to_string().contains("exceeds"),
+      "expected MAX_DOCSTORE_BYTES guard to surface, got: {err}"
+    );
+  }
+
+  #[test]
+  fn rejects_truncated_bundle() {
+    // A bundle shorter than the 4-byte length prefix must fail at the
+    // truncation guard rather than silently parsing as a zero-length doc.
+    let err = decode_docstore_record(&[0u8; 3], false).unwrap_err();
+    assert!(
+      err.to_string().contains("truncated"),
+      "expected length-prefix truncation surface, got: {err}"
+    );
+  }
+
+  #[test]
+  fn rejects_length_range_mismatch() {
+    // Embedded length is 8 bytes but bundle only carries 1 payload byte —
+    // the offset table claimed a longer record than the file actually
+    // encodes. Ensures the length/range consistency check fires after the
+    // MAX guard and before any JSON decode.
+    let mut bundle = Vec::new();
+    bundle.extend_from_slice(&8u32.to_le_bytes());
+    bundle.push(b'x');
+    let err = decode_docstore_record(&bundle, false).unwrap_err();
+    assert!(
+      err.to_string().contains("length mismatch"),
+      "expected range/length-mismatch surface, got: {err}"
     );
   }
 }

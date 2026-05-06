@@ -7,9 +7,14 @@ license.workspace = true
 
 [features]
 default = []
-vectors = ["searchlite-core/vectors"]
+vectors = ["searchlite-core/vectors", "searchlite-s3?/vectors"]
 gpu = ["searchlite-core/gpu"]
 zstd = ["searchlite-core/zstd"]
+# `--index name:s3://bucket/prefix` mount form for read-only S3-backed
+# indexes. Pulls in `searchlite-s3` (and `aws-sdk-s3`). Off by default
+# at the crate level; the CLI binary turns this on via its own `s3`
+# feature, which is on by default.
+s3 = ["dep:searchlite-s3"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,6 +22,7 @@ axum = "0.8.9"
 clap = { workspace = true, features = ["derive", "env"] }
 futures-util = "0.3.32"
 searchlite-core = { path = "../searchlite-core", package = "searchlite-core", features = ["write-key"] }
+searchlite-s3 = { path = "../searchlite-s3", package = "searchlite-s3", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

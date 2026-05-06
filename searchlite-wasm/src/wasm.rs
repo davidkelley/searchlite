@@ -1490,6 +1490,9 @@ fn open_opts(path: PathBuf) -> IndexOptions {
     bm25_k1: BM25_K1,
     bm25_b: BM25_B,
     storage: StorageType::InMemory,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }
@@ -1694,14 +1697,22 @@ fn expected_live_paths(root: &Path, manifest: &Manifest) -> (HashSet<PathBuf>, V
   #[cfg(not(feature = "vectors"))]
   let prefixes: Vec<PathBuf> = Vec::new();
   for seg in manifest.segments.iter() {
-    exact.insert(PathBuf::from(seg.paths.terms.clone()));
-    exact.insert(PathBuf::from(seg.paths.postings.clone()));
-    exact.insert(PathBuf::from(seg.paths.docstore.clone()));
-    exact.insert(PathBuf::from(seg.paths.fast.clone()));
-    exact.insert(PathBuf::from(seg.paths.meta.clone()));
+    // Resolve each segment's paths against the storage root before
+    // comparing to the IndexedDB key set. v2 manifests store
+    // `seg.paths.*` as relative-to-root keys, while
+    // `list_stored_paths` returns full IndexedDB keys (the root is
+    // the db name, baked into every key). Without the resolve step
+    // every legitimate segment artifact would look orphaned and the
+    // cleanup walk would delete them.
+    let resolved = seg.paths.resolve(root);
+    exact.insert(resolved.terms);
+    exact.insert(resolved.postings);
+    exact.insert(resolved.docstore);
+    exact.insert(resolved.fast);
+    exact.insert(resolved.meta);
     #[cfg(feature = "vectors")]
-    if let Some(vector_dir) = seg.paths.vector_dir.as_ref() {
-      prefixes.push(PathBuf::from(vector_dir));
+    if let Some(vector_dir) = resolved.vector_dir {
+      prefixes.push(vector_dir);
     }
   }
   (exact, prefixes)
@@ -1767,6 +1778,9 @@ impl Searchlite {
       // The wasm Index always uses in-memory storage; JsStorage persists to IndexedDB when enabled.
       // Do not mix storage modes for the same db_name; use a fresh name or clear stored data.
       storage: StorageType::InMemory,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };
@@ -2710,6 +2724,9 @@ mod tests {
       bm25_k1: BM25_K1,
       bm25_b: BM25_B,
       storage: StorageType::InMemory,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     };

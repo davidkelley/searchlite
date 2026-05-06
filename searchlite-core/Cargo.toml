@@ -13,11 +13,21 @@ vectors = ["bytemuck", "bincode"]
 gpu = []
 zstd = ["dep:zstd"]
 ffi = []
-write-key = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:subtle"]
+write-key = ["dep:argon2", "dep:hmac", "dep:subtle"]
+# Stage 10a: when enabled, the BlobStore sync→async bridge drives
+# futures on a global multi-thread Tokio runtime instead of the
+# default `futures::executor::block_on`. Required for any BlobStore
+# impl whose futures depend on Tokio (notably `aws-sdk-s3` in
+# `searchlite-s3`). Local-FS-only deployments (and wasm builds) keep
+# the smaller default to avoid pulling in the Tokio dep tree.
+tokio-runtime = ["dep:tokio"]
 
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc32fast = { workspace = true }
@@ -39,15 +49,18 @@ tdigest = { workspace = true }
 log = { workspace = true }
 argon2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 base64 = { workspace = true }
 subtle = { workspace = true, optional = true }
 rand = { workspace = true }
+tokio = { workspace = true, optional = true }
 
 zstd = { version = "0.13.1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
+fs2 = "0.4"
+moka = { version = "0.12", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }

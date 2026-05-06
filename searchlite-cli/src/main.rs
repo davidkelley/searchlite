@@ -4,13 +4,15 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+#[cfg(feature = "s3")]
+use clap::Args;
+use clap::{Parser, Subcommand, ValueEnum};
 use searchlite_core::api::builder::IndexBuilder;
 #[cfg(feature = "vectors")]
 use searchlite_core::api::types::QueryNode;
 use searchlite_core::api::types::{
-  Aggregation, Document, ExecutionStrategy, IndexOptions, Query, SearchRequest, SortOrder,
-  SortSpec, StorageType,
+  Aggregation, ChecksumPolicy, Document, ExecutionStrategy, IndexOptions, Query, SearchRequest,
+  SortOrder, SortSpec, StorageType,
 };
 #[cfg(feature = "vectors")]
 use searchlite_core::api::types::{VectorQuery, VectorQuerySpec};
@@ -21,6 +23,153 @@ use searchlite_http::{
 };
 use tokio::runtime::Runtime;
 use tracing::error;
+
+/// User-facing index location. Accepts either a local filesystem
+/// path or, when the `s3` feature is enabled, an `s3://bucket/prefix`
+/// URL. Constructed via `clap`'s `value_parser`.
+#[derive(Debug, Clone)]
+enum IndexLocator {
+  Local(PathBuf),
+  #[cfg(feature = "s3")]
+  S3(searchlite_s3::S3Url),
+}
+
+impl IndexLocator {
+  fn parse(s: &str) -> Result<Self, String> {
+    let trimmed = s.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("s3://") {
+      #[cfg(feature = "s3")]
+      {
+        return searchlite_s3::parse_s3_url(trimmed).map(Self::S3);
+      }
+      #[cfg(not(feature = "s3"))]
+      {
+        return Err(format!(
+          "{trimmed:?} is an s3:// URL but this build was compiled without the `s3` feature; \
+           rebuild searchlite-cli with `--features s3` (default), or pass a local index path"
+        ));
+      }
+    }
+    if trimmed.is_empty() {
+      return Err("index path cannot be empty".into());
+    }
+    Ok(Self::Local(PathBuf::from(trimmed)))
+  }
+
+  /// Coerce to a local filesystem path, erroring out for s3:// URLs.
+  /// Used by every writer command (init / add / commit / compact /
+  /// merge), which only operate on local indexes — s3:// indexes are
+  /// always opened read-only.
+  fn require_local(&self) -> Result<&Path> {
+    match self {
+      Self::Local(p) => Ok(p.as_path()),
+      #[cfg(feature = "s3")]
+      Self::S3(_) => bail!(
+        "this command does not support s3:// URLs — writes happen against a local index. \
+         Bake the index locally (`searchlite init`/`add`/`commit`/`compact`), then publish \
+         with `searchlite sync <local-path> <s3-url>`."
+      ),
+    }
+  }
+}
+
+/// `--checksum-policy` flag. Maps onto
+/// [`searchlite_core::api::types::ChecksumPolicy`].
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[clap(rename_all = "kebab-case")]
+enum ChecksumPolicyArg {
+  /// Re-verify SHA-256 of every segment artifact on each fresh
+  /// `Index::reader()`. Safest, but expensive on remote backends —
+  /// each reader pays one whole-object read per segment artifact.
+  #[default]
+  Strict,
+  /// Trust the manifest's recorded hashes without re-verifying.
+  /// Recommended for cloud serving where each reader open should
+  /// avoid pulling whole segment files over the network.
+  TrustManifest,
+  /// Open immediately and verify in a background `rayon` task,
+  /// surfacing failures via `log::error!`.
+  Audit,
+}
+
+impl From<ChecksumPolicyArg> for ChecksumPolicy {
+  fn from(value: ChecksumPolicyArg) -> Self {
+    match value {
+      ChecksumPolicyArg::Strict => ChecksumPolicy::Strict,
+      ChecksumPolicyArg::TrustManifest => ChecksumPolicy::TrustManifest,
+      ChecksumPolicyArg::Audit => ChecksumPolicy::Audit,
+    }
+  }
+}
+
+/// Connection-level S3 flags shared by `searchlite sync` and
+/// `--index s3://...` on read-side subcommands. Mirrors the
+/// equivalents on the `aws s3` CLI: endpoint URL, region, path-style
+/// addressing, and conditional-PUT support. Credentials always come
+/// from the standard AWS chain (env vars, shared credentials file,
+/// IAM roles) so secrets never appear in `ps` or shell history.
+#[cfg(feature = "s3")]
+#[derive(Args, Debug, Clone, Default)]
+struct S3ConnectionArgs {
+  /// S3-compatible endpoint URL. Set this for Cloudflare R2
+  /// (`https://<account>.r2.cloudflarestorage.com`) or MinIO /
+  /// LocalStack (`http://localhost:9000`). Leave unset to target AWS
+  /// S3 directly.
+  #[arg(long = "s3-endpoint", env = "SEARCHLITE_S3_ENDPOINT")]
+  endpoint: Option<String>,
+
+  /// AWS region (e.g. `us-east-1`). Required by SigV4 even for R2
+  /// (use `auto`) and MinIO. Defaults to the standard `AWS_REGION` /
+  /// `AWS_DEFAULT_REGION` env vars; falls back to `us-east-1` if
+  /// neither is set.
+  #[arg(long = "s3-region", env = "AWS_REGION")]
+  region: Option<String>,
+
+  /// Use path-style addressing (`https://endpoint/bucket/key`)
+  /// instead of virtual-hosted-style (`https://bucket.endpoint/key`).
+  /// Required for MinIO / LocalStack / wiremock.
+  #[arg(long = "s3-force-path-style")]
+  force_path_style: bool,
+
+  /// Enable conditional PUTs (`If-Match` / `If-None-Match`).
+  /// Defaults to `true` on AWS S3 and MinIO, and to `false` on
+  /// Cloudflare R2 (auto-detected from the endpoint hostname pattern
+  /// `*.r2.cloudflarestorage.com`). Pass `--s3-conditional-put true`
+  /// to opt in once you've confirmed your R2 account/bucket supports
+  /// them.
+  #[arg(long = "s3-conditional-put")]
+  conditional_put: Option<bool>,
+}
+
+#[cfg(feature = "s3")]
+impl S3ConnectionArgs {
+  /// Compose this flag bundle with a parsed [`searchlite_s3::S3Url`]
+  /// into a full [`searchlite_s3::S3Config`] ready for
+  /// [`searchlite_s3::S3BlobStore::new`].
+  fn into_config(self, url: &searchlite_s3::S3Url) -> searchlite_s3::S3Config {
+    let region = self
+      .region
+      .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+      .filter(|r| !r.trim().is_empty())
+      .unwrap_or_else(|| "us-east-1".to_string());
+    let endpoint_url = self.endpoint.filter(|e| !e.trim().is_empty());
+    let is_r2 = endpoint_url
+      .as_deref()
+      .map(searchlite_s3::is_r2_endpoint)
+      .unwrap_or(false);
+    let conditional_put = self.conditional_put.unwrap_or(!is_r2);
+    searchlite_s3::S3Config {
+      endpoint_url,
+      region,
+      bucket: url.bucket.clone(),
+      prefix: url.prefix.clone(),
+      credentials: searchlite_s3::S3Credentials::LoadFromEnv,
+      conditional_put,
+      force_path_style: self.force_path_style,
+    }
+  }
+}
 
 #[derive(Parser)]
 #[command(name = "searchlite", version, about = "Embedded search engine CLI")]
@@ -34,7 +183,8 @@ struct Cli {
 enum Commands {
   /// Initialize a new index with a schema
   Init {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     schema: PathBuf,
     /// Optional write key required for all future writes
     #[arg(long = "write-key")]
@@ -42,34 +192,40 @@ enum Commands {
   },
   /// Add documents from a JSONL file
   Add {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     doc: PathBuf,
     #[arg(long = "write-key")]
     write_key: Option<String>,
   },
   /// Update (upsert) documents from a JSONL file
   Update {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     doc: PathBuf,
     #[arg(long = "write-key")]
     write_key: Option<String>,
   },
   /// Delete documents by id (newline-delimited list)
   Delete {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     ids: PathBuf,
     #[arg(long = "write-key")]
     write_key: Option<String>,
   },
   /// Commit pending documents
   Commit {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     #[arg(long = "write-key")]
     write_key: Option<String>,
   },
-  /// Execute a search query
+  /// Execute a search query. Pass either a local path or an
+  /// `s3://bucket/prefix` URL as `<INDEX>`.
   Search {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     #[arg(short = 'q', long = "query")]
     query: Option<String>,
     #[arg(long, default_value_t = 10)]
@@ -118,20 +274,77 @@ enum Commands {
     /// Aggregations JSON file path
     #[arg(long)]
     aggs_file: Option<PathBuf>,
+    /// Checksum verification policy applied at index open. Defaults
+    /// to `strict`. Cloud serving (`s3://...`) typically benefits
+    /// from `trust-manifest` to skip whole-file SHA-256 re-reads on
+    /// every `Index::reader()`.
+    #[arg(long = "checksum-policy", value_enum, default_value_t = ChecksumPolicyArg::default())]
+    checksum_policy: ChecksumPolicyArg,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3ConnectionArgs,
   },
   /// Start the HTTP server for one or more indexes (NAME:PATH mounts)
   Http {
     #[command(flatten)]
     args: HttpServeArgs,
   },
-  /// Inspect manifest and segments
-  Inspect { index: PathBuf },
+  /// Inspect manifest and segments. Accepts either a local path or
+  /// an `s3://bucket/prefix` URL as `<INDEX>`.
+  Inspect {
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
+    #[arg(long = "checksum-policy", value_enum, default_value_t = ChecksumPolicyArg::default())]
+    checksum_policy: ChecksumPolicyArg,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3ConnectionArgs,
+  },
   /// Compact segments
   Compact {
-    index: PathBuf,
+    #[arg(value_parser = IndexLocator::parse)]
+    index: IndexLocator,
     #[arg(long = "write-key")]
     write_key: Option<String>,
   },
+  /// Bake-and-publish a local index to an S3-compatible bucket.
+  ///
+  /// Mirrors the `aws s3 sync` shape: `<SOURCE>` is a local index
+  /// directory, `<DEST>` is an `s3://bucket/prefix` URL. Refuses
+  /// to publish a partially-baked index (pending manifest, non-empty
+  /// WAL, missing artifacts, legacy v1 manifests, non-canonical
+  /// keys) and uploads `MANIFEST.json` last as the visibility fence.
+  ///
+  /// AWS credentials come from the standard chain (env vars,
+  /// shared credentials file, IAM roles); R2 / MinIO users set
+  /// `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` and pass
+  /// `--s3-endpoint`.
+  #[cfg(feature = "s3")]
+  Sync {
+    /// Local index directory (created with `searchlite init` and
+    /// committed via `searchlite commit`).
+    source: PathBuf,
+    /// Destination URL (`s3://bucket[/prefix]`).
+    #[arg(value_parser = parse_s3_dest)]
+    dest: searchlite_s3::S3Url,
+    #[command(flatten)]
+    s3: S3ConnectionArgs,
+  },
+}
+
+/// `clap::value_parser` for the `<DEST>` arg of `searchlite sync`.
+/// Adds a friendlier error than [`searchlite_s3::parse_s3_url`]'s
+/// default if the user passes a local path by mistake.
+#[cfg(feature = "s3")]
+fn parse_s3_dest(s: &str) -> Result<searchlite_s3::S3Url, String> {
+  let trimmed = s.trim();
+  if !trimmed.to_ascii_lowercase().starts_with("s3://") {
+    return Err(format!(
+      "{trimmed:?} is not an s3:// URL. \
+       Usage: `searchlite sync <local-path> s3://<bucket>/<prefix>`."
+    ));
+  }
+  searchlite_s3::parse_s3_url(trimmed)
 }
 
 fn main() -> Result<()> {
@@ -142,23 +355,23 @@ fn main() -> Result<()> {
       index,
       schema,
       write_key,
-    } => cmd_init(index.as_path(), schema.as_path(), write_key.as_deref()),
+    } => cmd_init(&index, schema.as_path(), write_key.as_deref()),
     Commands::Add {
       index,
       doc,
       write_key,
-    } => cmd_add(index.as_path(), doc.as_path(), write_key.as_deref()),
+    } => cmd_add(&index, doc.as_path(), write_key.as_deref()),
     Commands::Update {
       index,
       doc,
       write_key,
-    } => cmd_add(index.as_path(), doc.as_path(), write_key.as_deref()),
+    } => cmd_add(&index, doc.as_path(), write_key.as_deref()),
     Commands::Delete {
       index,
       ids,
       write_key,
-    } => cmd_delete(index.as_path(), ids.as_path(), write_key.as_deref()),
-    Commands::Commit { index, write_key } => cmd_commit(index.as_path(), write_key.as_deref()),
+    } => cmd_delete(&index, ids.as_path(), write_key.as_deref()),
+    Commands::Commit { index, write_key } => cmd_commit(&index, write_key.as_deref()),
     Commands::Search {
       index,
       query,
@@ -187,6 +400,9 @@ fn main() -> Result<()> {
       vector_candidates,
       aggs,
       aggs_file,
+      checksum_policy,
+      #[cfg(feature = "s3")]
+      s3,
     } => {
       let request = if let Some(req) = read_request(request, request_stdin)? {
         req
@@ -218,7 +434,12 @@ fn main() -> Result<()> {
           aggs_file,
         })?
       };
-      cmd_search(index, request)
+      let read_args = ReadOpenArgs {
+        checksum_policy,
+        #[cfg(feature = "s3")]
+        s3,
+      };
+      cmd_search(index, read_args, request)
     }
     Commands::Http { args } => {
       init_http_tracing();
@@ -229,9 +450,31 @@ fn main() -> Result<()> {
       }
       Ok(())
     }
-    Commands::Inspect { index } => cmd_inspect(index.as_path()),
-    Commands::Compact { index, write_key } => cmd_compact(index.as_path(), write_key.as_deref()),
+    Commands::Inspect {
+      index,
+      checksum_policy,
+      #[cfg(feature = "s3")]
+      s3,
+    } => cmd_inspect(
+      index,
+      ReadOpenArgs {
+        checksum_policy,
+        #[cfg(feature = "s3")]
+        s3,
+      },
+    ),
+    Commands::Compact { index, write_key } => cmd_compact(&index, write_key.as_deref()),
+    #[cfg(feature = "s3")]
+    Commands::Sync { source, dest, s3 } => cmd_sync(source.as_path(), dest, s3),
   }
+}
+
+/// Bundle of open-time arguments shared between read-side
+/// subcommands. Cleaner than threading every flag individually.
+struct ReadOpenArgs {
+  checksum_policy: ChecksumPolicyArg,
+  #[cfg(feature = "s3")]
+  s3: S3ConnectionArgs,
 }
 
 fn options(path: &Path, create_if_missing: bool) -> IndexOptions {
@@ -242,6 +485,9 @@ fn options(path: &Path, create_if_missing: bool) -> IndexOptions {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   }
@@ -274,7 +520,8 @@ struct SearchCliArgs {
   aggs_file: Option<PathBuf>,
 }
 
-fn cmd_init(index: &Path, schema_path: &Path, write_key: Option<&str>) -> Result<()> {
+fn cmd_init(index: &IndexLocator, schema_path: &Path, write_key: Option<&str>) -> Result<()> {
+  let index = index.require_local()?;
   let opts = options(index, true);
   let schema_str = fs::read_to_string(schema_path)?;
   let schema: searchlite_core::api::types::Schema = serde_json::from_str(&schema_str)?;
@@ -283,7 +530,8 @@ fn cmd_init(index: &Path, schema_path: &Path, write_key: Option<&str>) -> Result
   Ok(())
 }
 
-fn cmd_add(index: &Path, doc_path: &Path, write_key: Option<&str>) -> Result<()> {
+fn cmd_add(index: &IndexLocator, doc_path: &Path, write_key: Option<&str>) -> Result<()> {
+  let index = index.require_local()?;
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
@@ -312,7 +560,8 @@ fn cmd_add(index: &Path, doc_path: &Path, write_key: Option<&str>) -> Result<()>
   Ok(())
 }
 
-fn cmd_delete(index: &Path, ids_path: &Path, write_key: Option<&str>) -> Result<()> {
+fn cmd_delete(index: &IndexLocator, ids_path: &Path, write_key: Option<&str>) -> Result<()> {
+  let index = index.require_local()?;
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
@@ -346,7 +595,8 @@ fn cmd_delete(index: &Path, ids_path: &Path, write_key: Option<&str>) -> Result<
   Ok(())
 }
 
-fn cmd_commit(index: &Path, write_key: Option<&str>) -> Result<()> {
+fn cmd_commit(index: &IndexLocator, write_key: Option<&str>) -> Result<()> {
+  let index = index.require_local()?;
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   let mut writer = idx.writer_with_key(write_key)?;
@@ -355,13 +605,43 @@ fn cmd_commit(index: &Path, write_key: Option<&str>) -> Result<()> {
   Ok(())
 }
 
-fn cmd_search(index: PathBuf, request: SearchRequest) -> Result<()> {
-  let opts = options(index.as_path(), false);
-  let idx = Index::open(opts)?;
+fn cmd_search(index: IndexLocator, args: ReadOpenArgs, request: SearchRequest) -> Result<()> {
+  let idx = open_index_for_read(index, args)?;
   let reader = idx.reader()?;
   let result = reader.search(&request)?;
   println!("{}", serde_json::to_string_pretty(&result)?);
   Ok(())
+}
+
+/// Open an index for read-side commands (`search`, `inspect`).
+/// Local paths go through `Index::open` with the requested checksum
+/// policy threaded through; `s3://...` URLs route to
+/// `searchlite_s3::open_index_read_only_with_options`, which is
+/// async — we drive it on a fresh tokio runtime that's dropped after
+/// the index is constructed (subsequent BlobStore calls go through
+/// the global runtime that `searchlite_core::runtime::block_on_blob`
+/// owns under the `tokio-runtime` feature).
+fn open_index_for_read(loc: IndexLocator, args: ReadOpenArgs) -> Result<Index> {
+  let policy: ChecksumPolicy = args.checksum_policy.into();
+  match loc {
+    IndexLocator::Local(path) => {
+      let mut opts = options(path.as_path(), false);
+      opts.checksum_policy = policy;
+      Index::open(opts)
+    }
+    #[cfg(feature = "s3")]
+    IndexLocator::S3(url) => {
+      let s3_config = args.s3.into_config(&url);
+      let opts = IndexOptions {
+        checksum_policy: policy,
+        ..Default::default()
+      };
+      let rt = Runtime::new()?;
+      rt.block_on(searchlite_s3::open_index_read_only_with_options(
+        s3_config, opts,
+      ))
+    }
+  }
 }
 
 fn build_search_request_from_cli(args: SearchCliArgs) -> Result<SearchRequest> {
@@ -587,19 +867,43 @@ fn build_vector_query(
   Ok(None)
 }
 
-fn cmd_inspect(index: &Path) -> Result<()> {
-  let opts = options(index, false);
-  let idx = Index::open(opts)?;
+fn cmd_inspect(index: IndexLocator, args: ReadOpenArgs) -> Result<()> {
+  let idx = open_index_for_read(index, args)?;
   let manifest = idx.manifest();
   println!("manifest: {}", serde_json::to_string_pretty(&manifest)?);
   Ok(())
 }
 
-fn cmd_compact(index: &Path, write_key: Option<&str>) -> Result<()> {
+fn cmd_compact(index: &IndexLocator, write_key: Option<&str>) -> Result<()> {
+  let index = index.require_local()?;
   let opts = options(index, false);
   let idx = Index::open(opts)?;
   idx.compact_with_key(write_key)?;
   println!("compaction complete");
+  Ok(())
+}
+
+#[cfg(feature = "s3")]
+fn cmd_sync(source: &Path, dest: searchlite_s3::S3Url, s3_flags: S3ConnectionArgs) -> Result<()> {
+  if !source.is_dir() {
+    bail!(
+      "sync: <SOURCE> must be a local index directory, got {source:?} \
+       (which is not a directory)"
+    );
+  }
+  let s3_config = s3_flags.into_config(&dest);
+  let rt = Runtime::new()?;
+  let report = rt
+    .block_on(searchlite_s3::sync_to_s3(source, s3_config))
+    .with_context(|| format!("syncing {source:?} → s3://{}/", dest.bucket))?;
+  let prefix = dest.prefix.as_deref().unwrap_or("");
+  let separator = if prefix.is_empty() { "" } else { "/" };
+  println!(
+    "synced {files} files / {bytes} bytes to s3://{bucket}{separator}{prefix}",
+    files = report.files,
+    bytes = report.bytes,
+    bucket = dest.bucket,
+  );
   Ok(())
 }
 
@@ -608,6 +912,24 @@ mod tests {
   use super::*;
   use tempfile::tempdir;
 
+  /// Construct a local-path [`IndexLocator`] for tests. The full
+  /// enum has an `s3://` variant under the `s3` feature, but every
+  /// existing test exercises the local-FS path.
+  fn local(p: &Path) -> IndexLocator {
+    IndexLocator::Local(p.to_path_buf())
+  }
+
+  /// Default open-time read args (Strict policy, default S3 flags
+  /// when the feature is on). Tests that only exercise local indexes
+  /// don't need to vary these.
+  fn read_args() -> ReadOpenArgs {
+    ReadOpenArgs {
+      checksum_policy: ChecksumPolicyArg::Strict,
+      #[cfg(feature = "s3")]
+      s3: S3ConnectionArgs::default(),
+    }
+  }
+
   #[test]
   fn runs_cli_commands_end_to_end() {
     let dir = tempdir().unwrap();
@@ -615,7 +937,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -623,8 +945,8 @@ mod tests {
       "{\"_id\":\"1\",\"body\":\"Rust search\"}\n{\"_id\":\"2\",\"body\":\"Another document\"}\n",
     )
     .unwrap();
-    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
-    cmd_commit(index.as_path(), None).unwrap();
+    cmd_add(&local(index.as_path()), docs_path.as_path(), None).unwrap();
+    cmd_commit(&local(index.as_path()), None).unwrap();
     let request = build_search_request_from_cli(SearchCliArgs {
       query: Some("rust".into()),
       limit: 5,
@@ -652,9 +974,9 @@ mod tests {
       aggs_file: None,
     })
     .unwrap();
-    cmd_search(index.clone(), request).unwrap();
-    cmd_inspect(index.as_path()).unwrap();
-    cmd_compact(index.as_path(), None).unwrap();
+    cmd_search(local(index.as_path()), read_args(), request).unwrap();
+    cmd_inspect(local(index.as_path()), read_args()).unwrap();
+    cmd_compact(&local(index.as_path()), None).unwrap();
   }
 
   #[test]
@@ -664,12 +986,12 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(&docs_path, "{\"_id\":\"1\",\"body\":\"Rust search\"}\n").unwrap();
-    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
-    cmd_commit(index.as_path(), None).unwrap();
+    cmd_add(&local(index.as_path()), docs_path.as_path(), None).unwrap();
+    cmd_commit(&local(index.as_path()), None).unwrap();
 
     let request = SearchRequest {
       query: "rust".into(),
@@ -707,7 +1029,7 @@ mod tests {
     fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
 
     let parsed = read_request(Some(request_path), false).unwrap().unwrap();
-    cmd_search(index.clone(), parsed).unwrap();
+    cmd_search(local(index.as_path()), read_args(), parsed).unwrap();
   }
 
   #[test]
@@ -745,7 +1067,7 @@ mod tests {
       explain: false,
       profile: false,
     };
-    let err = cmd_search(index, request).unwrap_err();
+    let err = cmd_search(local(index.as_path()), read_args(), request).unwrap_err();
     assert!(
       err.to_string().contains("index does not exist"),
       "unexpected error: {err}"
@@ -762,7 +1084,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     let mut contents = String::new();
@@ -774,8 +1096,8 @@ mod tests {
     contents.push_str("\r\n");
     fs::write(&docs_path, contents).unwrap();
 
-    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
-    cmd_commit(index.as_path(), None).unwrap();
+    cmd_add(&local(index.as_path()), docs_path.as_path(), None).unwrap();
+    cmd_commit(&local(index.as_path()), None).unwrap();
 
     let opts = options(index.as_path(), false);
     let idx = Index::open(opts).unwrap();
@@ -829,7 +1151,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -840,7 +1162,7 @@ mod tests {
     )
     .unwrap();
 
-    let err = cmd_add(index.as_path(), docs_path.as_path(), None).unwrap_err();
+    let err = cmd_add(&local(index.as_path()), docs_path.as_path(), None).unwrap_err();
     let chain: String = err
       .chain()
       .map(|e| e.to_string())
@@ -861,13 +1183,13 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let ids_path = dir.path().join("ids.txt");
     // Second ID contains a NUL byte, which validate_doc_id rejects.
     fs::write(&ids_path, "good-id\nbad\0id\n").unwrap();
 
-    let err = cmd_delete(index.as_path(), ids_path.as_path(), None).unwrap_err();
+    let err = cmd_delete(&local(index.as_path()), ids_path.as_path(), None).unwrap_err();
     assert!(
       err.to_string().contains("invalid id on line 2"),
       "expected per-line error referencing line 2, got: {err}"
@@ -881,7 +1203,7 @@ mod tests {
     let schema_path = dir.path().join("schema.json");
     let schema = searchlite_core::api::types::Schema::default_text_body();
     fs::write(&schema_path, serde_json::to_string(&schema).unwrap()).unwrap();
-    cmd_init(index.as_path(), schema_path.as_path(), None).unwrap();
+    cmd_init(&local(index.as_path()), schema_path.as_path(), None).unwrap();
 
     let docs_path = dir.path().join("docs.jsonl");
     fs::write(
@@ -889,13 +1211,13 @@ mod tests {
       "{\"_id\":\"  padded-id  \",\"body\":\"spaced\"}\n",
     )
     .unwrap();
-    cmd_add(index.as_path(), docs_path.as_path(), None).unwrap();
-    cmd_commit(index.as_path(), None).unwrap();
+    cmd_add(&local(index.as_path()), docs_path.as_path(), None).unwrap();
+    cmd_commit(&local(index.as_path()), None).unwrap();
 
     let ids_path = dir.path().join("ids.txt");
     fs::write(&ids_path, "  padded-id  \n").unwrap();
-    cmd_delete(index.as_path(), ids_path.as_path(), None).unwrap();
-    cmd_commit(index.as_path(), None).unwrap();
+    cmd_delete(&local(index.as_path()), ids_path.as_path(), None).unwrap();
+    cmd_commit(&local(index.as_path()), None).unwrap();
 
     let opts = options(index.as_path(), false);
     let idx = Index::open(opts).unwrap();

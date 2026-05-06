@@ -13,23 +13,22 @@ pub fn wal_path(root: &Path) -> PathBuf {
   root.join("wal.log")
 }
 
-pub fn segment_paths(root: &Path, id: &str) -> SegmentPaths {
+/// Stage 9a: emit **relative-to-root keys** rather than absolute
+/// paths. Each field is a per-file (or per-directory, for vectors)
+/// key under the index root. Resolution against an actual filesystem
+/// root happens at every read/write call site via
+/// [`SegmentPaths::resolve`]. The `_root` parameter is preserved for
+/// API stability but is no longer dereferenced here — keys never
+/// embed the root, which is what makes manifests portable.
+pub fn segment_paths(_root: &Path, id: &str) -> SegmentPaths {
   SegmentPaths {
-    terms: root
-      .join(format!("seg_{id}.terms"))
-      .to_string_lossy()
-      .into(),
-    postings: root.join(format!("seg_{id}.post")).to_string_lossy().into(),
-    docstore: root.join(format!("seg_{id}.docs")).to_string_lossy().into(),
-    fast: root.join(format!("seg_{id}.fast")).to_string_lossy().into(),
-    meta: root.join(format!("seg_{id}.meta")).to_string_lossy().into(),
+    terms: format!("seg_{id}.terms"),
+    postings: format!("seg_{id}.post"),
+    docstore: format!("seg_{id}.docs"),
+    fast: format!("seg_{id}.fast"),
+    meta: format!("seg_{id}.meta"),
     #[cfg(feature = "vectors")]
-    vector_dir: Some(
-      root
-        .join(format!("seg_{id}_vectors"))
-        .to_string_lossy()
-        .into(),
-    ),
+    vector_dir: Some(format!("seg_{id}_vectors")),
   }
 }
 
@@ -49,18 +48,26 @@ mod tests {
   use tempfile::tempdir;
 
   #[test]
-  fn builds_paths_under_root() {
-    let dir = tempdir().unwrap();
-    let storage = crate::storage::FsStorage::new(dir.path().to_path_buf());
-    ensure_root(&storage, dir.path()).unwrap();
-    let paths = segment_paths(dir.path(), "abc");
-    assert!(paths.terms.ends_with("seg_abc.terms"));
-    assert!(paths.postings.ends_with("seg_abc.post"));
-    assert_eq!(wal_path(dir.path()), dir.path().join("wal.log"));
+  fn builds_relative_keys_independent_of_root() {
+    // Stage 9a: keys must NOT embed the root. Two different roots
+    // produce identical key strings — this is the property that makes
+    // manifests relocatable.
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let storage_a = crate::storage::FsStorage::new(dir_a.path().to_path_buf());
+    ensure_root(&storage_a, dir_a.path()).unwrap();
+    let paths_a = segment_paths(dir_a.path(), "abc");
+    let paths_b = segment_paths(dir_b.path(), "abc");
+    assert_eq!(paths_a.terms, "seg_abc.terms");
+    assert_eq!(paths_a.postings, "seg_abc.post");
+    assert_eq!(paths_a.terms, paths_b.terms);
+    assert_eq!(paths_a.postings, paths_b.postings);
+    assert_eq!(wal_path(dir_a.path()), dir_a.path().join("wal.log"));
+    paths_a.validate_v2_relative().unwrap();
     #[cfg(feature = "vectors")]
     {
-      let vector_dir = paths.vector_dir.as_deref().expect("vector dir set");
-      assert!(vector_dir.ends_with("seg_abc_vectors"));
+      let vector_dir = paths_a.vector_dir.as_deref().expect("vector dir set");
+      assert_eq!(vector_dir, "seg_abc_vectors");
     }
   }
 }

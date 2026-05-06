@@ -1,11 +1,10 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 #[cfg(feature = "vectors")]
 use bincode::Options;
@@ -15,23 +14,23 @@ use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::types::Document;
 #[cfg(feature = "vectors")]
 use crate::api::types::VectorMetric as ApiVectorMetric;
+use crate::api::types::{ChecksumAuditFailureHook, ChecksumPolicy, Document, IndexOptions};
 use crate::index::directory;
-use crate::index::docstore::{DocStoreReader, DocStoreWriter};
+use crate::index::docstore::{decode_docstore_record, DocStoreWriter, MAX_DOCSTORE_BYTES};
 use crate::index::fastfields::{
   doc_length_key, nested_count_key, nested_parent_key, FastFieldsReader, FastFieldsWriter,
   FastValue,
 };
 use crate::index::manifest::{
-  FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta, SegmentPaths,
+  FieldKind, NestedField, NestedProperty, ResolvedField, Schema, SegmentMeta,
 };
 use crate::index::postings::{read_doc_freq, InvertedIndexBuilder, PostingsReader, PostingsWriter};
 use crate::index::terms::{read_terms, write_terms};
-use crate::storage::{Storage, StorageFile};
+use crate::storage::Storage;
+use crate::storage::{BlobStore, Object as BlobObject, StorageAsBlobStore};
 use crate::util::case_fold::fold_keyword;
-use crate::util::checksum::checksum;
 #[cfg(feature = "vectors")]
 use crate::vectors::hnsw::HnswParams;
 #[cfg(feature = "vectors")]
@@ -645,7 +644,15 @@ impl<'a> SegmentWriter<'a> {
     I: IntoIterator<Item = Result<Cow<'doc, Document>>>,
   {
     let id = Uuid::new_v4().simple().to_string();
+    // Stage 9a: `paths` carries relative-to-root keys for the manifest;
+    // `resolved_paths` is the per-call absolute path bundle for actual
+    // file I/O. The `Storage` trait expects absolute paths (FsStorage
+    // doesn't auto-resolve), so we resolve here once and use
+    // `resolved_paths.X` below. (Named `resolved_paths` rather than
+    // `resolved` to avoid shadowing the schema-resolved-fields map a
+    // few lines down.)
     let paths = directory::segment_paths(self.root, &id);
+    let resolved_paths = paths.resolve(self.root);
     let analyzers = self.schema.build_analyzers()?;
 
     let mut postings_builder = InvertedIndexBuilder::new();
@@ -668,7 +675,7 @@ impl<'a> SegmentWriter<'a> {
       .map(|f| (f.path.as_str(), (f.numeric_i64.unwrap_or(false), f.fast)))
       .collect();
 
-    let mut docstore_file = self.storage.open_write(Path::new(&paths.docstore))?;
+    let mut docstore_file = self.storage.open_write(&resolved_paths.docstore)?;
     let mut doc_writer = DocStoreWriter::new(&mut *docstore_file, self.use_zstd);
 
     #[cfg(feature = "vectors")]
@@ -874,7 +881,7 @@ impl<'a> SegmentWriter<'a> {
     docstore_file.sync_all()?;
     drop(docstore_file);
 
-    let mut postings_file = self.storage.open_write(Path::new(&paths.postings))?;
+    let mut postings_file = self.storage.open_write(&resolved_paths.postings)?;
     let mut postings_writer = PostingsWriter::new(&mut *postings_file, self.enable_positions);
     let mut term_offsets = Vec::new();
     for (term, postings) in postings_builder.into_terms() {
@@ -883,24 +890,20 @@ impl<'a> SegmentWriter<'a> {
     }
     postings_file.sync_all()?;
 
-    write_terms(
-      self.storage.as_ref(),
-      Path::new(&paths.terms),
-      &term_offsets,
-    )?;
+    write_terms(self.storage.as_ref(), &resolved_paths.terms, &term_offsets)?;
 
     let total_docs = doc_ids.len();
     let avg_field_lengths = compute_avg_lengths(&total_doc_lengths, total_docs as u64);
 
-    fast_writer.write_to(self.storage.as_ref(), Path::new(&paths.fast))?;
+    fast_writer.write_to(self.storage.as_ref(), &resolved_paths.fast)?;
 
     #[cfg(feature = "vectors")]
     let mut vector_meta: HashMap<String, VectorFieldMeta> = HashMap::new();
     #[cfg(feature = "vectors")]
     {
       if !self.schema.vector_fields.is_empty() {
-        if let Some(dir) = paths.vector_dir.as_deref() {
-          self.storage.ensure_dir(Path::new(dir))?;
+        if let Some(dir) = resolved_paths.vector_dir.as_deref() {
+          self.storage.ensure_dir(dir)?;
         }
       }
       for vf in self.schema.vector_fields.iter() {
@@ -911,7 +914,7 @@ impl<'a> SegmentWriter<'a> {
           bail!("vector field {} missing values", vf.name);
         }
         let (store, present) = build_vector_store(vf, &field_vectors)?;
-        let (vec_path, hnsw_path) = vector_paths(&paths, &vf.name)?;
+        let (vec_path, hnsw_path) = vector_paths(&resolved_paths, &vf.name)?;
         write_vector_file(self.storage.as_ref(), &vec_path, &store)?;
         let params = vf.hnsw.unwrap_or_default();
         let store_arc = Arc::new(store);
@@ -952,23 +955,22 @@ impl<'a> SegmentWriter<'a> {
         .as_ref()
         .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
     };
-    write_segment_meta(
-      self.storage.as_ref(),
-      Path::new(&paths.meta),
-      &seg_file_meta,
-    )?;
+    write_segment_meta(self.storage.as_ref(), &resolved_paths.meta, &seg_file_meta)?;
 
+    // Stage 9b: compute CRC32 + SHA-256 in one pass per file. Vector
+    // artifacts are added below from buffers we already have in
+    // memory (or read once and add via `record_blob`).
     #[cfg(feature = "vectors")]
-    let mut checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    let mut integrity = collect_segment_integrity(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(not(feature = "vectors"))]
-    let checksums = collect_checksums(self.storage.as_ref(), &paths)?;
+    let integrity = collect_segment_integrity(self.storage.as_ref(), &resolved_paths)?;
     #[cfg(feature = "vectors")]
     for (field, _meta) in vector_meta.iter() {
-      let (vec_path, hnsw_path) = vector_paths(&paths, field)?;
+      let (vec_path, hnsw_path) = vector_paths(&resolved_paths, field)?;
       let vec_buf = self.storage.read_to_end(&vec_path)?;
       let hnsw_buf = self.storage.read_to_end(&hnsw_path)?;
-      checksums.insert(format!("vector_{field}_bin"), checksum(&vec_buf));
-      checksums.insert(format!("vector_{field}_hnsw"), checksum(&hnsw_buf));
+      integrity.record_blob(&format!("vector_{field}_bin"), &vec_buf);
+      integrity.record_blob(&format!("vector_{field}_hnsw"), &hnsw_buf);
     }
 
     let meta = SegmentMeta {
@@ -980,7 +982,7 @@ impl<'a> SegmentWriter<'a> {
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths,
-      checksums,
+      content_hashes: integrity.content_hashes,
       write_binding_b64: self
         .write_binding
         .as_ref()
@@ -1020,14 +1022,13 @@ const VECTOR_FILE_VERSION: u32 = 1;
 
 #[cfg(feature = "vectors")]
 fn vector_paths(
-  paths: &SegmentPaths,
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
   field: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-  let dir = paths
+  let base = resolved
     .vector_dir
     .as_deref()
     .ok_or_else(|| anyhow!("segment missing vector directory path"))?;
-  let base = Path::new(dir);
   Ok((
     base.join(format!("{field}.bin")),
     base.join(format!("{field}.hnsw")),
@@ -1193,97 +1194,183 @@ fn read_vector_file(
   Ok(VectorStore::new(dim, metric, offsets, values))
 }
 
-fn collect_checksums(storage: &dyn Storage, paths: &SegmentPaths) -> Result<HashMap<String, u32>> {
-  let mut map = HashMap::new();
-  for (name, path_str) in [
-    ("terms", &paths.terms),
-    ("postings", &paths.postings),
-    ("docstore", &paths.docstore),
-    ("fast", &paths.fast),
-    ("meta", &paths.meta),
-  ] {
-    let buf = storage.read_to_end(Path::new(path_str))?;
-    map.insert(name.to_string(), checksum(&buf));
-  }
-  Ok(map)
+/// Stage 9b/9c: bundle of integrity records computed for a segment at
+/// write time. Stage 9c collapsed this to SHA-256-only after dropping
+/// the legacy CRC32 path; the wrapper struct stays so that vector
+/// artifacts can be appended to the same builder via
+/// [`SegmentIntegrity::record_blob`] without threading a bare map
+/// through the code base.
+#[derive(Debug, Default)]
+pub(crate) struct SegmentIntegrity {
+  pub content_hashes: std::collections::BTreeMap<String, String>,
 }
 
+/// Compute SHA-256 over each non-vector segment artifact in one read
+/// pass per file. Vector artifacts are added separately via
+/// [`SegmentIntegrity::record_blob`] in the vectors-feature block.
+///
+/// Stage 9a: takes a [`ResolvedSegmentPaths`] (per-call resolution
+/// against the index root) so this works regardless of whether the
+/// manifest's `SegmentPaths` are v1 absolute or v2 relative keys.
+fn collect_segment_integrity(
+  storage: &dyn Storage,
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
+) -> Result<SegmentIntegrity> {
+  let mut integ = SegmentIntegrity::default();
+  for (name, p) in [
+    ("terms", &resolved.terms),
+    ("postings", &resolved.postings),
+    ("docstore", &resolved.docstore),
+    ("fast", &resolved.fast),
+    ("meta", &resolved.meta),
+  ] {
+    let buf = storage.read_to_end(p)?;
+    integ.record_blob(name, &buf);
+  }
+  Ok(integ)
+}
+
+impl SegmentIntegrity {
+  /// Record SHA-256 for a buffer under the given artifact name (e.g.
+  /// `terms`, `vector_v_bin`).
+  pub(crate) fn record_blob(&mut self, name: &str, buf: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(buf);
+    self
+      .content_hashes
+      .insert(name.to_string(), hex_lower(&digest));
+  }
+}
+
+/// Lowercase hex encoding, no allocations on the dependency graph.
+/// (`hex` crate would be one more dep for one function.)
+fn hex_lower(bytes: &[u8]) -> String {
+  const TABLE: &[u8; 16] = b"0123456789abcdef";
+  let mut out = String::with_capacity(bytes.len() * 2);
+  for b in bytes {
+    out.push(TABLE[(b >> 4) as usize] as char);
+    out.push(TABLE[(b & 0x0f) as usize] as char);
+  }
+  out
+}
+
+/// Stage 9b/9c: verify on-disk segment artifacts against the
+/// manifest's recorded SHA-256 hashes.
+///
+/// `meta.content_hashes` MUST be non-empty and MUST contain every
+/// expected artifact (`meta`, `terms`, `postings`, `docstore`, `fast`,
+/// plus `vector_{field}_bin` and `vector_{field}_hnsw` per vector
+/// field). Stage 9b writers always populate every entry, so:
+///
+/// * an empty map means a pre-Stage-9b legacy manifest — Stage 9c
+///   removed the CRC32 fallback, so such indexes must be rebuilt;
+/// * a non-empty map missing any expected entry means tampering.
+///
+/// Both surfaces fail the open with a clean explanation rather than
+/// silently skipping verification.
 fn verify_checksums(
   storage: &dyn Storage,
   meta: &SegmentMeta,
   _seg_meta: &SegmentFileMeta,
   seg_meta_bytes: &[u8],
+  resolved: &crate::index::manifest::ResolvedSegmentPaths,
 ) -> Result<()> {
-  let verify = |label: &str, path: &Path, expected: Option<&u32>, data: Option<&[u8]>| {
-    if let Some(expected) = expected {
-      let actual = if let Some(bytes) = data {
-        checksum(bytes)
-      } else {
-        checksum(&storage.read_to_end(path)?)
-      };
-      if actual != *expected {
-        bail!(
-          "segment {} failed checksum for {} (expected {}, found {})",
-          meta.id,
-          label,
-          expected,
-          actual
-        );
-      }
-    }
-    Ok(())
-  };
-  verify(
-    "meta",
-    Path::new(&meta.paths.meta),
-    meta.checksums.get("meta"),
-    Some(seg_meta_bytes),
-  )?;
-  verify(
-    "terms",
-    Path::new(&meta.paths.terms),
-    meta.checksums.get("terms"),
-    None,
-  )?;
-  verify(
-    "postings",
-    Path::new(&meta.paths.postings),
-    meta.checksums.get("postings"),
-    None,
-  )?;
-  verify(
-    "docstore",
-    Path::new(&meta.paths.docstore),
-    meta.checksums.get("docstore"),
-    None,
-  )?;
-  verify(
-    "fast fields",
-    Path::new(&meta.paths.fast),
-    meta.checksums.get("fast"),
-    None,
-  )?;
+  use sha2::{Digest, Sha256};
+
+  // Build the set of expected artifact names for this segment shape.
+  // Vector fields contribute two artifacts each (`*_bin` + `*_hnsw`).
+  // `mut` only used under `--features vectors` to push vector
+  // artifact names; allow the warning on the no-vectors build.
+  #[allow(unused_mut)]
+  let mut expected: Vec<String> = vec![
+    "meta".into(),
+    "terms".into(),
+    "postings".into(),
+    "docstore".into(),
+    "fast".into(),
+  ];
   #[cfg(feature = "vectors")]
   {
     let seg_meta = _seg_meta;
-    if let Some(dir) = meta.paths.vector_dir.as_deref() {
-      if !dir.is_empty() {
-        for field in seg_meta.vector_fields.keys() {
-          let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
-          verify(
-            &format!("vector {field} bin"),
-            &vec_path,
-            meta.checksums.get(&format!("vector_{field}_bin")),
-            None,
-          )?;
-          verify(
-            &format!("vector {field} hnsw"),
-            &hnsw_path,
-            meta.checksums.get(&format!("vector_{field}_hnsw")),
-            None,
-          )?;
-        }
+    if resolved.vector_dir.is_some() {
+      for field in seg_meta.vector_fields.keys() {
+        expected.push(format!("vector_{field}_bin"));
+        expected.push(format!("vector_{field}_hnsw"));
       }
+    }
+  }
+  // Helper to read the artifact bytes once per name. The `meta`
+  // entry is special-cased: its bytes were already loaded by the
+  // caller, so we reuse them rather than re-reading.
+  let read_bytes = |name: &str| -> Result<Vec<u8>> {
+    let path: &Path = match name {
+      "meta" => &resolved.meta,
+      "terms" => &resolved.terms,
+      "postings" => &resolved.postings,
+      "docstore" => &resolved.docstore,
+      "fast" => &resolved.fast,
+      #[cfg(feature = "vectors")]
+      n if n.starts_with("vector_") && n.ends_with("_bin") => {
+        // Strip "vector_" prefix and "_bin" suffix to recover field name.
+        let field = &n["vector_".len()..n.len() - "_bin".len()];
+        let (vec_path, _) = vector_paths(resolved, field)?;
+        return storage.read_to_end(&vec_path);
+      }
+      #[cfg(feature = "vectors")]
+      n if n.starts_with("vector_") && n.ends_with("_hnsw") => {
+        let field = &n["vector_".len()..n.len() - "_hnsw".len()];
+        let (_, hnsw_path) = vector_paths(resolved, field)?;
+        return storage.read_to_end(&hnsw_path);
+      }
+      other => bail!("unknown segment artifact {other:?}"),
+    };
+    if name == "meta" {
+      return Ok(seg_meta_bytes.to_vec());
+    }
+    storage.read_to_end(path)
+  };
+
+  if meta.content_hashes.is_empty() {
+    bail!(
+      "segment {} has no SHA-256 content_hashes; manifest predates Stage 9b. \
+       The legacy CRC32 fallback was removed in Stage 9c — rebuild the index \
+       under current code to upgrade its integrity records.",
+      meta.id
+    );
+  }
+  // First assert completeness (Codex Stage 9b plan #2).
+  for name in &expected {
+    if !meta.content_hashes.contains_key(name) {
+      bail!(
+        "segment {} content_hashes is non-empty but missing artifact {name:?}; \
+         manifest is malformed or tampered",
+        meta.id
+      );
+    }
+  }
+  for (name, hash) in &meta.content_hashes {
+    // Validate the hash format up-front so we get a clean error
+    // rather than a cryptic compare-mismatch.
+    if hash.len() != 64
+      || !hash
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+      bail!(
+        "segment {} content_hashes[{name:?}] is not a 64-char lowercase hex string: {hash:?}",
+        meta.id
+      );
+    }
+    let bytes = read_bytes(name)?;
+    let actual = hex_lower(&Sha256::digest(&bytes));
+    if &actual != hash {
+      bail!(
+        "segment {} failed SHA-256 verification for {} (expected {}, found {})",
+        meta.id,
+        name,
+        hash,
+        actual
+      );
     }
   }
   Ok(())
@@ -1295,23 +1382,87 @@ struct VectorFieldReader {
   index: HnswIndex,
 }
 
-pub struct SegmentReader {
-  pub meta: SegmentMeta,
+/// Immutable, parsed-once segment data shared across `IndexReader` instances.
+///
+/// `SegmentCore` is the cacheable half of a segment: terms dictionary, fast
+/// fields, doc-id table, vectors, and segment-level metadata. Once a core is
+/// loaded for a given (segment_id, content fingerprint), it can be reused by
+/// any number of `SegmentReader` views without re-reading or re-parsing the
+/// underlying files. Per-manifest mutable state (`deleted_docs`), the
+/// resolved file paths (which may move under a future portable-manifest
+/// scheme), and per-view stateful file handles all live on `SegmentReader`,
+/// not here, so the core stays safe to share via `Arc` and survives manifest
+/// rewrites that don't change segment file content.
+pub struct SegmentCore {
+  seg_meta: SegmentFileMeta,
   terms: TinyTerms,
-  postings: RefCell<Box<dyn StorageFile>>,
-  docstore: RefCell<DocStoreReader<Box<dyn StorageFile>>>,
   doc_ids: Vec<Arc<str>>,
-  deleted: FastHashSet<DocId>,
   fast_fields: FastFieldsReader,
   keep_positions: bool,
-  seg_meta: SegmentFileMeta,
   #[cfg(feature = "vectors")]
   vectors: HashMap<String, VectorFieldReader>,
 }
 
-impl SegmentReader {
-  pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
-    let seg_meta_bytes = storage.read_to_end(Path::new(&meta.paths.meta))?;
+/// Bundle of per-load options threaded through `SegmentCore::load` and
+/// `SegmentCache::get_or_load`. Cheap to clone (one bool, one enum, one
+/// `Option<Arc<…>>`).
+#[derive(Clone)]
+pub struct SegmentLoadCtx {
+  pub keep_positions: bool,
+  pub checksum_policy: ChecksumPolicy,
+  pub audit_hook: Option<ChecksumAuditFailureHook>,
+}
+
+impl SegmentLoadCtx {
+  pub fn from_options(options: &IndexOptions) -> Self {
+    Self {
+      keep_positions: options.enable_positions,
+      checksum_policy: options.checksum_policy,
+      audit_hook: options.checksum_audit_failure_hook.clone(),
+    }
+  }
+
+  /// Strict-policy default with no audit hook. Used by the legacy
+  /// `SegmentReader::open(storage, meta, keep_positions)` convenience
+  /// constructor (which existing tests depend on) so callers that don't
+  /// care about checksum policy keep the strictest behavior.
+  fn strict(keep_positions: bool) -> Self {
+    Self {
+      keep_positions,
+      checksum_policy: ChecksumPolicy::Strict,
+      audit_hook: None,
+    }
+  }
+}
+
+impl SegmentCore {
+  /// Load a segment's immutable data from storage. Performs term-dict load,
+  /// fast-field parse, and vector load unconditionally; whole-file checksum
+  /// verification is gated by `ctx.checksum_policy`:
+  /// - `Strict`: verify all five segment files synchronously (existing
+  ///   behavior); fails the load on mismatch.
+  /// - `TrustManifest`: skip whole-file verification entirely. Postings and
+  ///   docstore are NOT read during load — they're opened lazily by
+  ///   per-view handles in `SegmentReader::from_core`.
+  /// - `Audit`: skip synchronous verification but dispatch a background
+  ///   task (via `rayon::spawn`) that re-runs `verify_checksums` and
+  ///   surfaces failures via `ctx.audit_hook` (or `log::error!` if none).
+  ///
+  /// The returned `Arc` does not retain `storage` — view-level handles in
+  /// `SegmentReader::from_core` are opened against the manifest-current
+  /// storage, so a later manifest that relocates files (Stage 9) can still
+  /// reuse this core without serving reads through stale paths.
+  pub fn load(
+    storage: Arc<dyn Storage>,
+    meta: &SegmentMeta,
+    ctx: &SegmentLoadCtx,
+  ) -> Result<Arc<Self>> {
+    // Stage 9a: resolve segment paths once, against the storage root,
+    // and use the resolved bundle everywhere below. This works for v1
+    // (absolute keys passed through unchanged) and v2 (relative keys
+    // joined with the storage root).
+    let resolved = meta.paths.resolve(storage.root());
+    let seg_meta_bytes = storage.read_to_end(&resolved.meta)?;
     let mut seg_meta: SegmentFileMeta = serde_json::from_slice(&seg_meta_bytes)?;
     #[cfg(not(feature = "zstd"))]
     if seg_meta.use_zstd {
@@ -1320,10 +1471,36 @@ impl SegmentReader {
         meta.id
       );
     }
-    verify_checksums(storage.as_ref(), &meta, &seg_meta, &seg_meta_bytes)?;
-    let terms = read_terms(storage.as_ref(), Path::new(&meta.paths.terms))?;
-    let postings = storage.open_read(Path::new(&meta.paths.postings))?;
-    let doc_file = storage.open_read(Path::new(&meta.paths.docstore))?;
+    match ctx.checksum_policy {
+      ChecksumPolicy::Strict => {
+        verify_checksums(
+          storage.as_ref(),
+          meta,
+          &seg_meta,
+          &seg_meta_bytes,
+          &resolved,
+        )?;
+      }
+      ChecksumPolicy::TrustManifest => {
+        // Manifest is the trust anchor. No whole-file reads beyond what
+        // the data path itself requires (terms / fast fields / vectors).
+        // Postings and docstore are not touched during load.
+      }
+      ChecksumPolicy::Audit => {
+        // Open succeeds immediately; a background task re-runs the same
+        // verification and surfaces any mismatch via the audit hook (or
+        // `log::error!`). Captures clones of the inputs because the
+        // foreground load must not block on this.
+        dispatch_checksum_audit(
+          storage.clone(),
+          meta.clone(),
+          seg_meta.clone(),
+          seg_meta_bytes.clone(),
+          ctx.audit_hook.clone(),
+        );
+      }
+    }
+    let terms = read_terms(storage.as_ref(), &resolved.terms)?;
     if seg_meta.doc_ids.len() != seg_meta.doc_offsets.len() {
       bail!(
         "segment {} is missing document ids; reindex or re-commit documents with doc_id support",
@@ -1336,15 +1513,13 @@ impl SegmentReader {
         "warning: index uses zstd-compressed docstore, but this binary was built without the `zstd` feature; stored fields may be unavailable"
       );
     }
-    let docstore = DocStoreReader::new(doc_file, seg_meta.doc_offsets.clone(), seg_meta.use_zstd);
-    let fast_fields = FastFieldsReader::open(storage.as_ref(), Path::new(&meta.paths.fast))?;
-    let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
+    let fast_fields = FastFieldsReader::open(storage.as_ref(), &resolved.fast)?;
     #[cfg(feature = "vectors")]
     let mut vector_fields = HashMap::new();
     #[cfg(feature = "vectors")]
     {
       for (field, vmeta) in seg_meta.vector_fields.iter() {
-        let (vec_path, hnsw_path) = vector_paths(&meta.paths, field)?;
+        let (vec_path, hnsw_path) = vector_paths(&resolved, field)?;
         let expected_metric: ApiVectorMetric = vmeta.metric.clone().into();
         let store = read_vector_file(
           storage.as_ref(),
@@ -1388,39 +1563,449 @@ impl SegmentReader {
       .into_iter()
       .map(Arc::<str>::from)
       .collect();
-    Ok(Self {
-      meta,
-      terms: TinyTerms(terms),
-      postings: RefCell::new(postings),
-      docstore: RefCell::new(docstore),
-      doc_ids,
-      deleted,
-      fast_fields,
-      keep_positions,
+    // `storage` was used above for the load reads but is intentionally not
+    // retained on the core: per-view file handles are opened against the
+    // manifest-current storage in `SegmentReader::from_core`.
+    let _ = storage;
+    Ok(Arc::new(Self {
       seg_meta,
+      terms: TinyTerms(terms),
+      doc_ids,
+      fast_fields,
+      keep_positions: ctx.keep_positions,
       #[cfg(feature = "vectors")]
       vectors: vector_fields,
+    }))
+  }
+}
+
+/// Re-verify a cached `SegmentCore`'s on-disk segment files against the
+/// manifest's recorded checksums. Called on every `Strict` cache hit so
+/// the policy's pre-Stage-1 guarantee holds: a second `Index::reader()`
+/// against the same `Index` detects external mutation that happened
+/// between the first reader open and the second.
+///
+/// The cached core's parsed structures (terms, fast fields, doc-id table)
+/// are reused — verification re-reads the files but does not re-parse
+/// them. The bytes are dropped after CRC computation.
+fn verify_cached_core(storage: &dyn Storage, meta: &SegmentMeta, core: &SegmentCore) -> Result<()> {
+  // `seg_meta_bytes` is not retained on the cached core (the parsed
+  // `SegmentFileMeta` is). Re-read it so `verify_checksums` can compare
+  // the live meta-file bytes against the manifest's recorded checksum;
+  // this catches the "external mutation invalidated the meta file"
+  // case as well as the postings/docstore/fast/terms cases.
+  let resolved = meta.paths.resolve(storage.root());
+  let seg_meta_bytes = storage.read_to_end(&resolved.meta)?;
+  verify_checksums(storage, meta, &core.seg_meta, &seg_meta_bytes, &resolved)
+}
+
+/// Background checksum audit dispatched by `ChecksumPolicy::Audit`. Runs on
+/// the global `rayon` thread pool (bounded to roughly `num_cpus` workers by
+/// default), so opening an index with hundreds of segments under `Audit`
+/// won't fan out to hundreds of OS threads.
+///
+/// Re-runs `verify_checksums` against the same storage with the segment
+/// metadata that the foreground load already parsed. On failure, invokes
+/// `audit_hook` if provided; otherwise emits a `log::error!`. Successes are
+/// silent (no allocation, no log noise).
+fn dispatch_checksum_audit(
+  storage: Arc<dyn Storage>,
+  meta: SegmentMeta,
+  seg_meta: SegmentFileMeta,
+  seg_meta_bytes: Vec<u8>,
+  audit_hook: Option<ChecksumAuditFailureHook>,
+) {
+  rayon::spawn(move || {
+    let segment_id = meta.id.clone();
+    let resolved = meta.paths.resolve(storage.root());
+    if let Err(err) = verify_checksums(
+      storage.as_ref(),
+      &meta,
+      &seg_meta,
+      &seg_meta_bytes,
+      &resolved,
+    ) {
+      match audit_hook {
+        Some(hook) => hook.invoke(&segment_id, &err),
+        None => log::error!("checksum audit failed for segment {segment_id}: {err:#}"),
+      }
+    }
+  });
+}
+
+/// Cache key for `SegmentCore`.
+///
+/// The fingerprint is a [`SegmentFingerprint`] derived from the
+/// manifest's `content_hashes`: SHA-256 over the canonical encoding
+/// of the full hashes map. If any underlying segment file changes,
+/// its hash changes, so the fingerprint changes and the cache misses.
+///
+/// The segment id stays in the key as belt-and-suspenders defense
+/// against fingerprint collisions (effectively impossible for
+/// SHA-256, but cheap to keep).
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub(crate) struct SegmentCacheKey {
+  pub id: String,
+  pub fingerprint: SegmentFingerprint,
+}
+
+/// Stage 9b/9c: SHA-256-based fingerprint for the segment cache key.
+/// Stage 9b introduced a version-tagged enum to keep this distinct
+/// from the legacy CRC32 path; Stage 9c removed the legacy path so
+/// the enum collapses to a single-variant tuple struct holding the
+/// 32-byte digest. The cache key carries the full digest (no `u64`
+/// fold) so the 256-bit collision resistance of the underlying
+/// SHA-256 hashes is preserved end-to-end.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub(crate) struct SegmentFingerprint(pub [u8; 32]);
+
+impl SegmentCacheKey {
+  pub fn from_meta(meta: &SegmentMeta) -> Self {
+    Self {
+      id: meta.id.clone(),
+      fingerprint: SegmentFingerprint::from_meta(meta),
+    }
+  }
+}
+
+impl SegmentFingerprint {
+  /// Hash the manifest's `content_hashes` into the cache-key
+  /// fingerprint. An empty map (legacy pre-9b manifest) hashes to a
+  /// stable sentinel digest rather than panicking — `verify_checksums`
+  /// rejects empty `content_hashes` before any reader is returned, so
+  /// the sentinel is unreachable in practice but keeps the cache-key
+  /// path total in the face of future refactors.
+  pub fn from_meta(meta: &SegmentMeta) -> Self {
+    Self(fingerprint_content_hashes(&meta.content_hashes))
+  }
+}
+
+/// Stage 9b: SHA-256 over the canonical `name=hex\n` encoding of
+/// every entry in the (already-sorted) BTreeMap. Output is the full
+/// 32-byte digest — no `u64` collapse.
+fn fingerprint_content_hashes(
+  content_hashes: &std::collections::BTreeMap<String, String>,
+) -> [u8; 32] {
+  use sha2::{Digest, Sha256};
+  let mut hasher = Sha256::new();
+  // BTreeMap iteration is sorted by key, which gives us
+  // deterministic encoding for free. The `=` and `\n` separators
+  // disambiguate `{a=1, b=2}` from `{a=1b=2}` so cross-name
+  // concatenation can't collide.
+  for (k, v) in content_hashes {
+    hasher.update(k.as_bytes());
+    hasher.update(b"=");
+    hasher.update(v.as_bytes());
+    hasher.update(b"\n");
+  }
+  hasher.finalize().into()
+}
+
+/// Default capacity of the per-`InnerIndex` segment-core cache. Sized to
+/// comfortably hold every segment in any reasonable working index without
+/// touching evictions in normal operation; capacity is shared across
+/// generations so compaction churn can push older entries out before a new
+/// reader's references protect them.
+const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 1024;
+
+/// Process-wide cache of immutable `SegmentCore`s, owned by `InnerIndex`.
+///
+/// Stores `Arc<SegmentCore>` (strong refs) under a bounded-LRU policy so that
+/// the *typical* sequential reader pattern — open `IndexReader`, serve a
+/// query, drop the reader, open another reader for the next request — hits
+/// the cache instead of reloading from storage. The previous `Weak`-only
+/// design only retained cores while at least one `SegmentReader` view was
+/// alive, which collapses to a no-op for non-overlapping reader lifecycles.
+///
+/// In-flight readers hold their own `Arc<SegmentCore>` strong refs, so an
+/// LRU eviction (or a manifest rewrite that drops a segment) doesn't yank
+/// the core out from under them: the core stays alive until the last reader
+/// drops. This is the property that makes the cache safe under
+/// `Index::compact` mid-search.
+pub struct SegmentCache {
+  inner: parking_lot::Mutex<SegmentCacheInner>,
+  loads: std::sync::atomic::AtomicUsize,
+}
+
+struct SegmentCacheInner {
+  capacity: usize,
+  entries: HashMap<SegmentCacheKey, CacheEntry>,
+  next_seq: u64,
+}
+
+struct CacheEntry {
+  core: Arc<SegmentCore>,
+  /// Monotonic recency tag, bumped on every hit and on insert. The entry
+  /// with the smallest `seq` is the LRU candidate for eviction.
+  seq: u64,
+}
+
+impl Default for SegmentCache {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl SegmentCache {
+  pub fn new() -> Self {
+    Self::with_capacity(DEFAULT_SEGMENT_CACHE_CAPACITY)
+  }
+
+  pub fn with_capacity(capacity: usize) -> Self {
+    let capacity = capacity.max(1);
+    Self {
+      inner: parking_lot::Mutex::new(SegmentCacheInner {
+        capacity,
+        entries: HashMap::with_capacity(capacity),
+        next_seq: 0,
+      }),
+      loads: std::sync::atomic::AtomicUsize::new(0),
+    }
+  }
+
+  /// Get an existing core or load a fresh one. Single-flight is best-effort:
+  /// under heavy concurrent contention for the same key, two loaders may both
+  /// load the same core, and the second insertion's core (equivalent to the
+  /// first because they share a fingerprint) is dropped in favor of the
+  /// already-cached one.
+  pub fn get_or_load(
+    &self,
+    meta: &SegmentMeta,
+    ctx: &SegmentLoadCtx,
+    storage: Arc<dyn Storage>,
+  ) -> Result<Arc<SegmentCore>> {
+    let key = SegmentCacheKey::from_meta(meta);
+    {
+      let mut inner = self.inner.lock();
+      inner.next_seq = inner.next_seq.saturating_add(1);
+      let seq = inner.next_seq;
+      if let Some(entry) = inner.entries.get_mut(&key) {
+        let core = entry.core.clone();
+        entry.seq = seq;
+        // Drop the cache lock before any I/O.
+        drop(inner);
+        // Cache-hit semantics by policy:
+        // - `Strict`: re-verify the on-disk bytes against the manifest's
+        //   recorded checksums. The cached `SegmentCore` (parsed terms,
+        //   fast fields, etc.) is reused — we don't re-allocate or re-
+        //   parse — but the file contents must still match what the
+        //   manifest says they should. This restores the pre-Stage-1
+        //   guarantee that two `Index::reader()` calls within a single
+        //   process detect external mutation between opens.
+        // - `TrustManifest`: return immediately. The manifest is the
+        //   trust anchor by definition.
+        // - `Audit`: return immediately. Audit is a per-fresh-load
+        //   concern; re-firing on every cache hit would produce N*M
+        //   audit runs and defeat the bounded-execution model.
+        if matches!(ctx.checksum_policy, ChecksumPolicy::Strict) {
+          verify_cached_core(storage.as_ref(), meta, &core)?;
+        }
+        return Ok(core);
+      }
+    }
+    // Slow path: load outside the lock so concurrent misses for *different*
+    // keys aren't serialized on this load's I/O.
+    let core = SegmentCore::load(storage, meta, ctx)?;
+    self
+      .loads
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut inner = self.inner.lock();
+    // Re-check: a peer may have inserted while we loaded.
+    inner.next_seq = inner.next_seq.saturating_add(1);
+    let seq = inner.next_seq;
+    if let Some(entry) = inner.entries.get_mut(&key) {
+      entry.seq = seq;
+      return Ok(entry.core.clone());
+    }
+    // Evict the LRU entry if at capacity. Any in-flight reader holding an
+    // `Arc<SegmentCore>` for the evicted key keeps that core alive in memory
+    // until the reader drops; only the cache's own strong ref goes away.
+    if inner.entries.len() >= inner.capacity {
+      if let Some(victim) = inner
+        .entries
+        .iter()
+        .min_by_key(|(_, e)| e.seq)
+        .map(|(k, _)| k.clone())
+      {
+        inner.entries.remove(&victim);
+      }
+    }
+    inner.entries.insert(
+      key,
+      CacheEntry {
+        core: core.clone(),
+        seq,
+      },
+    );
+    Ok(core)
+  }
+
+  /// Number of times a core was actually loaded from storage. Cache hits do
+  /// not increment this. Used by tests to assert that segments are loaded at
+  /// most once across N reader opens for a stable manifest, and that
+  /// tombstone-only commits reuse the existing cached core.
+  pub fn loads(&self) -> usize {
+    self.loads.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  #[cfg(test)]
+  pub(crate) fn len(&self) -> usize {
+    self.inner.lock().entries.len()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn contains_key(&self, key: &SegmentCacheKey) -> bool {
+    self.inner.lock().entries.contains_key(key)
+  }
+}
+
+/// Per-`IndexReader` view over an immutable `SegmentCore`, plus the
+/// manifest-specific state (`deleted_docs`) and per-view handles for
+/// postings/docstore reads.
+///
+/// Stage 8 (a + b): both postings and docstore reads now go through
+/// `Arc<dyn Object>` handles opened from `BlobStore::open` (typically
+/// wrapping the inner `Storage` via `StorageAsBlobStore`).
+///
+/// * **Postings** (Stage 8a): each lookup issues a bounded
+///   `Object::read_range` driven by `TinyFst::range_for(term, postings_len)`
+///   — for cloud backends this becomes a single `bytes=start-end` GET per
+///   term instead of a whole-file read.
+/// * **Docstore** (Stage 8b): `get_doc` derives the per-doc byte range from
+///   the offsets table cached in `SegmentCore::seg_meta.doc_offsets` and
+///   issues exactly one `Object::read_range` per fetched doc. The span is
+///   bounded by `MAX_DOCSTORE_BYTES + 4` *before* issuing the read so a
+///   corrupt offset table can't trigger an oversized GET. See
+///   [`SegmentReader::get_doc`] for the full strict-validation contract.
+///
+/// Object handles deliberately live on the view, not on `SegmentCore` —
+/// matching Stage 1's "core stays parsed-only; per-storage state lives
+/// on the view" principle so manifest rewrites that relocate files
+/// (Stage 9 portable manifest) don't read through stale paths.
+pub struct SegmentReader {
+  pub(crate) core: Arc<SegmentCore>,
+  pub meta: SegmentMeta,
+  deleted: FastHashSet<DocId>,
+  /// Postings handle pinned at view-open time. `Object::stat()` exposes
+  /// the object length we need to drive `TinyFst::range_for`.
+  postings: Arc<dyn BlobObject>,
+  /// Cached postings object length so `range_for` calls don't re-stat
+  /// per term lookup. Equal to `postings.stat().len` at open time.
+  postings_len: u64,
+  /// Stage 8b: docstore handle pinned at view-open time. `get_doc` issues
+  /// exactly one bounded `read_range` call per fetched doc — see the
+  /// comment on `get_doc` for the offsets→range derivation and the
+  /// strict validation contract.
+  docstore: Arc<dyn BlobObject>,
+  /// Stage 8b: cached docstore object length, used as the upper bound
+  /// for the **last** doc's range (`offsets[N-1]..docstore_len`) so
+  /// `get_doc` doesn't re-stat per fetch. Equal to
+  /// `docstore.stat().len` at open time.
+  docstore_len: u64,
+}
+
+impl SegmentReader {
+  /// Build a per-manifest view over an already-loaded `SegmentCore`.
+  /// Opens fresh per-view handles against the manifest-current
+  /// `meta.paths`: postings and docstore both via `BlobStore::open`
+  /// (Stages 8a + 8b).
+  ///
+  /// Stage 9a: `root` is the index root used to resolve v2 relative
+  /// segment keys to concrete `BlobStore` keys. v1 absolute paths are
+  /// passed through unchanged. `Storage` is not threaded through —
+  /// both hot reads now flow through `BlobStore`.
+  pub fn from_core(
+    core: Arc<SegmentCore>,
+    meta: SegmentMeta,
+    blob_store: Arc<dyn BlobStore>,
+    root: &Path,
+  ) -> Result<Self> {
+    let resolved = meta.paths.resolve(root);
+    // Stage 8a: postings is opened as an `Object` so `postings()` and
+    // `doc_freq()` can issue bounded `read_range` calls using
+    // `TinyFst::range_for`. We use `block_on` to bridge the
+    // synchronous `from_core` API to the async `BlobStore::open`;
+    // this is a transitional bridge documented in the module-level
+    // comment of `storage_as_blob.rs` — Stage 8/9 may push async up
+    // the call stack, but Stage 8a keeps the read path sync.
+    let postings = crate::runtime::block_on_blob(blob_store.open(&resolved.postings))?;
+    let postings_len = postings.stat().len;
+
+    // Stage 8b: docstore now uses the same Object shape. `get_doc`
+    // computes the per-doc byte range from the offsets table cached
+    // in `SegmentCore::seg_meta.doc_offsets` and issues exactly one
+    // `Object::read_range` per fetch.
+    let docstore = crate::runtime::block_on_blob(blob_store.open(&resolved.docstore))?;
+    let docstore_len = docstore.stat().len;
+
+    let deleted: FastHashSet<DocId> = meta.deleted_docs.iter().copied().collect();
+    Ok(Self {
+      core,
+      meta,
+      deleted,
+      postings,
+      postings_len,
+      docstore,
+      docstore_len,
     })
   }
 
-  pub fn postings(&self, term: &str) -> Option<PostingsReader> {
-    let offset = self.terms.0.get(term)?;
-    let mut file = self.postings.borrow_mut();
-    PostingsReader::read_at(&mut *file, offset, self.keep_positions).ok()
+  /// Convenience constructor that loads a fresh `SegmentCore` under the
+  /// strict checksum policy and immediately builds a view from it. Bypasses
+  /// any reader-side cache; callers that want caching or a non-strict
+  /// policy should go through `Index::reader()`. Wraps `storage` with a
+  /// default `StorageAsBlobStore` so the test/legacy convenience API
+  /// doesn't need to thread a separate `BlobStore` argument.
+  pub fn open(storage: Arc<dyn Storage>, meta: SegmentMeta, keep_positions: bool) -> Result<Self> {
+    let ctx = SegmentLoadCtx::strict(keep_positions);
+    let core = SegmentCore::load(storage.clone(), &meta, &ctx)?;
+    let root = storage.root().to_path_buf();
+    let blob_store: Arc<dyn BlobStore> = Arc::new(StorageAsBlobStore::new(storage));
+    Self::from_core(core, meta, blob_store, &root)
   }
 
+  /// Stage 8a: bounded postings range read.
+  ///
+  /// Looks up the term's offset and length in the in-memory term
+  /// dictionary (`TinyFst::range_for`) and issues a single
+  /// `Object::read_range(start..end)` against the postings object.
+  /// On a cloud backend this becomes one `bytes=start-(end-1)` GET
+  /// per term; on local FS it's a single seek+read. Either way the
+  /// scan-from-EOF-and-decode logic in `PostingsReader::read_at`
+  /// operates on a `Cursor` over the bounded byte slice rather than
+  /// the whole postings file.
+  pub fn postings(&self, term: &str) -> Option<PostingsReader> {
+    let range = self.core.terms.0.range_for(term, self.postings_len)?;
+    let bytes = crate::runtime::block_on_blob(self.postings.read_range(range)).ok()?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    PostingsReader::read_at(&mut cursor, 0, self.core.keep_positions).ok()
+  }
+
+  /// Stage 8a: tiny range read for the leading `doc_freq` `u32`.
+  ///
+  /// `doc_freq` is the first 4 bytes of a term's postings payload. We
+  /// read just those 4 bytes via a bounded range — substantially less
+  /// I/O than the full postings list when the caller only needs the
+  /// frequency (e.g. for BM25 stats before deciding whether to
+  /// iterate).
   pub fn doc_freq(&self, term: &str) -> Option<u32> {
-    let offset = self.terms.0.get(term)?;
-    let mut file = self.postings.borrow_mut();
-    read_doc_freq(&mut *file, offset).ok()
+    let offset = self.core.terms.0.get(term)?;
+    let end = offset.checked_add(4)?;
+    if end > self.postings_len {
+      return None;
+    }
+    let bytes = crate::runtime::block_on_blob(self.postings.read_range(offset..end)).ok()?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    read_doc_freq(&mut cursor, 0).ok()
   }
 
   pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    self.terms.0.iter_prefix(prefix).map(|(term, _)| term)
+    self.core.terms.0.iter_prefix(prefix).map(|(term, _)| term)
   }
 
   pub fn avg_field_length(&self, field: &str) -> f32 {
     self
+      .core
       .seg_meta
       .avg_field_lengths
       .get(field)
@@ -1428,16 +2013,97 @@ impl SegmentReader {
       .unwrap_or(0.0)
   }
 
+  /// Stage 8b: fetch a single stored document via one bounded
+  /// `Object::read_range` against the docstore object.
+  ///
+  /// The byte range is derived from the offset table cached in
+  /// `SegmentCore::seg_meta.doc_offsets` (loaded once at segment-load
+  /// time): `start = offsets[doc_id]`, and `end = offsets[doc_id + 1]`
+  /// for any non-last doc, or `end = docstore_len` for the last doc.
+  /// The returned bundle is the exact `[u32 LE length][payload]`
+  /// record; parsing/decompression goes through the shared
+  /// [`decode_docstore_record`] helper, which is the single source of
+  /// truth for docstore on-wire-format semantics (length cap, zstd
+  /// handling, JSON decode, range/length consistency).
+  ///
+  /// Strict validation (Codex Stage 8b review, including the v2 P1
+  /// pre-read span guard):
+  /// * `doc_id` must be in bounds for the offset table.
+  /// * `start < end <= docstore_len` (rejects empty, inverted, and
+  ///   out-of-bounds ranges as corruption).
+  /// * `end - start` must be in `[4, MAX_DOCSTORE_BYTES + 4]` —
+  ///   enforced **before** issuing `read_range` so a corrupt offset
+  ///   table or appended/sparse docstore can't trigger a multi-GB
+  ///   object-store GET / Vec allocation before parse-time validation
+  ///   has a chance to reject.
+  /// * `decode_docstore_record` then enforces (post-read) that the
+  ///   embedded length is `<= MAX_DOCSTORE_BYTES` and that
+  ///   `4 + embedded_len == fetched_range.len()` — a longer offset-
+  ///   table-implied range than the embedded length actually encodes
+  ///   is treated as corruption rather than silently ignored.
   pub fn get_doc(&self, doc_id: DocId) -> Result<serde_json::Value> {
-    self.docstore.borrow_mut().get(doc_id)
+    let offsets = &self.core.seg_meta.doc_offsets;
+    let idx = doc_id as usize;
+    let start = *offsets.get(idx).ok_or_else(|| {
+      anyhow!(
+        "doc id {doc_id} out of bounds: offsets table has {} entries",
+        offsets.len()
+      )
+    })?;
+    let end = offsets.get(idx + 1).copied().unwrap_or(self.docstore_len);
+    if start >= end {
+      bail!(
+        "docstore: invalid range {start}..{end} for doc {doc_id} \
+         (offsets must be strictly increasing within the file)"
+      );
+    }
+    if end > self.docstore_len {
+      bail!(
+        "docstore: range {start}..{end} for doc {doc_id} exceeds \
+         docstore object length {}",
+        self.docstore_len
+      );
+    }
+    // Stage 8b [P1] (Codex review): bound the offset-derived span
+    // *before* issuing `read_range`. Without this guard, a corrupt
+    // offset table or a docstore that's been appended to / sparsely
+    // extended out-of-band can produce an arbitrarily large span,
+    // causing `read_range` to issue a multi-GB object-store GET (and
+    // a `Vec::with_capacity` of the same size) before
+    // `decode_docstore_record` ultimately rejects the length-prefix
+    // mismatch. The legitimate upper bound is `4 + MAX_DOCSTORE_BYTES`
+    // — the writer enforces `MAX_DOCSTORE_BYTES` post-compression on
+    // the payload, plus 4 bytes for the LE u32 length prefix. The
+    // lower bound is 4 because the bundle MUST contain at least the
+    // length prefix.
+    let span = end - start;
+    const MAX_BUNDLE_BYTES: u64 = MAX_DOCSTORE_BYTES as u64 + 4;
+    if span < 4 {
+      bail!(
+        "docstore: span {span} for doc {doc_id} too small for the 4-byte length \
+         prefix (offset table or file may be corrupt)"
+      );
+    }
+    if span > MAX_BUNDLE_BYTES {
+      bail!(
+        "docstore: span {span} for doc {doc_id} exceeds maximum bundle size \
+         {MAX_BUNDLE_BYTES} (= 4 + MAX_DOCSTORE_BYTES); refusing to issue \
+         oversized read_range — offset table or docstore file may be corrupt"
+      );
+    }
+    let bytes = crate::runtime::block_on_blob(self.docstore.read_range(start..end))
+      .with_context(|| format!("docstore read_range({start}..{end}) for doc {doc_id} failed"))?;
+    decode_docstore_record(&bytes, self.core.seg_meta.use_zstd)
+      .with_context(|| format!("decoding docstore record for doc {doc_id}"))
   }
 
   pub fn doc_id(&self, doc_id: DocId) -> Option<&str> {
-    self.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
+    self.core.doc_ids.get(doc_id as usize).map(|s| s.as_ref())
   }
 
   pub fn find_doc_id(&self, id: &str) -> Option<DocId> {
     self
+      .core
       .doc_ids
       .iter()
       .position(|d| d.as_ref() == id)
@@ -1445,7 +2111,7 @@ impl SegmentReader {
   }
 
   pub fn doc_ids(&self) -> &[Arc<str>] {
-    &self.doc_ids
+    &self.core.doc_ids
   }
 
   pub fn is_deleted(&self, doc_id: DocId) -> bool {
@@ -1460,12 +2126,13 @@ impl SegmentReader {
   }
 
   pub fn fast_fields(&self) -> &FastFieldsReader {
-    &self.fast_fields
+    &self.core.fast_fields
   }
 
   #[cfg(feature = "vectors")]
   pub fn vector(&self, field: &str, doc_id: DocId) -> Option<Vec<f32>> {
     self
+      .core
       .vectors
       .get(field)
       .and_then(|vf| vf.store.vector(doc_id).map(|v| v.to_vec()))
@@ -1474,6 +2141,7 @@ impl SegmentReader {
   #[cfg(feature = "vectors")]
   pub fn vector_components(&self, field: &str) -> Option<(&HnswIndex, Arc<VectorStore>)> {
     self
+      .core
       .vectors
       .get(field)
       .map(|vf| (&vf.index, vf.store.clone()))
@@ -1625,7 +2293,11 @@ mod tests {
       #[cfg(feature = "vectors")]
       vector_fields: HashMap::new(),
     };
-    std::fs::write(&paths.meta, serde_json::to_vec(&seg_file_meta).unwrap()).unwrap();
+    std::fs::write(
+      dir.path().join(&paths.meta),
+      serde_json::to_vec(&seg_file_meta).unwrap(),
+    )
+    .unwrap();
     let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
     let meta = crate::index::manifest::SegmentMeta {
       id: "zstd".into(),
@@ -1636,7 +2308,7 @@ mod tests {
       blockmax: true,
       deleted_docs: Vec::new(),
       avg_field_lengths: HashMap::new(),
-      checksums: HashMap::new(),
+      content_hashes: std::collections::BTreeMap::new(),
       write_binding_b64: None,
     };
     let err = SegmentReader::open(storage, meta, true);
@@ -1985,5 +2657,108 @@ mod tests {
         "failed atomic_write must not overwrite the live target path"
       );
     }
+  }
+
+  /// Stage 2 round-trip: for every term in a real segment's term dictionary,
+  /// `TinyFst::range_for(term, postings_len)` must return exactly the byte
+  /// range that `PostingsReader::read_at` consumes when decoding that term's
+  /// postings list. This is the load-bearing correctness contract for
+  /// future bounded `get_range` reads against an object-storage backend.
+  #[test]
+  fn range_for_matches_postings_reader_consumption_for_every_term() {
+    use std::io::Seek;
+
+    let dir = tempdir().unwrap();
+    let schema = sample_schema();
+    let storage = Arc::new(crate::storage::FsStorage::new(dir.path().to_path_buf()));
+
+    // Multiple docs with overlapping and disjoint terms so the resulting FST
+    // exercises both common-prefix and isolated-term layouts. Position-bearing
+    // postings (`keep_positions=true`) maximize per-term byte length so the
+    // test catches off-by-one errors in `read_at`'s inner loops, not just the
+    // outer doc-freq varint.
+    let writer = SegmentWriter::new(dir.path(), &schema, true, false, storage.clone(), None);
+    let meta = writer
+      .write_segment(
+        &[
+          doc("rust search engine fast", "news", 2024),
+          doc("rust language tooling", "tech", 2023),
+          doc("search engine indexing fast", "news", 2024),
+          doc("indexing pipeline", "infra", 2025),
+          doc("rust async tooling", "tech", 2024),
+        ],
+        1,
+      )
+      .unwrap();
+
+    let reader = SegmentReader::open(storage.clone(), meta.clone(), true).unwrap();
+    let postings_path = dir.path().join(&meta.paths.postings);
+    let postings_len = std::fs::metadata(&postings_path).unwrap().len();
+    assert!(
+      postings_len > 0,
+      "test prerequisite: segment must have a non-empty postings file"
+    );
+
+    // Walk the term dictionary in sorted order and check each term's range.
+    // Iterating with an empty prefix yields every term; the existing
+    // `terms_with_prefix` already binary-searches into the sorted vec.
+    let all_terms: Vec<String> = reader
+      .terms_with_prefix("")
+      .map(|t| t.to_string())
+      .collect();
+    assert!(
+      all_terms.len() >= 4,
+      "test prerequisite: schema + corpus must produce several distinct terms; got {}",
+      all_terms.len()
+    );
+
+    let mut last_term_seen = false;
+    for term in &all_terms {
+      let computed = reader
+        .core
+        .terms
+        .0
+        .range_for(term, postings_len)
+        .unwrap_or_else(|| panic!("range_for returned None for present term {term:?}"));
+
+      // What did the postings reader actually consume? `read_at` seeks to
+      // `offset` and decodes one postings list; the file's stream position
+      // afterwards is the first byte past this term's payload.
+      // Use `&mut file` (= `&mut Box<dyn StorageFile>`, which is `Sized`)
+      // rather than `&mut *file` (which would give a `&mut dyn StorageFile`
+      // unsized borrow that `PostingsReader::read_at`'s `R: Read + Seek`
+      // bound rejects).
+      let mut file = storage.open_read(&postings_path).unwrap();
+      let _decoded = PostingsReader::read_at(&mut file, computed.start, true).unwrap_or_else(|e| {
+        panic!(
+          "read_at failed for term {term:?} at offset {}: {e}",
+          computed.start
+        )
+      });
+      let consumed_end = file.stream_position().unwrap();
+
+      assert_eq!(
+        computed.start,
+        reader.core.terms.0.get(term).unwrap(),
+        "range_for({term:?}) start must equal the FST's recorded offset"
+      );
+      assert_eq!(
+        computed.end, consumed_end,
+        "range_for({term:?}) end ({}) must equal bytes consumed by read_at ({}); \
+         wrong end means an object-store range read would either truncate the \
+         postings list or overshoot into the next term",
+        computed.end, consumed_end
+      );
+
+      if computed.end == postings_len {
+        last_term_seen = true;
+      }
+    }
+
+    assert!(
+      last_term_seen,
+      "test must exercise the last-term branch (where range.end == postings_len); \
+       did the loop iterate over the lexicographically-greatest term?"
+    );
   }
 }

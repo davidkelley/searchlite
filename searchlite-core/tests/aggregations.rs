@@ -54,6 +54,9 @@ fn nested_terms_aggregation_counts_nested_objects() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -176,6 +179,9 @@ fn nested_terms_aggregation_respects_outer_filters() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -325,6 +331,9 @@ fn nested_terms_aggregation_skips_null_entries_in_nullable_arrays() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -413,6 +422,9 @@ fn nested_aggregation_rejects_unknown_path() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -464,6 +476,9 @@ fn nested_aggregation_rejects_dotted_non_nested_prefix_path() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -515,6 +530,9 @@ fn root_terms_aggregation_rejects_nested_keyword_field_without_nested_scope() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -564,6 +582,9 @@ fn root_terms_aggregation_rejects_dotted_nested_keyword_field_without_nested_sco
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -622,6 +643,9 @@ fn root_terms_aggregation_allows_literal_dotted_top_level_keyword_field() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -688,6 +712,9 @@ fn root_numeric_aggregation_rejects_nested_numeric_field_without_nested_scope() 
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -762,6 +789,9 @@ fn root_numeric_aggregation_allows_literal_dotted_top_level_numeric_field() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -807,6 +837,9 @@ fn collapse_rejects_nested_keyword_field_without_nested_scope() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -853,6 +886,9 @@ fn nested_terms_accept_direct_child_dotted_keyword_name() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -955,6 +991,9 @@ fn nested_aggregation_accepts_direct_child_dotted_object_name() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1059,6 +1098,9 @@ fn nested_aggregation_rejects_unsupported_child_aggregation() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1124,6 +1166,9 @@ fn nested_terms_reject_descendant_fields_in_nested_scope() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1193,6 +1238,9 @@ fn nested_aggregation_rejects_non_direct_child_nested_path_in_scope() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1261,6 +1309,9 @@ fn nested_sub_aggregation_binds_to_parent_object() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1412,6 +1463,9 @@ fn nested_metadata_facets_bind_key_value_pairs() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1573,6 +1627,9 @@ fn terms_and_stats_aggregations() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1702,6 +1759,9 @@ fn significant_terms_respects_deletions() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -1813,6 +1873,9 @@ fn aggregation_requires_fast_field() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1891,6 +1954,9 @@ fn histogram_bucket_generation() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -1989,6 +2055,9 @@ fn histogram_uses_floor_for_bucket_boundaries() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2092,6 +2161,9 @@ fn range_aggregation_counts() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2204,6 +2276,9 @@ fn date_range_missing_and_keyed() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2326,6 +2401,9 @@ fn date_range_rejects_non_finite_bound_strings() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2435,6 +2513,9 @@ fn extended_stats_and_value_count_include_missing() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2547,6 +2628,9 @@ fn date_histogram_fixed_interval_respects_offset_and_missing() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2677,6 +2761,9 @@ fn date_histogram_hard_bounds_filter_out_of_range() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2792,6 +2879,9 @@ fn terms_size_applied_after_merge() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -2910,6 +3000,9 @@ fn filter_aggregation_counts_and_sub_aggs() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3028,6 +3121,9 @@ fn composite_aggregation_paginates() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3132,6 +3228,9 @@ fn cardinality_and_percentiles_metrics() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3262,6 +3361,9 @@ fn percentile_ranks_tdigest_path_includes_observed_minimum() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3378,6 +3480,9 @@ fn percentile_ranks_tdigest_path_all_values_equal_target() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3481,6 +3586,9 @@ fn bucket_sort_and_avg_bucket_pipeline() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3619,6 +3727,9 @@ fn significant_and_rare_terms() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3756,6 +3867,9 @@ fn derivative_and_moving_avg_pipeline() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -3907,6 +4021,9 @@ fn pipeline_missing_metric_path_with_gap_policy_inserts_zeros() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4021,6 +4138,9 @@ fn range_aggregation_to_is_exclusive_at_boundary() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4155,6 +4275,9 @@ fn date_range_to_is_exclusive_at_boundary() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4281,6 +4404,9 @@ fn significant_terms_preserves_high_significance_low_frequency_terms() {
     bm25_k1: 0.9,
     bm25_b: 0.4,
     storage: StorageType::Filesystem,
+    checksum_policy: Default::default(),
+    checksum_audit_failure_hook: None,
+    read_only: false,
     #[cfg(feature = "vectors")]
     vector_defaults: None,
   };
@@ -4488,6 +4614,9 @@ fn bucket_sort_runs_after_derivative_pipeline() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4681,6 +4810,9 @@ fn bucket_sort_by_key_uses_numeric_ordering_for_histogram() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4800,6 +4932,9 @@ fn bucket_sort_by_key_desc_uses_numeric_ordering_for_histogram() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -4921,6 +5056,9 @@ fn bucket_sort_by_key_orders_negative_histogram_keys_numerically() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },
@@ -5045,6 +5183,9 @@ fn bucket_sort_by_key_uses_numeric_ordering_for_date_histogram() {
       bm25_k1: 0.9,
       bm25_b: 0.4,
       storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
       #[cfg(feature = "vectors")]
       vector_defaults: None,
     },

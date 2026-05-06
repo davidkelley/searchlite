@@ -8,6 +8,7 @@ members = [
   "searchlite-http",
   "searchlite-node",
   "searchlite-adapter-elastic",
+  "searchlite-s3",
 ]
 resolver = "2"
 
@@ -50,3 +51,4 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 subtle = "2.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

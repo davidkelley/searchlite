@@ -377,12 +377,25 @@ impl IndexReader {
   pub(crate) fn open(inner: Arc<InnerIndex>) -> Result<Self> {
     let manifest = inner.manifest.read().clone();
     let analysis = manifest.schema.build_analyzers()?;
+    let ctx = crate::index::segment::SegmentLoadCtx::from_options(&inner.options);
     let mut segments = Vec::new();
     for seg in manifest.segments.iter() {
-      segments.push(SegmentReader::open(
-        inner.storage.clone(),
+      // Consult the per-`InnerIndex` cache for an already-loaded `SegmentCore`
+      // matching this segment's `(id, fingerprint)`. On cache hit the
+      // expensive open work (checksum verification under `Strict`, term-dict
+      // / fast-field parse) is skipped — we just open per-view file handles
+      // against the manifest-current paths and storage, and derive the
+      // current `deleted_docs` set from the manifest. The audit hook
+      // (under `ChecksumPolicy::Audit`) only fires on fresh loads, never
+      // on cache hits.
+      let core = inner
+        .segment_cache
+        .get_or_load(seg, &ctx, inner.storage.clone())?;
+      segments.push(SegmentReader::from_core(
+        core,
         seg.clone(),
-        inner.options.enable_positions,
+        inner.blob_store.clone(),
+        inner.storage.root(),
       )?);
     }
     Ok(Self {
@@ -396,6 +409,9 @@ impl IndexReader {
         bm25_k1: inner.options.bm25_k1,
         bm25_b: inner.options.bm25_b,
         storage: inner.options.storage.clone(),
+        checksum_policy: inner.options.checksum_policy,
+        checksum_audit_failure_hook: inner.options.checksum_audit_failure_hook.clone(),
+        read_only: inner.options.read_only,
         #[cfg(feature = "vectors")]
         vector_defaults: inner.options.vector_defaults.clone(),
       },
@@ -1123,6 +1139,20 @@ impl IndexReader {
     Ok(heap.into_iter().collect())
   }
 
+  /// Async surface for `search`. Stage 4 establishes the API shape; the body
+  /// is the same sync work behind an `async fn`, so the future has no
+  /// internal `.await` points and resolves on first poll. Stage 8 replaces
+  /// this body with `BlobStore::get_range`-driven postings/docstore reads,
+  /// at which point async callers get genuine non-blocking I/O.
+  ///
+  /// Sync callers should keep using `search()` directly — Stage 4 does not
+  /// install a sync→async bridge because HTTP and other current callers
+  /// already use `tokio::task::spawn_blocking(... reader.search(...))`,
+  /// which is incompatible with `block_on` inside an active runtime.
+  pub async fn search_async(&self, req: &SearchRequest) -> Result<SearchResult> {
+    self.search(req)
+  }
+
   pub fn search(&self, req: &SearchRequest) -> Result<SearchResult> {
     if req.limit == 0 && req.cursor.is_some() {
       bail!("cursor is not supported when limit is 0");
@@ -1643,6 +1673,14 @@ impl IndexReader {
         None
       },
     })
+  }
+
+  /// Async surface for `mget`. See `search_async` for the Stage 4 contract:
+  /// the body is sync work behind an `async fn`, future resolves on first
+  /// poll, Stage 8 replaces the body with `BlobStore::get_range`-driven
+  /// docstore reads.
+  pub async fn mget_async(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
+    self.mget(ids, return_stored)
   }
 
   pub fn mget(&self, ids: &[String], return_stored: bool) -> Result<Vec<MgetDoc>> {
@@ -3428,6 +3466,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3562,6 +3603,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3677,6 +3721,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3790,6 +3837,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3903,6 +3953,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -3960,6 +4013,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4218,6 +4274,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4284,6 +4343,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4373,6 +4435,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4457,6 +4522,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4532,6 +4600,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4599,6 +4670,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4668,6 +4742,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4744,6 +4821,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4823,6 +4903,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4903,6 +4986,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -4978,6 +5064,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5052,6 +5141,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5109,6 +5201,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         vector_defaults: None,
       },
     )
@@ -5200,6 +5295,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5252,6 +5350,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },
@@ -5445,6 +5546,9 @@ mod tests {
         bm25_k1: 0.9,
         bm25_b: 0.4,
         storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
         #[cfg(feature = "vectors")]
         vector_defaults: None,
       },

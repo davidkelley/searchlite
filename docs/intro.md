@@ -38,6 +38,7 @@ Walk through ingesting a small JSONL file and running your first search in minut
 | CLI | ✅ | Ships with the workspace. |
 | C FFI | ⚙️ `ffi` feature | Enable the `ffi` feature to build the shared library/header. |
 | WASM | ⚙️ `wasm` crate | Experimental IndexedDB/memory backends; needs wasm-pack build. |
+| S3-compatible storage | ⚙️ `searchlite-s3` crate | Experimental — read-only `Index` opens against S3/R2/MinIO via a bake-and-sync workflow. See [s3.md](s3.md). |
 | Vectors | ⚙️ `vectors` feature | Enables HNSW + hybrid BM25/vector blending. |
 | GPU rerank | ⚙️ `gpu` feature | Stub hooks for GPU reranking. |
 | Compression | ⚙️ `zstd` feature | Compress stored fields. |
