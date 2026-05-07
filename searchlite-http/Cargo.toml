@@ -27,8 +27,8 @@ anyhow = { workspace = true }
 axum = "0.8.9"
 clap = { workspace = true, features = ["derive", "env"] }
 futures-util = "0.3.32"
-searchlite-core = { path = "../searchlite-core", version = "0.9.0", package = "searchlite-core", features = ["write-key"] }
-searchlite-s3 = { path = "../searchlite-s3", version = "0.2.6", package = "searchlite-s3", optional = true }
+searchlite-core = { path = "../searchlite-core", version = "0.9.1", package = "searchlite-core", features = ["write-key"] }
+searchlite-s3 = { path = "../searchlite-s3", version = "0.2.7", package = "searchlite-s3", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

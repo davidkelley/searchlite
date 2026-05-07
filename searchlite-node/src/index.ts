@@ -1,3 +1,4 @@
+export type { S3IndexConfig, S3StaticCredentials } from "./embedded";
 export { EmbeddedIndex } from "./embedded";
 export type { RemoteIndexOptions } from "./remote";
 export { RemoteIndex } from "./remote";
