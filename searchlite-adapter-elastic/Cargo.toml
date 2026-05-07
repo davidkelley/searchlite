@@ -4,6 +4,12 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Elasticsearch-compatible HTTP adapter for searchlite (translates ES query DSL to native API)"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["search", "elasticsearch", "adapter", "proxy", "compatibility"]
+categories = ["web-programming::http-server", "database"]
 
 [[bin]]
 name = "searchlite-elastic"
