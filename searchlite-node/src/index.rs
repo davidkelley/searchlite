@@ -115,9 +115,7 @@ impl S3IndexConfig {
       Some(other) => {
         return Err(napi::Error::new(
           napi::Status::InvalidArg,
-          format!(
-            "invalid checksumPolicy: {other}; expected strict, trust-manifest, or audit"
-          ),
+          format!("invalid checksumPolicy: {other}; expected strict, trust-manifest, or audit"),
         ));
       }
     };
