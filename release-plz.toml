@@ -1,8 +1,24 @@
 [workspace]
-publish = false
+publish = true
 git_release_enable = true
 git_tag_enable = true
 release_always = true
+
+# Internal-only crates: not published to crates.io.
+
+[[package]]
+name = "searchlite-ffi"
+publish = false
+release = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "searchlite-wasm"
+publish = false
+release = true
+git_release_enable = true
+git_tag_enable = true
 
 # Node.js addon — published to npm, not crates.io
 [[package]]
@@ -11,3 +27,10 @@ publish = false
 release = true
 git_release_enable = true
 git_tag_enable = true
+
+[[package]]
+name = "integration"
+publish = false
+release = false
+git_release_enable = false
+git_tag_enable = false

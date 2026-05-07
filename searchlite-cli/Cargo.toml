@@ -4,7 +4,12 @@ version = "0.1.13"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
-description = "CLI for searchlite"
+description = "Command-line interface for searchlite: build, query, sync, and serve full-text indexes"
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["search", "cli", "index", "bm25", "fulltext"]
+categories = ["command-line-utilities", "database"]
 
 [features]
 default = ["s3"]
@@ -29,9 +34,9 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-searchlite-core = { path = "../searchlite-core", package = "searchlite-core", features = ["write-key"] }
-searchlite-http = { path = "../searchlite-http", package = "searchlite-http" }
-searchlite-s3 = { path = "../searchlite-s3", package = "searchlite-s3", optional = true }
+searchlite-core = { path = "../searchlite-core", version = "0.9.0", package = "searchlite-core", features = ["write-key"] }
+searchlite-http = { path = "../searchlite-http", version = "0.2.6", package = "searchlite-http" }
+searchlite-s3 = { path = "../searchlite-s3", version = "0.2.6", package = "searchlite-s3", optional = true }
 tokio = { version = "1.52.2", features = ["rt-multi-thread"] }
 chrono = { workspace = true }
 env_logger = { workspace = true }

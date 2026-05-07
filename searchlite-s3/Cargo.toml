@@ -5,6 +5,11 @@ version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "S3-compatible BlobStore implementation for searchlite (AWS S3, R2, MinIO)"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["search", "s3", "r2", "minio", "blobstore"]
+categories = ["database", "web-programming"]
 
 [lib]
 path = "src/lib.rs"
@@ -21,7 +26,7 @@ vectors = ["searchlite-core/vectors"]
 # TLS). Wasm consumers continue on the StorageAsBlobStore path inside
 # searchlite-core; this crate is non-wasm-only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-searchlite-core = { path = "../searchlite-core", features = ["tokio-runtime"] }
+searchlite-core = { path = "../searchlite-core", version = "0.9.0", features = ["tokio-runtime"] }
 anyhow = { workspace = true }
 async-trait = "0.1"
 base64 = { workspace = true }
@@ -42,4 +47,4 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
 crc32fast = { workspace = true }
-searchlite-core = { path = "../searchlite-core", features = ["tokio-runtime"] }
+searchlite-core = { path = "../searchlite-core", version = "0.9.0", features = ["tokio-runtime"] }

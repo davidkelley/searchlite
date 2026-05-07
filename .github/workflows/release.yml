@@ -53,6 +53,7 @@ jobs:
       - name: Run release-plz
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           # release-plz detects the previous published version from git tags; the registry manifest
