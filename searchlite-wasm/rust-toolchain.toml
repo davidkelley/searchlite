@@ -1,4 +1,9 @@
 [toolchain]
-channel = "nightly"
+# Pinned to last known-good nightly. The 2026-05-06 nightly broke
+# wasm-bindgen's threading init with `failed to find __heap_base for
+# injecting thread id`. Bump this date once wasm-bindgen ships a fix,
+# or once a newer nightly is confirmed compatible with our threading
+# rustflags in .cargo/config.toml.
+channel = "nightly-2026-05-05"
 components = ["rust-src"]
 targets = ["wasm32-unknown-unknown"]
