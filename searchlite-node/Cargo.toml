@@ -13,8 +13,9 @@ vectors = ["searchlite-core/vectors"]
 zstd = ["searchlite-core/zstd"]
 
 [dependencies]
-searchlite-core = { path = "../searchlite-core", features = ["write-key"] }
-napi = { version = "3", features = ["serde-json", "napi9"] }
+searchlite-core = { path = "../searchlite-core", features = ["write-key", "tokio-runtime"] }
+searchlite-s3 = { path = "../searchlite-s3" }
+napi = { version = "3", features = ["serde-json", "napi9", "async"] }
 napi-derive = "3"
 serde_json = { workspace = true }
 anyhow = { workspace = true }
