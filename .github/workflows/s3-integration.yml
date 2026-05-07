@@ -1,0 +1,277 @@
+name: S3 Integration (rustfs)
+
+# End-to-end exercise of the `searchlite-s3` BlobStore against a real
+# S3-compatible server (rustfs). Runs the full deployment loop the way
+# a user would:
+#
+#   1. Bake a local index from one of the shipped examples.
+#   2. `searchlite sync` it to s3://bucket/prefix on rustfs.
+#   3. `searchlite search` against the s3:// URL.
+#   4. Boot `searchlite-http` with `--index name:s3://bucket/prefix` and
+#      hit `/indexes/{name}/search` + `/mget` over HTTP.
+#
+# Catches regressions in: S3 wire protocol (PUT/GET/HEAD/Range/DELETE),
+# manifest visibility fence in `sync_to_s3`, S3 mount bootstrap in the
+# HTTP server, and CLI/HTTP wiring of `--s3-endpoint`/path-style flags.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  workflow_dispatch:
+
+concurrency:
+  group: s3-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  s3-e2e:
+    name: bake → sync → query (rustfs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Static credentials match the rustfs service container below.
+      # rustfsadmin/rustfsadmin are the documented dev defaults — fine
+      # for CI against an ephemeral container, never for production.
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      # Skip the EC2 IMDS probe inside the AWS SDK — we have static
+      # creds; without this the SDK adds ~1s of dead time per call.
+      AWS_EC2_METADATA_DISABLED: "true"
+
+      RUSTFS_ENDPOINT: http://127.0.0.1:9000
+      BUCKET: searchlite-ci
+      PREFIX: video-games
+      LOCAL_INDEX: /tmp/sl-video-games
+      HTTP_BIND: 127.0.0.1:8080
+
+    services:
+      # rustfs is a pure-Rust S3-compatible object store. Single-node
+      # mode with one volume is enough for this smoke test; we don't
+      # need erasure coding or the console.
+      rustfs:
+        image: rustfs/rustfs:latest
+        ports:
+          - 9000:9000
+        env:
+          RUSTFS_ACCESS_KEY: rustfsadmin
+          RUSTFS_SECRET_KEY: rustfsadmin
+          RUSTFS_VOLUMES: /data
+          RUSTFS_ADDRESS: 0.0.0.0:9000
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_OBS_LOGGER_LEVEL: warn
+        # Service-container healthcheck — Actions waits for `healthy`
+        # before starting steps. /health returns 200 as soon as the
+        # listener is bound, but the JSON body's `ready` field flips
+        # to `true` only once IAM and storage finish initializing,
+        # so we grep on the body rather than just the exit code.
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/health | grep -q '\"ready\":true' || exit 1"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 40
+          --health-start-period 5s
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: s3-integration
+
+      - name: Confirm rustfs is reachable on host port
+        run: |
+          # Service-container healthcheck has already gated this step
+          # on `ready:true`; one final probe pins the failure mode to
+          # "host port not bound" vs. "rustfs not running" on the rare
+          # cases where something else holds 9000.
+          for i in $(seq 1 30); do
+            body=$(curl -fsS "$RUSTFS_ENDPOINT/health" 2>/dev/null || true)
+            if echo "$body" | grep -q '"ready":true'; then
+              echo "rustfs ready at $RUSTFS_ENDPOINT"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "rustfs never reached ready:true at $RUSTFS_ENDPOINT" >&2
+          exit 1
+
+      - name: Create bucket
+        run: |
+          aws s3api create-bucket \
+            --bucket "$BUCKET" \
+            --region "$AWS_REGION" \
+            --endpoint-url "$RUSTFS_ENDPOINT"
+          aws s3api list-buckets --endpoint-url "$RUSTFS_ENDPOINT"
+
+      - name: Build searchlite-cli + searchlite-http (release, s3 default feature)
+        run: |
+          cargo build --release \
+            --bin searchlite-cli \
+            --bin searchlite-http
+
+      - name: Bake video-games index locally
+        run: |
+          rm -rf "$LOCAL_INDEX"
+          ./target/release/searchlite-cli init "$LOCAL_INDEX" examples/video-games/schema.json
+          ./target/release/searchlite-cli add  "$LOCAL_INDEX" examples/video-games/data.jsonl
+          ./target/release/searchlite-cli commit "$LOCAL_INDEX"
+          ls -la "$LOCAL_INDEX"
+
+      - name: Sync to rustfs
+        run: |
+          ./target/release/searchlite-cli sync "$LOCAL_INDEX" "s3://$BUCKET/$PREFIX" \
+            --s3-endpoint "$RUSTFS_ENDPOINT" \
+            --s3-region "$AWS_REGION" \
+            --s3-force-path-style
+
+      - name: Verify objects landed (manifest is the visibility fence)
+        run: |
+          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive --endpoint-url "$RUSTFS_ENDPOINT"
+          aws s3api head-object \
+            --bucket "$BUCKET" \
+            --key "$PREFIX/MANIFEST.json" \
+            --endpoint-url "$RUSTFS_ENDPOINT"
+
+      - name: CLI inspect against s3:// URL
+        run: |
+          ./target/release/searchlite-cli inspect "s3://$BUCKET/$PREFIX" \
+            --s3-endpoint "$RUSTFS_ENDPOINT" \
+            --s3-region "$AWS_REGION" \
+            --s3-force-path-style \
+            --checksum-policy trust-manifest
+
+      - name: CLI search against s3:// URL (term query)
+        run: |
+          ./target/release/searchlite-cli search "s3://$BUCKET/$PREFIX" \
+            --s3-endpoint "$RUSTFS_ENDPOINT" \
+            --s3-region "$AWS_REGION" \
+            --s3-force-path-style \
+            --checksum-policy trust-manifest \
+            -q "rpg" --limit 5 > /tmp/cli-search.json
+          cat /tmp/cli-search.json
+          # Sanity: response is JSON with non-empty `hits`.
+          python3 - <<'PY'
+          import json
+          with open('/tmp/cli-search.json') as f:
+              d = json.load(f)
+          assert 'hits' in d, d
+          assert len(d['hits']) > 0, ('no hits for rpg', d)
+          print('CLI term query OK,', len(d['hits']), 'hits')
+          PY
+
+      - name: CLI search with prebuilt fuzzy request file
+        run: |
+          ./target/release/searchlite-cli search "s3://$BUCKET/$PREFIX" \
+            --s3-endpoint "$RUSTFS_ENDPOINT" \
+            --s3-region "$AWS_REGION" \
+            --s3-force-path-style \
+            --checksum-policy trust-manifest \
+            --request examples/video-games/queries/fuzzy-meta-ps5-misspell.json
+
+      - name: Start searchlite-http with rustfs-backed mount
+        run: |
+          ./target/release/searchlite-http \
+            --index "games:s3://$BUCKET/$PREFIX" \
+            --bind "$HTTP_BIND" \
+            --s3-endpoint "$RUSTFS_ENDPOINT" \
+            --s3-region "$AWS_REGION" \
+            --s3-force-path-style \
+            --checksum-policy trust-manifest \
+            --require-existing-index \
+            >/tmp/searchlite-http.log 2>&1 &
+          echo $! > /tmp/searchlite-http.pid
+          for i in $(seq 1 30); do
+            if curl -fsS "http://$HTTP_BIND/healthz" >/dev/null; then
+              echo "searchlite-http ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "searchlite-http never became ready" >&2
+          cat /tmp/searchlite-http.log >&2 || true
+          exit 1
+
+      - name: HTTP — stats endpoint
+        run: |
+          curl -fsS "http://$HTTP_BIND/indexes/games/stats" | python3 -m json.tool
+
+      - name: HTTP — term search
+        run: |
+          curl -fsS -X POST "http://$HTTP_BIND/indexes/games/search" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"rpg","limit":5,"return_stored":true}' > /tmp/http-search.json
+          python3 -m json.tool /tmp/http-search.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/http-search.json') as f:
+              d = json.load(f)
+          assert 'hits' in d and len(d['hits']) > 0, ('no hits over HTTP', d)
+          assert 'doc_id' in d['hits'][0], ('hit missing doc_id', d['hits'][0])
+          print('HTTP term query OK,', len(d['hits']), 'hits')
+          PY
+
+      - name: HTTP — prebuilt fuzzy query
+        run: |
+          curl -fsS -X POST "http://$HTTP_BIND/indexes/games/search" \
+            -H 'Content-Type: application/json' \
+            --data-binary @examples/video-games/queries/fuzzy-meta-ps5-misspell.json > /tmp/http-fuzzy.json
+          python3 -m json.tool /tmp/http-fuzzy.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/http-fuzzy.json') as f:
+              d = json.load(f)
+          assert 'hits' in d, d
+          # Fuzzy 1-edit query against the modern-meta-ps5 corpus must
+          # match at least one game — if it doesn't, fuzzy expansion
+          # over an S3-backed index has regressed.
+          assert len(d['hits']) > 0, d
+          print('HTTP fuzzy query OK,', len(d['hits']), 'hits')
+          PY
+
+      - name: HTTP — mget round-trip on first hit
+        run: |
+          curl -fsS -X POST "http://$HTTP_BIND/indexes/games/search" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"rpg","limit":1}' > /tmp/http-first.json
+          first_id=$(python3 -c 'import json; print(json.load(open("/tmp/http-first.json"))["hits"][0]["doc_id"])')
+          echo "first_id=$first_id"
+          curl -fsS -X POST "http://$HTTP_BIND/indexes/games/mget" \
+            -H 'Content-Type: application/json' \
+            -d "{\"ids\":[\"$first_id\"],\"return_stored\":true}" > /tmp/http-mget.json
+          python3 -m json.tool /tmp/http-mget.json
+
+      - name: Tear down searchlite-http
+        if: always()
+        run: |
+          if [ -f /tmp/searchlite-http.pid ]; then
+            kill "$(cat /tmp/searchlite-http.pid)" 2>/dev/null || true
+          fi
+
+      - name: Dump searchlite-http log (on failure)
+        if: failure()
+        run: |
+          if [ -f /tmp/searchlite-http.log ]; then
+            echo "=== searchlite-http.log ==="
+            cat /tmp/searchlite-http.log
+          fi
+
+      - name: Dump rustfs container logs (on failure)
+        if: failure()
+        run: |
+          docker ps -a
+          for cid in $(docker ps -a --filter "ancestor=rustfs/rustfs:latest" --format '{{.ID}}'); do
+            echo "=== rustfs logs ($cid) ==="
+            docker logs "$cid" 2>&1 || true
+          done
