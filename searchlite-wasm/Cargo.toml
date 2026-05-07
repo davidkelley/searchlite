@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
 description = "WASM bindings for searchlite with IndexedDB-backed storage"
+publish = false
 
 [features]
 default = []

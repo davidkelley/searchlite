@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Node.js native addon for searchlite"
+publish = false
 
 [features]
 default = []
