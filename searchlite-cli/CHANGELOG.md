@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.13...searchlite-cli-v0.1.14) - 2026-05-07
+
+### Other
+
+- publish 5 searchlite crates to crates.io ([#491](https://github.com/davidkelley/searchlite/pull/491))
+- *(deps)* bump the rust-minor-patch group across 1 directory with 6 updates ([#487](https://github.com/davidkelley/searchlite/pull/487))
+
 ## [0.1.13](https://github.com/davidkelley/searchlite/compare/searchlite-cli-v0.1.12...searchlite-cli-v0.1.13) - 2026-05-06
 
 ### Added

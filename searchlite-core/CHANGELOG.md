@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.9.0...searchlite-core-v0.9.1) - 2026-05-07
+
+### Other
+
+- publish 5 searchlite crates to crates.io ([#491](https://github.com/davidkelley/searchlite/pull/491))
+
 ## [0.9.0](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.8.2...searchlite-core-v0.9.0) - 2026-05-06
 
 ### Added
