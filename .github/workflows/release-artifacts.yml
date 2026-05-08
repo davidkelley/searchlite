@@ -87,7 +87,7 @@ jobs:
           fi
 
       - name: Upload CLI asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ env.DIST_DIR }}/*
         env:
@@ -155,7 +155,7 @@ jobs:
           zip -r "../../$DIST_DIR/searchlite-wasm.zip" .
 
       - name: Upload wasm asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ env.DIST_DIR }}/*
         env:
