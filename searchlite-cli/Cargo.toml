@@ -37,7 +37,7 @@ serde_json = { workspace = true }
 searchlite-core = { path = "../searchlite-core", version = "0.9.1", package = "searchlite-core", features = ["write-key"] }
 searchlite-http = { path = "../searchlite-http", version = "0.2.7", package = "searchlite-http" }
 searchlite-s3 = { path = "../searchlite-s3", version = "0.2.7", package = "searchlite-s3", optional = true }
-tokio = { version = "1.52.2", features = ["rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 chrono = { workspace = true }
 env_logger = { workspace = true }
 tracing = "0.1.40"
