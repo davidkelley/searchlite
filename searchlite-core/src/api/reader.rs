@@ -1183,25 +1183,6 @@ impl IndexReader {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse", None)?;
     }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
-    // BUG-411: a rescore stage rewrites `hit.score` and, for score-bearing sort
-    // plans, the score-keyed `hit.key` too. The cursor / search_after token
-    // emitted for a paginated rescore would therefore carry the *rescored*
-    // score, which page 2 cannot match against the base-score keys built
-    // during segment search — `saw_cursor` would never fire and the request
-    // would bail with `"stale or invalid cursor for this result set"`. Sort
-    // plans that don't use `_score` are unaffected because `build_key`
-    // ignores the score for non-score sort fields. Reject the inbound side
-    // here so a hand-crafted cursor can't reach the cursor-key comparison;
-    // the outbound side suppresses tokens at emission time to ensure callers
-    // are never handed one they can't use.
-    if req.rescore.is_some() && sort_plan.uses_score() {
-      if req.cursor.is_some() {
-        bail!("cursor pagination is not supported when rescore is combined with a sort that uses _score");
-      }
-      if req.search_after.is_some() {
-        bail!("search_after pagination is not supported when rescore is combined with a sort that uses _score");
-      }
-    }
     let track_total_hits = req.track_total_hits.unwrap_or(false);
     let score_fast_path = !track_total_hits
       && sort_plan.is_score_only()
@@ -1292,6 +1273,28 @@ impl IndexReader {
     if let Some(plan) = vector_plan.as_ref() {
       if plan.vector_only {
         return self.search_vector_only(req, sort_plan, manifest_generation, cursor_state, plan);
+      }
+    }
+    // BUG-411: a rescore stage rewrites `hit.score` and, for score-bearing sort
+    // plans, the score-keyed `hit.key` too. The cursor / search_after token
+    // emitted for a paginated rescore would therefore carry the *rescored*
+    // score, which page 2 cannot match against the base-score keys built
+    // during segment search — `saw_cursor` would never fire and the request
+    // would bail with `"stale or invalid cursor for this result set"`. Sort
+    // plans that don't use `_score` are unaffected because `build_key`
+    // ignores the score for non-score sort fields. The check (and the
+    // outbound `suppress_pagination_tokens` flag further down) runs *after*
+    // the vector-only early return on purpose: `search_vector_only` never
+    // calls `rescore_hits`, so its cursor is built from the base vector
+    // score and is not corrupted by rescore. Applying this guard there
+    // too would reject vector-only requests whose tokens are still valid,
+    // breaking what was previously a working flow.
+    if req.rescore.is_some() && sort_plan.uses_score() {
+      if req.cursor.is_some() {
+        bail!("cursor pagination is not supported when rescore is combined with a sort that uses _score");
+      }
+      if req.search_after.is_some() {
+        bail!("search_after pagination is not supported when rescore is combined with a sort that uses _score");
       }
     }
     let query_plan = build_query_plan(&req.query, &default_fields)?;
@@ -3971,43 +3974,55 @@ mod tests {
   // tokens so the failure mode is unreachable. The sister assertion below
   // guards the non-score sort plan, where rescore does not corrupt the
   // key and pagination must still work.
-  fn make_rescore_index(dir: &tempfile::TempDir) -> Index {
+  const RESCORE_CORPUS: &[(&str, &str)] = &[
+    ("doc-1", "rust rust search engine"),
+    ("doc-2", "rust query optimizer"),
+    ("doc-3", "rust safe parallel rust"),
+    ("doc-4", "rust borrow checker"),
+    ("doc-5", "rust traits and generics"),
+  ];
+
+  fn rescore_index_options(path: &std::path::Path) -> IndexOptions {
+    IndexOptions {
+      path: path.to_path_buf(),
+      create_if_missing: true,
+      enable_positions: true,
+      bm25_k1: 0.9,
+      bm25_b: 0.4,
+      storage: StorageType::Filesystem,
+      checksum_policy: Default::default(),
+      checksum_audit_failure_hook: None,
+      read_only: false,
+      #[cfg(feature = "vectors")]
+      vector_defaults: None,
+    }
+  }
+
+  /// Build an index from a custom `schema` and a closure that maps each
+  /// `(id, text, index)` tuple from `RESCORE_CORPUS` to a full `Document`.
+  /// Tests with extra fields (e.g. a numeric `rank` for sort-stability
+  /// checks) pass a closure that augments the base `_id` + `body`
+  /// fields; tests that only need the base schema pass the
+  /// `default_text_body` schema and the identity-style closure.
+  fn make_rescore_index_with(
+    dir: &tempfile::TempDir,
+    schema: Schema,
+    mut build_doc: impl FnMut(usize, &str, &str) -> Document,
+  ) -> Index {
     let path = dir.path().join("idx");
-    let schema = Schema::default_text_body();
-    let idx = Index::create(
-      &path,
-      schema,
-      IndexOptions {
-        path: path.clone(),
-        create_if_missing: true,
-        enable_positions: true,
-        bm25_k1: 0.9,
-        bm25_b: 0.4,
-        storage: StorageType::Filesystem,
-        checksum_policy: Default::default(),
-        checksum_audit_failure_hook: None,
-        read_only: false,
-        #[cfg(feature = "vectors")]
-        vector_defaults: None,
-      },
-    )
-    .unwrap();
+    let idx = Index::create(&path, schema, rescore_index_options(&path)).unwrap();
     let mut writer = idx.writer().unwrap();
-    for (id, text) in [
-      ("doc-1", "rust rust search engine"),
-      ("doc-2", "rust query optimizer"),
-      ("doc-3", "rust safe parallel rust"),
-      ("doc-4", "rust borrow checker"),
-      ("doc-5", "rust traits and generics"),
-    ] {
-      writer
-        .add_document(&Document {
-          fields: BTreeMap::from([("_id".into(), json!(id)), ("body".into(), json!(text))]),
-        })
-        .unwrap();
+    for (i, (id, text)) in RESCORE_CORPUS.iter().enumerate() {
+      writer.add_document(&build_doc(i, id, text)).unwrap();
     }
     writer.commit().unwrap();
     idx
+  }
+
+  fn make_rescore_index(dir: &tempfile::TempDir) -> Index {
+    make_rescore_index_with(dir, Schema::default_text_body(), |_, id, text| Document {
+      fields: BTreeMap::from([("_id".into(), json!(id)), ("body".into(), json!(text))]),
+    })
   }
 
   fn rescore_search_request(
@@ -4132,7 +4147,6 @@ mod tests {
   #[test]
   fn rescore_with_numeric_sort_still_paginates() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("idx");
     let mut schema = Schema::default_text_body();
     schema.numeric_fields.push(NumericField {
       name: "rank".into(),
@@ -4141,46 +4155,13 @@ mod tests {
       stored: false,
       nullable: false,
     });
-    let idx = Index::create(
-      &path,
-      schema,
-      IndexOptions {
-        path: path.clone(),
-        create_if_missing: true,
-        enable_positions: true,
-        bm25_k1: 0.9,
-        bm25_b: 0.4,
-        storage: StorageType::Filesystem,
-        checksum_policy: Default::default(),
-        checksum_audit_failure_hook: None,
-        read_only: false,
-        #[cfg(feature = "vectors")]
-        vector_defaults: None,
-      },
-    )
-    .unwrap();
-    let mut writer = idx.writer().unwrap();
-    for (idx_n, (id, text)) in [
-      ("doc-1", "rust rust search engine"),
-      ("doc-2", "rust query optimizer"),
-      ("doc-3", "rust safe parallel rust"),
-      ("doc-4", "rust borrow checker"),
-      ("doc-5", "rust traits and generics"),
-    ]
-    .iter()
-    .enumerate()
-    {
-      writer
-        .add_document(&Document {
-          fields: BTreeMap::from([
-            ("_id".into(), json!(id)),
-            ("body".into(), json!(text)),
-            ("rank".into(), json!(idx_n as i64)),
-          ]),
-        })
-        .unwrap();
-    }
-    writer.commit().unwrap();
+    let idx = make_rescore_index_with(&dir, schema, |i, id, text| Document {
+      fields: BTreeMap::from([
+        ("_id".into(), json!(id)),
+        ("body".into(), json!(text)),
+        ("rank".into(), json!(i as i64)),
+      ]),
+    });
     let reader = idx.reader().unwrap();
     let mut req = rescore_search_request(None, None, true);
     req.sort = vec![SortSpec {
