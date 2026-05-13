@@ -6,7 +6,8 @@ use std::path::Path;
 use searchlite_core::api::builder::IndexBuilder;
 use searchlite_core::api::types::{
   Aggregation, Document, ExecutionStrategy, Filter, IndexOptions, LegacyVectorQuery, Query,
-  QueryNode, SearchRequest, SortSpec, StorageType, VectorQuery, VectorQuerySpec,
+  QueryNode, RescoreMode, RescoreRequest, SearchRequest, SortSpec, StorageType, VectorQuery,
+  VectorQuerySpec,
 };
 use searchlite_core::{Index, Schema};
 use serde_json::json;
@@ -194,6 +195,111 @@ fn vector_query_with_limit_zero_succeeds_without_hits() {
   assert!(res.hits.is_empty());
   assert_eq!(res.next_cursor, None);
   assert!(res.total_hits_estimate > 0);
+}
+
+// BUG-411 follow-up (Codex P1 / Copilot review on #501): the text/hybrid
+// rescore + score-sort cursor guard must not regress vector-only queries.
+// `search_vector_only` never calls `rescore_hits`, so its cursor is built
+// from the base vector score and is not corrupted by rescore even when a
+// caller provides a (silently-ignored) `rescore` block. The inbound
+// validation and outbound suppression in `IndexReader::search` therefore
+// run *after* the vector-only early return; this test pins that scoping
+// in place so page 2 of a vector-only paginated request still succeeds.
+#[test]
+fn vector_only_paginated_cursor_works_when_request_carries_rescore() {
+  let dir = tempdir().unwrap();
+  let schema = schema();
+  IndexBuilder::create(dir.path(), schema.clone(), opts(dir.path())).unwrap();
+  let idx = Index::open(opts(dir.path())).unwrap();
+  add_docs(
+    &idx,
+    &[
+      Document {
+        fields: [
+          ("_id".into(), json!("vec-1")),
+          ("body".into(), json!("rust search engine")),
+          ("embedding".into(), json!([1.0, 0.0])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), json!("vec-2")),
+          ("body".into(), json!("rust traits")),
+          ("embedding".into(), json!([0.95, 0.05])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), json!("vec-3")),
+          ("body".into(), json!("rust query")),
+          ("embedding".into(), json!([0.9, 0.1])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+      Document {
+        fields: [
+          ("_id".into(), json!("vec-4")),
+          ("body".into(), json!("rust borrow checker")),
+          ("embedding".into(), json!([0.8, 0.2])),
+        ]
+        .into_iter()
+        .collect(),
+      },
+    ],
+  );
+  let reader = idx.reader().unwrap();
+  // Vector-only request: alpha=0.0 means pure vector ranking, no text
+  // contribution. The included `rescore` block would matter for a
+  // text/hybrid search, but `search_vector_only` silently ignores it —
+  // we still expect a working cursor.
+  let mut req = SearchRequest {
+    query: Query::Node(QueryNode::Vector(VectorQuery {
+      field: "embedding".into(),
+      vector: vec![1.0, 0.0],
+      k: Some(4),
+      alpha: Some(0.0),
+      ef_search: None,
+      candidate_size: Some(4),
+      boost: None,
+    })),
+    vector_query: None,
+    vector_filter: None,
+    rescore: Some(RescoreRequest {
+      window_size: 2,
+      query: QueryNode::Phrase {
+        field: Some("body".into()),
+        terms: vec!["rust".into(), "search".into()],
+        slop: Some(2),
+        boost: None,
+      },
+      score_mode: RescoreMode::Total,
+    }),
+    ..base_request(Query::String("".into()), 2)
+  };
+  let first = reader.search(&req).expect("page 1 must succeed");
+  assert_eq!(first.hits.len(), 2, "expected limit=2 hits on page 1");
+  let cursor = first
+    .next_cursor
+    .clone()
+    .expect("vector-only + rescore must still emit next_cursor");
+
+  req.cursor = Some(cursor);
+  let second = reader.search(&req).expect("page 2 must succeed");
+  assert!(!second.hits.is_empty(), "page 2 must return hits");
+  let first_ids: std::collections::HashSet<&str> =
+    first.hits.iter().map(|h| h.doc_id.as_str()).collect();
+  for hit in &second.hits {
+    assert!(
+      !first_ids.contains(hit.doc_id.as_str()),
+      "page 1 and page 2 must be disjoint; {} appeared in both",
+      hit.doc_id
+    );
+  }
 }
 
 #[test]
