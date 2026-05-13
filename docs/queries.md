@@ -353,6 +353,18 @@ re-ranks them with phrase proximity. This gives you phrase-quality results at BM
 }
 ```
 
+Rescore reorders the top window by combining the rescore score with the
+base score. When the request sorts by `_score`, the resulting order
+cannot be resumed with `cursor` or `search_after`: those tokens are keyed
+on the score component, and the next page would compare them against the
+*pre-rescore* score stream. To make this unambiguous, Searchlite does
+**not** emit `next_cursor` / `next_search_after` for a request that
+combines `rescore` with a score-bearing sort, and rejects a request that
+supplies either token with the same combination. Sort plans that don't
+include `_score` (e.g. sort by a numeric field) are unaffected — rescore
+changes the displayed score without touching the sort key, so the cursor
+remains stable and pagination is fully supported.
+
 ---
 
 ## Request-level tuning knobs

@@ -1183,6 +1183,25 @@ impl IndexReader {
       ensure_keyword_fast(&self.manifest.schema, &collapse.field, "collapse", None)?;
     }
     let sort_plan = SortPlan::from_request(&self.manifest.schema, &req.sort)?;
+    // BUG-411: a rescore stage rewrites `hit.score` and, for score-bearing sort
+    // plans, the score-keyed `hit.key` too. The cursor / search_after token
+    // emitted for a paginated rescore would therefore carry the *rescored*
+    // score, which page 2 cannot match against the base-score keys built
+    // during segment search — `saw_cursor` would never fire and the request
+    // would bail with `"stale or invalid cursor for this result set"`. Sort
+    // plans that don't use `_score` are unaffected because `build_key`
+    // ignores the score for non-score sort fields. Reject the inbound side
+    // here so a hand-crafted cursor can't reach the cursor-key comparison;
+    // the outbound side suppresses tokens at emission time to ensure callers
+    // are never handed one they can't use.
+    if req.rescore.is_some() && sort_plan.uses_score() {
+      if req.cursor.is_some() {
+        bail!("cursor pagination is not supported when rescore is combined with a sort that uses _score");
+      }
+      if req.search_after.is_some() {
+        bail!("search_after pagination is not supported when rescore is combined with a sort that uses _score");
+      }
+    }
     let track_total_hits = req.track_total_hits.unwrap_or(false);
     let score_fast_path = !track_total_hits
       && sort_plan.is_score_only()
@@ -1539,10 +1558,15 @@ impl IndexReader {
     }
     let mut next_cursor = None;
     let mut next_search_after = None;
+    // BUG-411: never hand out pagination tokens we can't honor on the next
+    // page. When rescore is paired with a score-bearing sort plan the
+    // emitted key would carry the rescored score, which cannot match the
+    // base-score keys produced during segment search.
+    let suppress_pagination_tokens = req.rescore.is_some() && sort_plan.uses_score();
     let hits: Vec<Hit> = if req.return_hits {
       let total_needed = from.saturating_add(req.limit);
       let has_more = total_needed > 0 && hits.len() > total_needed;
-      if has_more {
+      if has_more && !suppress_pagination_tokens {
         let last = &hits[total_needed - 1];
         if !search_after_mode {
           let returned = cursor_returned
@@ -1632,7 +1656,7 @@ impl IndexReader {
           Some(hit)
         })
         .collect();
-      if has_more {
+      if has_more && !suppress_pagination_tokens {
         if let Some(key) = last_returned_key.as_ref() {
           next_search_after = encode_search_after_token(&sort_plan, key, &self.segments).ok();
         }
@@ -3937,6 +3961,254 @@ mod tests {
     assert!(err
       .to_string()
       .contains("cursor cannot be combined with search_after"));
+  }
+
+  // BUG-411: a rescore stage rewrites the score-bearing component of the
+  // sort key, so a cursor / search_after token emitted alongside rescore
+  // would carry the rescored score and never match the base-score keys
+  // built during segment search on the next page (the engine bailed with
+  // "stale or invalid cursor"). Suppress emission and reject inbound
+  // tokens so the failure mode is unreachable. The sister assertion below
+  // guards the non-score sort plan, where rescore does not corrupt the
+  // key and pagination must still work.
+  fn make_rescore_index(dir: &tempfile::TempDir) -> Index {
+    let path = dir.path().join("idx");
+    let schema = Schema::default_text_body();
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (id, text) in [
+      ("doc-1", "rust rust search engine"),
+      ("doc-2", "rust query optimizer"),
+      ("doc-3", "rust safe parallel rust"),
+      ("doc-4", "rust borrow checker"),
+      ("doc-5", "rust traits and generics"),
+    ] {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([("_id".into(), json!(id)), ("body".into(), json!(text))]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    idx
+  }
+
+  fn rescore_search_request(
+    cursor: Option<String>,
+    search_after: Option<Vec<serde_json::Value>>,
+    rescore: bool,
+  ) -> SearchRequest {
+    SearchRequest {
+      query: Query::String("rust".into()),
+      fields: None,
+      filter: None,
+      limit: 2,
+      from: 0,
+      return_hits: true,
+      candidate_size: None,
+      #[cfg(feature = "vectors")]
+      max_global_vector_candidates: None,
+      sort: Vec::new(),
+      cursor,
+      search_after,
+      execution: ExecutionStrategy::Bm25,
+      bmw_block_size: None,
+      fuzzy: None,
+      track_total_hits: None,
+      #[cfg(feature = "vectors")]
+      vector_query: None,
+      #[cfg(feature = "vectors")]
+      vector_filter: None,
+      return_stored: false,
+      highlight_field: None,
+      highlight: None,
+      collapse: None,
+      aggs: BTreeMap::new(),
+      suggest: BTreeMap::new(),
+      rescore: rescore.then(|| RescoreRequest {
+        window_size: 5,
+        query: QueryNode::Phrase {
+          field: Some("body".into()),
+          terms: vec!["rust".into(), "search".into()],
+          slop: Some(2),
+          boost: None,
+        },
+        score_mode: RescoreMode::Total,
+      }),
+      explain: false,
+      profile: false,
+    }
+  }
+
+  #[test]
+  fn rescore_with_score_sort_suppresses_pagination_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = make_rescore_index(&dir);
+    let reader = idx.reader().unwrap();
+    let result = reader
+      .search(&rescore_search_request(None, None, true))
+      .unwrap();
+    assert!(
+      result.hits.len() >= 2,
+      "expected at least 2 hits, got {}",
+      result.hits.len()
+    );
+    assert!(
+      result.next_cursor.is_none(),
+      "rescore + score-sort must not emit next_cursor; got {:?}",
+      result.next_cursor
+    );
+    assert!(
+      result.next_search_after.is_none(),
+      "rescore + score-sort must not emit next_search_after; got {:?}",
+      result.next_search_after
+    );
+  }
+
+  #[test]
+  fn rescore_with_score_sort_rejects_cursor_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = make_rescore_index(&dir);
+    let reader = idx.reader().unwrap();
+    // Forge a syntactically valid cursor by running a non-rescore query
+    // first, then replay it together with rescore — the engine must
+    // reject the combination rather than silently mis-paginate.
+    let first = reader
+      .search(&rescore_search_request(None, None, false))
+      .unwrap();
+    let cursor = first
+      .next_cursor
+      .clone()
+      .expect("next_cursor from base query");
+    let err = reader
+      .search(&rescore_search_request(Some(cursor), None, true))
+      .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("cursor pagination is not supported when rescore"),
+      "unexpected error: {msg}"
+    );
+  }
+
+  #[test]
+  fn rescore_with_score_sort_rejects_search_after_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = make_rescore_index(&dir);
+    let reader = idx.reader().unwrap();
+    let first = reader
+      .search(&rescore_search_request(None, None, false))
+      .unwrap();
+    let token = first
+      .next_search_after
+      .clone()
+      .expect("next_search_after from base query");
+    let err = reader
+      .search(&rescore_search_request(None, Some(token), true))
+      .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("search_after pagination is not supported when rescore"),
+      "unexpected error: {msg}"
+    );
+  }
+
+  #[test]
+  fn rescore_with_numeric_sort_still_paginates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let mut schema = Schema::default_text_body();
+    schema.numeric_fields.push(NumericField {
+      name: "rank".into(),
+      i64: true,
+      fast: true,
+      stored: false,
+      nullable: false,
+    });
+    let idx = Index::create(
+      &path,
+      schema,
+      IndexOptions {
+        path: path.clone(),
+        create_if_missing: true,
+        enable_positions: true,
+        bm25_k1: 0.9,
+        bm25_b: 0.4,
+        storage: StorageType::Filesystem,
+        checksum_policy: Default::default(),
+        checksum_audit_failure_hook: None,
+        read_only: false,
+        #[cfg(feature = "vectors")]
+        vector_defaults: None,
+      },
+    )
+    .unwrap();
+    let mut writer = idx.writer().unwrap();
+    for (idx_n, (id, text)) in [
+      ("doc-1", "rust rust search engine"),
+      ("doc-2", "rust query optimizer"),
+      ("doc-3", "rust safe parallel rust"),
+      ("doc-4", "rust borrow checker"),
+      ("doc-5", "rust traits and generics"),
+    ]
+    .iter()
+    .enumerate()
+    {
+      writer
+        .add_document(&Document {
+          fields: BTreeMap::from([
+            ("_id".into(), json!(id)),
+            ("body".into(), json!(text)),
+            ("rank".into(), json!(idx_n as i64)),
+          ]),
+        })
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    let reader = idx.reader().unwrap();
+    let mut req = rescore_search_request(None, None, true);
+    req.sort = vec![SortSpec {
+      field: "rank".into(),
+      order: Some(SortOrder::Asc),
+    }];
+    let first = reader.search(&req).unwrap();
+    // Numeric-only sort key is unchanged by rescore (build_key ignores
+    // score for non-score sort fields), so the engine must still emit
+    // pagination tokens here.
+    let cursor = first
+      .next_cursor
+      .clone()
+      .expect("rescore + numeric sort must still emit next_cursor");
+    let mut next = rescore_search_request(None, None, true);
+    next.sort = req.sort.clone();
+    next.cursor = Some(cursor);
+    let second = reader.search(&next).expect("paginated page 2 succeeds");
+    assert!(!second.hits.is_empty(), "page 2 must return hits");
+    let first_ids: std::collections::HashSet<&str> =
+      first.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    for hit in &second.hits {
+      assert!(
+        !first_ids.contains(hit.doc_id.as_str()),
+        "page 1 and page 2 must be disjoint; {} appeared in both",
+        hit.doc_id
+      );
+    }
   }
 
   #[test]
