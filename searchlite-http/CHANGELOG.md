@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.2.7...searchlite-http-v0.2.8) - 2026-05-14
+
+### Other
+
+- remove "SQLite of search" positioning references ([#503](https://github.com/davidkelley/searchlite/pull/503))
+
 ## [0.2.7](https://github.com/davidkelley/searchlite/compare/searchlite-http-v0.2.6...searchlite-http-v0.2.7) - 2026-05-07
 
 ### Other

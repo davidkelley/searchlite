@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/davidkelley/searchlite/compare/searchlite-core-v0.9.1...searchlite-core-v0.9.2) - 2026-05-14
+
+### Fixed
+
+- *(pagination)* reject and suppress cursor/search_after with rescore over score sort (BUG-411) ([#501](https://github.com/davidkelley/searchlite/pull/501))
+
+### Other
+
+- remove "SQLite of search" positioning references ([#503](https://github.com/davidkelley/searchlite/pull/503))
+
 ### Fixed
 
 - *(pagination)* reject cursor/search_after pagination when rescore is combined with a score-bearing sort, and suppress `next_cursor`/`next_search_after` emission for the same combination — the cursor would otherwise carry the rescored score and never match the base-score keys on page 2, producing `"stale or invalid cursor for this result set"` (BUG-411).
