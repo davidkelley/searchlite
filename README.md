@@ -1,8 +1,6 @@
 <p align="center">
   <h1 align="center">searchlite</h1>
   <p align="center">
-    <strong>The SQLite of search.</strong>
-    <br />
     An embedded full-text search engine for Rust. No JVM, no cluster, no external
     process &mdash; just add a crate and search. WAL-backed durability, BM25
     relevance with WAND/BMW pruning, aggregations, filters, highlights, and

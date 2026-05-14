@@ -56,7 +56,7 @@ Create a small JSONL file (`/tmp/docs.jsonl`) with your documents. Each line is 
 ```bash
 cat > /tmp/docs.jsonl <<'EOF'
 {"_id":"doc-1","title":"Rust search engine","body":"Searchlite is a lightweight search engine written in Rust.","lang":"en","year":2024}
-{"_id":"doc-2","title":"SQLite vibes","body":"Single-node search with a WAL and atomic manifests.","lang":"en","year":2023}
+{"_id":"doc-2","title":"Atomic manifests","body":"Single-node search with a WAL and atomic manifests.","lang":"en","year":2023}
 {"_id":"doc-3","title":"Edge ready","body":"Run full-text search at the edge or in appliances.","lang":"en","year":2022}
 EOF
 ```
@@ -190,7 +190,7 @@ const index = new EmbeddedIndex("./my-index", {
 // 2. Add documents and commit
 await index.addMany([
   { _id: "1", title: "Rust Search Engine", body: "Searchlite is a fast embedded search engine.", lang: "en", year: 2024 },
-  { _id: "2", title: "SQLite Vibes", body: "Single-node search with WAL durability.", lang: "en", year: 2023 },
+  { _id: "2", title: "Atomic Manifests", body: "Single-node search with WAL durability.", lang: "en", year: 2023 },
   { _id: "3", title: "Edge Ready", body: "Run full-text search at the edge.", lang: "en", year: 2022 },
 ]);
 await index.commit();
