@@ -1,6 +1,6 @@
 [package]
 name = "searchlite-cli"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 authors = ["Searchlite Authors"]
 license = "MIT"
@@ -34,9 +34,9 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-searchlite-core = { path = "../searchlite-core", version = "0.9.1", package = "searchlite-core", features = ["write-key"] }
-searchlite-http = { path = "../searchlite-http", version = "0.2.7", package = "searchlite-http" }
-searchlite-s3 = { path = "../searchlite-s3", version = "0.2.7", package = "searchlite-s3", optional = true }
+searchlite-core = { path = "../searchlite-core", version = "0.9.2", package = "searchlite-core", features = ["write-key"] }
+searchlite-http = { path = "../searchlite-http", version = "0.2.8", package = "searchlite-http" }
+searchlite-s3 = { path = "../searchlite-s3", version = "0.2.8", package = "searchlite-s3", optional = true }
 tokio = { version = "1.52.2", features = ["rt-multi-thread"] }
 chrono = { workspace = true }
 env_logger = { workspace = true }
