@@ -15,7 +15,7 @@ fn main() -> Result<()> {
   let query_count = 200usize;
   let k = 10usize;
   let vocab = [
-    "rust", "search", "engine", "tiny", "sqlite", "wand", "bmw", "fast", "index",
+    "rust", "search", "engine", "tiny", "score", "wand", "bmw", "fast", "index",
   ];
   let dir = tempfile::tempdir()?;
   let path = dir.path().join("pruning_bench");

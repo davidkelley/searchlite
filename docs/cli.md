@@ -87,7 +87,7 @@ searchlite init "$INDEX" schema.json
 # 2. Add documents (NDJSON: one JSON object per line)
 cat > /tmp/docs.jsonl <<'EOF'
 {"_id":"1","body":"Rust is a systems programming language","lang":"en","year":2024}
-{"_id":"2","body":"SQLite is an embedded database","lang":"en","year":2023}
+{"_id":"2","body":"Tantivy is a Rust search library","lang":"en","year":2023}
 {"_id":"3","body":"Full-text search with BM25 scoring","lang":"en","year":2024}
 EOF
 searchlite add "$INDEX" /tmp/docs.jsonl
@@ -344,7 +344,7 @@ searchlite init "$INDEX" /tmp/schema.json
 cat > /tmp/posts.jsonl <<'EOF'
 {"_id":"p1","title":"Why Rust is winning",       "body":"Safe systems programming",       "tag":"rust",   "year":2024}
 {"_id":"p2","title":"Intro to BM25",             "body":"How search engines rank results", "tag":"search", "year":2023}
-{"_id":"p3","title":"SQLite for embedded data",  "body":"A single-file database",          "tag":"data",   "year":2022}
+{"_id":"p3","title":"Embedded data stores",     "body":"On-disk indexes",                 "tag":"data",   "year":2022}
 EOF
 searchlite add    "$INDEX" /tmp/posts.jsonl
 searchlite commit "$INDEX"

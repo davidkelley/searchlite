@@ -90,7 +90,7 @@ int main(void) {
 
   // 2. Queue two documents. The bodies are JSON objects keyed by field names.
   const char* doc1 = "{\"_id\":\"1\",\"body\":\"Rust is fast\"}";
-  const char* doc2 = "{\"_id\":\"2\",\"body\":\"SQLite is embedded\"}";
+  const char* doc2 = "{\"_id\":\"2\",\"body\":\"Embedded indexing in C\"}";
   if (searchlite_add_json(idx, doc1, strlen(doc1)) < 0 ||
       searchlite_add_json(idx, doc2, strlen(doc2)) < 0) {
     fprintf(stderr, "add failed\n");

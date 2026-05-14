@@ -1,13 +1,13 @@
 # Searchlite in a Nutshell
 
-Searchlite is a lightweight, SQLite-flavored search engine: a single on-disk index with WAL durability, BM25 relevance, and modern search features, all in a lean Rust binary (no JVM, no cluster to manage).
+Searchlite is a lightweight embedded search engine: a single on-disk index with WAL durability, BM25 relevance, and modern search features, all in a lean Rust binary (no JVM, no cluster to manage).
 
 ## Why Searchlite?
 
 - **Minimal ops**: open an index path and go — no Zookeeper, no cluster sizing, and simple backups/compaction.
 - **Predictable costs**: runs well on one NVMe-backed box; scale up before you have to scale out.
 - **Developer friendly**: clear Rust API, CLI, optional C FFI and wasm; JSON-based requests mirror how you think about queries and filters.
-- **SQLite mindset**: single-writer/multi-reader with WAL-style commits and atomic manifests; readers stay online during writes.
+- **WAL-backed commits**: single-writer/multi-reader design with atomic manifests; readers stay online during writes.
 - **Performance without bloat**: BM25 with WAND/BMW pruning, fast fields, and optional vectors—all without a heavyweight runtime.
 
 ## Try It Fast
@@ -45,7 +45,7 @@ Walk through ingesting a small JSONL file and running your first search in minut
 
 ## Limits and Expectations
 
-- Single-node scope: no built-in sharding/replication; think “SQLite for search.”
+- Single-node scope: no built-in sharding/replication; designed to run on one box, not a cluster.
 - Concurrency model: single writer, many readers; readers stay live across commits.
 - HA story: primary + standby via snapshots/backups rather than cluster replication.
 - Workload fit: low-latency top-k queries with filters/aggregations; not a distributed analytics engine.

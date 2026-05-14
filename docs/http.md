@@ -391,7 +391,7 @@ curl -s -XPOST "$BASE/init" -H 'Content-Type: application/json' --data-binary @/
 # 2. Ingest via NDJSON
 cat > /tmp/docs.ndjson <<'EOF'
 {"_id":"a","body":"Rust search","tag":"rust","year":2024}
-{"_id":"b","body":"SQLite internals","tag":"data","year":2023}
+{"_id":"b","body":"WAL durability","tag":"data","year":2023}
 {"_id":"c","body":"BM25 explained","tag":"search","year":2024}
 EOF
 curl -s -XPOST "$BASE/add" -H 'Content-Type: application/x-ndjson' --data-binary @/tmp/docs.ndjson
