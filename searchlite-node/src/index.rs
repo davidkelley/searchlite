@@ -276,6 +276,11 @@ impl Index {
   /// require a separate `commit`), `delete`/`deleteMany` delete **and commit**
   /// within one writer session, so the removal is durable on return. A missing
   /// id is a no-op (the engine queues a tombstone regardless of existence).
+  ///
+  /// Note: because this commits, any documents previously queued via
+  /// `add`/`addMany` but not yet committed are flushed and become searchable
+  /// too (the commit drains the whole pending WAL). Callers that batch writes
+  /// should not interleave uncommitted `add`s with `delete`.
   #[napi]
   pub fn delete(&self, id: String) -> napi::Result<()> {
     catch_panic("Index::delete", || {

@@ -421,6 +421,10 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 	 * delete **and commit** in one writer session, so the removal is durable
 	 * on return. Deleting a missing id is a no-op.
 	 *
+	 * Note: the commit drains the whole pending WAL, so any documents queued
+	 * via `add`/`addMany` but not yet committed are flushed too. Don't
+	 * interleave uncommitted `add`s with `delete` if you're batching writes.
+	 *
 	 * Not part of the shared `SearchIndex` interface (HTTP-backed indexes do
 	 * not expose it) — only `EmbeddedIndex` supports it.
 	 */
