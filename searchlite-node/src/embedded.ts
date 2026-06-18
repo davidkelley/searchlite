@@ -32,6 +32,8 @@ interface NativeIndex {
 	add(doc: unknown): void;
 	addMany(docs: unknown): number;
 	commit(): void;
+	delete(id: string): void;
+	deleteMany(ids: string[]): number;
 	search(query: unknown): unknown;
 	compact(): void;
 	close(): void;
@@ -411,6 +413,40 @@ export class EmbeddedIndex<T = Record<string, unknown>> implements SearchIndex<T
 
 	async commit(): Promise<void> {
 		this.#native.commit();
+	}
+
+	/**
+	 * Delete a single document by id, then commit. Unlike `add`/`addMany`
+	 * (which queue and require a separate `commit()`), `delete`/`deleteMany`
+	 * delete **and commit** in one writer session, so the removal is durable
+	 * on return. Deleting a missing id is a no-op.
+	 *
+	 * Not part of the shared `SearchIndex` interface (HTTP-backed indexes do
+	 * not expose it) — only `EmbeddedIndex` supports it.
+	 */
+	async delete(id: string): Promise<void> {
+		if (typeof id !== "string" || id.length === 0) {
+			throw new Error("id must be a non-empty string");
+		}
+		this.#native.delete(id);
+	}
+
+	/**
+	 * Delete many documents by id, then commit (one writer session). Returns
+	 * the number of ids submitted (not necessarily the number that existed).
+	 * An empty array is a no-op that returns 0. See `delete` for semantics.
+	 */
+	async deleteMany(ids: string[]): Promise<number> {
+		if (!Array.isArray(ids)) {
+			throw new Error("ids must be an array of non-empty strings");
+		}
+		for (const id of ids) {
+			if (typeof id !== "string" || id.length === 0) {
+				throw new Error("ids must be an array of non-empty strings");
+			}
+		}
+		if (ids.length === 0) return 0;
+		return this.#native.deleteMany(ids);
 	}
 
 	async search<U>(schema: ZodType<U>, query: string): Promise<TypedSearchResult<U>>;

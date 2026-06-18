@@ -132,6 +132,9 @@ jobs:
       - name: Build native addon
         working-directory: searchlite-node
         run: npm run build:native:debug
+      - name: Report .node size
+        working-directory: searchlite-node
+        run: ls -lh searchlite.*.node || true
       - name: Build TypeScript
         working-directory: searchlite-node
         run: npm run build:ts
@@ -161,6 +164,41 @@ jobs:
             echo "::error::Version mismatch: Cargo.toml=$cargo_version package.json=$node_version"
             exit 1
           fi
+
+  # Compile-only guard that the vectors-enabled native addon cross-compiles to
+  # aarch64-linux. The release matrix only runs on tags; without this, an
+  # aarch64 link failure from the `vectors` deps (e.g. a missing cross archiver)
+  # would not surface until release. Tests aren't run here (no emulation) — the
+  # goal is to catch link/build breakage early.
+  build-node-cross-aarch64:
+    name: Node.js (aarch64-linux cross build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install dependencies
+        working-directory: searchlite-node
+        run: npm install
+      - name: Cross-build native addon (vectors default)
+        working-directory: searchlite-node
+        run: npx napi build --platform --release --target aarch64-unknown-linux-gnu
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-ar
+      - name: Report .node size
+        working-directory: searchlite-node
+        run: ls -lh searchlite.*.node || true
 
   bench:
     name: Benchmarks

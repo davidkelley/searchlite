@@ -8,7 +8,11 @@ description = "Node.js native addon for searchlite"
 publish = false
 
 [features]
-default = []
+# `vectors` is on by default so the published `searchlite-js` binary supports
+# vector / hybrid search and `searchlite:vector` schemas out of the box. Without
+# it, a schema containing a vector field hard-errors at parse time and
+# `QueryNode::Vector` fails to deserialize.
+default = ["vectors"]
 vectors = ["searchlite-core/vectors"]
 zstd = ["searchlite-core/zstd"]
 
