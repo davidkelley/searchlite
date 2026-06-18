@@ -181,6 +181,18 @@ export class MemoryStore {
 			await writeFile(this.#config.paths.lock, "");
 		}
 
+		await this.#cache.load();
+		await this.#reloadState();
+		await this.#openOrRebuild();
+	}
+
+	/**
+	 * Re-read ledger + sidecar + access from disk and re-materialize live state.
+	 * Called at open and at the start of every locked mutation/rebuild so a
+	 * concurrent writer's committed records are MERGED, never lost (the ledger on
+	 * disk is authoritative; the in-memory snapshot may be stale).
+	 */
+	async #reloadState(): Promise<void> {
 		const ledger = await readLedger(this.#config.paths.ledger, SCHEMA_VERSION);
 		if (ledger.hasForwardVersion) {
 			throw new Error(
@@ -191,40 +203,43 @@ export class MemoryStore {
 		}
 		this.#malformed = ledger.malformed;
 		this.#allRecords = ledger.records;
-		const mat = materialize(ledger.records);
-		this.#live = new Map(mat.live.map((r) => [r.id, r]));
-
+		this.#live = new Map(materialize(ledger.records).live.map((r) => [r.id, r]));
 		const sidecar = await readSidecar(this.#config.paths.sidecar);
 		this.#sidecar = indexByContentHash(sidecar.entries);
-
 		this.#access = await this.#readAccess();
-		await this.#cache.load();
+	}
 
-		const desired = this.#computeGate(0);
-		const onDisk = await this.#readGate();
-		const currentGen = await this.#readCurrentGen();
-		const genDirExists = currentGen != null && (await this.#dirExists(this.#genDir(currentGen)));
-
-		const stale =
-			currentGen == null ||
-			!genDirExists ||
-			onDisk == null ||
+	#isStale(onDisk: Gate | null, currentGen: number | null, genDirExists: boolean): boolean {
+		if (currentGen == null || !genDirExists || onDisk == null) return true;
+		if (onDisk.indexGen !== currentGen) return true;
+		const desired = this.#computeGate(currentGen);
+		return (
 			onDisk.ledgerHash !== desired.ledgerHash ||
 			onDisk.sidecarHash !== desired.sidecarHash ||
 			onDisk.schemaFingerprint !== desired.schemaFingerprint ||
-			onDisk.vectorFingerprint !== desired.vectorFingerprint;
+			onDisk.vectorFingerprint !== desired.vectorFingerprint
+		);
+	}
 
-		if (stale) {
-			await withLock(this.#config.paths.lock, this.#lockOpts(), () =>
-				this.#rebuildLocked(currentGen),
-			);
-		} else {
-			this.#index = new EmbeddedIndex(this.#genDir(currentGen), {
-				schema: buildIndexSchema(this.#schemaOpts()),
-			});
-			this.#indexGen = currentGen;
-			this.#openedGate = onDisk;
+	async #openOrRebuild(): Promise<void> {
+		const onDisk = await this.#readGate();
+		const currentGen = await this.#readCurrentGen();
+		const genDirExists = currentGen != null && (await this.#dirExists(this.#genDir(currentGen)));
+		if (this.#isStale(onDisk, currentGen, genDirExists)) {
+			await withLock(this.#config.paths.lock, this.#lockOpts(), () => this.#rebuildLocked());
+		} else if (currentGen != null && onDisk != null) {
+			await this.#openIndex(currentGen, onDisk);
 		}
+	}
+
+	/** (Re)open the index handle on a generation dir, closing any prior handle. */
+	async #openIndex(gen: number, gate: Gate): Promise<void> {
+		if (this.#index) await this.#index.close();
+		this.#index = new EmbeddedIndex(this.#genDir(gen), {
+			schema: buildIndexSchema(this.#schemaOpts()),
+		});
+		this.#indexGen = gen;
+		this.#openedGate = gate;
 	}
 
 	async #dirExists(path: string): Promise<boolean> {
@@ -236,8 +251,22 @@ export class MemoryStore {
 		}
 	}
 
-	/** Rebuild the index into a fresh generation dir and flip CURRENT. MUST hold the lock. */
-	async #rebuildLocked(currentGen: number | null): Promise<void> {
+	/**
+	 * Rebuild into a fresh generation dir and flip CURRENT. MUST hold the lock.
+	 * Double-checked: re-reads on-disk state under the lock and, if another
+	 * process already produced a matching index, opens it instead of rebuilding
+	 * (and allocates the next generation from the fresh CURRENT, never a stale one).
+	 */
+	async #rebuildLocked(): Promise<void> {
+		await this.#reloadState();
+		const onDisk = await this.#readGate();
+		const currentGen = await this.#readCurrentGen();
+		const genDirExists = currentGen != null && (await this.#dirExists(this.#genDir(currentGen)));
+		if (!this.#isStale(onDisk, currentGen, genDirExists) && currentGen != null && onDisk != null) {
+			await this.#openIndex(currentGen, onDisk);
+			return;
+		}
+
 		const newGen = (currentGen ?? 0) + 1;
 		const dir = this.#genDir(newGen);
 		await rm(dir, { recursive: true, force: true });
@@ -349,28 +378,48 @@ export class MemoryStore {
 		}
 
 		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
+			await this.#reloadState(); // merge any concurrent writes before mutating
+			await this.#ensureIndexFresh();
 			const existing = this.#findLiveByHash(hash);
 			if (existing) return { id: existing, deduped: true };
 
 			this.#allRecords.push(record);
 			this.#live.set(record.id, record);
 			if (vecB64) {
-				const entry: VectorSidecarEntry = {
+				this.#sidecar.set(hash, {
 					id: record.id,
 					contentHash: hash,
 					model: this.#embedder.id,
 					dim: this.#embedder.dim,
 					quant: "i8",
 					vecB64,
-				};
-				this.#sidecar.set(hash, entry);
+				});
+			}
+
+			// Supersede: atomically tombstone the replaced memory + drop its vector.
+			const supersedeId =
+				input.supersedes && input.supersedes !== record.id && this.#live.has(input.supersedes)
+					? input.supersedes
+					: null;
+			if (supersedeId) {
+				const old = this.#live.get(supersedeId);
+				this.#allRecords.push(makeForgetRecord(supersedeId));
+				this.#live.delete(supersedeId);
+				if (old?.contentHash && !this.#hashStillLive(old.contentHash)) {
+					this.#sidecar.delete(old.contentHash);
+				}
+			}
+
+			if (this.vectorsEnabled) {
 				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
 			}
 			await writeLedger(this.#config.paths.ledger, this.#allRecords);
 
 			const embedding = vecB64 ? dequantizeInt8(vecB64, this.#embedder.dim) : null;
 			await this.#index?.add(recordToDoc(record, embedding));
-			await this.#index?.commit();
+			if (supersedeId)
+				await this.#index?.deleteMany([supersedeId]); // deletes + commits
+			else await this.#index?.commit();
 
 			await this.#bumpGate();
 			await this.#cache.flush();
@@ -380,15 +429,18 @@ export class MemoryStore {
 
 	async forget(id: string): Promise<{ id: string; forgotten: boolean }> {
 		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
+			await this.#reloadState(); // merge concurrent writes before mutating
+			await this.#ensureIndexFresh();
 			const existing = this.#live.get(id);
+			// Idempotent: nothing live to forget → no ledger churn / gate bump.
+			if (!existing) return { id, forgotten: true };
+
 			this.#allRecords.push(makeForgetRecord(id));
 			this.#live.delete(id);
-			if (existing?.contentHash) {
-				// Remove the sidecar entry if no other live record shares the hash.
-				const stillUsed = [...this.#live.values()].some(
-					(r) => r.contentHash === existing.contentHash,
-				);
-				if (!stillUsed) this.#sidecar.delete(existing.contentHash);
+			if (existing.contentHash && !this.#hashStillLive(existing.contentHash)) {
+				this.#sidecar.delete(existing.contentHash);
+			}
+			if (this.vectorsEnabled) {
 				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
 			}
 			await writeLedger(this.#config.paths.ledger, this.#allRecords);
@@ -396,6 +448,26 @@ export class MemoryStore {
 			await this.#bumpGate();
 			return { id, forgotten: true };
 		});
+	}
+
+	#hashStillLive(hash: string): boolean {
+		for (const r of this.#live.values()) if (r.contentHash === hash) return true;
+		return false;
+	}
+
+	/** Under the mutation lock: reopen the index if another process changed it. */
+	async #ensureIndexFresh(): Promise<void> {
+		const onDisk = await this.#readGate();
+		const currentGen = await this.#readCurrentGen();
+		if (!onDisk || currentGen == null) return;
+		if (
+			!this.#openedGate ||
+			this.#openedGate.indexGen !== currentGen ||
+			this.#openedGate.ledgerHash !== onDisk.ledgerHash ||
+			this.#openedGate.sidecarHash !== onDisk.sidecarHash
+		) {
+			await this.#openIndex(currentGen, onDisk);
+		}
 	}
 
 	async get(id: string): Promise<MemoryRecord | null> {
@@ -495,10 +567,7 @@ export class MemoryStore {
 	/** Force a rebuild. `reembed` re-embeds live records missing a sidecar vector (outside the lock). */
 	async rebuild(reembed = false): Promise<void> {
 		if (reembed && this.vectorsEnabled) await this.#reembedMissing();
-		const currentGen = await this.#readCurrentGen();
-		await withLock(this.#config.paths.lock, this.#lockOpts(), () =>
-			this.#rebuildLocked(currentGen),
-		);
+		await withLock(this.#config.paths.lock, this.#lockOpts(), () => this.#rebuildLocked());
 	}
 
 	async #reembedMissing(): Promise<void> {
@@ -529,14 +598,48 @@ export class MemoryStore {
 		const checks: { name: string; ok: boolean; detail: string }[] = [];
 		const add = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
 
-		add("ledger", true, `${this.#allRecords.length} ops, ${this.#live.size} live`);
+		const tombstones = this.#allRecords.filter((r) => r.op === "forget").length;
+		add(
+			"ledger",
+			true,
+			`${this.#allRecords.length} ops, ${this.#live.size} live, ${tombstones} tombstones`,
+		);
 		add("malformed lines", this.#malformed.length === 0, `${this.#malformed.length} malformed`);
+
+		// A configured local/api embedder that silently fell back to FTS-only is a problem.
+		const embedderOk = this.vectorsEnabled || this.#config.embedder.provider === "none";
 		add(
 			"embedder",
-			true,
+			embedderOk,
 			this.vectorsEnabled
 				? `available (${this.#embedder.id}, dim ${this.#embedder.dim})`
-				: "full-text-only (no embedder)",
+				: this.#config.embedder.provider === "none"
+					? "full-text-only (embedder=none)"
+					: `configured '${this.#config.embedder.provider}' but unavailable — running full-text-only`,
+		);
+
+		// Mixed schemaVersion across ledger ops (forward-compat / migration signal).
+		const versions = new Set(this.#allRecords.map((r) => r.schemaVersion));
+		add(
+			"schemaVersion",
+			versions.size <= 1,
+			versions.size <= 1 ? `uniform (v${SCHEMA_VERSION})` : `mixed: ${[...versions].join(", ")}`,
+		);
+
+		// Dangling supersededBy references (point at ids that are not live).
+		const dangling = [...this.#live.values()].filter(
+			(r) => r.supersededBy && !this.#live.has(r.supersededBy),
+		).length;
+		add("supersededBy refs", dangling === 0, `${dangling} dangling`);
+
+		// The committed source-of-truth files must not be accidentally gitignored.
+		const ignored = await this.#gitIgnored([this.#config.paths.ledger, this.#config.paths.sidecar]);
+		add(
+			"git tracking",
+			ignored.length === 0,
+			ignored.length === 0
+				? "memory.jsonl + vectors.jsonl are not gitignored"
+				: `gitignored (will be lost on clone): ${ignored.join(", ")}`,
 		);
 
 		// Duplicate contentHash among live records (should be 0 after dedup).
@@ -577,6 +680,25 @@ export class MemoryStore {
 		);
 
 		return { ok: checks.every((c) => c.ok), checks };
+	}
+
+	/** Which of `paths` are gitignored. Empty (no false alarms) outside a git repo. */
+	async #gitIgnored(paths: string[]): Promise<string[]> {
+		const { execFile } = await import("node:child_process");
+		const root = this.#config.paths.root;
+		const results = await Promise.all(
+			paths.map(
+				(p) =>
+					new Promise<string | null>((resolve) => {
+						// `git check-ignore -q` exits 0 if ignored, 1 if not, 128 if not a repo.
+						execFile("git", ["check-ignore", "-q", p], { cwd: root }, (err) => {
+							const code = (err as { code?: number } | null)?.code;
+							resolve(code === 0 || err == null ? p : null);
+						});
+					}),
+			),
+		);
+		return results.filter((p): p is string => p !== null);
 	}
 
 	async close(): Promise<void> {

@@ -25,6 +25,20 @@ searchlite-memory doctor           # health report
 The local embedder downloads a small ONNX model on first use. Set
 `SEARCHLITE_MEMORY_EMBEDDER=none` for a zero-dependency, full-text-only mode.
 
+## Configuration (env)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SEARCHLITE_MEMORY_DIR` | `$CLAUDE_PROJECT_DIR/.searchlite-memory` or `./.searchlite-memory` | Memory directory. **Set this to an absolute path when your MCP host does not inject `CLAUDE_PROJECT_DIR`** (e.g. Cursor, Cline) — otherwise it resolves from the server's cwd. |
+| `SEARCHLITE_MEMORY_EMBEDDER` | `local` | `local` \| `none` \| `openai` \| `voyage` \| `cohere` |
+| `SEARCHLITE_MEMORY_MODEL` / `_DIM` / `_QUANT` | all-MiniLM-L6-v2 / 384 / q8 | Local model pin (also the committed-vector fingerprint). |
+| `SEARCHLITE_MEMORY_RRF_K`, `_WEIGHTS`, `_HALF_LIFE_HOURS`, `_POOL_SIZE`, `_RECALL_LIMIT` | 60 / 0.6/0.2/0.15/0.05 / 168 / 50 / 8 | Retrieval + scoring tunables. |
+| `SEARCHLITE_MEMORY_LOCK_STALE`, `_LOCK_RETRIES`, `SEARCHLITE_MEMORY_NO_LOCK` | 30000 / 10 / off | Cross-process lock (set `NO_LOCK=1` on NFS/network mounts where file locking is unreliable). |
+
+Run `searchlite-memory doctor` to verify the setup (it warns when
+`CLAUDE_PROJECT_DIR` is unset and when the committed files are accidentally
+gitignored).
+
 ## Design at a glance
 
 - **Committed source of truth:** `.searchlite-memory/memory.jsonl` (text) +

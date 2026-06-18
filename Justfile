@@ -35,3 +35,18 @@ typecheck-node:
 
 check-node:
   cd searchlite-node && npm run lint && npm run typecheck && npm test
+
+build-memory:
+  cd searchlite-memory && npm run build
+
+test-memory:
+  cd searchlite-memory && npm test
+
+lint-memory:
+  cd searchlite-memory && npm run lint
+
+typecheck-memory:
+  cd searchlite-memory && npm run typecheck
+
+check-memory:
+  cd searchlite-memory && npm run build && npm run lint && npm run typecheck && npm test

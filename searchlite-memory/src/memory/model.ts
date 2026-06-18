@@ -104,6 +104,8 @@ export interface RememberInput {
 	entities?: string[];
 	importance?: number;
 	validFrom?: string;
+	/** Id of a memory this one replaces — tombstoned atomically with the add. */
+	supersedes?: string;
 }
 
 /** Build a fresh `add` record from user input. `now` is injected for testability. */

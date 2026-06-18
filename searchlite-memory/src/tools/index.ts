@@ -64,10 +64,8 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 				entities: args.entities,
 				importance: args.importance,
 				validFrom: args.validFrom,
+				supersedes: args.supersedes,
 			});
-			if (args.supersedes && args.supersedes !== result.id) {
-				await store.forget(args.supersedes);
-			}
 			return {
 				content: [
 					{

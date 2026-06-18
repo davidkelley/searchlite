@@ -165,6 +165,46 @@ jobs:
             exit 1
           fi
 
+  test-memory:
+    name: searchlite-memory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build searchlite-node (file: dependency of searchlite-memory)
+        working-directory: searchlite-node
+        run: |
+          npm install
+          npm run build:native:debug
+          npm run build:ts
+      - name: Install
+        working-directory: searchlite-memory
+        run: npm ci
+      - name: Build
+        working-directory: searchlite-memory
+        run: npm run build
+      - name: Typecheck
+        working-directory: searchlite-memory
+        run: npm run typecheck
+      - name: Lint
+        working-directory: searchlite-memory
+        run: npm run lint
+      - name: Test
+        working-directory: searchlite-memory
+        run: npm test
+      - name: FTS-only install (no optional embedder dependency)
+        working-directory: searchlite-memory
+        run: |
+          npm ci --omit=optional
+          npm run build
+          npm test
+
   # Compile-only guard that the vectors-enabled native addon cross-compiles to
   # aarch64-linux. The release matrix only runs on tags; without this, an
   # aarch64 link failure from the `vectors` deps (e.g. a missing cross archiver)

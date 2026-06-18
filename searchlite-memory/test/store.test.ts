@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -105,5 +105,41 @@ describe("MemoryStore (hybrid, stub embedder)", () => {
 		const report = await store.doctor();
 		expect(report.ok).toBe(true);
 		await store.close();
+	});
+
+	it("supersedes replaces a memory atomically", async () => {
+		const store = await MemoryStore.open(cfg(freshRoot()), stubEmbedder(16));
+		const a = await store.remember({ text: "old policy: deploy on fridays" });
+		const b = await store.remember({ text: "new policy: deploy any day", supersedes: a.id });
+		expect(b.id).not.toBe(a.id);
+		expect(await store.get(a.id)).toBeNull();
+		expect((await store.get(b.id))?.text).toContain("any day");
+		await store.close();
+	});
+
+	it("forget is idempotent and writes no phantom tombstones for unknown ids", async () => {
+		const root = freshRoot();
+		const config = cfg(root);
+		const store = await MemoryStore.open(config, stubEmbedder(16));
+		expect((await store.forget("nope")).forgotten).toBe(true);
+		expect((await store.forget("nope")).forgotten).toBe(true);
+		// Nothing live was forgotten → the ledger file is never created.
+		expect(existsSync(config.paths.ledger)).toBe(false);
+		await store.close();
+	});
+
+	it("merges concurrent writers without losing records", async () => {
+		const root = freshRoot();
+		const s1 = await MemoryStore.open(cfg(root, "none"));
+		const s2 = await MemoryStore.open(cfg(root, "none"));
+		const a = await s1.remember({ text: "alpha fact one" });
+		const b = await s2.remember({ text: "bravo fact two" });
+		await s1.close();
+		await s2.close();
+
+		const s3 = await MemoryStore.open(cfg(root, "none"));
+		expect((await s3.get(a.id))?.text).toContain("alpha");
+		expect((await s3.get(b.id))?.text).toContain("bravo");
+		await s3.close();
 	});
 });
