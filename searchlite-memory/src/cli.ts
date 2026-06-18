@@ -3,11 +3,14 @@
  * searchlite-memory CLI entry point.
  *
  * Subcommands:
- *   serve   (default) — run the MCP stdio server (Stage 7)
- *   rebuild           — rebuild the searchlite index from the committed ledger (Stage 5)
- *   doctor            — read-only health report (Stage 5)
+ *   serve   (default) — run the MCP stdio server
+ *   rebuild [--reembed] — rebuild the searchlite index from the committed ledger
+ *   doctor            — read-only health report (non-zero exit on problems)
  *   init              — scaffold .mcp.json + .searchlite-memory config (Stage 8)
  */
+import { loadConfig } from "./config.js";
+import { MemoryStore } from "./memory/store.js";
+import { serveStdio } from "./server.js";
 
 const USAGE = `searchlite-memory — repository-local memory MCP server (full-text + vector)
 
@@ -32,24 +35,37 @@ function isCommand(value: string): value is Command {
 	return (COMMANDS as readonly string[]).includes(value);
 }
 
-interface ParsedArgs {
-	command: Command;
-	rest: string[];
-}
-
-/** Returns null when help should be shown (explicit --help or unknown command). */
-function parseArgs(argv: string[]): ParsedArgs | null {
+function parseArgs(argv: string[]): { command: Command; rest: string[] } | null {
 	const args = argv.slice(2);
 	if (args.includes("--help") || args.includes("-h")) return null;
 	const first = args[0];
-	// No subcommand, or only flags → default to `serve`.
-	if (first === undefined || first.startsWith("-")) {
-		return { command: "serve", rest: args };
-	}
-	if (isCommand(first)) {
-		return { command: first, rest: args.slice(1) };
-	}
+	if (first === undefined || first.startsWith("-")) return { command: "serve", rest: args };
+	if (isCommand(first)) return { command: first, rest: args.slice(1) };
 	return null;
+}
+
+async function cmdServe(): Promise<void> {
+	const store = await MemoryStore.open(loadConfig());
+	// Note: do NOT write to stdout — it is the JSON-RPC channel. Logs go to stderr.
+	await serveStdio(store);
+}
+
+async function cmdRebuild(reembed: boolean): Promise<void> {
+	const store = await MemoryStore.open(loadConfig());
+	await store.rebuild(reembed);
+	await store.close();
+	process.stderr.write(`searchlite-memory: index rebuilt${reembed ? " (re-embedded)" : ""}.\n`);
+}
+
+async function cmdDoctor(): Promise<void> {
+	const store = await MemoryStore.open(loadConfig());
+	const report = await store.doctor();
+	await store.close();
+	for (const c of report.checks) {
+		process.stdout.write(`${c.ok ? "ok  " : "FAIL"}  ${c.name}: ${c.detail}\n`);
+	}
+	process.stdout.write(report.ok ? "\nAll checks passed.\n" : "\nSome checks failed.\n");
+	if (!report.ok) process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
@@ -58,12 +74,18 @@ async function main(): Promise<void> {
 		process.stdout.write(USAGE);
 		return;
 	}
-	// Command implementations land in later stages (serve: 7, rebuild/doctor: 5,
-	// init: 8). The scaffold recognizes and dispatches them today.
-	process.stderr.write(
-		`searchlite-memory: '${parsed.command}' is not implemented yet (scaffold)\n`,
-	);
-	process.exitCode = 70; // EX_SOFTWARE
+	switch (parsed.command) {
+		case "serve":
+			return cmdServe();
+		case "rebuild":
+			return cmdRebuild(parsed.rest.includes("--reembed"));
+		case "doctor":
+			return cmdDoctor();
+		case "init":
+			process.stderr.write("searchlite-memory: 'init' is not implemented yet (scaffold)\n");
+			process.exitCode = 70;
+			return;
+	}
 }
 
 main().catch((err) => {
