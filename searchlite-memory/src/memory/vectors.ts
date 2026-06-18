@@ -106,11 +106,16 @@ export function indexByContentHash(entries: VectorSidecarEntry[]): Map<string, V
 
 /** Write the sidecar atomically, sorted by (id, contentHash) for determinism. */
 export async function writeSidecar(path: string, entries: VectorSidecarEntry[]): Promise<void> {
+	await atomicWriteFile(path, serializeSidecar(entries));
+}
+
+/** Deterministic sidecar serialization — used for both writing and hashing. */
+export function serializeSidecar(entries: VectorSidecarEntry[]): string {
 	const sorted = [...entries].sort((a, b) => {
 		if (a.id !== b.id) return a.id < b.id ? -1 : 1;
 		if (a.contentHash !== b.contentHash) return a.contentHash < b.contentHash ? -1 : 1;
 		return 0;
 	});
-	const body = sorted.map((e) => canonicalJson(e)).join("\n");
-	await atomicWriteFile(path, sorted.length > 0 ? `${body}\n` : "");
+	if (sorted.length === 0) return "";
+	return `${sorted.map((e) => canonicalJson(e)).join("\n")}\n`;
 }

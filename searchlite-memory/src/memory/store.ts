@@ -1,0 +1,645 @@
+import { createHash } from "node:crypto";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { MemoryConfig } from "../config.js";
+import { cacheKey, VectorCache } from "../embed/cache.js";
+import { createEmbedder, type Embedder } from "../embed/embedder.js";
+import { withLock } from "../lock.js";
+import { EmbeddedIndex, type SearchRequest } from "../searchlite.js";
+import { atomicWriteFile, readFileOrNull } from "./io.js";
+import { materialize, readLedger, serializeLedger, writeLedger } from "./ledger.js";
+import {
+	embedTextOf,
+	type MemoryRecord,
+	type MemoryType,
+	makeAddRecord,
+	makeForgetRecord,
+	type RememberInput,
+	SCHEMA_VERSION,
+} from "./model.js";
+import { rescore, rrfFuse } from "./retrieval.js";
+import {
+	buildIndexSchema,
+	type IndexSchemaOptions,
+	recordToDoc,
+	schemaFingerprint,
+} from "./schema.js";
+import {
+	dequantizeInt8,
+	indexByContentHash,
+	quantizeInt8,
+	readSidecar,
+	serializeSidecar,
+	type VectorSidecarEntry,
+	writeSidecar,
+} from "./vectors.js";
+
+const SNIPPET_MAX = 200;
+
+interface Gate {
+	ledgerHash: string;
+	sidecarHash: string;
+	schemaFingerprint: string;
+	vectorFingerprint: string;
+	indexGen: number;
+}
+
+interface AccessStat {
+	lastAccessed: string;
+	accessCount: number;
+}
+
+export interface RememberResult {
+	id: string;
+	deduped: boolean;
+}
+
+export interface RecallOptions {
+	limit?: number;
+	namespace?: string;
+	type?: MemoryType | MemoryType[];
+	tags?: string[];
+	minImportance?: number;
+}
+
+export interface RecallHit {
+	id: string;
+	snippet: string;
+	type: MemoryType;
+	namespace: string;
+	tags: string[];
+	score: number;
+	createdAt: string | null;
+}
+
+export interface DoctorReport {
+	ok: boolean;
+	checks: { name: string; ok: boolean; detail: string }[];
+}
+
+function sha256(s: string): string {
+	return createHash("sha256").update(s).digest("hex");
+}
+
+function truncate(text: string, max = SNIPPET_MAX): string {
+	const t = text.replace(/\s+/g, " ").trim();
+	return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+}
+
+function normalizeVector(v: Float32Array): number[] {
+	let norm = 0;
+	for (const x of v) norm += x * x;
+	norm = Math.sqrt(norm);
+	const out = new Array<number>(v.length);
+	for (let i = 0; i < v.length; i++) out[i] = norm > 0 ? v[i] / norm : 0;
+	return out;
+}
+
+/**
+ * Orchestrates the committed ledger + vector sidecar, the rebuildable searchlite
+ * index (generation dirs + an atomic CURRENT pointer), the embedder, the
+ * vector cache, and access stats. Every mutation and rebuild runs under a
+ * cross-process lock; the slow embed runs BEFORE the lock.
+ */
+export class MemoryStore {
+	#config: MemoryConfig;
+	#embedder: Embedder;
+	#cache: VectorCache;
+	#index: InstanceType<typeof EmbeddedIndex> | null = null;
+	#indexGen = 0;
+	#openedGate: Gate | null = null;
+
+	#allRecords: MemoryRecord[] = [];
+	#live = new Map<string, MemoryRecord>();
+	#sidecar = new Map<string, VectorSidecarEntry>(); // contentHash -> entry
+	#access = new Map<string, AccessStat>();
+	#malformed: { lineNumber: number; error: string }[] = [];
+	#missingVectorIds: string[] = [];
+
+	private constructor(config: MemoryConfig, embedder: Embedder) {
+		this.#config = config;
+		this.#embedder = embedder;
+		this.#cache = new VectorCache(config.paths.cache);
+	}
+
+	/** Open the store. `embedder` overrides config-based creation (tests / custom providers). */
+	static async open(config: MemoryConfig, embedder?: Embedder): Promise<MemoryStore> {
+		const resolved = embedder ?? (await createEmbedder(config.embedder));
+		const store = new MemoryStore(config, resolved);
+		await store.#load();
+		return store;
+	}
+
+	get vectorsEnabled(): boolean {
+		return this.#embedder.available;
+	}
+
+	#schemaOpts(): IndexSchemaOptions {
+		return { vectorDim: this.vectorsEnabled ? this.#embedder.dim : null };
+	}
+
+	#computeGate(indexGen: number): Gate {
+		return {
+			ledgerHash: sha256(serializeLedger(this.#allRecords)),
+			sidecarHash: sha256(serializeSidecar([...this.#sidecar.values()])),
+			schemaFingerprint: schemaFingerprint(this.#schemaOpts()),
+			vectorFingerprint: this.vectorsEnabled ? this.#embedder.id : "none",
+			indexGen,
+		};
+	}
+
+	async #readGate(): Promise<Gate | null> {
+		const raw = await readFileOrNull(this.#config.paths.gate);
+		if (!raw) return null;
+		try {
+			return JSON.parse(raw) as Gate;
+		} catch {
+			return null;
+		}
+	}
+
+	async #writeGate(gate: Gate): Promise<void> {
+		await atomicWriteFile(this.#config.paths.gate, JSON.stringify(gate));
+	}
+
+	#genDir(gen: number): string {
+		return join(this.#config.paths.indexDir, `gen-${gen}`);
+	}
+
+	async #readCurrentGen(): Promise<number | null> {
+		const raw = await readFileOrNull(this.#config.paths.currentPointer);
+		if (!raw) return null;
+		const n = Number.parseInt(raw.trim(), 10);
+		return Number.isFinite(n) ? n : null;
+	}
+
+	async #load(): Promise<void> {
+		await mkdir(this.#config.paths.root, { recursive: true });
+		await mkdir(this.#config.paths.indexDir, { recursive: true });
+		// Ensure the lock target exists (proper-lockfile with realpath:false).
+		if ((await readFileOrNull(this.#config.paths.lock)) === null) {
+			await writeFile(this.#config.paths.lock, "");
+		}
+
+		const ledger = await readLedger(this.#config.paths.ledger, SCHEMA_VERSION);
+		if (ledger.hasForwardVersion) {
+			throw new Error(
+				"the memory ledger contains records from a newer schemaVersion than this " +
+					"searchlite-memory understands; upgrade the package (refusing to rebuild and " +
+					"risk dropping unrecognized records)",
+			);
+		}
+		this.#malformed = ledger.malformed;
+		this.#allRecords = ledger.records;
+		const mat = materialize(ledger.records);
+		this.#live = new Map(mat.live.map((r) => [r.id, r]));
+
+		const sidecar = await readSidecar(this.#config.paths.sidecar);
+		this.#sidecar = indexByContentHash(sidecar.entries);
+
+		this.#access = await this.#readAccess();
+		await this.#cache.load();
+
+		const desired = this.#computeGate(0);
+		const onDisk = await this.#readGate();
+		const currentGen = await this.#readCurrentGen();
+		const genDirExists = currentGen != null && (await this.#dirExists(this.#genDir(currentGen)));
+
+		const stale =
+			currentGen == null ||
+			!genDirExists ||
+			onDisk == null ||
+			onDisk.ledgerHash !== desired.ledgerHash ||
+			onDisk.sidecarHash !== desired.sidecarHash ||
+			onDisk.schemaFingerprint !== desired.schemaFingerprint ||
+			onDisk.vectorFingerprint !== desired.vectorFingerprint;
+
+		if (stale) {
+			await withLock(this.#config.paths.lock, this.#lockOpts(), () =>
+				this.#rebuildLocked(currentGen),
+			);
+		} else {
+			this.#index = new EmbeddedIndex(this.#genDir(currentGen), {
+				schema: buildIndexSchema(this.#schemaOpts()),
+			});
+			this.#indexGen = currentGen;
+			this.#openedGate = onDisk;
+		}
+	}
+
+	async #dirExists(path: string): Promise<boolean> {
+		try {
+			await readdir(path);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Rebuild the index into a fresh generation dir and flip CURRENT. MUST hold the lock. */
+	async #rebuildLocked(currentGen: number | null): Promise<void> {
+		const newGen = (currentGen ?? 0) + 1;
+		const dir = this.#genDir(newGen);
+		await rm(dir, { recursive: true, force: true });
+		await mkdir(dir, { recursive: true });
+
+		const idx = new EmbeddedIndex(dir, { schema: buildIndexSchema(this.#schemaOpts()) });
+		this.#missingVectorIds = [];
+		const live = [...this.#live.values()];
+		const BATCH = 256;
+		for (let i = 0; i < live.length; i += BATCH) {
+			const docs = live.slice(i, i + BATCH).map((rec) => this.#docFor(rec));
+			if (docs.length > 0) await idx.addMany(docs);
+			await new Promise((r) => setImmediate(r)); // yield the event loop
+		}
+		await idx.commit();
+		if (this.#index) await this.#index.close();
+		this.#index = idx;
+		this.#indexGen = newGen;
+
+		// Atomic pointer flip, then best-effort GC of stale generations.
+		await atomicWriteFile(this.#config.paths.currentPointer, String(newGen));
+		await this.#gcGenerations(newGen);
+
+		const gate = this.#computeGate(newGen);
+		await this.#writeGate(gate);
+		this.#openedGate = gate;
+	}
+
+	#docFor(rec: MemoryRecord): Record<string, unknown> {
+		let embedding: Float32Array | null = null;
+		if (this.vectorsEnabled && rec.contentHash) {
+			const entry = this.#sidecar.get(rec.contentHash);
+			if (entry) {
+				embedding = dequantizeInt8(entry.vecB64, entry.dim);
+			} else {
+				this.#missingVectorIds.push(rec.id);
+			}
+		}
+		return recordToDoc(rec, embedding);
+	}
+
+	async #gcGenerations(keep: number): Promise<void> {
+		let names: string[];
+		try {
+			names = await readdir(this.#config.paths.indexDir);
+		} catch {
+			return;
+		}
+		for (const name of names) {
+			if (name.startsWith("gen-") && name !== `gen-${keep}`) {
+				await rm(join(this.#config.paths.indexDir, name), { recursive: true, force: true }).catch(
+					() => {},
+				);
+			}
+		}
+	}
+
+	#lockOpts() {
+		return {
+			staleMs: this.#config.lockStaleMs,
+			retries: this.#config.lockRetries,
+			disabled: this.#config.lockDisabled,
+		};
+	}
+
+	async #readAccess(): Promise<Map<string, AccessStat>> {
+		const raw = await readFileOrNull(this.#config.paths.access);
+		if (!raw) return new Map();
+		try {
+			const obj = JSON.parse(raw) as Record<string, AccessStat>;
+			return new Map(Object.entries(obj));
+		} catch {
+			return new Map();
+		}
+	}
+
+	async #writeAccess(): Promise<void> {
+		const obj: Record<string, AccessStat> = {};
+		for (const [id, stat] of this.#access) obj[id] = stat;
+		await atomicWriteFile(this.#config.paths.access, JSON.stringify(obj));
+	}
+
+	// --- Public operations ---
+
+	async remember(input: RememberInput): Promise<RememberResult> {
+		if (!input.text || input.text.trim().length === 0) {
+			throw new Error("remember: text is required");
+		}
+		const record = makeAddRecord(input);
+		const hash = record.contentHash as string;
+
+		// Fast pre-check: an identical-content live memory short-circuits before
+		// any (slow) embedding. Re-checked authoritatively under the lock.
+		const pre = this.#findLiveByHash(hash);
+		if (pre) return { id: pre, deduped: true };
+
+		// Embed OUTSIDE the lock (slow, pure). Cache by fingerprint+text.
+		let vecB64: string | null = null;
+		if (this.vectorsEnabled) {
+			const key = cacheKey(this.#embedder.id, embedTextOf(record));
+			const cached = this.#cache.get(key);
+			if (cached) {
+				vecB64 = cached;
+			} else {
+				const [vec] = await this.#embedder.embed([embedTextOf(record)]);
+				vecB64 = quantizeInt8(vec);
+				this.#cache.set(key, vecB64);
+			}
+		}
+
+		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
+			const existing = this.#findLiveByHash(hash);
+			if (existing) return { id: existing, deduped: true };
+
+			this.#allRecords.push(record);
+			this.#live.set(record.id, record);
+			if (vecB64) {
+				const entry: VectorSidecarEntry = {
+					id: record.id,
+					contentHash: hash,
+					model: this.#embedder.id,
+					dim: this.#embedder.dim,
+					quant: "i8",
+					vecB64,
+				};
+				this.#sidecar.set(hash, entry);
+				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
+			}
+			await writeLedger(this.#config.paths.ledger, this.#allRecords);
+
+			const embedding = vecB64 ? dequantizeInt8(vecB64, this.#embedder.dim) : null;
+			await this.#index?.add(recordToDoc(record, embedding));
+			await this.#index?.commit();
+
+			await this.#bumpGate();
+			await this.#cache.flush();
+			return { id: record.id, deduped: false };
+		});
+	}
+
+	async forget(id: string): Promise<{ id: string; forgotten: boolean }> {
+		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
+			const existing = this.#live.get(id);
+			this.#allRecords.push(makeForgetRecord(id));
+			this.#live.delete(id);
+			if (existing?.contentHash) {
+				// Remove the sidecar entry if no other live record shares the hash.
+				const stillUsed = [...this.#live.values()].some(
+					(r) => r.contentHash === existing.contentHash,
+				);
+				if (!stillUsed) this.#sidecar.delete(existing.contentHash);
+				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
+			}
+			await writeLedger(this.#config.paths.ledger, this.#allRecords);
+			await this.#index?.deleteMany([id]);
+			await this.#bumpGate();
+			return { id, forgotten: true };
+		});
+	}
+
+	async get(id: string): Promise<MemoryRecord | null> {
+		await this.#refreshIfStale();
+		const rec = this.#live.get(id);
+		if (!rec) return null;
+		this.#bumpAccess([id]);
+		await this.#writeAccess();
+		return rec;
+	}
+
+	async recall(query: string, opts: RecallOptions = {}): Promise<{ memories: RecallHit[] }> {
+		await this.#refreshIfStale();
+		if (!query || query.trim().length === 0) return { memories: [] };
+		const limit = opts.limit ?? this.#config.recallLimit;
+		const pool = this.#config.poolSize;
+		const filter = this.#buildFilter(opts);
+
+		// BM25 call (snippet via highlightField; no per-call schema → no forced
+		// returnStored). Metadata comes from the in-memory live records.
+		const bmReq: SearchRequest = {
+			query,
+			fields: ["text"],
+			limit: pool,
+			highlightField: "text",
+			...(filter ? { filter } : {}),
+		};
+		const bm = await this.#index?.search(bmReq);
+		const bmHits = bm?.hits ?? [];
+		const bmIds = bmHits.map((h) => h.docId);
+		const snippets = new Map<string, string>();
+		for (const h of bmHits) {
+			if (typeof h.snippet === "string" && h.snippet.length > 0) {
+				snippets.set(h.docId, truncate(h.snippet));
+			}
+		}
+
+		// Vector call (pure vector via query node; snake_case inner keys).
+		let vecIds: string[] = [];
+		if (this.vectorsEnabled) {
+			const [qvec] = await this.#embedder.embed([query]);
+			const vector = normalizeVector(qvec);
+			const vecReq: SearchRequest = {
+				query: { type: "vector", field: "embedding", vector, k: pool, alpha: 0.0 },
+				limit: pool,
+				...(filter ? { filter } : {}),
+			};
+			const vr = await this.#index?.search(vecReq);
+			vecIds = (vr?.hits ?? []).map((h) => h.docId);
+		}
+
+		const fused = rrfFuse([bmIds, vecIds], this.#config.rrfK);
+		const now = Date.now();
+		const candidates = [...fused.entries()]
+			.map(([id, rrf]) => {
+				const rec = this.#live.get(id);
+				if (!rec) return null;
+				const ref = this.#access.get(id)?.lastAccessed ?? rec.createdAt;
+				const refMs = ref ? Date.parse(ref) : now;
+				const ageHours = Math.max(0, (now - (Number.isFinite(refMs) ? refMs : now)) / 3_600_000);
+				return {
+					id,
+					rrf,
+					importance: typeof rec.importance === "number" ? rec.importance : 0.5,
+					ageHours,
+					accessCount: this.#access.get(id)?.accessCount ?? 0,
+				};
+			})
+			.filter((c): c is NonNullable<typeof c> => c !== null);
+
+		const ranked = rescore(candidates, {
+			weights: this.#config.weights,
+			halfLifeHours: this.#config.halfLifeHours,
+			accessCap: this.#config.accessCap,
+		}).slice(0, limit);
+
+		const memories: RecallHit[] = ranked.map(({ id, score }) => {
+			const rec = this.#live.get(id) as MemoryRecord;
+			return {
+				id,
+				snippet: snippets.get(id) ?? truncate(rec.text ?? ""),
+				type: (rec.type ?? "semantic") as MemoryType,
+				namespace: rec.namespace ?? "default",
+				tags: rec.tags ?? [],
+				score,
+				createdAt: rec.createdAt ?? null,
+			};
+		});
+
+		if (memories.length > 0) {
+			this.#bumpAccess(memories.map((m) => m.id));
+			await this.#writeAccess();
+		}
+		return { memories };
+	}
+
+	/** Force a rebuild. `reembed` re-embeds live records missing a sidecar vector (outside the lock). */
+	async rebuild(reembed = false): Promise<void> {
+		if (reembed && this.vectorsEnabled) await this.#reembedMissing();
+		const currentGen = await this.#readCurrentGen();
+		await withLock(this.#config.paths.lock, this.#lockOpts(), () =>
+			this.#rebuildLocked(currentGen),
+		);
+	}
+
+	async #reembedMissing(): Promise<void> {
+		const missing = [...this.#live.values()].filter(
+			(r) => r.contentHash && !this.#sidecar.has(r.contentHash),
+		);
+		if (missing.length === 0) return;
+		// Embed OUTSIDE the lock, then take the lock only to persist the sidecar.
+		const fresh: VectorSidecarEntry[] = [];
+		for (const rec of missing) {
+			const [vec] = await this.#embedder.embed([embedTextOf(rec)]);
+			fresh.push({
+				id: rec.id,
+				contentHash: rec.contentHash as string,
+				model: this.#embedder.id,
+				dim: this.#embedder.dim,
+				quant: "i8",
+				vecB64: quantizeInt8(vec),
+			});
+		}
+		await withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
+			for (const e of fresh) this.#sidecar.set(e.contentHash, e);
+			await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
+		});
+	}
+
+	async doctor(): Promise<DoctorReport> {
+		const checks: { name: string; ok: boolean; detail: string }[] = [];
+		const add = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
+
+		add("ledger", true, `${this.#allRecords.length} ops, ${this.#live.size} live`);
+		add("malformed lines", this.#malformed.length === 0, `${this.#malformed.length} malformed`);
+		add(
+			"embedder",
+			true,
+			this.vectorsEnabled
+				? `available (${this.#embedder.id}, dim ${this.#embedder.dim})`
+				: "full-text-only (no embedder)",
+		);
+
+		// Duplicate contentHash among live records (should be 0 after dedup).
+		const seen = new Set<string>();
+		let dups = 0;
+		for (const r of this.#live.values()) {
+			if (!r.contentHash) continue;
+			if (seen.has(r.contentHash)) dups++;
+			else seen.add(r.contentHash);
+		}
+		add("duplicate contentHash", dups === 0, `${dups} duplicates`);
+
+		if (this.vectorsEnabled) {
+			const missing = [...this.#live.values()].filter(
+				(r) => r.contentHash && !this.#sidecar.has(r.contentHash),
+			).length;
+			add(
+				"vectors present",
+				missing === 0,
+				missing === 0 ? "all live records have vectors" : `${missing} live records missing vectors`,
+			);
+			const drift = [...this.#sidecar.values()].filter((e) => e.model !== this.#embedder.id).length;
+			add(
+				"embedder fingerprint",
+				drift === 0,
+				drift === 0
+					? "sidecar matches embedder"
+					: `${drift} sidecar entries from a different model`,
+			);
+		}
+
+		add(
+			"CLAUDE_PROJECT_DIR",
+			!this.#config.projectDirResolvedFromCwd,
+			this.#config.projectDirResolvedFromCwd
+				? "not set — memory dir resolved from cwd; set it for non-Claude-Code hosts"
+				: "set",
+		);
+
+		return { ok: checks.every((c) => c.ok), checks };
+	}
+
+	async close(): Promise<void> {
+		await this.#cache.flush();
+		if (this.#index) {
+			await this.#index.close();
+			this.#index = null;
+		}
+	}
+
+	// --- internals ---
+
+	#findLiveByHash(hash: string): string | null {
+		for (const rec of this.#live.values()) {
+			if (rec.contentHash === hash) return rec.id;
+		}
+		return null;
+	}
+
+	#buildFilter(opts: RecallOptions): Record<string, unknown> | undefined {
+		const clauses: Record<string, unknown>[] = [];
+		if (opts.namespace) {
+			clauses.push({ KeywordEq: { field: "namespace", value: opts.namespace } });
+		}
+		if (opts.type) {
+			const types = Array.isArray(opts.type) ? opts.type : [opts.type];
+			clauses.push({ KeywordIn: { field: "type", values: types } });
+		}
+		if (opts.tags && opts.tags.length > 0) {
+			clauses.push({ KeywordIn: { field: "tags", values: opts.tags } });
+		}
+		if (typeof opts.minImportance === "number") {
+			clauses.push({ F64Range: { field: "importance", min: opts.minImportance, max: 1 } });
+		}
+		if (clauses.length === 0) return undefined;
+		if (clauses.length === 1) return clauses[0];
+		return { And: clauses };
+	}
+
+	#bumpAccess(ids: string[]): void {
+		const now = new Date().toISOString();
+		for (const id of ids) {
+			const prev = this.#access.get(id);
+			this.#access.set(id, { lastAccessed: now, accessCount: (prev?.accessCount ?? 0) + 1 });
+		}
+	}
+
+	async #bumpGate(): Promise<void> {
+		const gate = this.#computeGate(this.#indexGen);
+		await this.#writeGate(gate);
+		this.#openedGate = gate;
+	}
+
+	/** Reopen + reload if another process changed the on-disk gate (cross-process freshness). */
+	async #refreshIfStale(): Promise<void> {
+		const onDisk = await this.#readGate();
+		if (!onDisk || !this.#openedGate) return;
+		const changed =
+			onDisk.ledgerHash !== this.#openedGate.ledgerHash ||
+			onDisk.sidecarHash !== this.#openedGate.sidecarHash ||
+			onDisk.indexGen !== this.#openedGate.indexGen ||
+			onDisk.schemaFingerprint !== this.#openedGate.schemaFingerprint ||
+			onDisk.vectorFingerprint !== this.#openedGate.vectorFingerprint;
+		if (changed) await this.#load();
+	}
+}

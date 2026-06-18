@@ -105,9 +105,15 @@ export function materialize(records: MemoryRecord[], now: Date = new Date()): Ma
  * the `merge=union` gitattribute for conflict-free concurrent appends.
  */
 export async function writeLedger(path: string, records: MemoryRecord[]): Promise<void> {
+	await atomicWriteFile(path, serializeLedger(records));
+}
+
+/** Deterministic ledger serialization (sorted canonical lines). Used for both
+ * writing and hashing (the gate's ledgerHash). */
+export function serializeLedger(records: MemoryRecord[]): string {
 	const sorted = [...records].sort(compareRecords);
-	const body = sorted.map((r) => canonicalJson(r)).join("\n");
-	await atomicWriteFile(path, sorted.length > 0 ? `${body}\n` : "");
+	if (sorted.length === 0) return "";
+	return `${sorted.map((r) => canonicalJson(r)).join("\n")}\n`;
 }
 
 function compareRecords(a: MemoryRecord, b: MemoryRecord): number {
