@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -130,12 +130,21 @@ describe("MemoryStore (hybrid, stub embedder)", () => {
 
 	it("merges concurrent writers without losing records", async () => {
 		const root = freshRoot();
-		const s1 = await MemoryStore.open(cfg(root, "none"));
+		const config = cfg(root, "none");
+		const s1 = await MemoryStore.open(config);
 		const s2 = await MemoryStore.open(cfg(root, "none"));
 		const a = await s1.remember({ text: "alpha fact one" });
 		const b = await s2.remember({ text: "bravo fact two" });
 		await s1.close();
 		await s2.close();
+
+		// The ledger must contain BOTH adds (the lost-update guard).
+		const adds = readFileSync(config.paths.ledger, "utf8")
+			.split("\n")
+			.filter((l) => l.trim())
+			.map((l) => JSON.parse(l))
+			.filter((r) => r.op === "add");
+		expect(adds).toHaveLength(2);
 
 		const s3 = await MemoryStore.open(cfg(root, "none"));
 		expect((await s3.get(a.id))?.text).toContain("alpha");

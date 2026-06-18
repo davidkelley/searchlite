@@ -232,14 +232,17 @@ export class MemoryStore {
 		}
 	}
 
-	/** (Re)open the index handle on a generation dir, closing any prior handle. */
+	/** (Re)open the index handle on a generation dir. Swaps the new handle in
+	 * BEFORE closing the old one so a concurrent reader never sees a closed
+	 * handle. */
 	async #openIndex(gen: number, gate: Gate): Promise<void> {
-		if (this.#index) await this.#index.close();
+		const old = this.#index;
 		this.#index = new EmbeddedIndex(this.#genDir(gen), {
 			schema: buildIndexSchema(this.#schemaOpts()),
 		});
 		this.#indexGen = gen;
 		this.#openedGate = gate;
+		if (old) await old.close();
 	}
 
 	async #dirExists(path: string): Promise<boolean> {
@@ -282,9 +285,10 @@ export class MemoryStore {
 			await new Promise((r) => setImmediate(r)); // yield the event loop
 		}
 		await idx.commit();
-		if (this.#index) await this.#index.close();
+		const old = this.#index;
 		this.#index = idx;
 		this.#indexGen = newGen;
+		if (old) await old.close();
 
 		// Atomic pointer flip, then best-effort GC of stale generations.
 		await atomicWriteFile(this.#config.paths.currentPointer, String(newGen));
@@ -358,12 +362,11 @@ export class MemoryStore {
 		const record = makeAddRecord(input);
 		const hash = record.contentHash as string;
 
-		// Fast pre-check: an identical-content live memory short-circuits before
-		// any (slow) embedding. Re-checked authoritatively under the lock.
-		const pre = this.#findLiveByHash(hash);
-		if (pre) return { id: pre, deduped: true };
-
-		// Embed OUTSIDE the lock (slow, pure). Cache by fingerprint+text.
+		// Embed OUTSIDE the lock (slow, pure). Cache by fingerprint+text. We embed
+		// unconditionally (no pre-lock dedup): the only authoritative dedup happens
+		// under the lock against freshly-reloaded state — a stale in-memory match
+		// could otherwise return an id another process already forgot. A duplicate
+		// discovered under the lock just discards the (cheap, cached) vector.
 		let vecB64: string | null = null;
 		if (this.vectorsEnabled) {
 			const key = cacheKey(this.#embedder.id, embedTextOf(record));
@@ -380,11 +383,28 @@ export class MemoryStore {
 		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
 			await this.#reloadState(); // merge any concurrent writes before mutating
 			await this.#ensureIndexFresh();
+
+			const supersedeId =
+				input.supersedes && this.#live.has(input.supersedes) ? input.supersedes : null;
 			const existing = this.#findLiveByHash(hash);
-			if (existing) return { id: existing, deduped: true };
+
+			// Dedup: identical content already present. Still honor `supersedes`.
+			if (existing) {
+				if (supersedeId && supersedeId !== existing) {
+					const sidecarMutated = this.#tombstone(supersedeId);
+					if (sidecarMutated) {
+						await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
+					}
+					await writeLedger(this.#config.paths.ledger, this.#allRecords);
+					await this.#index?.deleteMany([supersedeId]);
+					await this.#bumpGate();
+				}
+				return { id: existing, deduped: true };
+			}
 
 			this.#allRecords.push(record);
 			this.#live.set(record.id, record);
+			let sidecarMutated = false;
 			if (vecB64) {
 				this.#sidecar.set(hash, {
 					id: record.id,
@@ -394,32 +414,24 @@ export class MemoryStore {
 					quant: "i8",
 					vecB64,
 				});
+				sidecarMutated = true;
+			}
+			if (supersedeId && supersedeId !== record.id) {
+				if (this.#tombstone(supersedeId)) sidecarMutated = true;
 			}
 
-			// Supersede: atomically tombstone the replaced memory + drop its vector.
-			const supersedeId =
-				input.supersedes && input.supersedes !== record.id && this.#live.has(input.supersedes)
-					? input.supersedes
-					: null;
-			if (supersedeId) {
-				const old = this.#live.get(supersedeId);
-				this.#allRecords.push(makeForgetRecord(supersedeId));
-				this.#live.delete(supersedeId);
-				if (old?.contentHash && !this.#hashStillLive(old.contentHash)) {
-					this.#sidecar.delete(old.contentHash);
-				}
-			}
-
-			if (this.vectorsEnabled) {
+			if (sidecarMutated) {
 				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
 			}
 			await writeLedger(this.#config.paths.ledger, this.#allRecords);
 
 			const embedding = vecB64 ? dequantizeInt8(vecB64, this.#embedder.dim) : null;
 			await this.#index?.add(recordToDoc(record, embedding));
-			if (supersedeId)
+			if (supersedeId && supersedeId !== record.id) {
 				await this.#index?.deleteMany([supersedeId]); // deletes + commits
-			else await this.#index?.commit();
+			} else {
+				await this.#index?.commit();
+			}
 
 			await this.#bumpGate();
 			await this.#cache.flush();
@@ -431,16 +443,11 @@ export class MemoryStore {
 		return withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
 			await this.#reloadState(); // merge concurrent writes before mutating
 			await this.#ensureIndexFresh();
-			const existing = this.#live.get(id);
 			// Idempotent: nothing live to forget → no ledger churn / gate bump.
-			if (!existing) return { id, forgotten: true };
+			if (!this.#live.has(id)) return { id, forgotten: true };
 
-			this.#allRecords.push(makeForgetRecord(id));
-			this.#live.delete(id);
-			if (existing.contentHash && !this.#hashStillLive(existing.contentHash)) {
-				this.#sidecar.delete(existing.contentHash);
-			}
-			if (this.vectorsEnabled) {
+			const sidecarMutated = this.#tombstone(id);
+			if (sidecarMutated) {
 				await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
 			}
 			await writeLedger(this.#config.paths.ledger, this.#allRecords);
@@ -448,6 +455,22 @@ export class MemoryStore {
 			await this.#bumpGate();
 			return { id, forgotten: true };
 		});
+	}
+
+	/**
+	 * Append a tombstone for `id` and drop it from live state, removing its
+	 * sidecar entry when no other live record shares the contentHash. Returns
+	 * whether the sidecar was mutated (so the caller persists it — regardless of
+	 * vectorsEnabled, since a committed sidecar may exist even in FTS-only mode).
+	 */
+	#tombstone(id: string): boolean {
+		const old = this.#live.get(id);
+		this.#allRecords.push(makeForgetRecord(id));
+		this.#live.delete(id);
+		if (old?.contentHash && !this.#hashStillLive(old.contentHash)) {
+			return this.#sidecar.delete(old.contentHash);
+		}
+		return false;
 	}
 
 	#hashStillLive(hash: string): boolean {
@@ -690,10 +713,10 @@ export class MemoryStore {
 			paths.map(
 				(p) =>
 					new Promise<string | null>((resolve) => {
-						// `git check-ignore -q` exits 0 if ignored, 1 if not, 128 if not a repo.
+						// `git check-ignore -q` exits 0 (no err) if ignored, 1 if not,
+						// 128 if not a repo. Only exit 0 (err == null) means "ignored".
 						execFile("git", ["check-ignore", "-q", p], { cwd: root }, (err) => {
-							const code = (err as { code?: number } | null)?.code;
-							resolve(code === 0 || err == null ? p : null);
+							resolve(err == null ? p : null);
 						});
 					}),
 			),
