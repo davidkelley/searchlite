@@ -43,7 +43,18 @@ export async function createLocalEmbedder(opts: LocalEmbedderOptions): Promise<E
 			dtype: opts.quant,
 			revision: opts.revision,
 		});
-	} catch {
+	} catch (err) {
+		// A missing optional dependency is the expected, silent FTS-only fallback.
+		// Any other failure (bad revision/dtype, download/network error) is a
+		// degradation the operator should see — log it to stderr, then still fall
+		// back to FTS-only rather than crashing the server.
+		const msg = err instanceof Error ? err.message : String(err);
+		if (!/Cannot find (module|package)|MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/i.test(msg)) {
+			process.stderr.write(
+				`searchlite-memory: local embedder failed to initialize (${msg}); ` +
+					"falling back to full-text-only\n",
+			);
+		}
 		return null;
 	}
 

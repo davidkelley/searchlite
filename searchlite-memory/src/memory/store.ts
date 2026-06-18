@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MemoryConfig } from "../config.js";
 import { cacheKey, VectorCache } from "../embed/cache.js";
@@ -115,6 +115,11 @@ export class MemoryStore {
 	#access = new Map<string, AccessStat>();
 	#malformed: { lineNumber: number; error: string }[] = [];
 	#missingVectorIds: string[] = [];
+	/** Per-file mtime stamp of the committed ledger+sidecar at last load — detects
+	 * external (git pull / branch switch) changes a long-running server would
+	 * otherwise miss. Per-file (not a single max) so a change to either file —
+	 * including the older one, or a deletion — is always seen. */
+	#sourceStamp = "";
 
 	private constructor(config: MemoryConfig, embedder: Embedder) {
 		this.#config = config;
@@ -207,6 +212,20 @@ export class MemoryStore {
 		const sidecar = await readSidecar(this.#config.paths.sidecar);
 		this.#sidecar = indexByContentHash(sidecar.entries);
 		this.#access = await this.#readAccess();
+		this.#sourceStamp = await this.#currentSourceStamp();
+	}
+
+	/** Per-file mtime stamp of the committed ledger + sidecar ("-" if absent). */
+	async #currentSourceStamp(): Promise<string> {
+		const parts: string[] = [];
+		for (const p of [this.#config.paths.ledger, this.#config.paths.sidecar]) {
+			try {
+				parts.push(String((await stat(p)).mtimeMs));
+			} catch {
+				parts.push("-");
+			}
+		}
+		return parts.join("|");
 	}
 
 	#isStale(onDisk: Gate | null, currentGen: number | null, genDirExists: boolean): boolean {
@@ -303,7 +322,12 @@ export class MemoryStore {
 		let embedding: Float32Array | null = null;
 		if (this.vectorsEnabled && rec.contentHash) {
 			const entry = this.#sidecar.get(rec.contentHash);
-			if (entry) {
+			// Only reuse a committed vector when it was produced by the CURRENT
+			// embedder + dim. A model/revision/quant change (same dim) would
+			// otherwise index semantically-stale vectors that are silently wrong
+			// against fresh query embeddings. Drifted/mismatched → index FTS-only
+			// for this record; `doctor`/`rebuild --reembed` repairs it.
+			if (entry && entry.model === this.#embedder.id && entry.dim === this.#embedder.dim) {
 				embedding = dequantizeInt8(entry.vecB64, entry.dim);
 			} else {
 				this.#missingVectorIds.push(rec.id);
@@ -478,19 +502,36 @@ export class MemoryStore {
 		return false;
 	}
 
-	/** Under the mutation lock: reopen the index if another process changed it. */
+	/**
+	 * Caller holds the mutation lock and has just `#reloadState()`d. Make the
+	 * index reflect that fresh state: REBUILD if stale (e.g. an external git-pull
+	 * changed the committed ledger but not the gitignored gate, so the desired
+	 * gate now mismatches), otherwise reopen if another process advanced the gate.
+	 * Calls `#rebuildLocked()` directly (not via `withLock`) since the lock is held.
+	 */
 	async #ensureIndexFresh(): Promise<void> {
 		const onDisk = await this.#readGate();
 		const currentGen = await this.#readCurrentGen();
-		if (!onDisk || currentGen == null) return;
-		if (
-			!this.#openedGate ||
-			this.#openedGate.indexGen !== currentGen ||
-			this.#openedGate.ledgerHash !== onDisk.ledgerHash ||
-			this.#openedGate.sidecarHash !== onDisk.sidecarHash
+		const genDirExists = currentGen != null && (await this.#dirExists(this.#genDir(currentGen)));
+		if (this.#isStale(onDisk, currentGen, genDirExists)) {
+			await this.#rebuildLocked();
+		} else if (
+			currentGen != null &&
+			onDisk != null &&
+			(!this.#openedGate || !this.#sameGate(this.#openedGate, onDisk))
 		) {
 			await this.#openIndex(currentGen, onDisk);
 		}
+	}
+
+	#sameGate(a: Gate, b: Gate): boolean {
+		return (
+			a.indexGen === b.indexGen &&
+			a.ledgerHash === b.ledgerHash &&
+			a.sidecarHash === b.sidecarHash &&
+			a.schemaFingerprint === b.schemaFingerprint &&
+			a.vectorFingerprint === b.vectorFingerprint
+		);
 	}
 
 	async get(id: string): Promise<MemoryRecord | null> {
@@ -593,10 +634,15 @@ export class MemoryStore {
 		await withLock(this.#config.paths.lock, this.#lockOpts(), () => this.#rebuildLocked());
 	}
 
+	#needsEmbed(rec: MemoryRecord): boolean {
+		if (!rec.contentHash) return false;
+		const entry = this.#sidecar.get(rec.contentHash);
+		// Missing OR produced by a different model/dim (drift) → needs (re)embed.
+		return !entry || entry.model !== this.#embedder.id || entry.dim !== this.#embedder.dim;
+	}
+
 	async #reembedMissing(): Promise<void> {
-		const missing = [...this.#live.values()].filter(
-			(r) => r.contentHash && !this.#sidecar.has(r.contentHash),
-		);
+		const missing = [...this.#live.values()].filter((r) => this.#needsEmbed(r));
 		if (missing.length === 0) return;
 		// Embed OUTSIDE the lock, then take the lock only to persist the sidecar.
 		const fresh: VectorSidecarEntry[] = [];
@@ -612,8 +658,22 @@ export class MemoryStore {
 			});
 		}
 		await withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
-			for (const e of fresh) this.#sidecar.set(e.contentHash, e);
-			await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
+			await this.#reloadState(); // merge concurrent sidecar writes before persisting
+			const liveHashes = new Set(
+				[...this.#live.values()].map((r) => r.contentHash).filter((h): h is string => !!h),
+			);
+			let changed = false;
+			for (const e of fresh) {
+				// Skip vectors for records forgotten during embedding, or already
+				// (re)embedded for the current model by a concurrent writer.
+				const cur = this.#sidecar.get(e.contentHash);
+				const stillNeeded = !cur || cur.model !== e.model || cur.dim !== e.dim;
+				if (liveHashes.has(e.contentHash) && stillNeeded) {
+					this.#sidecar.set(e.contentHash, e);
+					changed = true;
+				}
+			}
+			if (changed) await writeSidecar(this.#config.paths.sidecar, [...this.#sidecar.values()]);
 		});
 	}
 
@@ -676,13 +736,16 @@ export class MemoryStore {
 		add("duplicate contentHash", dups === 0, `${dups} duplicates`);
 
 		if (this.vectorsEnabled) {
-			const missing = [...this.#live.values()].filter(
-				(r) => r.contentHash && !this.#sidecar.has(r.contentHash),
-			).length;
+			// Records with no usable vector for the CURRENT embedder (absent OR
+			// produced by a different model/dim) — these index FTS-only until
+			// `rebuild --reembed`.
+			const missing = [...this.#live.values()].filter((r) => this.#needsEmbed(r)).length;
 			add(
 				"vectors present",
 				missing === 0,
-				missing === 0 ? "all live records have vectors" : `${missing} live records missing vectors`,
+				missing === 0
+					? "all live records have current-model vectors"
+					: `${missing} live records need (re)embedding (run: searchlite-memory rebuild --reembed)`,
 			);
 			const drift = [...this.#sidecar.values()].filter((e) => e.model !== this.#embedder.id).length;
 			add(
@@ -773,18 +836,25 @@ export class MemoryStore {
 		const gate = this.#computeGate(this.#indexGen);
 		await this.#writeGate(gate);
 		this.#openedGate = gate;
+		// Record post-write source stamp so our own mutation isn't seen as an
+		// external change on the next recall.
+		this.#sourceStamp = await this.#currentSourceStamp();
 	}
 
-	/** Reopen + reload if another process changed the on-disk gate (cross-process freshness). */
+	/**
+	 * Reopen + reload if the committed memory changed underneath a long-running
+	 * server — either by another searchlite-memory process (detected via the gate)
+	 * or by an external edit / `git pull` / branch switch (detected via the
+	 * ledger+sidecar mtime, which the gitignored gate file would not reflect).
+	 */
 	async #refreshIfStale(): Promise<void> {
+		if ((await this.#currentSourceStamp()) !== this.#sourceStamp) {
+			await this.#load();
+			return;
+		}
 		const onDisk = await this.#readGate();
-		if (!onDisk || !this.#openedGate) return;
-		const changed =
-			onDisk.ledgerHash !== this.#openedGate.ledgerHash ||
-			onDisk.sidecarHash !== this.#openedGate.sidecarHash ||
-			onDisk.indexGen !== this.#openedGate.indexGen ||
-			onDisk.schemaFingerprint !== this.#openedGate.schemaFingerprint ||
-			onDisk.vectorFingerprint !== this.#openedGate.vectorFingerprint;
-		if (changed) await this.#load();
+		if (onDisk && this.#openedGate && !this.#sameGate(onDisk, this.#openedGate)) {
+			await this.#load();
+		}
 	}
 }

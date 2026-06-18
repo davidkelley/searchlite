@@ -44,14 +44,16 @@
 		"build:js": "swc src -d dist --strip-leading-paths",
 		"build:types": "tsc",
 		"build": "npm run build:js && npm run build:types",
+		"prepublishOnly": "npm run build && npm test",
 		"test": "vitest run",
 		"test:watch": "vitest",
+		"test:e2e": "npm run build && RUN_E2E=1 vitest run test/e2e",
 		"typecheck": "tsc && tsc --noEmit -p tsconfig.test.json",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write ."
 	},
 	"dependencies": {
-		"@modelcontextprotocol/sdk": "^1.0.0",
+		"@modelcontextprotocol/sdk": "^1.29.0",
 		"proper-lockfile": "^4.1.2",
 		"searchlite-js": "file:../searchlite-node",
 		"ulid": "^2.3.0",

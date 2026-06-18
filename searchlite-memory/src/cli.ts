@@ -48,6 +48,20 @@ function parseArgs(argv: string[]): { command: Command; rest: string[] } | null 
 async function cmdServe(): Promise<void> {
 	const store = await MemoryStore.open(loadConfig());
 	// Note: do NOT write to stdout — it is the JSON-RPC channel. Logs go to stderr.
+	// Graceful shutdown so a host killing the server releases the lock + flushes
+	// the cache (avoids stale .lock files / lost cache writes).
+	let shuttingDown = false;
+	const shutdown = async (code: number) => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		try {
+			await store.close();
+		} finally {
+			process.exit(code);
+		}
+	};
+	process.on("SIGINT", () => void shutdown(0));
+	process.on("SIGTERM", () => void shutdown(0));
 	await serveStdio(store);
 }
 
