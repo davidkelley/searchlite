@@ -9,6 +9,7 @@
  *   init              — scaffold .mcp.json + .searchlite-memory config (Stage 8)
  */
 import { loadConfig } from "./config.js";
+import { runInit } from "./init.js";
 import { MemoryStore } from "./memory/store.js";
 import { serveStdio } from "./server.js";
 
@@ -81,10 +82,11 @@ async function main(): Promise<void> {
 			return cmdRebuild(parsed.rest.includes("--reembed"));
 		case "doctor":
 			return cmdDoctor();
-		case "init":
-			process.stderr.write("searchlite-memory: 'init' is not implemented yet (scaffold)\n");
-			process.exitCode = 70;
+		case "init": {
+			const result = await runInit();
+			for (const line of result.lines) process.stdout.write(`${line}\n`);
 			return;
+		}
 	}
 }
 

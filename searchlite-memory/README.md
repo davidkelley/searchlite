@@ -9,9 +9,21 @@ Memory is committed into the repository as a human-readable JSONL ledger (plus a
 quantized vector sidecar) so it travels with the code and is shared across a
 team. The searchlite binary index is a gitignored, rebuildable cache.
 
-> Status: in development. This package is built in stages; see the repository
-> plan for the roadmap. The CLI scaffold (`serve` / `rebuild` / `doctor` /
-> `init`) is in place; tool/server behavior lands in later stages.
+## Quick start
+
+```bash
+# In your repo (a one-time scaffold of .mcp.json + .searchlite-memory/ config):
+npx searchlite-memory init
+
+# Your MCP client (e.g. Claude Code) launches the server from .mcp.json.
+# CLI subcommands:
+searchlite-memory serve            # MCP stdio server (default)
+searchlite-memory rebuild [--reembed]
+searchlite-memory doctor           # health report
+```
+
+The local embedder downloads a small ONNX model on first use. Set
+`SEARCHLITE_MEMORY_EMBEDDER=none` for a zero-dependency, full-text-only mode.
 
 ## Design at a glance
 
