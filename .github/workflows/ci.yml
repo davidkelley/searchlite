@@ -198,15 +198,15 @@ jobs:
       - name: Test
         working-directory: searchlite-memory
         run: npm test
-      - name: FTS-only install (no optional embedder dependency)
+      - name: FTS-only fallback (optional embedder absent)
         working-directory: searchlite-memory
-        # Reinstall without optionalDependencies to prove the package works
-        # absent @huggingface/transformers (the optional embedder). Run the test
-        # suite directly — vitest transforms TS itself, so no build step (and
-        # therefore no @swc native binary, which --omit=optional would also strip).
+        # Remove ONLY the optional embedder dep (a blanket `npm ci --omit=optional`
+        # also strips dev-tool native binaries like @swc/core and vitest's
+        # @rolldown/binding) and assert the local embedder degrades to FTS-only
+        # instead of throwing. Reuses the dist built by the earlier Build step.
         run: |
-          npm ci --omit=optional
-          npm test
+          rm -rf node_modules/@huggingface/transformers
+          node --input-type=module -e "import { createEmbedder } from './dist/embed/embedder.js'; const e = await createEmbedder({ provider: 'local', model: 'Xenova/all-MiniLM-L6-v2', dim: 384, quant: 'q8', revision: 'main' }); if (e.available) { console.error('FAIL: expected FTS-only fallback when @huggingface/transformers is absent'); process.exit(1); } console.log('FTS-only fallback OK (embedder.available=false)');"
 
   # Compile-only guard that the vectors-enabled native addon cross-compiles to
   # aarch64-linux. The release matrix only runs on tags; without this, an
