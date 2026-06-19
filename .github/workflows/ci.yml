@@ -200,9 +200,12 @@ jobs:
         run: npm test
       - name: FTS-only install (no optional embedder dependency)
         working-directory: searchlite-memory
+        # Reinstall without optionalDependencies to prove the package works
+        # absent @huggingface/transformers (the optional embedder). Run the test
+        # suite directly — vitest transforms TS itself, so no build step (and
+        # therefore no @swc native binary, which --omit=optional would also strip).
         run: |
           npm ci --omit=optional
-          npm run build
           npm test
 
   # Compile-only guard that the vectors-enabled native addon cross-compiles to
@@ -215,9 +218,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-gnu
+      - name: Ensure aarch64 std is installed
+        run: rustup target add aarch64-unknown-linux-gnu
       - uses: actions/setup-node@v6
         with:
           node-version: 22
