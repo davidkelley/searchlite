@@ -26,14 +26,22 @@ export async function readLedger(
 	const records: MemoryRecord[] = [];
 	let hasForwardVersion = false;
 	for (const line of parsed.records) {
+		// Detect a forward-version record from its RAW schemaVersion BEFORE full
+		// validation: a newer writer may also have changed a required shape (e.g.
+		// `op`), which would otherwise fail `safeParse` and be dropped as merely
+		// "malformed" — never tripping open()'s forward-version refusal, so the
+		// next rewrite would silently lose that newer record.
+		const rawVersion = (line.value as { schemaVersion?: unknown })?.schemaVersion;
+		if (typeof rawVersion === "number" && rawVersion > maxSchemaVersion) {
+			hasForwardVersion = true;
+			continue;
+		}
 		const result = MemoryRecordSchema.safeParse(line.value);
 		if (!result.success) {
 			malformed.push({ lineNumber: line.lineNumber, error: result.error.message });
 			continue;
 		}
-		const record = result.data as MemoryRecord;
-		if (record.schemaVersion > maxSchemaVersion) hasForwardVersion = true;
-		records.push(record);
+		records.push(result.data as MemoryRecord);
 	}
 	return { records, malformed, hasForwardVersion };
 }
@@ -67,7 +75,7 @@ export function materialize(records: MemoryRecord[], now: Date = new Date()): Ma
 		winners.set(rec.id, prev ? winningOp(prev, rec) : rec);
 	}
 
-	const nowIso = now.toISOString();
+	const nowMs = now.getTime();
 	const tombstoned: string[] = [];
 	const liveById: MemoryRecord[] = [];
 	for (const rec of winners.values()) {
@@ -76,7 +84,12 @@ export function materialize(records: MemoryRecord[], now: Date = new Date()): Ma
 			continue;
 		}
 		if (rec.supersededBy) continue;
-		if (rec.invalidAt != null && rec.invalidAt <= nowIso) continue;
+		// Parse timestamps for comparison — string compare is unreliable across
+		// ISO format/timezone/precision differences (e.g. `Z` vs `+00:00`).
+		if (rec.invalidAt != null) {
+			const invalidMs = Date.parse(rec.invalidAt);
+			if (Number.isFinite(invalidMs) && invalidMs <= nowMs) continue;
+		}
 		liveById.push(rec);
 	}
 

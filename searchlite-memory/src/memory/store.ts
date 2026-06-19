@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { MemoryConfig } from "../config.js";
 import { cacheKey, VectorCache } from "../embed/cache.js";
 import { createEmbedder, type Embedder } from "../embed/embedder.js";
@@ -372,8 +372,22 @@ export class MemoryStore {
 	}
 
 	async #writeAccess(): Promise<void> {
+		// access.json is updated lock-free on read paths (recall/get). Merge the
+		// latest on-disk stats before writing so a concurrent reader's increments
+		// aren't clobbered (best-effort, not a strict lock): newest lastAccessed
+		// wins, and accessCount takes the max of the two.
+		const merged = await this.#readAccess();
+		for (const [id, stat] of this.#access) {
+			const disk = merged.get(id);
+			merged.set(id, {
+				lastAccessed:
+					disk && disk.lastAccessed > stat.lastAccessed ? disk.lastAccessed : stat.lastAccessed,
+				accessCount: Math.max(stat.accessCount, disk?.accessCount ?? 0),
+			});
+		}
+		this.#access = merged;
 		const obj: Record<string, AccessStat> = {};
-		for (const [id, stat] of this.#access) obj[id] = stat;
+		for (const [id, stat] of merged) obj[id] = stat;
 		await atomicWriteFile(this.#config.paths.access, JSON.stringify(obj));
 	}
 
@@ -646,16 +660,20 @@ export class MemoryStore {
 		if (missing.length === 0) return;
 		// Embed OUTSIDE the lock, then take the lock only to persist the sidecar.
 		const fresh: VectorSidecarEntry[] = [];
-		for (const rec of missing) {
-			const [vec] = await this.#embedder.embed([embedTextOf(rec)]);
-			fresh.push({
-				id: rec.id,
-				contentHash: rec.contentHash as string,
-				model: this.#embedder.id,
-				dim: this.#embedder.dim,
-				quant: "i8",
-				vecB64: quantizeInt8(vec),
-			});
+		const BATCH = 32;
+		for (let i = 0; i < missing.length; i += BATCH) {
+			const batch = missing.slice(i, i + BATCH);
+			const vecs = await this.#embedder.embed(batch.map((r) => embedTextOf(r)));
+			for (let j = 0; j < batch.length; j++) {
+				fresh.push({
+					id: batch[j].id,
+					contentHash: batch[j].contentHash as string,
+					model: this.#embedder.id,
+					dim: this.#embedder.dim,
+					quant: "i8",
+					vecB64: quantizeInt8(vecs[j]),
+				});
+			}
 		}
 		await withLock(this.#config.paths.lock, this.#lockOpts(), async () => {
 			await this.#reloadState(); // merge concurrent sidecar writes before persisting
@@ -776,11 +794,18 @@ export class MemoryStore {
 			paths.map(
 				(p) =>
 					new Promise<string | null>((resolve) => {
-						// `git check-ignore -q` exits 0 (no err) if ignored, 1 if not,
-						// 128 if not a repo. Only exit 0 (err == null) means "ignored".
-						execFile("git", ["check-ignore", "-q", p], { cwd: root }, (err) => {
-							resolve(err == null ? p : null);
-						});
+						// Run from the repo and pass a path RELATIVE to cwd (git
+						// check-ignore is most reliable with worktree-relative paths;
+						// `--` guards a leading dash). Exit 0 (no err) = ignored, 1 =
+						// not, 128 = not a repo. Only exit 0 means "ignored".
+						execFile(
+							"git",
+							["check-ignore", "-q", "--", relative(root, p)],
+							{ cwd: root },
+							(err) => {
+								resolve(err == null ? p : null);
+							},
+						);
 					}),
 			),
 		);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 
 /**
  * Deterministic JSON serialization: object keys are emitted in sorted order at
@@ -32,8 +32,14 @@ function sortKeys(value: unknown): unknown {
  */
 export async function atomicWriteFile(path: string, contents: string): Promise<void> {
 	const tmp = `${path}.tmp.${process.pid}.${randomUUID()}`;
-	await writeFile(tmp, contents, "utf8");
-	await rename(tmp, path);
+	try {
+		await writeFile(tmp, contents, "utf8");
+		await rename(tmp, path);
+	} catch (err) {
+		// Don't leave the temp file behind on a failed write/rename.
+		await unlink(tmp).catch(() => {});
+		throw err;
+	}
 }
 
 /** Read a UTF-8 file, returning null if it does not exist. Rethrows other errors. */

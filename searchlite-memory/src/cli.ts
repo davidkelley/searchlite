@@ -56,6 +56,10 @@ async function cmdServe(): Promise<void> {
 		shuttingDown = true;
 		try {
 			await store.close();
+		} catch (err) {
+			process.stderr.write(
+				`searchlite-memory: shutdown error: ${err instanceof Error ? err.message : String(err)}\n`,
+			);
 		} finally {
 			process.exit(code);
 		}

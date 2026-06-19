@@ -53,13 +53,13 @@ export function quantizeInt8(vec: ArrayLike<number>): string {
  * if the decoded length does not equal `dim`.
  */
 export function dequantizeInt8(vecB64: string, dim: number): Float32Array {
-	// `new Uint8Array(buffer)` copies into a fresh, zero-offset ArrayBuffer so
-	// the Int8Array view below is safe regardless of Buffer pooling.
-	const u8 = new Uint8Array(Buffer.from(vecB64, "base64"));
-	if (u8.length !== dim) {
-		throw new Error(`vector length ${u8.length} does not match dim ${dim}`);
+	// Buffer IS a Uint8Array; view its (possibly pooled, non-zero-offset)
+	// ArrayBuffer directly as signed int8 — no intermediate copy.
+	const buf = Buffer.from(vecB64, "base64");
+	if (buf.length !== dim) {
+		throw new Error(`vector length ${buf.length} does not match dim ${dim}`);
 	}
-	const i8 = new Int8Array(u8.buffer, 0, dim);
+	const i8 = new Int8Array(buf.buffer, buf.byteOffset, dim);
 	const out = new Float32Array(dim);
 	for (let i = 0; i < dim; i++) out[i] = i8[i] / 127;
 	const norm = l2norm(out);
