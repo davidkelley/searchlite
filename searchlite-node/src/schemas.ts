@@ -256,7 +256,9 @@ const VectorQuerySchema = z.object({
 	field: z.string(),
 	vector: z.array(z.number()),
 	k: z.number().int().positive().optional(),
-	alpha: z.number().optional(),
+	// Blend factor: 1.0 = pure BM25, 0.0 = pure vector. Constrained to [0,1]
+	// to reject invalid values before they reach the native layer.
+	alpha: z.number().min(0).max(1).optional(),
 	efSearch: z.number().int().positive().optional(),
 	candidateSize: z.number().int().positive().optional(),
 	boost: z.number().optional(),

@@ -60,8 +60,8 @@
 	},
 	"scripts": {
 		"artifacts": "napi artifacts",
-		"build:native": "napi build --platform --release",
-		"build:native:debug": "napi build --platform",
+		"build:native": "napi build --platform --release --features vectors",
+		"build:native:debug": "napi build --platform --features vectors",
 		"build:ts": "swc src -d dist --strip-leading-paths && tsc",
 		"build": "npm run build:native && npm run build:ts",
 		"build:debug": "npm run build:native:debug && npm run build:ts",
