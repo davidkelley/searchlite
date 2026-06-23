@@ -51,7 +51,7 @@
 		"@napi-rs/cli": "^3",
 		"@swc/cli": "^0.8",
 		"@swc/core": "^1",
-		"@types/node": "^25.9.3",
+		"@types/node": "^26.0.0",
 		"typescript": "^6",
 		"vitest": "^4"
 	},
