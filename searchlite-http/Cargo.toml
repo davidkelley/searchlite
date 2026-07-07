@@ -35,7 +35,7 @@ thiserror = { workspace = true }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
 tokio-util = { version = "0.7.10", features = ["io"] }
 tower = { version = "0.5.3", features = ["timeout", "limit"] }
-tower-http = { version = "0.6.11", features = ["limit", "trace"] }
+tower-http = { version = "0.7.0", features = ["limit", "trace"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
