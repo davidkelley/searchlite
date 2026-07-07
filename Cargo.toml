@@ -49,7 +49,7 @@ regex = "1.10.4"
 tdigest = "0.2.3"
 log = "0.4.20"
 argon2 = { version = "0.5", default-features = false, features = ["std"] }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 base64 = "0.22"
 subtle = "2.5"
