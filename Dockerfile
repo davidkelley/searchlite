@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Builder stage: compile the searchlite CLI binary.
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 WORKDIR /workspace
 
 # Install minimal build tooling (ca-certificates so released binary can validate TLS backends when used).
