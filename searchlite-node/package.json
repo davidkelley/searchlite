@@ -46,7 +46,7 @@
 		}
 	},
 	"devDependencies": {
-		"zod": "^4.4.3",
+		"zod": "^4.5.2",
 		"@biomejs/biome": "^2",
 		"@napi-rs/cli": "^3",
 		"@swc/cli": "^0.8",
