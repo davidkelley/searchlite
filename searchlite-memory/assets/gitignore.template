@@ -1,0 +1,8 @@
+# searchlite-memory: commit the human-readable ledger + vector sidecar
+# (memory.jsonl, vectors.jsonl). Everything below is a rebuildable cache.
+index/
+access.json
+.ledger-hash
+embeddings.cache
+.lock
+.lock.lock

@@ -8,6 +8,13 @@ description = "Node.js native addon for searchlite"
 publish = false
 
 [features]
+# NOTE: `vectors` is intentionally NOT in `default`. The published `searchlite-js`
+# binary is built with `--features vectors` (see package.json build:native* and the
+# release/CI workflows) so it ships vector/hybrid support. Enabling it via the
+# crate default instead would leak through Cargo feature unification into
+# `searchlite-core` for the whole `cargo build --all` default build, breaking
+# sibling crates (searchlite-ffi/-http) whose IndexOptions/SearchRequest literals
+# gate the vectors-only fields on *their own* (unset) `vectors` feature.
 default = []
 vectors = ["searchlite-core/vectors"]
 zstd = ["searchlite-core/zstd"]
