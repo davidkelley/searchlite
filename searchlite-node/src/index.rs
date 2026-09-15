@@ -272,6 +272,45 @@ impl Index {
     })
   }
 
+  /// Delete a single document by id. Unlike `add`/`addMany` (which queue and
+  /// require a separate `commit`), `delete`/`deleteMany` delete **and commit**
+  /// within one writer session, so the removal is durable on return. A missing
+  /// id is a no-op (the engine queues a tombstone regardless of existence).
+  ///
+  /// Note: because this commits, any documents previously queued via
+  /// `add`/`addMany` but not yet committed are flushed and become searchable
+  /// too (the commit drains the whole pending WAL). Callers that batch writes
+  /// should not interleave uncommitted `add`s with `delete`.
+  #[napi]
+  pub fn delete(&self, id: String) -> napi::Result<()> {
+    catch_panic("Index::delete", || {
+      self.with_index(|index| {
+        let mut writer = index
+          .writer_with_key(self.write_key.as_deref())
+          .map_err(to_napi_error)?;
+        writer.delete_documents(&[id]).map_err(to_napi_error)?;
+        writer.commit().map_err(to_napi_error)
+      })
+    })
+  }
+
+  /// Delete many documents by id, then commit — all in one writer session.
+  /// Returns the number of ids submitted (not necessarily the number that
+  /// existed). See `delete` for the commit semantics.
+  #[napi(js_name = "deleteMany")]
+  pub fn delete_many(&self, ids: Vec<String>) -> napi::Result<u32> {
+    catch_panic("Index::deleteMany", || {
+      self.with_index(|index| {
+        let mut writer = index
+          .writer_with_key(self.write_key.as_deref())
+          .map_err(to_napi_error)?;
+        writer.delete_documents(&ids).map_err(to_napi_error)?;
+        writer.commit().map_err(to_napi_error)?;
+        Ok(ids.len() as u32)
+      })
+    })
+  }
+
   #[napi]
   pub fn search(&self, env: Env, query: Unknown) -> napi::Result<Unknown<'_>> {
     catch_panic("Index::search", || {

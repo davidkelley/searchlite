@@ -45,6 +45,34 @@
       "maximum": 100000,
       "default": 20000
     },
+    "vector_query": {
+      "description": "Top-level vector clause for hybrid (BM25 + vector) search. Either the structured object form or the legacy tuple [field, vector, alpha]. Requires the engine to be built with the `vectors` feature (default).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["field", "vector"],
+          "properties": {
+            "field": { "type": "string", "description": "Name of the vector field to search." },
+            "vector": { "type": "array", "items": { "type": "number" }, "description": "Query embedding; length must equal the field's configured dim." },
+            "k": { "type": ["integer", "null"], "minimum": 1, "description": "Number of ANN neighbours to retrieve." },
+            "alpha": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "Hybrid blend: 1.0 = pure BM25, 0.0 = pure vector. Defaults to 0.5." },
+            "ef_search": { "type": ["integer", "null"], "minimum": 1, "description": "HNSW beam width at query time." },
+            "candidate_size": { "type": ["integer", "null"], "minimum": 1, "description": "Over-sampling pool before re-ranking." },
+            "boost": { "type": ["number", "null"], "description": "Score multiplier for this vector clause." }
+          }
+        },
+        {
+          "type": "array",
+          "description": "Legacy tuple form: [field, vector, alpha].",
+          "minItems": 2,
+          "maxItems": 3
+        }
+      ]
+    },
+    "vector_filter": {
+      "description": "Pre-filter applied during vector candidate selection (same filter AST as `filter`).",
+      "type": ["object", "null"]
+    },
     "sort": { "type": "array", "items": { "$ref": "#/$defs/sort_spec" }, "default": [] },
     "cursor": { "type": ["string", "null"], "description": "Opaque cursor from the previous page." },
     "search_after": {

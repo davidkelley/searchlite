@@ -1,0 +1,12 @@
+{
+	"mcpServers": {
+		"searchlite-memory": {
+			"command": "npx",
+			"args": ["-y", "searchlite-memory", "serve"],
+			"env": {
+				"SEARCHLITE_MEMORY_DIR": "${CLAUDE_PROJECT_DIR:-.}/.searchlite-memory",
+				"SEARCHLITE_MEMORY_EMBEDDER": "${SEARCHLITE_MEMORY_EMBEDDER:-local}"
+			}
+		}
+	}
+}
