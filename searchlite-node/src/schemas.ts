@@ -248,6 +248,22 @@ const SortSpecSchema = z.union([
 	SortSpecShorthandString,
 ]);
 
+// Structured vector query (camelCase). Mapped to the Rust `VectorQuery`
+// (snake_case fields) by `requestToSnake`'s nested transform. The whole
+// `vectorQuery` envelope was previously stripped by Zod (unknown key), so
+// hybrid/vector search via the typed request path silently no-op'd.
+const VectorQuerySchema = z.object({
+	field: z.string(),
+	vector: z.array(z.number()),
+	k: z.number().int().positive().optional(),
+	// Blend factor: 1.0 = pure BM25, 0.0 = pure vector. Constrained to [0,1]
+	// to reject invalid values before they reach the native layer.
+	alpha: z.number().min(0).max(1).optional(),
+	efSearch: z.number().int().positive().optional(),
+	candidateSize: z.number().int().positive().optional(),
+	boost: z.number().optional(),
+});
+
 export const SearchRequestSchema = z.object({
 	query: z.union([z.string(), z.record(z.string(), z.unknown())]),
 	fields: z.array(z.string()).optional(),
@@ -282,6 +298,13 @@ export const SearchRequestSchema = z.object({
 	rescore: z.record(z.string(), z.unknown()).optional(),
 	explain: z.boolean().optional(),
 	profile: z.boolean().optional(),
+	// Vector / hybrid search (requires the `vectors` feature in the native
+	// binding, which is on by default). `vectorQuery` is the structured form;
+	// the tuple shorthand `["field",[...],alpha]` is also accepted by the
+	// engine if passed through `query`.
+	vectorQuery: VectorQuerySchema.optional(),
+	vectorFilter: FilterSchema.optional(),
+	maxGlobalVectorCandidates: z.number().int().positive().nullish(),
 });
 
 // --- Output schemas (camelCase) ---
