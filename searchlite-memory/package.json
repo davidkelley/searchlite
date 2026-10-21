@@ -1,0 +1,74 @@
+{
+	"name": "searchlite-memory",
+	"version": "0.1.0",
+	"description": "Repository-local memory MCP server for AI agents, backed by searchlite full-text + vector search.",
+	"type": "module",
+	"bin": {
+		"searchlite-memory": "dist/cli.js"
+	},
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/davidkelley/searchlite.git",
+		"directory": "searchlite-memory"
+	},
+	"homepage": "https://github.com/davidkelley/searchlite/tree/main/searchlite-memory#readme",
+	"bugs": "https://github.com/davidkelley/searchlite/issues",
+	"keywords": [
+		"mcp",
+		"memory",
+		"agent",
+		"search",
+		"vector",
+		"rag",
+		"searchlite"
+	],
+	"engines": {
+		"node": ">=20"
+	},
+	"files": [
+		"dist",
+		"assets",
+		"LICENSE",
+		"README.md"
+	],
+	"scripts": {
+		"build:js": "swc src -d dist --strip-leading-paths",
+		"build:types": "tsc",
+		"build": "npm run build:js && npm run build:types",
+		"prepublishOnly": "npm run build && npm test",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:e2e": "npm run build && RUN_E2E=1 vitest run test/e2e",
+		"typecheck": "tsc && tsc --noEmit -p tsconfig.test.json",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write ."
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.29.0",
+		"proper-lockfile": "^4.1.2",
+		"searchlite-js": "file:../searchlite-node",
+		"ulid": "^2.3.0",
+		"zod": "^4.4.3"
+	},
+	"optionalDependencies": {
+		"@huggingface/transformers": "^3.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2",
+		"@swc/cli": "^0.8",
+		"@swc/core": "^1",
+		"@types/node": "^25.7.0",
+		"@types/proper-lockfile": "^4.1.4",
+		"typescript": "^6",
+		"vitest": "^4"
+	}
+}

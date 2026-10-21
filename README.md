@@ -145,6 +145,20 @@ await index.close();
 
 See the [quickstart](docs/quickstart.md#nodejs--typescript) for a full TypeScript example with Zod-validated typed search.
 
+### As repository-local memory for AI agents (MCP)
+
+Give coding agents durable, committed memory — `remember` / `recall` / `get` / `forget`
+over MCP, backed by hybrid full-text + vector search:
+
+```bash
+# In your repo: scaffold a project-scoped .mcp.json + .searchlite-memory/ config
+npx -y searchlite-memory init
+```
+
+Claude Code (and other MCP hosts) then pick up the four memory tools automatically.
+Memory is committed as a human-readable JSONL ledger (the binary index is a rebuildable,
+gitignored cache). See [docs/agent-memory.md](docs/agent-memory.md).
+
 ---
 
 ## Features
@@ -188,6 +202,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | **WASM** | [`searchlite-wasm`](searchlite-wasm/README.md) | Pre-1.0 &mdash; IndexedDB-backed browser search with worker runtime, migrations, quota handling |
 | **S3 / R2 / MinIO** | [`searchlite-s3`](searchlite-s3/README.md) | Experimental &mdash; read-only `Index` opens against object stores, with `sync_to_s3` for publishing locally-baked indexes |
 | **Elasticsearch adapter** | [`searchlite-adapter-elastic`](searchlite-adapter-elastic/README.md) | Pre-1.0 &mdash; read-only Elasticsearch HTTP-API compatibility for existing ES clients (Kibana, official SDKs) |
+| **Agent memory (MCP)** | [`searchlite-memory`](searchlite-memory/README.md) | Pre-1.0 &mdash; repository-local memory MCP server for AI agents: committed text ledger + hybrid (BM25 + vector) recall. See [docs/agent-memory.md](docs/agent-memory.md) |
 
 ---
 
@@ -246,6 +261,7 @@ Benchmarked on Apple M3 Max (36 GB), Rust 1.92.0, in-memory storage. All times a
 | Aggregations | [docs/aggregations.md](docs/aggregations.md) |
 | Collapsing and highlighting | [docs/collapsing-and-highlighting.md](docs/collapsing-and-highlighting.md) |
 | Vector search | [docs/vectors.md](docs/vectors.md) |
+| Agent memory (MCP) | [docs/agent-memory.md](docs/agent-memory.md) |
 | In-memory indexes | [docs/in-memory.md](docs/in-memory.md) |
 | S3-compatible storage | [docs/s3.md](docs/s3.md) |
 | WASM bindings | [docs/wasm.md](docs/wasm.md) |
