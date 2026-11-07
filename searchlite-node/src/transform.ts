@@ -24,6 +24,28 @@ const REQUEST_KEY_MAP: Record<string, string> = {
 	searchAfter: "search_after",
 	candidateSize: "candidate_size",
 	bmwBlockSize: "bmw_block_size",
+	// Top-level vector fields are simple renames. `vectorFilter` carries a
+	// Filter whose own keys are already in the engine's tagged shape
+	// (`KeywordEq`, …), so no nested rewrite is needed. `vectorQuery` IS
+	// rewritten nested below (its inner keys are camelCase).
+	vectorFilter: "vector_filter",
+	maxGlobalVectorCandidates: "max_global_vector_candidates",
+};
+
+// camelCase keys inside the nested `vectorQuery` object → the Rust
+// `VectorQuery` struct fields. Kept as an explicit whitelist (mirroring the
+// `fuzzy` handling) rather than the top-level `REQUEST_KEY_MAP`, because this
+// is an inner-object transform: note `candidateSize`/`efSearch` here map the
+// vector-query's own oversampling/beam-width, distinct from the top-level
+// `candidateSize` entry in `REQUEST_KEY_MAP`.
+const VECTOR_QUERY_KEY_MAP: Record<string, string> = {
+	field: "field",
+	vector: "vector",
+	k: "k",
+	alpha: "alpha",
+	efSearch: "ef_search",
+	candidateSize: "candidate_size",
+	boost: "boost",
 };
 
 export function requestToSnake(obj: Record<string, unknown>): Record<string, unknown> {
@@ -37,6 +59,16 @@ export function requestToSnake(obj: Record<string, unknown>): Record<string, unk
 		if ("maxEdits" in fuzzy) f.max_edits = fuzzy.maxEdits;
 		if ("prefixLength" in fuzzy) f.prefix_length = fuzzy.prefixLength;
 		out.fuzzy = f;
+	}
+	// `vectorQuery` (camelCase) → `vector_query` with snake_case inner keys.
+	if (out.vectorQuery && typeof out.vectorQuery === "object" && !Array.isArray(out.vectorQuery)) {
+		const vq = out.vectorQuery as Record<string, unknown>;
+		const v: Record<string, unknown> = {};
+		for (const [k, val] of Object.entries(vq)) {
+			v[VECTOR_QUERY_KEY_MAP[k] ?? k] = val;
+		}
+		delete out.vectorQuery;
+		out.vector_query = v;
 	}
 	return out;
 }

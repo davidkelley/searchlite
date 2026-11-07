@@ -1,0 +1,4 @@
+# Union-merge the append-only memory files so concurrent-branch additions merge
+# without conflicts (materialization de-dupes and orders by (opTs, id)).
+memory.jsonl merge=union
+vectors.jsonl merge=union
